@@ -8,7 +8,10 @@ Phase 1 ported the agent, runner, session, events, items, handoffs, the OpenAI W
 and the fake transport. Phase 2 closed the SIP / call-accept flow, the playback tracker, and
 Python's generation-scoped guardrail interrupt branching. **Phase 3 closed the rest: strict step
 scripting, history audio storage, debug log redaction, and the invocation-identity behavior that is
-observable in realtime events and approvals.** All three phases are reflected below.
+observable in realtime events and approvals. **Phase 4 closed the realtime rows of the
+`parity-audit-261030-0505` report: MCP tools on realtime agents, the nested audio config tree,
+`conversation.item.retrieve` re-requests, the usage modality breakdown, transport settings,
+lifecycle hooks and the remaining small config gaps.** All four phases are reflected below.
 
 ## Files
 
@@ -16,21 +19,21 @@ Created (all under the allowed scope):
 
 | File | Lines | Contents |
 | --- | --- | --- |
-| `src/realtime/mod.rs` | 106 | Module docs, submodules, re-exports |
-| `src/realtime/items.rs` | 461 | `RealtimeItem`, message/tool-call items, history merge helpers |
-| `src/realtime/debug.rs` | 169 | Model/tool data redaction for realtime logs |
-| `src/realtime/config.rs` | 492 | `RealtimeSessionModelSettings`, `RealtimeRunConfig`, turn detection, tracing, user input |
-| `src/realtime/model_events.rs` | 216 | `RealtimeModelEvent` and payload types |
+| `src/realtime/mod.rs` | 111 | Module docs, submodules, re-exports |
+| `src/realtime/items.rs` | 480 | `RealtimeItem`, message/tool-call items, history merge helpers |
+| `src/realtime/debug.rs` | 105 | Model/tool data redaction for realtime logs |
+| `src/realtime/config.rs` | 835 | `RealtimeSessionModelSettings`, `RealtimeRunConfig`, turn detection, tracing, user input |
+| `src/realtime/model_events.rs` | 267 | `RealtimeModelEvent` and payload types |
 | `src/realtime/model_inputs.rs` | 224 | `RealtimeModelSendEvent`, `RealtimeInterrupt` |
-| `src/realtime/model.rs` | 339 | `RealtimeModel` trait, `RealtimeModelConfig`, `RealtimePlaybackTracker`, audio length math |
-| `src/realtime/agent.rs` | 217 | `RealtimeAgent<C>`, `RealtimeInstructions<C>` |
-| `src/realtime/handoffs.rs` | 271 | `RealtimeHandoff<C>`, `realtime_handoff` |
+| `src/realtime/model.rs` | 460 | `RealtimeModel` trait, `RealtimeModelConfig`, `RealtimePlaybackTracker`, audio length math |
+| `src/realtime/agent.rs` | 338 | `RealtimeAgent<C>`, `RealtimeInstructions<C>` |
+| `src/realtime/handoffs.rs` | 272 | `RealtimeHandoff<C>`, `realtime_handoff` |
 | `src/realtime/events.rs` | 421 | `RealtimeSessionEvent<C>`, `RealtimeEventInfo<C>` |
-| `src/realtime/session.rs` | 1779 | `RealtimeSession<C>`: history, tools, approvals, handoffs, guardrails |
-| `src/realtime/openai_model.rs` | 2093 | `OpenAIRealtimeWebSocketModel`, `OpenAIRealtimeSIPModel`, `ModelAudioTracker` |
+| `src/realtime/session.rs` | 1844 | `RealtimeSession<C>`: history, tools, approvals, handoffs, guardrails |
+| `src/realtime/openai_model.rs` | 2303 | `OpenAIRealtimeWebSocketModel`, `OpenAIRealtimeSIPModel`, `ModelAudioTracker` |
 | `src/realtime/runner.rs` | 107 | `RealtimeRunner<C>` |
 | `src/realtime/testing.rs` | 766 | `FakeRealtimeModel`, `ScriptedRealtimeModel` (port of `testing.py`) |
-| `tests/realtime_tests.rs` | 1920 | 28 integration tests |
+| `tests/realtime_tests.rs` | 2345 | 33 integration tests |
 | `examples/realtime_text.rs` | 83 | Text-only realtime session example |
 
 Nothing outside `src/realtime/**`, `tests/realtime_tests.rs` and `examples/realtime_text.rs` was
@@ -41,8 +44,9 @@ touched.
 ```
 export CARGO_TARGET_DIR=/Users/ngocthach/.cache/oars-build/realtime
 cargo clippy --features realtime --all-targets -- -D warnings   # clean
-cargo test --features realtime --test realtime_tests            # 28 passed
-cargo test --features realtime --lib realtime                   # 39 passed
+cargo test --features realtime --test realtime_tests            # 33 passed
+cargo test --features realtime,mcp --test realtime_tests        # 33 passed
+cargo test --features realtime --lib realtime                   # 41 passed
 cargo test --features realtime --doc                            # 6 realtime doctests compile
 cargo doc --features realtime --no-deps                         # no warnings in src/realtime
 cargo check --all-targets                                       # clean without the feature
@@ -168,11 +172,15 @@ history.
 
 ### Debug log redaction
 
-The crate had no equivalent of `agents._debug`, and `src/**` outside `src/realtime` is not in scope,
-so the switch lives in `realtime::debug`: `dont_log_model_data()` / `dont_log_tool_data()`, both
-defaulting to `true` as in Python, read from `OPENAI_AGENTS_DONT_LOG_MODEL_DATA` /
-`OPENAI_AGENTS_DONT_LOG_TOOL_DATA`, with `set_*` overrides that beat the environment and `reset_*`
-to go back to it.
+The crate had no equivalent of `agents._debug` when Phase 3 landed, and `src/**` outside
+`src/realtime` was not in scope, so the switch started in `realtime::debug`:
+`dont_log_model_data()` / `dont_log_tool_data()`, both defaulting to `true` as in Python, read from
+`OPENAI_AGENTS_DONT_LOG_MODEL_DATA` / `OPENAI_AGENTS_DONT_LOG_TOOL_DATA`, with `set_*` overrides
+that beat the environment and `reset_*` to go back to it.
+
+**Update (Phase 4):** a crate-wide `crate::debug` now exists, carrying exactly those six
+functions, and `realtime::debug` re-exports them, so the flags are shared with the rest of the SDK
+and the realtime names still resolve. The request below is resolved.
 
 Internal helpers mirror `logger.py`'s redacting wrappers (`log_model_action_error`,
 `log_model_action_warning`, `log_model_data_debug`, `log_tool_action_error`,
@@ -217,12 +225,86 @@ compared directly instead of hashed:
 
 Handoffs are tracked the same way, so a handoff call id cannot later be reused for a function tool.
 
+## Phase 4: the parity-audit rows
+
+### MCP tools reach realtime sessions (audit row `realtime/agent.py` + `realtime/session.py`)
+
+`RealtimeAgent` now has `mcp_servers` and `mcp_config` (both behind `#[cfg(feature = "mcp")]`,
+since `realtime` does not imply `mcp`), plus `with_mcp_server` / `with_mcp_config`. The new
+`RealtimeAgent::get_all_tools(ctx)` mirrors `crate::Agent::get_all_tools`: it calls
+`crate::mcp::util::get_all_function_tools` first, then the agent's own enabled function tools, and
+skips hosted tools because realtime models accept function tools only. The session's settings
+builder calls it where it used to call `function_tools()`, so MCP tools are advertised in
+`session.update` and dispatched like any other function tool. Covered end to end by
+`mcp_tools_reach_the_realtime_session`, which runs under `--features realtime,mcp`.
+
+### The nested audio config tree (audit row `realtime/config.py`)
+
+`RealtimeAudioConfig` / `RealtimeAudioInputConfig` / `RealtimeAudioOutputConfig` and the `audio`
+settings key are ported, and `session_payload` resolves Python's precedence exactly:
+`audio.input.*` / `audio.output.*`, then the flat legacy keys, then the SDK defaults — except on an
+attached call, which keeps the formats it negotiated. Also in this row:
+
+- `RealtimeAudioFormat` is now a value (`Name` or `Object`), not a bare string, so the GA object
+  form is accepted. `to_session_value` ports `to_realtime_audio_format` including the mapping
+  branch and its warn-and-coerce path for a PCM rate other than 24000 — the branch the audit
+  called unreachable is now reachable and tested.
+- `RealtimeVoice` is `Name` or `Custom { id }`, porting `RealtimeCustomVoice`; a custom voice is
+  sent as `{"id": ...}`.
+- Transcription gained `keywords`, `languages` and `delay`; turn detection gained `model_version`.
+- The legacy `modalities` key is back, used only when `output_modalities` is unset.
+- `RealtimeRunConfig::tool_error_formatter` is ported and **is** consulted on the
+  approval-rejection path and the tool-not-found path. An explicit per-call rejection message from
+  the reviewer still wins over the formatter, as in Python.
+- `default_model_settings()` exposes Python's `DEFAULT_MODEL_SETTINGS`.
+
+The formatter takes a realtime-local `RealtimeToolErrorArgs<C>` rather than the core
+`ToolErrorFormatterArgs`, because that core type was being reshaped by another agent during this
+phase; see the requests below.
+
+### `conversation.item.retrieve` re-requests (audit row `realtime/openai_realtime.py`)
+
+The transport tracks `current_item_id` from audio deltas and re-requests that item on
+`conversation.item.input_audio_transcription.completed` and on `conversation.item.truncated`, which
+was previously a no-op. Both rewrite the item server side, so without this the local history keeps
+the pre-edit copy. Also in this row:
+
+- `RealtimeTransportConfig` with `ping_interval`, `ping_timeout`, `handshake_timeout` and
+  `max_size`, defaulting to Python's 8 MiB message cap. `tokio-tungstenite` has no built-in
+  keepalive, so pings are a task that tracks the last pong and closes the connection when the peer
+  stops answering.
+- A `User-Agent: Agents/Rust <version>` handshake header.
+- `RealtimeApiKey` is now a value *or* a provider resolved at connect time, porting Python's
+  `str | Callable[[], MaybeAwaitable[str]]`; `with_api_key_fn` sets one. Its `Debug` never prints
+  the key.
+- `OpenAIRealtimeWebSocketModel::session_payload_for_settings` makes the rendered session payload
+  public, which is what the SIP accept flow builds and what the new tests assert against.
+
+### Usage modality breakdown and item round-tripping (audit row `realtime/model_events.py`)
+
+`RealtimeModelEvent::Usage` now carries `input_tokens_details` and `output_tokens_details`
+(`RealtimeModelInputTokensDetails`, `RealtimeModelOutputTokensDetails`,
+`RealtimeModelCachedTokensDetails`), so the text/audio/image split the realtime API reports is no
+longer dropped on the way to the shared `Usage` totals. Also in this row: `RealtimeResponse` is
+ported, and `RealtimeMessageItem` / `RealtimeToolCallItem` keep an `extra` map so unknown server
+fields survive a round trip, as Python's `extra="allow"` does. Content *parts* still drop unknown
+fields, since they are rebuilt from a closed set of shapes at parse time.
+
+### Lifecycle hooks
+
+One `RealtimeHooks<C>` trait covers Python's `RealtimeAgentHooks` and `RealtimeRunHooks`:
+`on_agent_start`, `on_agent_end`, `on_handoff`, `on_tool_start`, `on_tool_end`, all with default
+no-op bodies. Set them per agent (`RealtimeAgent::hooks`) or per run (`RealtimeRunConfig::hooks`);
+the run's hooks fire first. They run at the same moments as the matching events, for code that
+reacts inline rather than driving the event stream.
+
 ## Public API
 
 ```rust
 // agents, handoffs
 RealtimeAgent<C>            // name, handoff_description, instructions (static or async fn),
-                            // prompt, tools, handoffs, output_guardrails, model_settings
+                            // prompt, tools, handoffs, output_guardrails, model_settings,
+                            // hooks, mcp_servers + mcp_config (feature `mcp`), get_all_tools
 RealtimeInstructions<C>     // Static | Dynamic
 RealtimeHandoff<C>, realtime_handoff(Arc<RealtimeAgent<C>>)
 
@@ -252,7 +334,10 @@ RealtimeModelConfig, RealtimeModelEvents (= mpsc::UnboundedReceiver<RealtimeMode
 RealtimeModelEvent, RealtimeModelSendEvent, RealtimeInterrupt, RealtimeModelToolCallEvent,
 RealtimeModelAudioEvent, RealtimeConnectionStatus, RealtimeSendCondition
 RealtimePlaybackTracker, RealtimePlaybackState
-OpenAIRealtimeWebSocketModel, OpenAIRealtimeSIPModel
+RealtimeApiKey, RealtimeApiKeyProvider, RealtimeTransportConfig
+RealtimeModelInputTokensDetails, RealtimeModelOutputTokensDetails,
+    RealtimeModelCachedTokensDetails
+OpenAIRealtimeWebSocketModel (+ session_payload_for_settings), OpenAIRealtimeSIPModel
 FakeRealtimeModel, fake_realtime_model(), ScriptedRealtimeModel, RealtimeStep,
 RealtimeSendMatcher, RealtimeScriptError, RealtimeConnectCall
 
@@ -265,7 +350,13 @@ RealtimeItem, RealtimeMessageItem, RealtimeToolCallItem, RealtimeContent, Realti
 RealtimeSessionModelSettings, RealtimeRunConfig<C>, RealtimeFunctionToolSpec,
 RealtimeTurnDetectionConfig, RealtimeInputAudioTranscriptionConfig,
 RealtimeNoiseReductionConfig, RealtimeModelTracing(+Config), RealtimeGuardrailsSettings,
-RealtimeToolExecutionConfig, RealtimeUserInput(+Content), RealtimeAudioStorage
+RealtimeToolExecutionConfig, RealtimeUserInput(+Content), RealtimeAudioStorage,
+RealtimeAudioConfig(+Input/Output), RealtimeAudioFormat, RealtimeVoice, RealtimeResponse,
+RealtimeToolErrorArgs, RealtimeToolErrorKind, RealtimeToolErrorFormatter,
+default_model_settings()
+
+// lifecycle
+RealtimeHooks<C>  // on_agent_start/end, on_handoff, on_tool_start/end
 DEFAULT_REALTIME_MODEL ("gpt-realtime-2.1"), DEFAULT_REALTIME_VOICE,
 DEFAULT_INPUT_AUDIO_TRANSCRIPTION_MODEL, DEFAULT_DEBOUNCE_TEXT_LENGTH
 calculate_audio_length_ms
@@ -386,18 +477,22 @@ calculate_audio_length_ms
 3. **No `pub`/`pub(crate)` visibility changes were needed.** `crate::util::BoxFuture`,
    `crate::models::default_openai_key()` and the rest were reachable from inside the crate.
 
-4. **A crate-wide `_debug` equivalent would be worth having.** `realtime::debug` is scoped to this
-   module because `src/**` outside `src/realtime` is off limits, but
-   `OPENAI_AGENTS_DONT_LOG_MODEL_DATA` / `OPENAI_AGENTS_DONT_LOG_TOOL_DATA` are crate-wide concerns
-   in Python. If a shared module appears, `realtime::debug` should delegate to it and keep its
-   current names as re-exports.
+4. **`RealtimeRunConfig::tool_error_formatter` should move to the core type.** It currently takes
+   a realtime-local `RealtimeToolErrorArgs<C>` because `run_config::ToolErrorFormatterArgs` was
+   being made generic and gaining `error` / `run_context` fields in a parallel edit during this
+   phase. Once that settles, the realtime type should become an alias for it; the field names
+   already line up.
 
-5. **Optional cleanup, unrelated to this module:** `cargo doc` warns about the `[`mcp`]`
+5. ~~**A crate-wide `_debug` equivalent would be worth having.**~~ **Done during Phase 4** by
+   another agent: `crate::debug` now owns the flags and `realtime::debug` re-exports them, which is
+   exactly the shape this request asked for.
+
+6. **Optional cleanup, unrelated to this module:** `cargo doc` warns about the `[`mcp`]`
    intra-doc link in `src/lib.rs` when the `mcp` feature is off.
 
 ## Test coverage
 
-`tests/realtime_tests.rs` (28 tests, all event waits wrapped in `tokio::time::timeout`, no sleeps,
+`tests/realtime_tests.rs` (33 tests, all event waits wrapped in `tokio::time::timeout`, no sleeps,
 no network beyond `127.0.0.1`, dummy key `sk-test`):
 
 1. `tool_call_runs_end_to_end_and_sends_function_call_output` — tool advertised in the connect
@@ -466,7 +561,21 @@ no network beyond `127.0.0.1`, dummy key `sk-test`):
    handoff's `session.update`; the agent still switches, and the retry resends the update before
    the output.
 
-Plus 39 unit tests in `src/realtime/**`, covering URL sanitizing, the send matchers, the
+26. `the_nested_audio_config_wins_over_the_flat_keys` — the nested tree overrides every flat key,
+   and the new transcription, turn-detection, custom-voice and legacy-`modalities` fields all
+   reach the wire.
+27. `mcp_tools_reach_the_realtime_session` — an MCP server's tool is advertised in the session
+   settings and runs end to end (needs `--features realtime,mcp`).
+28. `the_transport_re_requests_an_item_the_server_rewrote` — a mock server sends audio, then a
+   transcription and a truncation; the transport issues `conversation.item.retrieve` for the
+   current item both times and still forwards the transcription.
+29. `usage_events_carry_the_modality_breakdown` — the text/audio split survives to the session and
+   the totals still reach the shared usage accounting.
+30. `hooks_see_the_same_lifecycle_as_the_events` — run-level hooks fire in order around a tool
+   call.
+
+Plus 41 unit tests in `src/realtime/**`, covering GA audio-format normalization and its rate
+coercion, custom voices, the usage detail conversion, URL sanitizing, the send matchers, the
 emit-and-fail rule, the redaction flags, audio stripping, the cancel gate (not running, mismatched response
 id, duplicate cancel, released after a failed send, allowed again for the next response), the
 playback tracker's accumulation and byte conversion, the `ModelAudioTracker`'s per-response indexes and their selective release, audio

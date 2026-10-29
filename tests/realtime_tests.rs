@@ -9,12 +9,16 @@ use std::time::Duration;
 use futures::{SinkExt, StreamExt};
 use openai_agents_sdk::realtime::{
     FakeRealtimeModel, OpenAIRealtimeSIPModel, OpenAIRealtimeWebSocketModel, RealtimeAgent,
-    RealtimeAudioStorage, RealtimeContent, RealtimeInterrupt, RealtimeMessageItem,
-    RealtimeMessageRole, RealtimeModel, RealtimeModelConfig, RealtimeModelEvent,
-    RealtimeModelSendEvent, RealtimeModelToolCallEvent, RealtimePlaybackTracker, RealtimeRunConfig,
-    RealtimeRunner, RealtimeScriptError, RealtimeSendMatcher, RealtimeSession,
-    RealtimeSessionEvent, RealtimeSessionModelSettings, RealtimeStep, RealtimeToolExecutionConfig,
-    RealtimeUserInput, ScriptedRealtimeModel, realtime_handoff,
+    RealtimeAudioConfig, RealtimeAudioFormat, RealtimeAudioInputConfig, RealtimeAudioOutputConfig,
+    RealtimeAudioStorage, RealtimeContent, RealtimeInputAudioTranscriptionConfig,
+    RealtimeInterrupt, RealtimeMessageItem, RealtimeMessageRole, RealtimeModel,
+    RealtimeModelConfig, RealtimeModelEvent, RealtimeModelInputTokensDetails,
+    RealtimeModelOutputTokensDetails, RealtimeModelSendEvent, RealtimeModelToolCallEvent,
+    RealtimeNoiseReductionConfig, RealtimePlaybackTracker, RealtimeRunConfig, RealtimeRunner,
+    RealtimeScriptError, RealtimeSendMatcher, RealtimeSession, RealtimeSessionEvent,
+    RealtimeSessionModelSettings, RealtimeStep, RealtimeToolExecutionConfig,
+    RealtimeTurnDetectionConfig, RealtimeUserInput, RealtimeVoice, ScriptedRealtimeModel,
+    realtime_handoff,
 };
 use openai_agents_sdk::tool::FunctionTool;
 use openai_agents_sdk::tool_guardrails::{ToolGuardrailFunctionOutput, ToolInputGuardrail};
@@ -195,11 +199,11 @@ async fn handoff_switches_agent_and_sends_session_update() {
     let settings = model.last_session_settings().expect("initial settings");
     let tools = settings.tools.clone().unwrap_or_default();
     assert_eq!(tools.len(), 1);
-    assert_eq!(tools[0].name, "transfer_to_Billing");
+    assert_eq!(tools[0].name, "transfer_to_billing");
     assert_eq!(session.current_agent_name(), "Triage");
 
     assert!(model.emit(RealtimeModelEvent::FunctionCall(
-        RealtimeModelToolCallEvent::new("transfer_to_Billing", "call_h", "{}")
+        RealtimeModelToolCallEvent::new("transfer_to_billing", "call_h", "{}")
     )));
 
     let (handoff, _) = wait_for(&session, |event| {
@@ -579,7 +583,7 @@ async fn dynamic_instructions_and_run_config_settings_reach_the_model() {
 
     let settings = model.last_session_settings().unwrap();
     assert_eq!(settings.instructions.as_deref(), Some("You are Assistant"));
-    assert_eq!(settings.voice.as_deref(), Some("marin"));
+    assert_eq!(settings.voice, Some(RealtimeVoice::from("marin")));
     assert_eq!(
         settings.output_modalities.as_deref(),
         Some(["text".to_string()].as_slice())
@@ -1639,7 +1643,7 @@ async fn an_undelivered_handoff_output_resends_its_session_update() {
         .await
         .unwrap();
 
-    let call = RealtimeModelToolCallEvent::new("transfer_to_Billing", "call_h", "{}");
+    let call = RealtimeModelToolCallEvent::new("transfer_to_billing", "call_h", "{}");
     assert!(model.emit(RealtimeModelEvent::FunctionCall(call.clone())));
     let (error, _) = wait_for(&session, |event| {
         matches!(event, RealtimeSessionEvent::Error { .. })
@@ -1678,6 +1682,427 @@ async fn an_undelivered_handoff_output_resends_its_session_update() {
     );
     let update = sent[update_index].as_session_update().unwrap();
     assert_eq!(update.instructions.as_deref(), Some("Talk about billing"));
+
+    session.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn the_nested_audio_config_wins_over_the_flat_keys() {
+    let model = Arc::new(FakeRealtimeModel::new());
+    let agent = RealtimeAgent::<()>::new("Assistant").into_arc();
+    let settings = RealtimeSessionModelSettings::new()
+        // Flat legacy keys, which the nested tree below must override.
+        .with_voice("ash")
+        .with_audio(
+            RealtimeAudioConfig::new()
+                .with_input(RealtimeAudioInputConfig {
+                    format: Some(RealtimeAudioFormat::from("g711_ulaw")),
+                    transcription: Some(RealtimeInputAudioTranscriptionConfig {
+                        model: Some("gpt-transcribe".to_string()),
+                        keywords: Some(vec!["Oslo".to_string()]),
+                        languages: Some(vec!["en".to_string()]),
+                        delay: Some("low".to_string()),
+                        ..Default::default()
+                    }),
+                    turn_detection: Some(Some(RealtimeTurnDetectionConfig {
+                        kind: Some("server_vad".to_string()),
+                        model_version: Some("v2".to_string()),
+                        ..Default::default()
+                    })),
+                    noise_reduction: Some(Some(RealtimeNoiseReductionConfig {
+                        kind: Some("far_field".to_string()),
+                    })),
+                })
+                .with_output(RealtimeAudioOutputConfig {
+                    format: Some(RealtimeAudioFormat::from("g711_alaw")),
+                    voice: Some(RealtimeVoice::Custom {
+                        id: "voice_123".to_string(),
+                    }),
+                    speed: Some(1.25),
+                }),
+        );
+    let mut settings = settings;
+    settings.input_audio_format = Some(RealtimeAudioFormat::from("pcm16"));
+    settings.output_audio_format = Some(RealtimeAudioFormat::from("pcm16"));
+    settings.speed = Some(0.5);
+    // `modalities` is the legacy name, used only when `output_modalities` is unset.
+    settings.modalities = Some(vec!["text".to_string()]);
+
+    let config = RealtimeRunConfig::<()> {
+        model_settings: Some(settings),
+        ..Default::default()
+    };
+    let session = RealtimeRunner::new(agent)
+        .with_model(model.clone())
+        .with_config(config)
+        .run(())
+        .await
+        .unwrap();
+
+    let payload = session_payload_for(&model);
+    assert_eq!(payload["audio"]["input"]["format"]["type"], "audio/pcmu");
+    assert_eq!(payload["audio"]["output"]["format"]["type"], "audio/pcma");
+    assert_eq!(payload["audio"]["output"]["voice"]["id"], "voice_123");
+    assert_eq!(payload["audio"]["output"]["speed"], 1.25);
+    assert_eq!(
+        payload["audio"]["input"]["transcription"]["model"],
+        "gpt-transcribe"
+    );
+    assert_eq!(
+        payload["audio"]["input"]["transcription"]["keywords"][0],
+        "Oslo"
+    );
+    assert_eq!(
+        payload["audio"]["input"]["transcription"]["languages"][0],
+        "en"
+    );
+    assert_eq!(payload["audio"]["input"]["transcription"]["delay"], "low");
+    assert_eq!(
+        payload["audio"]["input"]["turn_detection"]["type"],
+        "server_vad"
+    );
+    assert_eq!(
+        payload["audio"]["input"]["turn_detection"]["model_version"],
+        "v2"
+    );
+    assert_eq!(
+        payload["audio"]["input"]["noise_reduction"]["type"],
+        "far_field"
+    );
+    assert_eq!(payload["output_modalities"], json!(["text"]));
+
+    session.close().await.unwrap();
+}
+
+/// Render the session payload the transport would send for the session's current settings.
+fn session_payload_for(model: &Arc<FakeRealtimeModel>) -> Value {
+    let settings = model.last_session_settings().expect("initial settings");
+    let transport = OpenAIRealtimeWebSocketModel::new();
+    transport.session_payload_for_settings(&settings)
+}
+
+#[tokio::test]
+async fn mcp_tools_reach_the_realtime_session() {
+    #[cfg(feature = "mcp")]
+    {
+        use openai_agents_sdk::mcp::{MCPServer, MCPServerConfig, MCPTool};
+
+        #[derive(Debug)]
+        struct StaticMcpServer;
+
+        #[async_trait::async_trait]
+        impl MCPServer for StaticMcpServer {
+            fn name(&self) -> &str {
+                "docs"
+            }
+            fn config(&self) -> &MCPServerConfig {
+                static CONFIG: std::sync::OnceLock<MCPServerConfig> = std::sync::OnceLock::new();
+                CONFIG.get_or_init(MCPServerConfig::default)
+            }
+            async fn connect(&self) -> openai_agents_sdk::Result<()> {
+                Ok(())
+            }
+            async fn cleanup(&self) -> openai_agents_sdk::Result<()> {
+                Ok(())
+            }
+            async fn list_tools(&self) -> openai_agents_sdk::Result<Vec<MCPTool>> {
+                Ok(vec![MCPTool {
+                    name: "search_docs".to_string(),
+                    title: None,
+                    description: Some("Search the docs".to_string()),
+                    input_schema: json!({"type": "object", "properties": {}}),
+                    annotations: None,
+                }])
+            }
+            async fn call_tool(
+                &self,
+                _tool_name: &str,
+                _arguments: Option<serde_json::Map<String, Value>>,
+            ) -> openai_agents_sdk::Result<Value> {
+                Ok(json!({"content": [{"type": "text", "text": "a doc"}]}))
+            }
+            async fn list_prompts(&self) -> openai_agents_sdk::Result<Vec<Value>> {
+                Ok(Vec::new())
+            }
+            async fn get_prompt(
+                &self,
+                _name: &str,
+                _arguments: Option<std::collections::BTreeMap<String, String>>,
+            ) -> openai_agents_sdk::Result<Value> {
+                Ok(Value::Null)
+            }
+        }
+
+        let model = Arc::new(FakeRealtimeModel::new());
+        let agent = RealtimeAgent::<()>::new("Assistant")
+            .with_tool(weather_tool())
+            .with_mcp_server(Arc::new(StaticMcpServer))
+            .into_arc();
+        let session = start_session(model.clone(), agent).await;
+
+        // The MCP server's tool is advertised to the model alongside the agent's own.
+        let settings = model.last_session_settings().expect("initial settings");
+        let names: Vec<&str> = settings
+            .tools
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(|spec| spec.name.as_str())
+            .collect();
+        assert!(
+            names.contains(&"search_docs"),
+            "expected the MCP tool, saw {names:?}"
+        );
+        assert!(names.contains(&"get_weather"));
+
+        // And the session can run it.
+        assert!(model.emit(RealtimeModelEvent::FunctionCall(
+            RealtimeModelToolCallEvent::new("search_docs", "call_1", "{}")
+        )));
+        let (tool_end, _) = wait_for(&session, |event| {
+            matches!(event, RealtimeSessionEvent::ToolEnd { .. })
+        })
+        .await;
+        match tool_end {
+            RealtimeSessionEvent::ToolEnd { tool, output, .. } => {
+                assert_eq!(tool.name, "search_docs");
+                assert_eq!(output.to_model_string(), "a doc");
+            }
+            other => panic!("expected tool_end, got {other:?}"),
+        }
+
+        session.close().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn the_transport_re_requests_an_item_the_server_rewrote() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (client_tx, mut client_rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
+
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+        while let Some(Ok(message)) = ws.next().await {
+            if let Message::Text(text) = message {
+                let value: Value = serde_json::from_str(text.as_str()).unwrap();
+                let first = value["type"] == "session.update";
+                let _ = client_tx.send(value);
+                if first {
+                    break;
+                }
+            }
+        }
+        // Audio for item_1 makes it the current item, then the server rewrites it.
+        let silence = base64_encode(&[0u8; 48]);
+        for event in [
+            json!({
+                "type": "response.output_audio.delta",
+                "item_id": "item_1",
+                "content_index": 0,
+                "response_id": "resp_1",
+                "delta": silence,
+            }),
+            json!({
+                "type": "conversation.item.input_audio_transcription.completed",
+                "item_id": "user_1",
+                "transcript": "hello",
+            }),
+            json!({"type": "conversation.item.truncated", "item_id": "item_1"}),
+        ] {
+            ws.send(Message::text(event.to_string())).await.unwrap();
+        }
+        while let Some(Ok(message)) = ws.next().await {
+            if let Message::Text(text) = message
+                && let Ok(value) = serde_json::from_str::<Value>(text.as_str())
+            {
+                let _ = client_tx.send(value);
+            }
+        }
+    });
+
+    let model = OpenAIRealtimeWebSocketModel::new();
+    let mut events = model
+        .connect(
+            RealtimeModelConfig::new()
+                .with_api_key("sk-test")
+                .with_url(format!("ws://127.0.0.1:{port}/v1/realtime")),
+        )
+        .await
+        .expect("connects to the mock server");
+
+    // The transcription still reaches the session.
+    tokio::time::timeout(EVENT_TIMEOUT, async {
+        loop {
+            if let RealtimeModelEvent::InputAudioTranscriptionCompleted { transcript, .. } =
+                events.recv().await.expect("stream stays open")
+            {
+                return transcript;
+            }
+        }
+    })
+    .await
+    .expect("transcription mapped");
+
+    // Both rewrites prompt a re-read of the item the model is speaking.
+    let mut retrieves = 0;
+    tokio::time::timeout(EVENT_TIMEOUT, async {
+        while let Some(value) = client_rx.recv().await {
+            if value["type"] == "conversation.item.retrieve" {
+                assert_eq!(value["item_id"], "item_1");
+                retrieves += 1;
+                if retrieves == 2 {
+                    return;
+                }
+            }
+        }
+        panic!("conversation.item.retrieve never arrived");
+    })
+    .await
+    .expect("retrieve requests received");
+
+    model.close().await.unwrap();
+    server.abort();
+}
+
+#[tokio::test]
+async fn usage_events_carry_the_modality_breakdown() {
+    let model = Arc::new(FakeRealtimeModel::new());
+    let agent = RealtimeAgent::<()>::new("Assistant").into_arc();
+    let session = start_session(model.clone(), agent).await;
+
+    assert!(model.emit(RealtimeModelEvent::Usage {
+        usage: Box::new(openai_agents_sdk::Usage {
+            requests: 1,
+            input_tokens: 10,
+            output_tokens: 4,
+            total_tokens: 14,
+            ..Default::default()
+        }),
+        input_tokens_details: Some(RealtimeModelInputTokensDetails {
+            text_tokens: Some(6),
+            audio_tokens: Some(4),
+            ..Default::default()
+        }),
+        output_tokens_details: Some(RealtimeModelOutputTokensDetails {
+            text_tokens: Some(1),
+            audio_tokens: Some(3),
+        }),
+    }));
+
+    let (raw, _) = wait_for(&session, |event| {
+        matches!(
+            event,
+            RealtimeSessionEvent::RawModelEvent {
+                data: RealtimeModelEvent::Usage { .. },
+                ..
+            }
+        )
+    })
+    .await;
+    match raw {
+        RealtimeSessionEvent::RawModelEvent {
+            data:
+                RealtimeModelEvent::Usage {
+                    input_tokens_details,
+                    output_tokens_details,
+                    ..
+                },
+            ..
+        } => {
+            assert_eq!(input_tokens_details.unwrap().audio_tokens, Some(4));
+            assert_eq!(output_tokens_details.unwrap().audio_tokens, Some(3));
+        }
+        other => panic!("expected a usage raw event, got {other:?}"),
+    }
+
+    // The totals still reach the shared usage accounting.
+    assert_eq!(session.context().usage().total_tokens, 14);
+
+    session.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn hooks_see_the_same_lifecycle_as_the_events() {
+    #[derive(Debug, Default)]
+    struct RecordingHooks {
+        calls: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl openai_agents_sdk::realtime::RealtimeHooks<()> for RecordingHooks {
+        async fn on_agent_start(
+            &self,
+            _context: &openai_agents_sdk::RunContext<()>,
+            agent: &Arc<RealtimeAgent<()>>,
+        ) {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("start:{}", agent.name));
+        }
+        async fn on_tool_start(
+            &self,
+            _context: &openai_agents_sdk::RunContext<()>,
+            _agent: &Arc<RealtimeAgent<()>>,
+            tool: &Arc<openai_agents_sdk::tool::FunctionTool<()>>,
+        ) {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("tool_start:{}", tool.name));
+        }
+        async fn on_tool_end(
+            &self,
+            _context: &openai_agents_sdk::RunContext<()>,
+            _agent: &Arc<RealtimeAgent<()>>,
+            tool: &Arc<openai_agents_sdk::tool::FunctionTool<()>>,
+            _output: &openai_agents_sdk::tool::ToolOutput,
+        ) {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("tool_end:{}", tool.name));
+        }
+    }
+
+    let hooks = Arc::new(RecordingHooks::default());
+    let model = Arc::new(FakeRealtimeModel::new());
+    let agent = RealtimeAgent::<()>::new("Assistant")
+        .with_tool(weather_tool())
+        .into_arc();
+    let config = RealtimeRunConfig::<()> {
+        hooks: Some(hooks.clone()),
+        ..Default::default()
+    };
+    let session = RealtimeRunner::new(agent)
+        .with_model(model.clone())
+        .with_config(config)
+        .run(())
+        .await
+        .unwrap();
+
+    assert!(model.emit(RealtimeModelEvent::TurnStarted {
+        response_id: Some("resp_1".to_string()),
+    }));
+    assert!(model.emit(RealtimeModelEvent::FunctionCall(
+        RealtimeModelToolCallEvent::new("get_weather", "call_1", r#"{"city":"Oslo"}"#)
+    )));
+    wait_for(&session, |event| {
+        matches!(event, RealtimeSessionEvent::ToolEnd { .. })
+    })
+    .await;
+
+    let calls = hooks.calls.lock().unwrap().clone();
+    assert_eq!(
+        calls,
+        vec![
+            "start:Assistant".to_string(),
+            "tool_start:get_weather".to_string(),
+            "tool_end:get_weather".to_string(),
+        ]
+    );
 
     session.close().await.unwrap();
 }

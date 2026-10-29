@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use base64::Engine;
@@ -17,26 +17,27 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue};
-use tokio_tungstenite::tungstenite::protocol::Message;
+use tokio_tungstenite::tungstenite::protocol::{Message, WebSocketConfig};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 use crate::error::{AgentsError, Result};
 use crate::realtime::agent::RealtimeAgent;
 use crate::realtime::config::{
     DEFAULT_INPUT_AUDIO_TRANSCRIPTION_MODEL, DEFAULT_REALTIME_MODEL, DEFAULT_REALTIME_VOICE,
-    RealtimeModelTracing, RealtimeRunConfig, RealtimeSessionModelSettings,
-    RealtimeTurnDetectionConfig,
+    RealtimeAudioFormat, RealtimeInputAudioTranscriptionConfig, RealtimeModelTracing,
+    RealtimeRunConfig, RealtimeSessionModelSettings, RealtimeTurnDetectionConfig, RealtimeVoice,
 };
-use crate::realtime::debug::{log_model_action_error, log_model_data_debug};
+use crate::realtime::debug::log_model_action_error;
 use crate::realtime::items::{
     RealtimeContent, RealtimeItem, RealtimeMessageItem, RealtimeMessageRole, RealtimeToolCallItem,
 };
 use crate::realtime::model::{
-    RealtimeModel, RealtimeModelConfig, RealtimeModelEvents, RealtimePlaybackState,
+    RealtimeApiKey, RealtimeModel, RealtimeModelConfig, RealtimeModelEvents, RealtimePlaybackState,
     RealtimePlaybackTracker, RealtimeSendCondition, calculate_audio_length_ms,
 };
 use crate::realtime::model_events::{
-    RealtimeConnectionStatus, RealtimeModelAudioEvent, RealtimeModelEvent,
+    RealtimeConnectionStatus, RealtimeModelAudioEvent, RealtimeModelCachedTokensDetails,
+    RealtimeModelEvent, RealtimeModelInputTokensDetails, RealtimeModelOutputTokensDetails,
     RealtimeModelToolCallEvent,
 };
 use crate::realtime::model_inputs::{RealtimeInterrupt, RealtimeModelSendEvent};
@@ -46,6 +47,12 @@ use crate::usage::Usage;
 
 /// The default realtime WebSocket endpoint.
 const DEFAULT_REALTIME_URL: &str = "wss://api.openai.com/v1/realtime";
+
+/// Sent as the `User-Agent` of the WebSocket handshake.
+const USER_AGENT: &str = concat!("Agents/Rust ", env!("CARGO_PKG_VERSION"));
+
+/// Largest incoming message accepted by default, matching the Python client.
+const DEFAULT_MAX_MESSAGE_SIZE: usize = 8 * 1024 * 1024;
 
 type WsSink = SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>;
 
@@ -192,6 +199,8 @@ struct WsState {
     ongoing_response_id: Option<String>,
     /// A `response.cancel` was sent for the active response and not yet resolved.
     cancel_requested: bool,
+    /// The item the model is currently producing audio for.
+    current_item_id: Option<String>,
     /// A `response.create` was sent and neither `response.created` nor a matching error arrived.
     create_in_flight: Option<String>,
     /// A response was requested while one was running or in flight.
@@ -349,6 +358,9 @@ impl WsState {
 
 struct WsInner {
     sink: tokio::sync::Mutex<Option<WsSink>>,
+    /// When the last pong arrived, for the keepalive deadline.
+    last_pong: Mutex<Instant>,
+    keepalive: Mutex<Option<JoinHandle<()>>>,
     playback_tracker: Mutex<Option<Arc<RealtimePlaybackTracker>>>,
     events: Mutex<Option<mpsc::UnboundedSender<RealtimeModelEvent>>>,
     state: Mutex<WsState>,
@@ -387,6 +399,8 @@ impl OpenAIRealtimeWebSocketModel {
         OpenAIRealtimeWebSocketModel {
             inner: Arc::new(WsInner {
                 sink: tokio::sync::Mutex::new(None),
+                last_pong: Mutex::new(Instant::now()),
+                keepalive: Mutex::new(None),
                 playback_tracker: Mutex::new(None),
                 events: Mutex::new(None),
                 state: Mutex::new(WsState {
@@ -397,6 +411,15 @@ impl OpenAIRealtimeWebSocketModel {
                 close_requested: AtomicBool::new(false),
             }),
         }
+    }
+
+    /// Render the `session` object this transport would send for `settings`.
+    ///
+    /// This is what a `session.update` carries, and what the Realtime Calls accept endpoint
+    /// expects. It resolves the same precedence the transport uses, so a payload built here
+    /// matches what a live session would send.
+    pub fn session_payload_for_settings(&self, settings: &RealtimeSessionModelSettings) -> Value {
+        self.inner.session_payload(settings)
     }
 
     /// The realtime model name the transport will use, or used, to connect.
@@ -447,6 +470,7 @@ impl RealtimeModel for OpenAIRealtimeWebSocketModel {
             state.ongoing_response = false;
             state.ongoing_response_id = None;
             state.cancel_requested = false;
+            state.current_item_id = None;
             state.pending_response_create = false;
             state.create_in_flight = None;
         }
@@ -472,9 +496,7 @@ impl RealtimeModel for OpenAIRealtimeWebSocketModel {
                 }
             }
             None => {
-                let api_key = resolve_api_key(config.api_key.as_deref()).ok_or_else(|| {
-                    AgentsError::user("API key is required but was not provided.")
-                })?;
+                let api_key = resolve_api_key(config.api_key.as_ref()).await?;
                 let value = HeaderValue::from_str(&format!("Bearer {api_key}"))
                     .map_err(|e| AgentsError::user(format!("Invalid API key: {e}")))?;
                 request
@@ -485,8 +507,23 @@ impl RealtimeModel for OpenAIRealtimeWebSocketModel {
 
         crate::util::ensure_crypto_provider();
 
-        let (stream, _response) = tokio_tungstenite::connect_async(request)
-            .await
+        request.headers_mut().insert(
+            HeaderName::from_static("user-agent"),
+            HeaderValue::from_static(USER_AGENT),
+        );
+
+        let transport = config.transport.clone().unwrap_or_default();
+        let ws_config = WebSocketConfig::default()
+            .max_message_size(Some(transport.max_size.unwrap_or(DEFAULT_MAX_MESSAGE_SIZE)));
+        let connecting =
+            tokio_tungstenite::connect_async_with_config(request, Some(ws_config), false);
+        let connected = match transport.handshake_timeout {
+            Some(timeout) => tokio::time::timeout(timeout, connecting)
+                .await
+                .map_err(|_| AgentsError::other("Realtime connection handshake timed out"))?,
+            None => connecting.await,
+        };
+        let (stream, _response) = connected
             .map_err(|e| AgentsError::other(format!("Realtime connection failed: {e}")))?;
         let (sink, mut source) = stream.split();
         *self.inner.sink.lock().await = Some(sink);
@@ -517,6 +554,12 @@ impl RealtimeModel for OpenAIRealtimeWebSocketModel {
                             });
                         }
                     },
+                    Ok(Message::Pong(_)) => {
+                        *reader_inner
+                            .last_pong
+                            .lock()
+                            .expect("realtime model poisoned") = Instant::now();
+                    }
                     Ok(_) => {}
                     Err(error) => {
                         reader_inner.emit(RealtimeModelEvent::Exception {
@@ -536,6 +579,19 @@ impl RealtimeModel for OpenAIRealtimeWebSocketModel {
             *reader_inner.events.lock().expect("realtime model poisoned") = None;
         });
         *self.inner.reader.lock().expect("realtime model poisoned") = Some(reader);
+
+        if let Some(interval) = transport.ping_interval {
+            let keepalive_inner = self.inner.clone();
+            let ping_timeout = transport.ping_timeout;
+            let keepalive = tokio::spawn(async move {
+                keepalive_inner.keepalive(interval, ping_timeout).await;
+            });
+            *self
+                .inner
+                .keepalive
+                .lock()
+                .expect("realtime model poisoned") = Some(keepalive);
+        }
 
         self.inner.send_session_update(&settings).await?;
         Ok(rx)
@@ -591,6 +647,7 @@ impl RealtimeModel for OpenAIRealtimeWebSocketModel {
                         arguments: tool_call.arguments.clone(),
                         name: tool_call.name.clone(),
                         output: Some(output),
+                        extra: Map::new(),
                     }));
                 if start_response {
                     self.inner.request_response_create().await?;
@@ -654,6 +711,15 @@ impl RealtimeModel for OpenAIRealtimeWebSocketModel {
         {
             reader.abort();
         }
+        if let Some(keepalive) = self
+            .inner
+            .keepalive
+            .lock()
+            .expect("realtime model poisoned")
+            .take()
+        {
+            keepalive.abort();
+        }
         *self.inner.events.lock().expect("realtime model poisoned") = None;
         if let Some(tracker) = self
             .inner
@@ -671,6 +737,7 @@ impl RealtimeModel for OpenAIRealtimeWebSocketModel {
         state.ongoing_response = false;
         state.ongoing_response_id = None;
         state.cancel_requested = false;
+        state.current_item_id = None;
         state.pending_response_create = false;
         state.create_in_flight = None;
         Ok(())
@@ -778,9 +845,7 @@ impl OpenAIRealtimeSIPModel {
         }
 
         // A fresh transport, so the payload reflects only the settings, never a live connection.
-        Ok(OpenAIRealtimeWebSocketModel::new()
-            .inner
-            .session_payload(&resolved.settings))
+        Ok(OpenAIRealtimeWebSocketModel::new().session_payload_for_settings(&resolved.settings))
     }
 }
 
@@ -817,6 +882,57 @@ impl RealtimeModel for OpenAIRealtimeSIPModel {
 }
 
 impl WsInner {
+    /// Send keepalive pings, and give up when the peer stops answering.
+    ///
+    /// `tokio-tungstenite` has no built-in keepalive, so this is the equivalent of the Python
+    /// client's `ping_interval` / `ping_timeout`.
+    async fn keepalive(&self, interval: Duration, timeout: Option<Duration>) {
+        *self.last_pong.lock().expect("realtime model poisoned") = Instant::now();
+        loop {
+            tokio::time::sleep(interval).await;
+            if self.close_requested.load(Ordering::SeqCst) {
+                return;
+            }
+            if self
+                .send_message(Message::Ping(Vec::new().into()))
+                .await
+                .is_err()
+            {
+                return;
+            }
+            if let Some(timeout) = timeout {
+                let since_pong = {
+                    self.last_pong
+                        .lock()
+                        .expect("realtime model poisoned")
+                        .elapsed()
+                };
+                if since_pong > interval + timeout {
+                    log::warn!("Realtime keepalive timed out; closing the connection");
+                    self.emit(RealtimeModelEvent::ConnectionStatus {
+                        status: RealtimeConnectionStatus::Disconnected,
+                    });
+                    self.emit(RealtimeModelEvent::EndOfStream);
+                    if let Some(mut sink) = self.sink.lock().await.take() {
+                        let _ = sink.close().await;
+                    }
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Write one frame to the socket.
+    async fn send_message(&self, message: Message) -> Result<()> {
+        let mut guard = self.sink.lock().await;
+        let sink = guard
+            .as_mut()
+            .ok_or_else(|| AgentsError::user("The realtime model is not connected."))?;
+        sink.send(message)
+            .await
+            .map_err(|e| AgentsError::other(format!("Realtime send failed: {e}")))
+    }
+
     fn emit(&self, event: RealtimeModelEvent) {
         let sender = { self.events.lock().expect("realtime model poisoned").clone() };
         if let Some(sender) = sender {
@@ -825,13 +941,7 @@ impl WsInner {
     }
 
     async fn send_raw(&self, message: Value) -> Result<()> {
-        let mut guard = self.sink.lock().await;
-        let sink = guard
-            .as_mut()
-            .ok_or_else(|| AgentsError::user("The realtime model is not connected."))?;
-        sink.send(Message::text(message.to_string()))
-            .await
-            .map_err(|e| AgentsError::other(format!("Realtime send failed: {e}")))
+        self.send_message(Message::text(message.to_string())).await
     }
 
     /// Recheck `condition` at the write boundary, so the decision and the send are atomic.
@@ -878,28 +988,46 @@ impl WsInner {
     }
 
     /// Build the `session` object of a `session.update`, mirroring `_get_session_config`.
+    ///
+    /// The nested `audio.input.*` / `audio.output.*` settings win over the flat legacy keys, which
+    /// in turn win over the SDK defaults — except on an attached call, which already negotiated
+    /// its audio formats and must not have them overridden.
     fn session_payload(&self, settings: &RealtimeSessionModelSettings) -> Value {
         let (model, call_id) = {
             let state = self.state.lock().expect("realtime model poisoned");
             (state.model.clone(), state.call_id.clone())
         };
         let model = settings.model_name.clone().unwrap_or(model);
+        let audio_input = settings
+            .audio
+            .as_ref()
+            .and_then(|audio| audio.input.as_ref());
+        let audio_output = settings
+            .audio
+            .as_ref()
+            .and_then(|audio| audio.output.as_ref());
 
         let mut input = Map::new();
-        let input_format = settings
-            .input_audio_format
-            .clone()
-            .or_else(|| call_id.is_none().then(|| "pcm16".to_string()));
-        if let Some(format) = input_format.as_deref()
-            && let Some(value) = audio_format_payload(format)
-        {
+        let input_format = audio_input
+            .and_then(|input| input.format.clone())
+            .or_else(|| settings.input_audio_format.clone())
+            .or_else(|| {
+                call_id
+                    .is_none()
+                    .then(|| RealtimeAudioFormat::Name("pcm16".to_string()))
+            });
+        if let Some(value) = input_format.as_ref().and_then(|f| f.to_session_value()) {
             input.insert("format".to_string(), value);
         }
-        match &settings.input_audio_noise_reduction {
+
+        let noise_reduction = audio_input
+            .and_then(|input| input.noise_reduction.clone())
+            .or_else(|| settings.input_audio_noise_reduction.clone());
+        match noise_reduction {
             Some(Some(config)) => {
                 input.insert(
                     "noise_reduction".to_string(),
-                    serde_json::to_value(config).unwrap_or(Value::Null),
+                    serde_json::to_value(&config).unwrap_or(Value::Null),
                 );
             }
             Some(None) => {
@@ -907,21 +1035,21 @@ impl WsInner {
             }
             None => {}
         }
-        let transcription = settings
-            .input_audio_transcription
-            .clone()
+
+        let transcription = audio_input
+            .and_then(|input| input.transcription.clone())
+            .or_else(|| settings.input_audio_transcription.clone())
             .unwrap_or_else(|| {
-                crate::realtime::config::RealtimeInputAudioTranscriptionConfig::new(
-                    DEFAULT_INPUT_AUDIO_TRANSCRIPTION_MODEL,
-                )
+                RealtimeInputAudioTranscriptionConfig::new(DEFAULT_INPUT_AUDIO_TRANSCRIPTION_MODEL)
             });
         input.insert(
             "transcription".to_string(),
             serde_json::to_value(&transcription).unwrap_or(Value::Null),
         );
-        let turn_detection = settings
-            .turn_detection
-            .clone()
+
+        let turn_detection = audio_input
+            .and_then(|input| input.turn_detection.clone())
+            .or_else(|| settings.turn_detection.clone())
             .unwrap_or_else(|| Some(RealtimeTurnDetectionConfig::semantic_vad()));
         match &turn_detection {
             Some(config) => {
@@ -943,31 +1071,35 @@ impl WsInner {
         }
 
         let mut output = Map::new();
-        output.insert(
-            "voice".to_string(),
-            Value::String(
-                settings
-                    .voice
-                    .clone()
-                    .unwrap_or_else(|| DEFAULT_REALTIME_VOICE.to_string()),
-            ),
-        );
-        let output_format = settings
-            .output_audio_format
-            .clone()
-            .or_else(|| call_id.is_none().then(|| "pcm16".to_string()));
-        if let Some(format) = output_format.as_deref()
-            && let Some(value) = audio_format_payload(format)
-        {
+        let voice = audio_output
+            .and_then(|output| output.voice.clone())
+            .or_else(|| settings.voice.clone())
+            .unwrap_or_else(|| RealtimeVoice::Name(DEFAULT_REALTIME_VOICE.to_string()));
+        output.insert("voice".to_string(), voice.to_session_value());
+
+        let output_format = audio_output
+            .and_then(|output| output.format.clone())
+            .or_else(|| settings.output_audio_format.clone())
+            .or_else(|| {
+                call_id
+                    .is_none()
+                    .then(|| RealtimeAudioFormat::Name("pcm16".to_string()))
+            });
+        if let Some(value) = output_format.as_ref().and_then(|f| f.to_session_value()) {
             output.insert("format".to_string(), value);
         }
-        if let Some(speed) = settings.speed {
+        if let Some(speed) = audio_output
+            .and_then(|output| output.speed)
+            .or(settings.speed)
+        {
             output.insert("speed".to_string(), json!(speed));
         }
 
+        // `modalities` is the legacy name, used only when `output_modalities` is unset.
         let modalities = settings
             .output_modalities
             .clone()
+            .or_else(|| settings.modalities.clone())
             .unwrap_or_else(|| vec!["audio".to_string()]);
 
         let tools: Vec<Value> = settings
@@ -1317,11 +1449,13 @@ impl WsInner {
                     });
                     return;
                 };
-                self.state
-                    .lock()
-                    .expect("realtime model poisoned")
-                    .audio
-                    .on_audio_delta(&item_id, content_index, &data, Some(&response_id));
+                {
+                    let mut state = self.state.lock().expect("realtime model poisoned");
+                    state.current_item_id = Some(item_id.clone());
+                    state
+                        .audio
+                        .on_audio_delta(&item_id, content_index, &data, Some(&response_id));
+                }
                 self.emit(RealtimeModelEvent::audio(RealtimeModelAudioEvent {
                     data,
                     response_id,
@@ -1372,12 +1506,10 @@ impl WsInner {
                     }
                     state.on_response_done()
                 };
-                if let Some(usage) = event.pointer("/response/usage")
-                    && let Some(usage) = convert_usage(usage)
+                if let Some(reported) = event.pointer("/response/usage")
+                    && let Some(converted) = convert_usage(reported)
                 {
-                    self.emit(RealtimeModelEvent::Usage {
-                        usage: Box::new(usage),
-                    });
+                    self.emit(converted);
                 }
                 self.emit(RealtimeModelEvent::TurnEnded { response_id });
                 if let Some(event_id) = deferred {
@@ -1442,10 +1574,16 @@ impl WsInner {
                 }
             }
             "conversation.item.input_audio_transcription.completed" => {
+                // Both of these change the item server side, so re-read it rather than let the
+                // local history drift.
+                self.retrieve_current_item().await;
                 self.emit(RealtimeModelEvent::InputAudioTranscriptionCompleted {
                     item_id: string_field(&event, "item_id"),
                     transcript: string_field(&event, "transcript"),
                 });
+            }
+            "conversation.item.truncated" => {
+                self.retrieve_current_item().await;
             }
             "response.output_item.added" | "response.output_item.done" => {
                 let done = event_type == "response.output_item.done";
@@ -1466,10 +1604,29 @@ impl WsInner {
                     .await;
             }
             "conversation.item.input_audio_transcription.delta"
-            | "response.function_call_arguments.delta"
-            | "conversation.item.truncated" => {}
+            | "response.function_call_arguments.delta" => {}
             _ => self.emit(RealtimeModelEvent::Other { data: event }),
         }
+    }
+
+    /// Ask the server to resend the item it is currently producing audio for.
+    ///
+    /// A transcription or a truncation rewrites that item server side, so without this the local
+    /// history keeps the pre-edit copy.
+    async fn retrieve_current_item(&self) {
+        let item_id = {
+            self.state
+                .lock()
+                .expect("realtime model poisoned")
+                .current_item_id
+                .clone()
+        };
+        let Some(item_id) = item_id else {
+            return;
+        };
+        let _ = self
+            .send_raw(json!({"type": "conversation.item.retrieve", "item_id": item_id}))
+            .await;
     }
 
     /// Interrupt playback when the server's VAD hears the user start speaking.
@@ -1575,6 +1732,7 @@ impl WsInner {
                     arguments: arguments.to_string(),
                     name: name.to_string(),
                     output: None,
+                    extra: Map::new(),
                 }));
                 self.emit(RealtimeModelEvent::FunctionCall(
                     RealtimeModelToolCallEvent {
@@ -1624,27 +1782,16 @@ fn connect_url(url: Option<&str>, call_id: Option<&str>, model: &str) -> String 
 }
 
 /// The API key for a realtime connection: explicit, then the SDK default, then the environment.
-fn resolve_api_key(explicit: Option<&str>) -> Option<String> {
+///
+/// An explicit key may be a provider resolved at connect time, so a short-lived key can be
+/// refreshed without rebuilding the model.
+async fn resolve_api_key(explicit: Option<&RealtimeApiKey>) -> Result<String> {
     if let Some(key) = explicit {
-        return Some(key.to_string());
+        return key.resolve().await;
     }
-    if let Some(key) = crate::models::default_openai_key() {
-        return Some(key);
-    }
-    std::env::var("OPENAI_API_KEY").ok()
-}
-
-/// The GA `audio.format` object for a legacy or GA format name.
-fn audio_format_payload(format: &str) -> Option<Value> {
-    match format {
-        "pcm16" | "audio/pcm" | "pcm" => Some(json!({"type": "audio/pcm", "rate": 24000})),
-        "g711_ulaw" | "audio/pcmu" | "pcmu" => Some(json!({"type": "audio/pcmu"})),
-        "g711_alaw" | "audio/pcma" | "pcma" => Some(json!({"type": "audio/pcma"})),
-        other => {
-            log_model_data_debug("Unknown realtime audio format", &other);
-            None
-        }
-    }
+    crate::models::default_openai_key()
+        .or_else(|| std::env::var("OPENAI_API_KEY").ok())
+        .ok_or_else(|| AgentsError::user("API key is required but was not provided."))
 }
 
 /// The format name of a GA `audio.format` value, in either its object or string spelling.
@@ -1734,6 +1881,20 @@ fn parse_message_item(
         .map(str::to_string)
         .or_else(|| default_status.map(str::to_string));
 
+    // Keep whatever else the server sent, so a field this port does not model survives the round
+    // trip, as Python's `extra="allow"` does.
+    let known = ["id", "type", "role", "status", "content", "object"];
+    let extra: Map<String, Value> = item
+        .as_object()
+        .map(|fields| {
+            fields
+                .iter()
+                .filter(|(key, _)| !known.contains(&key.as_str()))
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+
     Some(RealtimeItem::Message(RealtimeMessageItem {
         item_id: item
             .get("id")
@@ -1744,11 +1905,20 @@ fn parse_message_item(
         role,
         status,
         content,
+        extra,
     }))
 }
 
-/// Convert a realtime `response.usage` object into SDK usage.
-fn convert_usage(usage: &Value) -> Option<Usage> {
+/// Read an optional token count from a usage detail object.
+fn detail_tokens(details: Option<&Value>, key: &str) -> Option<u64> {
+    details?.get(key).and_then(Value::as_u64)
+}
+
+/// Convert a realtime `response.usage` object into a usage event.
+///
+/// The shared [`Usage`] carries the totals; the modality breakdown the realtime API reports is
+/// kept beside it rather than flattened away.
+fn convert_usage(usage: &Value) -> Option<RealtimeModelEvent> {
     let input_tokens = usage.get("input_tokens").and_then(Value::as_u64)?;
     let output_tokens = usage
         .get("output_tokens")
@@ -1765,13 +1935,31 @@ fn convert_usage(usage: &Value) -> Option<Usage> {
         total_tokens,
         ..Default::default()
     };
-    if let Some(cached) = usage
-        .pointer("/input_token_details/cached_tokens")
-        .and_then(Value::as_u64)
-    {
+    let input_details = usage.get("input_token_details");
+    let output_details = usage.get("output_token_details");
+    if let Some(cached) = detail_tokens(input_details, "cached_tokens") {
         converted.input_tokens_details.cached_tokens = cached;
     }
-    Some(converted)
+
+    let cached_details = input_details.and_then(|details| details.get("cached_tokens_details"));
+    Some(RealtimeModelEvent::Usage {
+        usage: Box::new(converted),
+        input_tokens_details: input_details.map(|details| RealtimeModelInputTokensDetails {
+            text_tokens: detail_tokens(Some(details), "text_tokens"),
+            audio_tokens: detail_tokens(Some(details), "audio_tokens"),
+            image_tokens: detail_tokens(Some(details), "image_tokens"),
+            cached_tokens: detail_tokens(Some(details), "cached_tokens"),
+            cached_tokens_details: cached_details.map(|cached| RealtimeModelCachedTokensDetails {
+                text_tokens: detail_tokens(Some(cached), "text_tokens"),
+                audio_tokens: detail_tokens(Some(cached), "audio_tokens"),
+                image_tokens: detail_tokens(Some(cached), "image_tokens"),
+            }),
+        }),
+        output_tokens_details: output_details.map(|details| RealtimeModelOutputTokensDetails {
+            text_tokens: detail_tokens(Some(details), "text_tokens"),
+            audio_tokens: detail_tokens(Some(details), "audio_tokens"),
+        }),
+    })
 }
 
 #[cfg(test)]
@@ -1818,7 +2006,7 @@ mod tests {
 
         // An explicitly configured format is still sent.
         let payload = model.inner.session_payload(&RealtimeSessionModelSettings {
-            input_audio_format: Some("g711_ulaw".to_string()),
+            input_audio_format: Some(RealtimeAudioFormat::from("g711_ulaw")),
             ..Default::default()
         });
         assert_eq!(payload["audio"]["input"]["format"]["type"], "audio/pcmu");
@@ -1872,19 +2060,6 @@ mod tests {
     }
 
     #[test]
-    fn audio_formats_map_to_ga_objects() {
-        assert_eq!(
-            audio_format_payload("g711_ulaw"),
-            Some(json!({"type": "audio/pcmu"}))
-        );
-        assert_eq!(
-            audio_format_payload("g711_alaw"),
-            Some(json!({"type": "audio/pcma"}))
-        );
-        assert_eq!(audio_format_payload("nonsense"), None);
-    }
-
-    #[test]
     fn parses_ga_message_content() {
         let item = json!({
             "id": "item_1",
@@ -1901,16 +2076,51 @@ mod tests {
     }
 
     #[test]
-    fn converts_usage() {
-        let usage = convert_usage(&json!({
+    fn converts_usage_with_its_modality_breakdown() {
+        let event = convert_usage(&json!({
             "input_tokens": 10,
             "output_tokens": 4,
-            "input_token_details": {"cached_tokens": 2},
+            "input_token_details": {
+                "cached_tokens": 2,
+                "text_tokens": 6,
+                "audio_tokens": 4,
+                "cached_tokens_details": {"text_tokens": 1, "audio_tokens": 1},
+            },
+            "output_token_details": {"text_tokens": 1, "audio_tokens": 3},
         }))
         .unwrap();
+        let RealtimeModelEvent::Usage {
+            usage,
+            input_tokens_details,
+            output_tokens_details,
+        } = event
+        else {
+            panic!("expected a usage event");
+        };
         assert_eq!(usage.requests, 1);
         assert_eq!(usage.total_tokens, 14);
         assert_eq!(usage.input_tokens_details.cached_tokens, 2);
+
+        let input = input_tokens_details.expect("input details");
+        assert_eq!(input.text_tokens, Some(6));
+        assert_eq!(input.audio_tokens, Some(4));
+        assert_eq!(input.image_tokens, None);
+        let cached = input.cached_tokens_details.expect("cached details");
+        assert_eq!(cached.audio_tokens, Some(1));
+
+        let output = output_tokens_details.expect("output details");
+        assert_eq!(output.audio_tokens, Some(3));
+
+        // A response that reports no breakdown still yields totals.
+        let event = convert_usage(&json!({"input_tokens": 1})).unwrap();
+        let RealtimeModelEvent::Usage {
+            input_tokens_details,
+            ..
+        } = event
+        else {
+            panic!("expected a usage event");
+        };
+        assert!(input_tokens_details.is_none());
     }
 }
 

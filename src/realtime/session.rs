@@ -15,10 +15,10 @@ use crate::agent::Agent;
 use crate::error::{AgentsError, Result};
 use crate::guardrail::{OutputGuardrail, OutputGuardrailResult};
 use crate::items::{FunctionCall, ToolApprovalItem};
-use crate::realtime::agent::RealtimeAgent;
+use crate::realtime::agent::{RealtimeAgent, RealtimeHooks};
 use crate::realtime::config::{
     RealtimeAudioStorage, RealtimeFunctionToolSpec, RealtimeModelTracing, RealtimeRunConfig,
-    RealtimeSessionModelSettings, RealtimeUserInput,
+    RealtimeSessionModelSettings, RealtimeToolErrorArgs, RealtimeToolErrorKind, RealtimeUserInput,
 };
 use crate::realtime::debug::{
     log_model_action_warning, log_tool_action_error, log_tool_action_warning,
@@ -543,12 +543,8 @@ pub(crate) async fn build_model_settings_from_agent<C: Send + Sync + 'static>(
         settings.prompt = Some(prompt.clone());
     }
 
-    let mut tools = Vec::new();
-    for tool in agent.function_tools() {
-        if tool.is_enabled.evaluate(context, &agent.name).await {
-            tools.push(tool);
-        }
-    }
+    // Includes the agent's MCP tools, as Python's `agent.get_all_tools(ctx)` does.
+    let tools = agent.get_all_tools(context).await?;
     let mut handoffs = Vec::new();
     for handoff in &agent.handoffs {
         if handoff.is_enabled.evaluate(context, &agent.name).await {
@@ -585,6 +581,18 @@ pub(crate) async fn build_model_settings_from_agent<C: Send + Sync + 'static>(
 }
 
 impl<C: Send + Sync + 'static> SessionInner<C> {
+    /// The hooks to notify: the run's, then the active agent's.
+    fn hooks_for(&self, agent: &Arc<RealtimeAgent<C>>) -> Vec<Arc<dyn RealtimeHooks<C>>> {
+        let mut hooks = Vec::new();
+        if let Some(run_hooks) = &self.run_config.hooks {
+            hooks.push(run_hooks.clone());
+        }
+        if let Some(agent_hooks) = &agent.hooks {
+            hooks.push(agent_hooks.clone());
+        }
+        hooks
+    }
+
     fn info(&self) -> RealtimeEventInfo<C> {
         RealtimeEventInfo {
             context: self.context.clone(),
@@ -863,12 +871,15 @@ impl<C: Send + Sync + 'static> SessionInner<C> {
                     }
                     state.agent.clone()
                 };
+                for hooks in self.hooks_for(&agent) {
+                    hooks.on_agent_start(&self.context, &agent).await;
+                }
                 self.emit(RealtimeSessionEvent::AgentStart {
                     agent,
                     info: self.info(),
                 });
             }
-            RealtimeModelEvent::Usage { usage } => {
+            RealtimeModelEvent::Usage { usage, .. } => {
                 self.context.add_usage(&usage);
             }
             RealtimeModelEvent::TurnEnded { response_id } => {
@@ -899,6 +910,9 @@ impl<C: Send + Sync + 'static> SessionInner<C> {
                     self.finish_response_guardrail_lifecycle(&response_id).await;
                 }
                 if let Some(agent) = agent {
+                    for hooks in self.hooks_for(&agent) {
+                        hooks.on_agent_end(&self.context, &agent).await;
+                    }
                     self.emit(RealtimeSessionEvent::AgentEnd {
                         agent,
                         info: self.info(),
@@ -1114,7 +1128,13 @@ impl<C: Send + Sync + 'static> SessionInner<C> {
             return self.execute_handoff(agent, handoff, call).await;
         }
 
-        let message = format!("Tool {} not found", call.name);
+        let default_message = format!("Tool {} not found", call.name);
+        let message = self.format_tool_error(
+            RealtimeToolErrorKind::ToolNotFound,
+            &call.name,
+            &call.call_id,
+            &default_message,
+        );
         self.commit_tool_output(
             &call,
             PendingToolOutput {
@@ -1184,6 +1204,9 @@ impl<C: Send + Sync + 'static> SessionInner<C> {
             }
         }
 
+        for hooks in self.hooks_for(&agent) {
+            hooks.on_tool_start(&self.context, &agent, &tool).await;
+        }
         self.emit(RealtimeSessionEvent::ToolStart {
             agent: agent.clone(),
             tool: tool.clone(),
@@ -1313,6 +1336,11 @@ impl<C: Send + Sync + 'static> SessionInner<C> {
             );
         }
         if let Some(tool) = &pending.tool {
+            for hooks in self.hooks_for(&pending.agent) {
+                hooks
+                    .on_tool_end(&self.context, &pending.agent, tool, &pending.output)
+                    .await;
+            }
             self.emit(RealtimeSessionEvent::ToolEnd {
                 agent: pending.agent.clone(),
                 tool: tool.clone(),
@@ -1385,12 +1413,43 @@ impl<C: Send + Sync + 'static> SessionInner<C> {
         tool: &Arc<FunctionTool<C>>,
         call: &RealtimeModelToolCallEvent,
     ) -> Result<()> {
-        let message = self
+        // An explicit per-call message from the reviewer wins over any formatter.
+        let message = match self
             .context
             .rejection_message(&agent.name, &tool.name, &call.call_id)
-            .unwrap_or_else(|| DEFAULT_APPROVAL_REJECTION_MESSAGE.to_string());
+        {
+            Some(message) => message,
+            None => self.format_tool_error(
+                RealtimeToolErrorKind::ApprovalRejected,
+                &tool.name,
+                &call.call_id,
+                DEFAULT_APPROVAL_REJECTION_MESSAGE,
+            ),
+        };
         self.complete_tool_call(agent, tool, call, ToolOutput::Text(message))
             .await
+    }
+
+    /// Let the run config reword a message the SDK sends in place of a tool result.
+    fn format_tool_error(
+        &self,
+        kind: RealtimeToolErrorKind,
+        tool_name: &str,
+        call_id: &str,
+        default_message: &str,
+    ) -> String {
+        let Some(formatter) = &self.run_config.tool_error_formatter else {
+            return default_message.to_string();
+        };
+        let args = RealtimeToolErrorArgs {
+            kind,
+            tool_type: "function".to_string(),
+            tool_name: tool_name.to_string(),
+            call_id: call_id.to_string(),
+            default_message: default_message.to_string(),
+            run_context: self.context.clone(),
+        };
+        formatter(&args).unwrap_or_else(|| default_message.to_string())
     }
 
     /// Switch to the handoff target, push its settings and answer the call.
@@ -1412,6 +1471,11 @@ impl<C: Send + Sync + 'static> SessionInner<C> {
             state.handoffs = resolved.handoffs.clone();
         }
 
+        for hooks in self.hooks_for(&to_agent) {
+            hooks
+                .on_handoff(&self.context, &from_agent, &to_agent)
+                .await;
+        }
         self.emit(RealtimeSessionEvent::Handoff {
             from_agent,
             to_agent: to_agent.clone(),
@@ -1726,6 +1790,7 @@ fn tool_call_history_item(call: &RealtimeModelToolCallEvent, output: &str) -> Re
         arguments: call.arguments.clone(),
         name: call.name.clone(),
         output: Some(output.to_string()),
+        extra: serde_json::Map::new(),
     })
 }
 

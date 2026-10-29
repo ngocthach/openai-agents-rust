@@ -22,6 +22,25 @@ pub const DEFAULT_INPUT_AUDIO_TRANSCRIPTION_MODEL: &str = "gpt-4o-mini-transcrib
 /// Default number of characters accumulated before output guardrails run.
 pub const DEFAULT_DEBOUNCE_TEXT_LENGTH: usize = 100;
 
+/// The settings the OpenAI realtime transport falls back to for anything unset.
+///
+/// Mirrors `DEFAULT_MODEL_SETTINGS` in the Python SDK. These are what the transport sends when a
+/// session configures nothing; a session that attaches to an existing call leaves the audio
+/// formats alone, since the call already negotiated them.
+pub fn default_model_settings() -> RealtimeSessionModelSettings {
+    RealtimeSessionModelSettings {
+        voice: Some(RealtimeVoice::Name(DEFAULT_REALTIME_VOICE.to_string())),
+        modalities: Some(vec!["audio".to_string()]),
+        input_audio_format: Some(RealtimeAudioFormat::Name("pcm16".to_string())),
+        output_audio_format: Some(RealtimeAudioFormat::Name("pcm16".to_string())),
+        input_audio_transcription: Some(RealtimeInputAudioTranscriptionConfig::new(
+            DEFAULT_INPUT_AUDIO_TRANSCRIPTION_MODEL,
+        )),
+        turn_detection: Some(Some(RealtimeTurnDetectionConfig::semantic_vad())),
+        ..Default::default()
+    }
+}
+
 /// A function tool, or handoff, as the realtime transport sees it.
 ///
 /// The session converts [`crate::tool::FunctionTool`]s and
@@ -58,6 +77,132 @@ impl RealtimeFunctionToolSpec {
     }
 }
 
+/// An audio format for a realtime stream.
+///
+/// The GA wire format is an object such as `{"type": "audio/pcm", "rate": 24000}`; the legacy
+/// names (`pcm16`, `g711_ulaw`, `g711_alaw`) and the GA names are both accepted and normalized to
+/// that object. Port of `audio_formats.to_realtime_audio_format`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RealtimeAudioFormat {
+    /// A format name, legacy or GA.
+    Name(String),
+    /// An explicit GA format object, passed through after validation.
+    Object(Value),
+}
+
+impl RealtimeAudioFormat {
+    /// The `audio.*.format` value to send, or `None` when the format is not recognized.
+    pub fn to_session_value(&self) -> Option<Value> {
+        match self {
+            RealtimeAudioFormat::Name(name) => match name.as_str() {
+                "pcm16" | "audio/pcm" | "pcm" => {
+                    Some(serde_json::json!({"type": "audio/pcm", "rate": 24000}))
+                }
+                "g711_ulaw" | "audio/pcmu" | "pcmu" => {
+                    Some(serde_json::json!({"type": "audio/pcmu"}))
+                }
+                "g711_alaw" | "audio/pcma" | "pcma" => {
+                    Some(serde_json::json!({"type": "audio/pcma"}))
+                }
+                other => {
+                    crate::realtime::debug::log_model_data_debug(
+                        "Unknown realtime audio format",
+                        &other,
+                    );
+                    None
+                }
+            },
+            RealtimeAudioFormat::Object(value) => {
+                let kind = value.get("type").and_then(Value::as_str);
+                match kind {
+                    Some("audio/pcm") => {
+                        // The API supports one PCM rate; anything else is coerced, as in Python.
+                        let rate = value.get("rate").and_then(Value::as_f64);
+                        if let Some(rate) = rate
+                            && rate != 24000.0
+                        {
+                            crate::realtime::debug::log_model_data_debug(
+                                "Unknown PCM rate in a realtime audio format",
+                                &rate,
+                            );
+                        }
+                        Some(serde_json::json!({"type": "audio/pcm", "rate": 24000}))
+                    }
+                    Some("audio/pcmu") => Some(serde_json::json!({"type": "audio/pcmu"})),
+                    Some("audio/pcma") => Some(serde_json::json!({"type": "audio/pcma"})),
+                    _ => {
+                        crate::realtime::debug::log_model_data_debug(
+                            "Unknown realtime audio format mapping",
+                            &value,
+                        );
+                        None
+                    }
+                }
+            }
+        }
+    }
+
+    /// The format name the audio-length math uses.
+    pub fn name(&self) -> Option<&str> {
+        match self {
+            RealtimeAudioFormat::Name(name) => Some(name.as_str()),
+            RealtimeAudioFormat::Object(value) => value.get("type").and_then(Value::as_str),
+        }
+    }
+}
+
+impl From<&str> for RealtimeAudioFormat {
+    fn from(value: &str) -> Self {
+        RealtimeAudioFormat::Name(value.to_string())
+    }
+}
+
+impl From<String> for RealtimeAudioFormat {
+    fn from(value: String) -> Self {
+        RealtimeAudioFormat::Name(value)
+    }
+}
+
+impl From<Value> for RealtimeAudioFormat {
+    fn from(value: Value) -> Self {
+        RealtimeAudioFormat::Object(value)
+    }
+}
+
+/// The voice the model speaks with.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RealtimeVoice {
+    /// A built-in voice name, such as `ash` or `marin`.
+    Name(String),
+    /// A custom voice, identified by id.
+    Custom {
+        /// The custom voice id.
+        id: String,
+    },
+}
+
+impl RealtimeVoice {
+    /// The `audio.output.voice` value to send.
+    pub fn to_session_value(&self) -> Value {
+        match self {
+            RealtimeVoice::Name(name) => Value::String(name.clone()),
+            RealtimeVoice::Custom { id } => serde_json::json!({ "id": id }),
+        }
+    }
+}
+
+impl From<&str> for RealtimeVoice {
+    fn from(value: &str) -> Self {
+        RealtimeVoice::Name(value.to_string())
+    }
+}
+
+impl From<String> for RealtimeVoice {
+    fn from(value: String) -> Self {
+        RealtimeVoice::Name(value)
+    }
+}
+
 /// Configuration for transcribing the user's audio.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct RealtimeInputAudioTranscriptionConfig {
@@ -70,6 +215,15 @@ pub struct RealtimeInputAudioTranscriptionConfig {
     /// Prompt guiding the transcription.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt: Option<String>,
+    /// Literal terms that may appear in the audio.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keywords: Option<Vec<String>>,
+    /// Expected input languages.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub languages: Option<Vec<String>>,
+    /// Latency/accuracy trade-off for streaming transcription (`minimal` .. `xhigh`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delay: Option<String>,
 }
 
 impl RealtimeInputAudioTranscriptionConfig {
@@ -117,6 +271,9 @@ pub struct RealtimeTurnDetectionConfig {
     /// Idle duration in milliseconds after which the server responds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idle_timeout_ms: Option<u32>,
+    /// Backend-specific VAD model identifier.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_version: Option<String>,
 }
 
 impl RealtimeTurnDetectionConfig {
@@ -127,6 +284,63 @@ impl RealtimeTurnDetectionConfig {
             interrupt_response: Some(true),
             ..Default::default()
         }
+    }
+}
+
+/// Input half of the nested [`RealtimeAudioConfig`] tree.
+///
+/// These take precedence over the flat `input_audio_*` and `turn_detection` settings, as in
+/// Python's `_get_session_config`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RealtimeAudioInputConfig {
+    /// Format of the audio the user sends.
+    pub format: Option<RealtimeAudioFormat>,
+    /// Noise reduction; `Some(None)` disables it explicitly.
+    pub noise_reduction: Option<Option<RealtimeNoiseReductionConfig>>,
+    /// Transcription of the user's audio.
+    pub transcription: Option<RealtimeInputAudioTranscriptionConfig>,
+    /// Turn detection; `Some(None)` disables it explicitly.
+    pub turn_detection: Option<Option<RealtimeTurnDetectionConfig>>,
+}
+
+/// Output half of the nested [`RealtimeAudioConfig`] tree.
+///
+/// These take precedence over the flat `output_audio_format`, `voice` and `speed` settings.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RealtimeAudioOutputConfig {
+    /// Format of the audio the model produces.
+    pub format: Option<RealtimeAudioFormat>,
+    /// Voice the model speaks with.
+    pub voice: Option<RealtimeVoice>,
+    /// Playback speed.
+    pub speed: Option<f64>,
+}
+
+/// The GA nested audio configuration.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RealtimeAudioConfig {
+    /// Settings for the audio the user sends.
+    pub input: Option<RealtimeAudioInputConfig>,
+    /// Settings for the audio the model produces.
+    pub output: Option<RealtimeAudioOutputConfig>,
+}
+
+impl RealtimeAudioConfig {
+    /// An empty audio configuration.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the input half.
+    pub fn with_input(mut self, input: RealtimeAudioInputConfig) -> Self {
+        self.input = Some(input);
+        self
+    }
+
+    /// Set the output half.
+    pub fn with_output(mut self, output: RealtimeAudioOutputConfig) -> Self {
+        self.output = Some(output);
+        self
     }
 }
 
@@ -182,16 +396,21 @@ pub struct RealtimeSessionModelSettings {
     pub prompt: Option<Prompt>,
     /// Output modalities, e.g. `["audio"]` or `["text"]`.
     pub output_modalities: Option<Vec<String>>,
+    /// Legacy name for [`RealtimeSessionModelSettings::output_modalities`], used when that is
+    /// unset.
+    pub modalities: Option<Vec<String>>,
+    /// The GA nested audio configuration, which wins over the flat audio keys below.
+    pub audio: Option<RealtimeAudioConfig>,
     /// Voice used for audio output.
-    pub voice: Option<String>,
+    pub voice: Option<RealtimeVoice>,
     /// Playback speed of the model's audio.
     pub speed: Option<f64>,
     /// Maximum output tokens per response (a number, or the string `"inf"`).
     pub max_output_tokens: Option<Value>,
-    /// Input audio format (`pcm16`, `g711_ulaw` or `g711_alaw`).
-    pub input_audio_format: Option<String>,
-    /// Output audio format (`pcm16`, `g711_ulaw` or `g711_alaw`).
-    pub output_audio_format: Option<String>,
+    /// Input audio format (`pcm16`, `g711_ulaw` or `g711_alaw`, or a GA format object).
+    pub input_audio_format: Option<RealtimeAudioFormat>,
+    /// Output audio format (`pcm16`, `g711_ulaw` or `g711_alaw`, or a GA format object).
+    pub output_audio_format: Option<RealtimeAudioFormat>,
     /// Transcription of the user's audio.
     pub input_audio_transcription: Option<RealtimeInputAudioTranscriptionConfig>,
     /// Noise reduction for input audio; `Some(None)` disables it explicitly.
@@ -235,6 +454,8 @@ impl RealtimeSessionModelSettings {
             instructions,
             prompt,
             output_modalities,
+            modalities,
+            audio,
             voice,
             speed,
             max_output_tokens,
@@ -281,8 +502,14 @@ impl RealtimeSessionModelSettings {
     }
 
     /// Set the output voice.
-    pub fn with_voice(mut self, voice: impl Into<String>) -> Self {
+    pub fn with_voice(mut self, voice: impl Into<RealtimeVoice>) -> Self {
         self.voice = Some(voice.into());
+        self
+    }
+
+    /// Set the nested audio configuration, which wins over the flat audio keys.
+    pub fn with_audio(mut self, audio: RealtimeAudioConfig) -> Self {
+        self.audio = Some(audio);
         self
     }
 
@@ -348,6 +575,49 @@ pub struct RealtimeToolExecutionConfig {
     pub pre_approval_tool_input_guardrails: bool,
 }
 
+/// Why the SDK is answering a tool call itself rather than running the tool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RealtimeToolErrorKind {
+    /// A reviewer rejected the call.
+    ApprovalRejected,
+    /// The model called a tool the session does not have.
+    ToolNotFound,
+}
+
+/// What a [`RealtimeToolErrorFormatter`] is given.
+pub struct RealtimeToolErrorArgs<C> {
+    /// Why the SDK is answering the call.
+    pub kind: RealtimeToolErrorKind,
+    /// Tool runtime, currently always `function`.
+    pub tool_type: String,
+    /// Name of the tool the model called.
+    pub tool_name: String,
+    /// The call id being answered.
+    pub call_id: String,
+    /// The message the SDK would send without a formatter.
+    pub default_message: String,
+    /// The session's run context.
+    pub run_context: crate::run_context::RunContext<C>,
+}
+
+impl<C> fmt::Debug for RealtimeToolErrorArgs<C> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RealtimeToolErrorArgs")
+            .field("kind", &self.kind)
+            .field("tool_type", &self.tool_type)
+            .field("tool_name", &self.tool_name)
+            .field("call_id", &self.call_id)
+            .field("default_message", &self.default_message)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Formats the model-visible message for a tool call the SDK answers itself.
+///
+/// Returning `None` keeps the default message.
+pub type RealtimeToolErrorFormatter<C> =
+    std::sync::Arc<dyn Fn(&RealtimeToolErrorArgs<C>) -> Option<String> + Send + Sync>;
+
 /// Configuration for a whole realtime run.
 pub struct RealtimeRunConfig<C> {
     /// Base settings for the model session.
@@ -362,6 +632,10 @@ pub struct RealtimeRunConfig<C> {
     pub tool_execution: RealtimeToolExecutionConfig,
     /// Whether base64 audio is kept in the session history.
     pub history_audio_storage: RealtimeAudioStorage,
+    /// Formats the message sent to the model when a tool call is rejected or not found.
+    pub tool_error_formatter: Option<RealtimeToolErrorFormatter<C>>,
+    /// Lifecycle callbacks for the whole run, in addition to each agent's own.
+    pub hooks: Option<std::sync::Arc<dyn crate::realtime::agent::RealtimeHooks<C>>>,
 }
 
 impl<C> Default for RealtimeRunConfig<C> {
@@ -373,6 +647,8 @@ impl<C> Default for RealtimeRunConfig<C> {
             tracing_disabled: false,
             tool_execution: RealtimeToolExecutionConfig::default(),
             history_audio_storage: RealtimeAudioStorage::default(),
+            tool_error_formatter: None,
+            hooks: None,
         }
     }
 }
@@ -386,6 +662,8 @@ impl<C> Clone for RealtimeRunConfig<C> {
             tracing_disabled: self.tracing_disabled,
             tool_execution: self.tool_execution.clone(),
             history_audio_storage: self.history_audio_storage,
+            tool_error_formatter: self.tool_error_formatter.clone(),
+            hooks: self.hooks.clone(),
         }
     }
 }
@@ -399,6 +677,11 @@ impl<C> fmt::Debug for RealtimeRunConfig<C> {
             .field("tracing_disabled", &self.tracing_disabled)
             .field("tool_execution", &self.tool_execution)
             .field("history_audio_storage", &self.history_audio_storage)
+            .field(
+                "tool_error_formatter",
+                &self.tool_error_formatter.as_ref().map(|_| "..."),
+            )
+            .field("hooks", &self.hooks)
             .finish()
     }
 }
@@ -470,7 +753,7 @@ mod tests {
             .with_instructions("base");
         let override_settings = RealtimeSessionModelSettings::new().with_instructions("override");
         base.merge(&override_settings);
-        assert_eq!(base.voice.as_deref(), Some("ash"));
+        assert_eq!(base.voice, Some(RealtimeVoice::from("ash")));
         assert_eq!(base.instructions.as_deref(), Some("override"));
     }
 
@@ -480,6 +763,66 @@ mod tests {
         assert!(unset.turn_detection.is_none());
         let disabled = RealtimeSessionModelSettings::new().without_turn_detection();
         assert_eq!(disabled.turn_detection, Some(None));
+    }
+
+    #[test]
+    fn audio_formats_normalize_to_ga_objects() {
+        assert_eq!(
+            RealtimeAudioFormat::from("pcm16").to_session_value(),
+            Some(serde_json::json!({"type": "audio/pcm", "rate": 24000}))
+        );
+        assert_eq!(
+            RealtimeAudioFormat::from("g711_ulaw").to_session_value(),
+            Some(serde_json::json!({"type": "audio/pcmu"}))
+        );
+        assert_eq!(
+            RealtimeAudioFormat::from("g711_alaw").to_session_value(),
+            Some(serde_json::json!({"type": "audio/pcma"}))
+        );
+        assert_eq!(
+            RealtimeAudioFormat::from("nonsense").to_session_value(),
+            None
+        );
+    }
+
+    #[test]
+    fn a_format_object_is_validated_and_its_rate_coerced() {
+        let coerced =
+            RealtimeAudioFormat::from(serde_json::json!({"type": "audio/pcm", "rate": 8000}))
+                .to_session_value();
+        // The API supports one PCM rate, so an unexpected one is coerced rather than forwarded.
+        assert_eq!(
+            coerced,
+            Some(serde_json::json!({"type": "audio/pcm", "rate": 24000}))
+        );
+        assert_eq!(
+            RealtimeAudioFormat::from(serde_json::json!({"type": "audio/pcmu"})).to_session_value(),
+            Some(serde_json::json!({"type": "audio/pcmu"}))
+        );
+        assert_eq!(
+            RealtimeAudioFormat::from(serde_json::json!({"type": "audio/unknown"}))
+                .to_session_value(),
+            None
+        );
+        assert_eq!(
+            RealtimeAudioFormat::from(serde_json::json!({"type": "audio/pcmu"})).name(),
+            Some("audio/pcmu")
+        );
+    }
+
+    #[test]
+    fn a_custom_voice_is_sent_as_an_object() {
+        assert_eq!(
+            RealtimeVoice::from("ash").to_session_value(),
+            serde_json::json!("ash")
+        );
+        assert_eq!(
+            RealtimeVoice::Custom {
+                id: "voice_123".to_string()
+            }
+            .to_session_value(),
+            serde_json::json!({"id": "voice_123"})
+        );
     }
 
     #[test]

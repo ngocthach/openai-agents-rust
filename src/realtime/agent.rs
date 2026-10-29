@@ -4,13 +4,15 @@ use std::fmt;
 use std::future::Future;
 use std::sync::Arc;
 
+#[cfg(feature = "mcp")]
+use crate::agent::MCPConfig;
 use crate::error::Result;
 use crate::guardrail::OutputGuardrail;
 use crate::prompts::Prompt;
 use crate::realtime::config::RealtimeSessionModelSettings;
 use crate::realtime::handoffs::RealtimeHandoff;
 use crate::run_context::RunContext;
-use crate::tool::{FunctionTool, Tool};
+use crate::tool::{FunctionTool, Tool, ToolOutput};
 use crate::util::BoxFuture;
 
 type DynamicInstructionsFn<C> = Arc<
@@ -63,12 +65,20 @@ pub struct RealtimeAgent<C> {
     pub prompt: Option<Prompt>,
     /// Tools exposed to the model.
     pub tools: Vec<Tool<C>>,
+    /// MCP servers whose tools are exposed to the model alongside `tools`.
+    #[cfg(feature = "mcp")]
+    pub mcp_servers: Vec<Arc<dyn crate::mcp::MCPServer>>,
+    /// How MCP tools are prepared.
+    #[cfg(feature = "mcp")]
+    pub mcp_config: MCPConfig,
     /// Agents this one can hand off to.
     pub handoffs: Vec<RealtimeHandoff<C>>,
     /// Guardrails run on the assistant transcript.
     pub output_guardrails: Vec<OutputGuardrail<C>>,
     /// Session settings applied when this agent becomes active.
     pub model_settings: Option<RealtimeSessionModelSettings>,
+    /// Lifecycle callbacks for this agent, in addition to the session's own.
+    pub hooks: Option<Arc<dyn RealtimeHooks<C>>>,
 }
 
 impl<C> Clone for RealtimeAgent<C> {
@@ -79,9 +89,14 @@ impl<C> Clone for RealtimeAgent<C> {
             instructions: self.instructions.clone(),
             prompt: self.prompt.clone(),
             tools: self.tools.clone(),
+            #[cfg(feature = "mcp")]
+            mcp_servers: self.mcp_servers.clone(),
+            #[cfg(feature = "mcp")]
+            mcp_config: self.mcp_config.clone(),
             handoffs: self.handoffs.clone(),
             output_guardrails: self.output_guardrails.clone(),
             model_settings: self.model_settings.clone(),
+            hooks: self.hooks.clone(),
         }
     }
 }
@@ -106,9 +121,14 @@ impl<C: Send + Sync + 'static> RealtimeAgent<C> {
             instructions: None,
             prompt: None,
             tools: Vec::new(),
+            #[cfg(feature = "mcp")]
+            mcp_servers: Vec::new(),
+            #[cfg(feature = "mcp")]
+            mcp_config: MCPConfig::default(),
             handoffs: Vec::new(),
             output_guardrails: Vec::new(),
             model_settings: None,
+            hooks: None,
         }
     }
 
@@ -158,6 +178,20 @@ impl<C: Send + Sync + 'static> RealtimeAgent<C> {
         self
     }
 
+    /// Add an MCP server whose tools the model may call.
+    #[cfg(feature = "mcp")]
+    pub fn with_mcp_server(mut self, server: Arc<dyn crate::mcp::MCPServer>) -> Self {
+        self.mcp_servers.push(server);
+        self
+    }
+
+    /// Set how MCP tools are prepared (strict schemas, server-prefixed names).
+    #[cfg(feature = "mcp")]
+    pub fn with_mcp_config(mut self, config: MCPConfig) -> Self {
+        self.mcp_config = config;
+        self
+    }
+
     /// Add a handoff.
     pub fn with_handoff(mut self, handoff: impl Into<RealtimeHandoff<C>>) -> Self {
         self.handoffs.push(handoff.into());
@@ -186,6 +220,12 @@ impl<C: Send + Sync + 'static> RealtimeAgent<C> {
         self
     }
 
+    /// Set the lifecycle callbacks for this agent.
+    pub fn with_hooks(mut self, hooks: Arc<dyn RealtimeHooks<C>>) -> Self {
+        self.hooks = Some(hooks);
+        self
+    }
+
     /// Wrap the agent in an `Arc`, as sessions and handoffs expect.
     pub fn into_arc(self) -> Arc<Self> {
         Arc::new(self)
@@ -207,11 +247,92 @@ impl<C> RealtimeAgent<C> {
         }
     }
 
-    /// The function tools of this agent, skipping hosted tools, which realtime models reject.
+    /// The function tools declared on this agent, skipping hosted tools, which realtime models
+    /// reject.
+    ///
+    /// This does not include MCP tools; use [`RealtimeAgent::get_all_tools`] for those.
     pub fn function_tools(&self) -> Vec<Arc<FunctionTool<C>>> {
         self.tools
             .iter()
             .filter_map(|tool| tool.as_function().cloned())
             .collect()
+    }
+}
+
+impl<C: Send + Sync + 'static> RealtimeAgent<C> {
+    /// Every enabled tool the model may call, including the tools of this agent's MCP servers.
+    ///
+    /// MCP tools come first, as in [`crate::Agent::get_all_tools`], and hosted tools are skipped
+    /// because realtime models accept function tools only.
+    pub async fn get_all_tools(
+        &self,
+        context: &RunContext<C>,
+    ) -> Result<Vec<Arc<FunctionTool<C>>>> {
+        let mut tools: Vec<Arc<FunctionTool<C>>> = Vec::new();
+
+        #[cfg(feature = "mcp")]
+        if !self.mcp_servers.is_empty() {
+            let mcp_tools = crate::mcp::util::get_all_function_tools(
+                &self.mcp_servers,
+                &self.mcp_config,
+                context,
+                &self.name,
+            )
+            .await?;
+            tools.extend(
+                mcp_tools
+                    .iter()
+                    .filter_map(|tool| tool.as_function().cloned()),
+            );
+        }
+
+        for tool in self.function_tools() {
+            if tool.is_enabled.evaluate(context, &self.name).await {
+                tools.push(tool);
+            }
+        }
+        Ok(tools)
+    }
+}
+
+/// Callbacks for the lifecycle of a realtime session.
+///
+/// The same moments are also published as [`crate::realtime::RealtimeSessionEvent`]s; hooks are
+/// for code that wants to react inline, next to the session, rather than drive the event stream.
+/// Mirrors `RealtimeAgentHooks` / `RealtimeRunHooks` in the Python SDK.
+#[async_trait::async_trait]
+pub trait RealtimeHooks<C>: Send + Sync + fmt::Debug {
+    /// An agent started a turn.
+    async fn on_agent_start(&self, _context: &RunContext<C>, _agent: &Arc<RealtimeAgent<C>>) {}
+
+    /// An agent finished a turn.
+    async fn on_agent_end(&self, _context: &RunContext<C>, _agent: &Arc<RealtimeAgent<C>>) {}
+
+    /// An agent handed off to another agent.
+    async fn on_handoff(
+        &self,
+        _context: &RunContext<C>,
+        _from_agent: &Arc<RealtimeAgent<C>>,
+        _to_agent: &Arc<RealtimeAgent<C>>,
+    ) {
+    }
+
+    /// A tool call is about to run.
+    async fn on_tool_start(
+        &self,
+        _context: &RunContext<C>,
+        _agent: &Arc<RealtimeAgent<C>>,
+        _tool: &Arc<FunctionTool<C>>,
+    ) {
+    }
+
+    /// A tool call finished.
+    async fn on_tool_end(
+        &self,
+        _context: &RunContext<C>,
+        _agent: &Arc<RealtimeAgent<C>>,
+        _tool: &Arc<FunctionTool<C>>,
+        _output: &ToolOutput,
+    ) {
     }
 }

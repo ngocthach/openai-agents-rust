@@ -257,7 +257,8 @@ mod tests {
     fn default_naming_matches_core_handoffs() {
         let agent = RealtimeAgent::<()>::new("Billing Agent").into_arc();
         let handoff = realtime_handoff(agent);
-        assert_eq!(handoff.tool_name, "transfer_to_Billing_Agent");
+        // The core transform lowercases, as Python's `transform_string_function_style` does.
+        assert_eq!(handoff.tool_name, "transfer_to_billing_agent");
         assert_eq!(handoff.agent_name, "Billing Agent");
     }
 

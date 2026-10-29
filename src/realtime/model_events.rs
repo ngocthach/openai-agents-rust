@@ -61,6 +61,41 @@ pub struct RealtimeModelAudioEvent {
     pub content_index: usize,
 }
 
+/// Modality breakdown of cached realtime input tokens.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RealtimeModelCachedTokensDetails {
+    /// Cached text tokens.
+    pub text_tokens: Option<u64>,
+    /// Cached audio tokens.
+    pub audio_tokens: Option<u64>,
+    /// Cached image tokens.
+    pub image_tokens: Option<u64>,
+}
+
+/// Modality breakdown of realtime input tokens.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RealtimeModelInputTokensDetails {
+    /// Text tokens.
+    pub text_tokens: Option<u64>,
+    /// Audio tokens.
+    pub audio_tokens: Option<u64>,
+    /// Image tokens.
+    pub image_tokens: Option<u64>,
+    /// Tokens served from the prompt cache.
+    pub cached_tokens: Option<u64>,
+    /// Breakdown of the cached tokens.
+    pub cached_tokens_details: Option<RealtimeModelCachedTokensDetails>,
+}
+
+/// Modality breakdown of realtime output tokens.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RealtimeModelOutputTokensDetails {
+    /// Text tokens.
+    pub text_tokens: Option<u64>,
+    /// Audio tokens.
+    pub audio_tokens: Option<u64>,
+}
+
 /// An event emitted by a [`crate::realtime::RealtimeModel`].
 #[derive(Debug, Clone, PartialEq)]
 pub enum RealtimeModelEvent {
@@ -145,8 +180,15 @@ pub enum RealtimeModelEvent {
     },
     /// Token usage for a completed response.
     Usage {
-        /// The usage totals.
+        /// The usage totals, compatible with the SDK's shared usage accounting.
         usage: Box<Usage>,
+        /// Input-token modality breakdown, when the provider reports one.
+        ///
+        /// The shared [`Usage`] type carries totals and cached tokens only; realtime responses
+        /// also report how many of them were text, audio or image.
+        input_tokens_details: Option<RealtimeModelInputTokensDetails>,
+        /// Output-token modality breakdown, when the provider reports one.
+        output_tokens_details: Option<RealtimeModelOutputTokensDetails>,
     },
     /// The model finished generating a response.
     TurnEnded {
@@ -176,6 +218,15 @@ impl RealtimeModelEvent {
     /// Build an audio event.
     pub fn audio(event: RealtimeModelAudioEvent) -> Self {
         RealtimeModelEvent::Audio(Box::new(event))
+    }
+
+    /// Build a usage event with no modality breakdown.
+    pub fn usage(usage: Usage) -> Self {
+        RealtimeModelEvent::Usage {
+            usage: Box::new(usage),
+            input_tokens_details: None,
+            output_tokens_details: None,
+        }
     }
 
     /// Build an item-updated event.

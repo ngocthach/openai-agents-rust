@@ -69,7 +69,7 @@ pub mod runner;
 pub mod session;
 pub mod testing;
 
-pub use agent::{RealtimeAgent, RealtimeInstructions};
+pub use agent::{RealtimeAgent, RealtimeHooks, RealtimeInstructions};
 pub use debug::{
     dont_log_model_data, dont_log_tool_data, reset_dont_log_model_data, reset_dont_log_tool_data,
     set_dont_log_model_data, set_dont_log_tool_data,
@@ -77,23 +77,28 @@ pub use debug::{
 
 pub use config::{
     DEFAULT_DEBOUNCE_TEXT_LENGTH, DEFAULT_INPUT_AUDIO_TRANSCRIPTION_MODEL, DEFAULT_REALTIME_MODEL,
-    DEFAULT_REALTIME_VOICE, RealtimeAudioStorage, RealtimeFunctionToolSpec,
+    DEFAULT_REALTIME_VOICE, RealtimeAudioConfig, RealtimeAudioFormat, RealtimeAudioInputConfig,
+    RealtimeAudioOutputConfig, RealtimeAudioStorage, RealtimeFunctionToolSpec,
     RealtimeGuardrailsSettings, RealtimeInputAudioTranscriptionConfig, RealtimeModelTracing,
     RealtimeModelTracingConfig, RealtimeNoiseReductionConfig, RealtimeRunConfig,
-    RealtimeSessionModelSettings, RealtimeToolExecutionConfig, RealtimeTurnDetectionConfig,
-    RealtimeUserInput, RealtimeUserInputContent,
+    RealtimeSessionModelSettings, RealtimeToolErrorArgs, RealtimeToolErrorFormatter,
+    RealtimeToolErrorKind, RealtimeToolExecutionConfig, RealtimeTurnDetectionConfig,
+    RealtimeUserInput, RealtimeUserInputContent, RealtimeVoice, default_model_settings,
 };
 pub use events::{RealtimeEventInfo, RealtimeSessionEvent};
 pub use handoffs::{RealtimeHandoff, realtime_handoff};
 pub use items::{
-    RealtimeContent, RealtimeItem, RealtimeMessageItem, RealtimeMessageRole, RealtimeToolCallItem,
+    RealtimeContent, RealtimeItem, RealtimeMessageItem, RealtimeMessageRole, RealtimeResponse,
+    RealtimeToolCallItem,
 };
 pub use model::{
-    RealtimeModel, RealtimeModelConfig, RealtimeModelEvents, RealtimePlaybackState,
-    RealtimePlaybackTracker, RealtimeSendCondition, calculate_audio_length_ms,
+    RealtimeApiKey, RealtimeApiKeyProvider, RealtimeModel, RealtimeModelConfig,
+    RealtimeModelEvents, RealtimePlaybackState, RealtimePlaybackTracker, RealtimeSendCondition,
+    RealtimeTransportConfig, calculate_audio_length_ms,
 };
 pub use model_events::{
-    RealtimeConnectionStatus, RealtimeModelAudioEvent, RealtimeModelEvent,
+    RealtimeConnectionStatus, RealtimeModelAudioEvent, RealtimeModelCachedTokensDetails,
+    RealtimeModelEvent, RealtimeModelInputTokensDetails, RealtimeModelOutputTokensDetails,
     RealtimeModelToolCallEvent,
 };
 pub use model_inputs::{RealtimeInterrupt, RealtimeModelSendEvent};

@@ -141,6 +141,9 @@ pub struct RealtimeMessageItem {
     /// The content parts of the message.
     #[serde(default)]
     pub content: Vec<RealtimeContent>,
+    /// Any other fields the transport reported, kept so they survive a round trip.
+    #[serde(flatten, default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 impl RealtimeMessageItem {
@@ -156,6 +159,7 @@ impl RealtimeMessageItem {
             role,
             status: None,
             content,
+            extra: serde_json::Map::new(),
         }
     }
 
@@ -189,6 +193,9 @@ pub struct RealtimeToolCallItem {
     /// Output of the call, once it is known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output: Option<String>,
+    /// Any other fields the transport reported, kept so they survive a round trip.
+    #[serde(flatten, default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 /// An item of the session history: a message or a tool call.
@@ -245,6 +252,18 @@ impl From<RealtimeToolCallItem> for RealtimeItem {
     fn from(value: RealtimeToolCallItem) -> Self {
         RealtimeItem::FunctionCall(value)
     }
+}
+
+/// A completed response from the realtime model.
+///
+/// Mirrors `agents.realtime.items.RealtimeResponse`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RealtimeResponse {
+    /// Unique identifier of the response.
+    pub id: String,
+    /// The message items the response produced.
+    #[serde(default)]
+    pub output: Vec<RealtimeMessageItem>,
 }
 
 /// Drop the base64 audio from a message item, keeping transcripts and every other field.

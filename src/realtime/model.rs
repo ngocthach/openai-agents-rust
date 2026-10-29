@@ -133,11 +133,113 @@ impl RealtimePlaybackTracker {
 /// A condition rechecked at the transport's send boundary.
 pub type RealtimeSendCondition = Box<dyn Fn() -> bool + Send + Sync>;
 
+/// Resolves the API key for a connection.
+pub type RealtimeApiKeyProvider =
+    Arc<dyn Fn() -> crate::util::BoxFuture<'static, crate::error::Result<String>> + Send + Sync>;
+
+/// The API key to connect with, either a value or something that produces one.
+///
+/// A provider is resolved on every connect, so a key with a short lifetime can be refreshed
+/// without rebuilding the model. Port of Python's `str | Callable[[], MaybeAwaitable[str]]`.
+#[derive(Clone)]
+pub enum RealtimeApiKey {
+    /// A literal key.
+    Value(String),
+    /// A function that produces a key when the transport connects.
+    Provider(RealtimeApiKeyProvider),
+}
+
+impl RealtimeApiKey {
+    /// Resolve the key.
+    pub async fn resolve(&self) -> crate::error::Result<String> {
+        match self {
+            RealtimeApiKey::Value(key) => Ok(key.clone()),
+            RealtimeApiKey::Provider(provider) => provider().await,
+        }
+    }
+}
+
+impl fmt::Debug for RealtimeApiKey {
+    /// Never prints the key itself.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RealtimeApiKey::Value(_) => write!(f, "Value(<redacted>)"),
+            RealtimeApiKey::Provider(_) => write!(f, "Provider(..)"),
+        }
+    }
+}
+
+impl PartialEq for RealtimeApiKey {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (RealtimeApiKey::Value(a), RealtimeApiKey::Value(b)) => a == b,
+            (RealtimeApiKey::Provider(a), RealtimeApiKey::Provider(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        }
+    }
+}
+
+impl From<&str> for RealtimeApiKey {
+    fn from(value: &str) -> Self {
+        RealtimeApiKey::Value(value.to_string())
+    }
+}
+
+impl From<String> for RealtimeApiKey {
+    fn from(value: String) -> Self {
+        RealtimeApiKey::Value(value)
+    }
+}
+
+/// Low-level transport settings for the WebSocket connection.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RealtimeTransportConfig {
+    /// How often to send a keepalive ping. `None` disables pings.
+    pub ping_interval: Option<std::time::Duration>,
+    /// How long to wait for a pong before treating the connection as dead.
+    pub ping_timeout: Option<std::time::Duration>,
+    /// How long to wait for the connection handshake.
+    pub handshake_timeout: Option<std::time::Duration>,
+    /// Maximum size of an incoming message. Defaults to 8 MiB, as in the Python SDK.
+    pub max_size: Option<usize>,
+}
+
+impl RealtimeTransportConfig {
+    /// Default transport settings.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Send a keepalive ping every `interval`.
+    pub fn with_ping_interval(mut self, interval: std::time::Duration) -> Self {
+        self.ping_interval = Some(interval);
+        self
+    }
+
+    /// Treat the connection as dead when no pong arrives within `timeout`.
+    pub fn with_ping_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.ping_timeout = Some(timeout);
+        self
+    }
+
+    /// Give up on the handshake after `timeout`.
+    pub fn with_handshake_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.handshake_timeout = Some(timeout);
+        self
+    }
+
+    /// Accept incoming messages up to `max_size` bytes.
+    pub fn with_max_size(mut self, max_size: usize) -> Self {
+        self.max_size = Some(max_size);
+        self
+    }
+}
+
 /// Options used when connecting to a realtime model.
 #[derive(Debug, Clone, Default)]
 pub struct RealtimeModelConfig {
     /// API key to authenticate with. Falls back to the SDK default key, then `OPENAI_API_KEY`.
-    pub api_key: Option<String>,
+    pub api_key: Option<RealtimeApiKey>,
     /// Connection URL. Defaults to the OpenAI realtime WebSocket endpoint.
     pub url: Option<String>,
     /// Connection headers. When set, no `Authorization` header is added.
@@ -148,6 +250,8 @@ pub struct RealtimeModelConfig {
     pub call_id: Option<String>,
     /// Tracks how much audio the user has heard, for accurate interruption truncation.
     pub playback_tracker: Option<Arc<RealtimePlaybackTracker>>,
+    /// Low-level WebSocket settings.
+    pub transport: Option<RealtimeTransportConfig>,
 }
 
 impl PartialEq for RealtimeModelConfig {
@@ -158,6 +262,7 @@ impl PartialEq for RealtimeModelConfig {
             && self.headers == other.headers
             && self.initial_model_settings == other.initial_model_settings
             && self.call_id == other.call_id
+            && self.transport == other.transport
             && match (&self.playback_tracker, &other.playback_tracker) {
                 (None, None) => true,
                 (Some(a), Some(b)) => Arc::ptr_eq(a, b),
@@ -173,8 +278,24 @@ impl RealtimeModelConfig {
     }
 
     /// Set the API key.
-    pub fn with_api_key(mut self, api_key: impl Into<String>) -> Self {
+    pub fn with_api_key(mut self, api_key: impl Into<RealtimeApiKey>) -> Self {
         self.api_key = Some(api_key.into());
+        self
+    }
+
+    /// Resolve the API key when the transport connects, rather than up front.
+    pub fn with_api_key_fn<F, Fut>(mut self, f: F) -> Self
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = crate::error::Result<String>> + Send + 'static,
+    {
+        self.api_key = Some(RealtimeApiKey::Provider(Arc::new(move || Box::pin(f()))));
+        self
+    }
+
+    /// Set the low-level WebSocket settings.
+    pub fn with_transport(mut self, transport: RealtimeTransportConfig) -> Self {
+        self.transport = Some(transport);
         self
     }
 
