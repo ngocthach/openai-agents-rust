@@ -104,3 +104,8 @@ pub use tracing::{
     set_tracing_disabled, set_tracing_export_api_key, trace,
 };
 pub use usage::{RequestUsage, Usage};
+
+/// Compiles the README examples as doctests.
+#[doc = include_str!("../README.md")]
+#[cfg(doctest)]
+pub struct ReadmeDoctests;

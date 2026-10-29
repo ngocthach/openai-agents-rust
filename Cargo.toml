@@ -2,9 +2,9 @@
 name = "openai-agents-sdk"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.89"
 description = "Unofficial Rust port of the OpenAI Agents SDK: agents, tools, handoffs, guardrails, sessions, tracing, MCP"
-license = "MIT"
+license = "Apache-2.0"
 repository = "https://github.com/ngocthach/openai-agents-rust"
 homepage = "https://github.com/ngocthach/openai-agents-rust"
 documentation = "https://docs.rs/openai-agents-sdk"
@@ -44,3 +44,11 @@ rmcp = { version = "3", default-features = false, features = ["client", "transpo
 tokio = { version = "1", features = ["full"] }
 env_logger = "0.11"
 tempfile = "3"
+
+[[example]]
+name = "mcp_stdio"
+required-features = ["mcp"]
+
+[[example]]
+name = "sessions_sqlite"
+required-features = ["sqlite"]
