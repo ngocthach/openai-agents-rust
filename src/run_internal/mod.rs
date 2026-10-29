@@ -546,6 +546,7 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
                 }
                 NextStep::Interruption(items) => {
                     self.save_session().await?;
+                    self.notify_session_completed().await?;
                     return Ok(self.build_result(None, items));
                 }
                 NextStep::Handoff(agent) => {
@@ -672,6 +673,7 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
             h.on_end(&self.ctx, &agent, &output).await;
         }
         self.save_session().await?;
+        self.notify_session_completed().await?;
         let mut r = self.build_result(Some(output), Vec::new());
         r.state.final_output = r.final_output.clone();
         Ok(r)
@@ -743,6 +745,30 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
         }
         self.input_saved_to_session = true;
         self.session_saved_items = self.generated_items.len();
+        Ok(())
+    }
+
+    /// Notify the session that the run finished (used for automatic compaction).
+    async fn notify_session_completed(&mut self) -> Result<()> {
+        let Some(session) = self.session.clone() else {
+            return Ok(());
+        };
+        let has_local_tool_outputs = self.generated_items
+            [self.turn_start.min(self.generated_items.len())..]
+            .iter()
+            .any(|i| matches!(i.kind, RunItemKind::ToolCallOutput { .. }));
+        let info = crate::memory::SessionRunCompletion {
+            response_id: self
+                .model_responses
+                .last()
+                .and_then(|r| r.response_id.clone()),
+            store: self.current_agent.model_settings.store,
+            has_local_tool_outputs,
+        };
+        let usage = session.on_run_completed(&info).await?;
+        if usage.requests > 0 || usage.total_tokens > 0 {
+            self.ctx.add_usage(&usage);
+        }
         Ok(())
     }
 

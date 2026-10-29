@@ -49,6 +49,27 @@ pub enum SpanData {
     Custom { name: String, data: Value },
     /// A guardrail check.
     Guardrail { name: String, triggered: bool },
+    /// Speech-to-text.
+    Transcription {
+        /// Base64 audio input (only when sensitive audio data is included).
+        input: Option<String>,
+        input_format: Option<String>,
+        output: Option<String>,
+        model: Option<String>,
+        model_config: Option<Value>,
+    },
+    /// Text-to-speech.
+    Speech {
+        input: Option<String>,
+        /// Base64 audio output (only when sensitive audio data is included).
+        output: Option<String>,
+        output_format: Option<String>,
+        model: Option<String>,
+        model_config: Option<Value>,
+        first_content_at: Option<String>,
+    },
+    /// Groups the speech spans of one voice turn.
+    SpeechGroup { input: Option<String> },
     /// Listing tools of an MCP server.
     MCPListTools {
         server: Option<String>,
@@ -69,6 +90,9 @@ impl SpanData {
             SpanData::Handoff { .. } => "handoff",
             SpanData::Custom { .. } => "custom",
             SpanData::Guardrail { .. } => "guardrail",
+            SpanData::Transcription { .. } => "transcription",
+            SpanData::Speech { .. } => "speech",
+            SpanData::SpeechGroup { .. } => "speech_group",
             SpanData::MCPListTools { .. } => "mcp_tools",
         }
     }
@@ -148,6 +172,35 @@ impl SpanData {
             SpanData::Guardrail { name, triggered } => {
                 json!({"type": "guardrail", "name": name, "triggered": triggered})
             }
+            SpanData::Transcription {
+                input,
+                input_format,
+                output,
+                model,
+                model_config,
+            } => json!({
+                "type": "transcription",
+                "input": {"data": input.clone().unwrap_or_default(), "format": input_format},
+                "output": output,
+                "model": model,
+                "model_config": model_config,
+            }),
+            SpanData::Speech {
+                input,
+                output,
+                output_format,
+                model,
+                model_config,
+                first_content_at,
+            } => json!({
+                "type": "speech",
+                "input": input,
+                "output": {"data": output.clone().unwrap_or_default(), "format": output_format},
+                "model": model,
+                "model_config": model_config,
+                "first_content_at": first_content_at,
+            }),
+            SpanData::SpeechGroup { input } => json!({"type": "speech_group", "input": input}),
             SpanData::MCPListTools { server, result } => {
                 json!({"type": "mcp_tools", "server": server, "result": result})
             }

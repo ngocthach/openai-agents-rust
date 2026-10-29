@@ -39,6 +39,17 @@ impl SessionSettings {
     }
 }
 
+/// Information passed to [`Session::on_run_completed`] after the runner persisted a run.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionRunCompletion {
+    /// Id of the last model response (Responses API), if any.
+    pub response_id: Option<String>,
+    /// The `store` model setting used for the last response.
+    pub store: Option<bool>,
+    /// Whether the last turn produced local tool outputs.
+    pub has_local_tool_outputs: bool,
+}
+
 /// Stores conversation history for a session.
 ///
 /// The runner retrieves history before each run and stores new items after it.
@@ -63,6 +74,13 @@ pub trait Session: Send + Sync + fmt::Debug {
 
     /// Remove all items.
     async fn clear_session(&self) -> Result<()>;
+
+    /// Called after a run finished and its items were persisted. Sessions that compact history
+    /// (for example `OpenAIResponsesCompactionSession`) override this and return the usage of
+    /// any model requests they made, which the runner adds to the run usage.
+    async fn on_run_completed(&self, _info: &SessionRunCompletion) -> Result<crate::usage::Usage> {
+        Ok(crate::usage::Usage::default())
+    }
 }
 
 /// A session stored in process memory.

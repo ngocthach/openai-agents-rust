@@ -230,6 +230,51 @@ pub fn mcp_tools_span(server: &str, result: Option<Vec<String>>) -> Span {
     )
 }
 
+/// A speech-to-text span.
+pub fn transcription_span(
+    model: Option<String>,
+    model_config: Option<Value>,
+    disabled: bool,
+) -> Span {
+    create_span(
+        SpanData::Transcription {
+            input: None,
+            input_format: Some("pcm".into()),
+            output: None,
+            model,
+            model_config,
+        },
+        None,
+        disabled,
+    )
+}
+
+/// A text-to-speech span.
+pub fn speech_span(
+    model: Option<String>,
+    input: Option<String>,
+    model_config: Option<Value>,
+    disabled: bool,
+) -> Span {
+    create_span(
+        SpanData::Speech {
+            input,
+            output: None,
+            output_format: Some("pcm".into()),
+            model,
+            model_config,
+            first_content_at: None,
+        },
+        None,
+        disabled,
+    )
+}
+
+/// A span grouping the speech of one voice turn.
+pub fn speech_group_span(input: Option<String>, disabled: bool) -> Span {
+    create_span(SpanData::SpeechGroup { input }, None, disabled)
+}
+
 /// Globally enable or disable tracing.
 pub fn set_tracing_disabled(disabled: bool) {
     provider().set_disabled(disabled);

@@ -37,6 +37,8 @@ pub mod memory;
 pub mod model_settings;
 pub mod models;
 pub mod prompts;
+#[cfg(feature = "realtime")]
+pub mod realtime;
 pub mod repl;
 pub mod result;
 pub mod run;
@@ -45,6 +47,8 @@ pub mod run_context;
 pub mod run_error_handlers;
 mod run_internal;
 pub mod run_state;
+#[cfg(feature = "sandbox")]
+pub mod sandbox;
 pub mod stream_events;
 pub mod strict_schema;
 pub mod testing;
@@ -54,6 +58,8 @@ pub mod tool_guardrails;
 pub mod tracing;
 pub mod usage;
 pub(crate) mod util;
+#[cfg(feature = "voice")]
+pub mod voice;
 
 pub use agent::{
     Agent, AgentAsToolOptions, AgentModel, Instructions, MCPConfig, StopAtTools, ToolUseBehavior,
