@@ -247,6 +247,21 @@ impl From<RealtimeToolCallItem> for RealtimeItem {
     }
 }
 
+/// Drop the base64 audio from a message item, keeping transcripts and every other field.
+pub(crate) fn strip_audio(item: &mut RealtimeItem) {
+    let RealtimeItem::Message(message) = item else {
+        return;
+    };
+    for part in message.content.iter_mut() {
+        match part {
+            RealtimeContent::Audio { audio, .. } | RealtimeContent::InputAudio { audio, .. } => {
+                *audio = None;
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Insert or merge `incoming` into `history`, mirroring `RealtimeSession._get_new_history`.
 ///
 /// An item with a known id replaces the existing one, preserving transcripts and text that the
@@ -356,6 +371,31 @@ pub(crate) fn apply_assistant_transcript(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strip_audio_keeps_transcripts() {
+        let mut item = RealtimeItem::Message(RealtimeMessageItem::new(
+            "item_1",
+            RealtimeMessageRole::Assistant,
+            vec![
+                RealtimeContent::Audio {
+                    audio: Some("AAAA".to_string()),
+                    transcript: Some("hello".to_string()),
+                },
+                RealtimeContent::text("hi"),
+            ],
+        ));
+        strip_audio(&mut item);
+        let content = &item.as_message().unwrap().content;
+        assert_eq!(
+            content[0],
+            RealtimeContent::Audio {
+                audio: None,
+                transcript: Some("hello".to_string()),
+            }
+        );
+        assert_eq!(content[1].text_value(), Some("hi"));
+    }
 
     #[test]
     fn merges_message_preserving_transcript() {

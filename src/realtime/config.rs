@@ -305,6 +305,23 @@ impl RealtimeSessionModelSettings {
     }
 }
 
+/// Whether the session keeps base64 audio in its local history.
+///
+/// The realtime API includes audio bytes in some conversation items, and a long call can
+/// accumulate a lot of them. Transcripts are always kept.
+///
+/// The Python SDK has only a `TODO (rm) Add history audio storage config` here, so this knob is
+/// this port's implementation of that intent. [`RealtimeAudioStorage::Keep`] is the default
+/// because it is what Python does today.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RealtimeAudioStorage {
+    /// Keep audio exactly as the transport reports it (the Python behavior).
+    #[default]
+    Keep,
+    /// Drop the audio bytes from history items, keeping transcripts and every other field.
+    DiscardAudio,
+}
+
 /// Settings for output guardrail execution.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RealtimeGuardrailsSettings {
@@ -343,6 +360,8 @@ pub struct RealtimeRunConfig<C> {
     pub tracing_disabled: bool,
     /// Local tool execution settings.
     pub tool_execution: RealtimeToolExecutionConfig,
+    /// Whether base64 audio is kept in the session history.
+    pub history_audio_storage: RealtimeAudioStorage,
 }
 
 impl<C> Default for RealtimeRunConfig<C> {
@@ -353,6 +372,7 @@ impl<C> Default for RealtimeRunConfig<C> {
             guardrails_settings: RealtimeGuardrailsSettings::default(),
             tracing_disabled: false,
             tool_execution: RealtimeToolExecutionConfig::default(),
+            history_audio_storage: RealtimeAudioStorage::default(),
         }
     }
 }
@@ -365,6 +385,7 @@ impl<C> Clone for RealtimeRunConfig<C> {
             guardrails_settings: self.guardrails_settings.clone(),
             tracing_disabled: self.tracing_disabled,
             tool_execution: self.tool_execution.clone(),
+            history_audio_storage: self.history_audio_storage,
         }
     }
 }
@@ -377,6 +398,7 @@ impl<C> fmt::Debug for RealtimeRunConfig<C> {
             .field("guardrails_settings", &self.guardrails_settings)
             .field("tracing_disabled", &self.tracing_disabled)
             .field("tool_execution", &self.tool_execution)
+            .field("history_audio_storage", &self.history_audio_storage)
             .finish()
     }
 }

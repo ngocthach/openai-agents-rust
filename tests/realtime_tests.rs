@@ -9,11 +9,12 @@ use std::time::Duration;
 use futures::{SinkExt, StreamExt};
 use openai_agents_sdk::realtime::{
     FakeRealtimeModel, OpenAIRealtimeSIPModel, OpenAIRealtimeWebSocketModel, RealtimeAgent,
-    RealtimeContent, RealtimeInterrupt, RealtimeMessageItem, RealtimeMessageRole, RealtimeModel,
-    RealtimeModelConfig, RealtimeModelEvent, RealtimeModelSendEvent, RealtimeModelToolCallEvent,
-    RealtimePlaybackTracker, RealtimeRunConfig, RealtimeRunner, RealtimeSession,
-    RealtimeSessionEvent, RealtimeSessionModelSettings, RealtimeToolExecutionConfig,
-    RealtimeUserInput, realtime_handoff,
+    RealtimeAudioStorage, RealtimeContent, RealtimeInterrupt, RealtimeMessageItem,
+    RealtimeMessageRole, RealtimeModel, RealtimeModelConfig, RealtimeModelEvent,
+    RealtimeModelSendEvent, RealtimeModelToolCallEvent, RealtimePlaybackTracker, RealtimeRunConfig,
+    RealtimeRunner, RealtimeScriptError, RealtimeSendMatcher, RealtimeSession,
+    RealtimeSessionEvent, RealtimeSessionModelSettings, RealtimeStep, RealtimeToolExecutionConfig,
+    RealtimeUserInput, ScriptedRealtimeModel, realtime_handoff,
 };
 use openai_agents_sdk::tool::FunctionTool;
 use openai_agents_sdk::tool_guardrails::{ToolGuardrailFunctionOutput, ToolInputGuardrail};
@@ -1165,6 +1166,520 @@ fn base64_encode(bytes: &[u8]) -> String {
         });
     }
     out
+}
+
+#[tokio::test]
+async fn a_duplicate_tool_call_id_runs_the_tool_only_once() {
+    let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = runs.clone();
+    let tool = FunctionTool::new(
+        "get_weather",
+        "Get the weather for a city",
+        move |_ctx, args: CityArgs| {
+            let counted = counted.clone();
+            async move {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(format!("The weather in {} is sunny", args.city))
+            }
+        },
+    );
+    let model = Arc::new(FakeRealtimeModel::new());
+    let agent = RealtimeAgent::<()>::new("Assistant")
+        .with_tool(tool)
+        .into_arc();
+    let session = start_session(model.clone(), agent).await;
+
+    let call = RealtimeModelToolCallEvent::new("get_weather", "call_1", r#"{"city":"Oslo"}"#);
+    assert!(model.emit(RealtimeModelEvent::FunctionCall(call.clone())));
+    wait_for(&session, |event| {
+        matches!(event, RealtimeSessionEvent::ToolEnd { .. })
+    })
+    .await;
+
+    // The transport redelivering the same call must not run the tool again.
+    assert!(model.emit(RealtimeModelEvent::FunctionCall(call)));
+    assert!(model.emit(RealtimeModelEvent::AudioDone {
+        item_id: "item_1".to_string(),
+        content_index: 0,
+    }));
+    wait_for(&session, |event| {
+        matches!(event, RealtimeSessionEvent::AudioEnd { .. })
+    })
+    .await;
+
+    assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(model.tool_outputs().len(), 1);
+
+    session.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn reusing_a_call_id_for_a_different_invocation_is_an_error() {
+    let model = Arc::new(FakeRealtimeModel::new());
+    let agent = RealtimeAgent::<()>::new("Assistant")
+        .with_tool(weather_tool())
+        .with_tool(FunctionTool::new(
+            "get_time",
+            "Get the time",
+            |_ctx, _args: CityArgs| async move { Ok("noon".to_string()) },
+        ))
+        .into_arc();
+    let session = start_session(model.clone(), agent).await;
+
+    assert!(model.emit(RealtimeModelEvent::FunctionCall(
+        RealtimeModelToolCallEvent::new("get_weather", "call_1", r#"{"city":"Oslo"}"#)
+    )));
+    wait_for(&session, |event| {
+        matches!(event, RealtimeSessionEvent::ToolEnd { .. })
+    })
+    .await;
+
+    // Same call id, different tool: the outputs would collide on the server.
+    assert!(model.emit(RealtimeModelEvent::FunctionCall(
+        RealtimeModelToolCallEvent::new("get_time", "call_1", r#"{"city":"Oslo"}"#)
+    )));
+    let (error, _) = wait_for(&session, |event| {
+        matches!(event, RealtimeSessionEvent::Error { .. })
+    })
+    .await;
+    match error {
+        RealtimeSessionEvent::Error { error, .. } => {
+            assert!(
+                error["message"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("reused a Realtime tool call ID"),
+                "unexpected error: {error}"
+            );
+        }
+        other => panic!("expected error, got {other:?}"),
+    }
+    // Only the first call answered the model.
+    assert_eq!(model.tool_outputs().len(), 1);
+
+    session.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn an_undelivered_tool_output_is_cached_and_resent() {
+    // The connect-time settings travel with `connect`, so the first send is the tool output.
+    let model = Arc::new(ScriptedRealtimeModel::new([
+        RealtimeStep::new("tool_output").failing("transport write failed"),
+        RealtimeStep::new("tool_output"),
+    ]));
+    let agent = RealtimeAgent::<()>::new("Assistant")
+        .with_tool(weather_tool())
+        .into_arc();
+    let session = RealtimeRunner::new(agent)
+        .with_model(model.clone())
+        .run(())
+        .await
+        .unwrap();
+
+    let call = RealtimeModelToolCallEvent::new("get_weather", "call_1", r#"{"city":"Oslo"}"#);
+    assert!(model.emit(RealtimeModelEvent::FunctionCall(call.clone())));
+
+    // The failed send surfaces as an error event, not a lost call.
+    let (error, _) = wait_for(&session, |event| {
+        matches!(event, RealtimeSessionEvent::Error { .. })
+    })
+    .await;
+    match error {
+        RealtimeSessionEvent::Error { error, .. } => {
+            assert_eq!(
+                error["message"],
+                "Tool output send failed; cached output will be retried"
+            );
+        }
+        other => panic!("expected error, got {other:?}"),
+    }
+
+    // Retrying the same call resends the cached output instead of running the tool again.
+    assert!(model.emit(RealtimeModelEvent::FunctionCall(call)));
+    let (tool_end, seen) = wait_for(&session, |event| {
+        matches!(event, RealtimeSessionEvent::ToolEnd { .. })
+    })
+    .await;
+    assert!(
+        !seen
+            .iter()
+            .any(|event| matches!(event, RealtimeSessionEvent::ToolStart { .. })),
+        "a cached output must not start the tool a second time"
+    );
+    match tool_end {
+        RealtimeSessionEvent::ToolEnd { output, .. } => {
+            assert_eq!(output.to_model_string(), "The weather in Oslo is sunny");
+        }
+        other => panic!("expected tool_end, got {other:?}"),
+    }
+
+    model.assert_complete().unwrap();
+    session.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn the_scripted_model_enforces_the_expected_exchange() {
+    let model = Arc::new(ScriptedRealtimeModel::new([RealtimeStep::new(
+        RealtimeSendMatcher::predicate(|event| {
+            matches!(
+                event,
+                RealtimeModelSendEvent::UserInput {
+                    user_input: RealtimeUserInput::Text(text),
+                } if text == "Hello"
+            )
+        }),
+    )
+    .emitting([RealtimeModelEvent::TurnStarted {
+        response_id: Some("resp_1".to_string()),
+    }])]));
+    let agent = RealtimeAgent::<()>::new("Assistant")
+        .with_instructions("Be brief")
+        .into_arc();
+    let session = RealtimeRunner::new(agent)
+        .with_model(model.clone())
+        .with_model_config(RealtimeModelConfig::new().with_api_key("sk-test"))
+        .run(())
+        .await
+        .unwrap();
+
+    // The connect snapshot records that a key was supplied, never the key.
+    let calls = model.connect_calls();
+    assert_eq!(calls.len(), 1);
+    assert!(calls[0].api_key_provided);
+    assert!(!calls[0].headers_provided);
+    assert!(!calls[0].playback_tracker_provided);
+    assert_eq!(calls[0].url, None);
+    // Connect-time settings reach the transport through `connect`, not through a send.
+    assert_eq!(
+        calls[0]
+            .initial_model_settings
+            .as_ref()
+            .and_then(|settings| settings.instructions.as_deref()),
+        Some("Be brief")
+    );
+
+    assert_eq!(model.remaining_steps(), 1);
+    session.send_message("Hello").await.unwrap();
+    wait_for(&session, |event| {
+        matches!(event, RealtimeSessionEvent::AgentStart { .. })
+    })
+    .await;
+    model.assert_complete().unwrap();
+
+    // An unscripted send is refused.
+    let error = session
+        .send_message("Again")
+        .await
+        .expect_err("the script is exhausted");
+    assert!(
+        error.to_string().contains("no scripted steps remain"),
+        "unexpected error: {error}"
+    );
+
+    session.close().await.unwrap();
+    assert_eq!(model.close_calls(), 1);
+}
+
+#[tokio::test]
+async fn the_scripted_model_reports_unconsumed_steps() {
+    let model = Arc::new(ScriptedRealtimeModel::new([
+        RealtimeStep::new("audio"),
+        RealtimeStep::new("interrupt"),
+    ]));
+    let agent = RealtimeAgent::<()>::new("Assistant").into_arc();
+    let session = RealtimeRunner::new(agent)
+        .with_model(model.clone())
+        .run(())
+        .await
+        .unwrap();
+
+    let error = model
+        .assert_complete()
+        .expect_err("both steps are unconsumed");
+    assert_eq!(error, RealtimeScriptError::UnconsumedSteps { remaining: 2 });
+    assert!(error.to_string().contains("not consumed"));
+
+    // A send of the wrong kind names what was expected.
+    let error = session
+        .send_message("Hello")
+        .await
+        .expect_err("user_input does not match the audio step");
+    assert!(
+        error.to_string().contains("expected an event of kind"),
+        "unexpected error: {error}"
+    );
+
+    session.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn discarding_history_audio_keeps_transcripts() {
+    for (storage, expect_audio) in [
+        (RealtimeAudioStorage::Keep, true),
+        (RealtimeAudioStorage::DiscardAudio, false),
+    ] {
+        let model = Arc::new(FakeRealtimeModel::new());
+        let agent = RealtimeAgent::<()>::new("Assistant").into_arc();
+        let config = RealtimeRunConfig::<()> {
+            history_audio_storage: storage,
+            ..Default::default()
+        };
+        let session = RealtimeRunner::new(agent)
+            .with_model(model.clone())
+            .with_config(config)
+            .run(())
+            .await
+            .unwrap();
+
+        assert!(
+            model.emit(RealtimeModelEvent::item_updated(RealtimeMessageItem::new(
+                "item_1",
+                RealtimeMessageRole::Assistant,
+                vec![RealtimeContent::Audio {
+                    audio: Some("AAAA".to_string()),
+                    transcript: Some("hello".to_string()),
+                }],
+            )))
+        );
+        wait_for(&session, |event| {
+            matches!(event, RealtimeSessionEvent::HistoryAdded { .. })
+        })
+        .await;
+
+        let history = session.history();
+        let message = history
+            .iter()
+            .find_map(|item| item.as_message())
+            .expect("assistant message in history");
+        // The transcript survives either way; only the bytes are optional.
+        assert_eq!(message.text(), "hello");
+        match &message.content[0] {
+            RealtimeContent::Audio { audio, .. } => assert_eq!(
+                audio.is_some(),
+                expect_audio,
+                "unexpected audio retention for {storage:?}"
+            ),
+            other => panic!("expected audio content, got {other:?}"),
+        }
+
+        session.close().await.unwrap();
+    }
+}
+
+#[test]
+fn log_redaction_overrides_beat_the_environment() {
+    use openai_agents_sdk::realtime::{
+        dont_log_model_data, reset_dont_log_model_data, set_dont_log_model_data,
+    };
+
+    // Redaction is on unless the environment turns it off, so derive the expectation rather than
+    // assuming an unset variable.
+    let from_env = !matches!(
+        std::env::var("OPENAI_AGENTS_DONT_LOG_MODEL_DATA")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "0" | "false" | "no"
+    );
+    assert_eq!(dont_log_model_data(), from_env);
+
+    set_dont_log_model_data(false);
+    assert!(!dont_log_model_data());
+    set_dont_log_model_data(true);
+    assert!(dont_log_model_data());
+    reset_dont_log_model_data();
+    assert_eq!(dont_log_model_data(), from_env);
+}
+
+#[tokio::test]
+async fn a_call_redelivered_while_its_approved_tool_runs_is_ignored() {
+    // The tool blocks until the test releases it, so the redelivery lands mid-run.
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let tool_gate = gate.clone();
+    let counted = runs.clone();
+    let tool = FunctionTool::new(
+        "get_weather",
+        "Get the weather for a city",
+        move |_ctx, args: CityArgs| {
+            let gate = tool_gate.clone();
+            let counted = counted.clone();
+            async move {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let permit = gate.acquire().await.expect("gate stays open");
+                permit.forget();
+                Ok(format!("The weather in {} is sunny", args.city))
+            }
+        },
+    )
+    .with_needs_approval(true);
+
+    let model = Arc::new(FakeRealtimeModel::new());
+    let agent = RealtimeAgent::<()>::new("Assistant")
+        .with_tool(tool)
+        .into_arc();
+    let session = start_session(model.clone(), agent).await;
+
+    let call = RealtimeModelToolCallEvent::new("get_weather", "call_1", r#"{"city":"Oslo"}"#);
+    assert!(model.emit(RealtimeModelEvent::FunctionCall(call.clone())));
+    wait_for(&session, |event| {
+        matches!(event, RealtimeSessionEvent::ToolApprovalRequired { .. })
+    })
+    .await;
+
+    // Approving runs the tool, which blocks, so the approval future stays pending.
+    let approving = {
+        let session = session.clone();
+        tokio::spawn(async move { session.approve_tool_call("call_1", false).await })
+    };
+    wait_for(&session, |event| {
+        matches!(event, RealtimeSessionEvent::ToolStart { .. })
+    })
+    .await;
+
+    // The model redelivers the call while the approved tool is still running.
+    assert!(model.emit(RealtimeModelEvent::FunctionCall(call)));
+    assert!(model.emit(RealtimeModelEvent::AudioDone {
+        item_id: "item_1".to_string(),
+        content_index: 0,
+    }));
+    let (_, seen) = wait_for(&session, |event| {
+        matches!(event, RealtimeSessionEvent::AudioEnd { .. })
+    })
+    .await;
+    assert!(
+        !seen
+            .iter()
+            .any(|event| matches!(event, RealtimeSessionEvent::Error { .. })),
+        "a redelivery during an approved run must be ignored, not reported as an error"
+    );
+
+    gate.add_permits(1);
+    approving.await.unwrap().unwrap();
+    wait_for(&session, |event| {
+        matches!(event, RealtimeSessionEvent::ToolEnd { .. })
+    })
+    .await;
+    assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(model.tool_outputs().len(), 1);
+
+    session.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn reusing_a_rejected_call_id_for_another_tool_is_an_error() {
+    let model = Arc::new(FakeRealtimeModel::new());
+    let agent = RealtimeAgent::<()>::new("Assistant")
+        .with_tool(weather_tool().with_needs_approval(true))
+        .with_tool(FunctionTool::new(
+            "get_time",
+            "Get the time",
+            |_ctx, _args: CityArgs| async move { Ok("noon".to_string()) },
+        ))
+        .into_arc();
+    let session = start_session(model.clone(), agent).await;
+
+    assert!(model.emit(RealtimeModelEvent::FunctionCall(
+        RealtimeModelToolCallEvent::new("get_weather", "call_1", r#"{"city":"Oslo"}"#)
+    )));
+    wait_for(&session, |event| {
+        matches!(event, RealtimeSessionEvent::ToolApprovalRequired { .. })
+    })
+    .await;
+    session
+        .reject_tool_call("call_1", false, None)
+        .await
+        .unwrap();
+    wait_for(&session, |event| {
+        matches!(event, RealtimeSessionEvent::ToolEnd { .. })
+    })
+    .await;
+
+    // The rejected call never ran a tool, but its id is still taken.
+    assert!(model.emit(RealtimeModelEvent::FunctionCall(
+        RealtimeModelToolCallEvent::new("get_time", "call_1", r#"{"city":"Oslo"}"#)
+    )));
+    let (error, _) = wait_for(&session, |event| {
+        matches!(event, RealtimeSessionEvent::Error { .. })
+    })
+    .await;
+    match error {
+        RealtimeSessionEvent::Error { error, .. } => assert!(
+            error["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("reused a Realtime tool call ID"),
+            "unexpected error: {error}"
+        ),
+        other => panic!("expected error, got {other:?}"),
+    }
+    assert_eq!(model.tool_outputs().len(), 1);
+
+    session.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn an_undelivered_handoff_output_resends_its_session_update() {
+    let model = Arc::new(ScriptedRealtimeModel::new([
+        // The handoff's session.update is the first send, and it fails.
+        RealtimeStep::new("session_update").failing("transport write failed"),
+        RealtimeStep::new("session_update"),
+        RealtimeStep::new("tool_output"),
+    ]));
+    let billing = RealtimeAgent::<()>::new("Billing")
+        .with_instructions("Talk about billing")
+        .into_arc();
+    let agent = RealtimeAgent::<()>::new("Triage")
+        .with_handoff(realtime_handoff(billing))
+        .into_arc();
+    let session = RealtimeRunner::new(agent)
+        .with_model(model.clone())
+        .run(())
+        .await
+        .unwrap();
+
+    let call = RealtimeModelToolCallEvent::new("transfer_to_Billing", "call_h", "{}");
+    assert!(model.emit(RealtimeModelEvent::FunctionCall(call.clone())));
+    let (error, _) = wait_for(&session, |event| {
+        matches!(event, RealtimeSessionEvent::Error { .. })
+    })
+    .await;
+    match error {
+        RealtimeSessionEvent::Error { error, .. } => assert_eq!(
+            error["message"],
+            "Tool output send failed; cached output will be retried"
+        ),
+        other => panic!("expected error, got {other:?}"),
+    }
+    // The agent switched even though the output never landed.
+    assert_eq!(session.current_agent_name(), "Billing");
+
+    // The retry resends the session update before the output, in that order.
+    assert!(model.emit(RealtimeModelEvent::FunctionCall(call)));
+    let deadline = std::time::Instant::now() + EVENT_TIMEOUT;
+    while model.remaining_steps() > 0 && std::time::Instant::now() < deadline {
+        tokio::task::yield_now().await;
+    }
+    model.assert_complete().unwrap();
+
+    let sent = model.sent_events();
+    let update_index = sent
+        .iter()
+        .rposition(|event| event.as_session_update().is_some())
+        .expect("session.update resent");
+    let output_index = sent
+        .iter()
+        .position(|event| event.as_tool_output().is_some())
+        .expect("tool output sent");
+    assert!(
+        update_index < output_index,
+        "the cached session.update must precede the output on a retry"
+    );
+    let update = sent[update_index].as_session_update().unwrap();
+    assert_eq!(update.instructions.as_deref(), Some("Talk about billing"));
+
+    session.close().await.unwrap();
 }
 
 /// What the mock server captured from the client handshake.

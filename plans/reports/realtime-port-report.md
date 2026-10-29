@@ -5,9 +5,10 @@ Scope: port of Python `agents.realtime` (openai-agents 0.24) into `openai_agents
 (feature `realtime`).
 
 Phase 1 ported the agent, runner, session, events, items, handoffs, the OpenAI WebSocket transport
-and the fake transport. **Phase 2 closed the three parity gaps Phase 1 had listed as not ported:
-the SIP / call-accept flow, the playback tracker, and Python's generation-scoped guardrail
-interrupt branching.** Both phases are reflected below.
+and the fake transport. Phase 2 closed the SIP / call-accept flow, the playback tracker, and
+Python's generation-scoped guardrail interrupt branching. **Phase 3 closed the rest: strict step
+scripting, history audio storage, debug log redaction, and the invocation-identity behavior that is
+observable in realtime events and approvals.** All three phases are reflected below.
 
 ## Files
 
@@ -15,20 +16,21 @@ Created (all under the allowed scope):
 
 | File | Lines | Contents |
 | --- | --- | --- |
-| `src/realtime/mod.rs` | 92 | Module docs, submodules, re-exports |
-| `src/realtime/items.rs` | 421 | `RealtimeItem`, message/tool-call items, history merge helpers |
-| `src/realtime/config.rs` | 470 | `RealtimeSessionModelSettings`, `RealtimeRunConfig`, turn detection, tracing, user input |
+| `src/realtime/mod.rs` | 106 | Module docs, submodules, re-exports |
+| `src/realtime/items.rs` | 461 | `RealtimeItem`, message/tool-call items, history merge helpers |
+| `src/realtime/debug.rs` | 169 | Model/tool data redaction for realtime logs |
+| `src/realtime/config.rs` | 492 | `RealtimeSessionModelSettings`, `RealtimeRunConfig`, turn detection, tracing, user input |
 | `src/realtime/model_events.rs` | 216 | `RealtimeModelEvent` and payload types |
 | `src/realtime/model_inputs.rs` | 224 | `RealtimeModelSendEvent`, `RealtimeInterrupt` |
 | `src/realtime/model.rs` | 339 | `RealtimeModel` trait, `RealtimeModelConfig`, `RealtimePlaybackTracker`, audio length math |
 | `src/realtime/agent.rs` | 217 | `RealtimeAgent<C>`, `RealtimeInstructions<C>` |
 | `src/realtime/handoffs.rs` | 271 | `RealtimeHandoff<C>`, `realtime_handoff` |
 | `src/realtime/events.rs` | 421 | `RealtimeSessionEvent<C>`, `RealtimeEventInfo<C>` |
-| `src/realtime/session.rs` | 1464 | `RealtimeSession<C>`: history, tools, approvals, handoffs, guardrails |
-| `src/realtime/openai_model.rs` | 1950 | `OpenAIRealtimeWebSocketModel`, `OpenAIRealtimeSIPModel`, `ModelAudioTracker` |
+| `src/realtime/session.rs` | 1779 | `RealtimeSession<C>`: history, tools, approvals, handoffs, guardrails |
+| `src/realtime/openai_model.rs` | 2093 | `OpenAIRealtimeWebSocketModel`, `OpenAIRealtimeSIPModel`, `ModelAudioTracker` |
 | `src/realtime/runner.rs` | 107 | `RealtimeRunner<C>` |
-| `src/realtime/testing.rs` | 251 | `FakeRealtimeModel` (port of `testing.py`) |
-| `tests/realtime_tests.rs` | 1395 | 18 integration tests |
+| `src/realtime/testing.rs` | 766 | `FakeRealtimeModel`, `ScriptedRealtimeModel` (port of `testing.py`) |
+| `tests/realtime_tests.rs` | 1920 | 28 integration tests |
 | `examples/realtime_text.rs` | 83 | Text-only realtime session example |
 
 Nothing outside `src/realtime/**`, `tests/realtime_tests.rs` and `examples/realtime_text.rs` was
@@ -39,9 +41,9 @@ touched.
 ```
 export CARGO_TARGET_DIR=/Users/ngocthach/.cache/oars-build/realtime
 cargo clippy --features realtime --all-targets -- -D warnings   # clean
-cargo test --features realtime --test realtime_tests            # 18 passed
-cargo test --features realtime --lib realtime                   # 33 passed
-cargo test --features realtime --doc                            # 5 realtime doctests compile
+cargo test --features realtime --test realtime_tests            # 28 passed
+cargo test --features realtime --lib realtime                   # 39 passed
+cargo test --features realtime --doc                            # 6 realtime doctests compile
 cargo doc --features realtime --no-deps                         # no warnings in src/realtime
 cargo check --all-targets                                       # clean without the feature
 rustfmt --edition 2024 --check <all files above>                # clean
@@ -126,6 +128,95 @@ or records it in `responses_awaiting_guardrail_cleanup`, and the last guardrail 
 triggers `RealtimeModel::retire_response_audio` (a new trait method, default no-op) plus the
 `interrupted_response_ids` discard.
 
+## Phase 3: the remaining gaps
+
+### Strict step scripting (`ScriptedRealtimeModel`)
+
+Alongside `FakeRealtimeModel`, which records and emits on demand, the port now has
+`ScriptedRealtimeModel`: every outbound event must match the next `RealtimeStep`, which then
+decides what the transport delivers back or how the send fails.
+
+- `RealtimeSendMatcher` covers Python's three matcher forms: an exact event, a kind (the
+  `RealtimeModelSendEvent::event_type` name, standing in for Python's class matcher) and a
+  predicate. `From<RealtimeModelSendEvent>` and `From<&'static str>` keep steps terse.
+- `RealtimeStep::new(expect).emitting([...])` / `.failing("...")`, with the same "cannot both emit
+  and fail" rule Python enforces in `__post_init__`.
+- `RealtimeScriptError::{UnexpectedSend, UnconsumedSteps}` with `Display`/`Error` and
+  `From<RealtimeScriptError> for AgentsError`, plus `assert_complete()`, `remaining_steps()`,
+  `sent_events()`, `close_calls()`, `emit()` and `lenient()` for Python's `strict=False`.
+- `RealtimeConnectCall` is the credential-free connect snapshot: `api_key_provided`,
+  `headers_provided`, a URL stripped of its query string and userinfo, the initial settings, the
+  call id, and whether a playback tracker was supplied. The URL sanitizer ports
+  `sanitize_url_for_trace`.
+- Note for test authors: connect-time settings travel with `connect`, not as a `session.update`
+  send, so the first scripted step is the session's first *real* send. The snapshot's
+  `initial_model_settings` is where to assert them.
+- **Not ported:** Python's delivery queue (`_RealtimeDeliveryResult`, `pending_deliveries`,
+  re-entrancy detection). That machinery exists because Python's listeners run synchronously inside
+  `send_event`; here emitting is a channel push, so a step's events cannot re-enter the send that
+  produced them.
+
+### History audio storage
+
+Python exposes **no** API here — `config.py` and `session.py` carry only
+`TODO (rm) Add history audio storage config`. There was nothing to port, so this is the port's
+implementation of that intent, marked as such in the doc comment:
+`RealtimeRunConfig::history_audio_storage` takes `RealtimeAudioStorage::Keep` (the default, which is
+what Python does today) or `DiscardAudio`, which drops the base64 bytes from history items while
+keeping transcripts and every other field. It is applied where the transport's items enter the
+history.
+
+### Debug log redaction
+
+The crate had no equivalent of `agents._debug`, and `src/**` outside `src/realtime` is not in scope,
+so the switch lives in `realtime::debug`: `dont_log_model_data()` / `dont_log_tool_data()`, both
+defaulting to `true` as in Python, read from `OPENAI_AGENTS_DONT_LOG_MODEL_DATA` /
+`OPENAI_AGENTS_DONT_LOG_TOOL_DATA`, with `set_*` overrides that beat the environment and `reset_*`
+to go back to it.
+
+Internal helpers mirror `logger.py`'s redacting wrappers (`log_model_action_error`,
+`log_model_action_warning`, `log_model_data_debug`, `log_tool_action_error`,
+`log_tool_action_warning`): with redaction on they log the message alone, otherwise the message and
+its detail. They are applied at every realtime site whose detail is model or tool data — server
+payload parse failures, undecodable audio deltas, unknown audio formats, guardrail errors, tool
+failures and tool output send failures. **Event payloads are never redacted**, since
+`RealtimeSessionEvent` is the session's API rather than its log; Python likewise puts the detail in
+events.
+
+If the crate later grows a shared `_debug` equivalent, this module should delegate to it; see the
+requests below.
+
+### Invocation identity, as far as it is observable
+
+The full `_tool_identity` / `_tool_invocation` machinery (lookup keys, namespaces, SHA-256 semantic
+fingerprints, hosted-MCP approval scopes) has no counterpart in this crate's core and is not
+observable through realtime events. What *is* observable is ported, with identity reduced to the
+fields the fingerprint covers for a realtime function call — name, dispatch role and arguments —
+compared directly instead of hashed:
+
+- **A redelivered call runs once.** A second `function_call` for a call id that is dispatching,
+  awaiting approval, or already answered is dropped. Approving or rejecting a pending call reserves
+  its id under the same lock that takes it off the pending list and releases it on every exit path,
+  so a redelivery arriving while an approved tool is still running is ignored rather than running
+  the tool twice or drawing a spurious "already executed" error.
+- **A reused call id is an error.** The same id with a different tool, role or arguments raises
+  `ModelBehaviorError("Model reused a Realtime tool call ID for a different invocation...")`,
+  surfaced as a `RealtimeSessionEvent::Error`. An unresolved role matches anything, so a call that
+  arrives before its tool is enabled is not mistaken for a different invocation. The route is
+  recorded at admission and kept for the session's life — Python's `_tool_invocation_routes` — so a
+  call answered *without* running a tool (rejected, guardrail-blocked or not found) still owns its
+  id.
+- **An executed call whose output never committed cannot be retried.** It raises
+  `"A Realtime tool call already executed, but its output was not committed..."`.
+- **An undelivered output is cached and resent.** Function tool outputs, handoff transfer messages
+  and "tool not found" replies all go through one `commit_tool_output` path: on a send failure the
+  output is kept under its call id, the session emits
+  `"Tool output send failed; cached output will be retried"`, and a retry of that call id resends
+  it instead of running the tool again. A handoff's cached entry carries the `session.update` it
+  depends on, which is resent before the output, so the new agent's settings still land first.
+
+Handoffs are tracked the same way, so a handoff call id cannot later be reused for a function tool.
+
 ## Public API
 
 ```rust
@@ -161,14 +252,20 @@ RealtimeModelConfig, RealtimeModelEvents (= mpsc::UnboundedReceiver<RealtimeMode
 RealtimeModelEvent, RealtimeModelSendEvent, RealtimeInterrupt, RealtimeModelToolCallEvent,
 RealtimeModelAudioEvent, RealtimeConnectionStatus, RealtimeSendCondition
 RealtimePlaybackTracker, RealtimePlaybackState
-OpenAIRealtimeWebSocketModel, OpenAIRealtimeSIPModel, FakeRealtimeModel, fake_realtime_model()
+OpenAIRealtimeWebSocketModel, OpenAIRealtimeSIPModel
+FakeRealtimeModel, fake_realtime_model(), ScriptedRealtimeModel, RealtimeStep,
+RealtimeSendMatcher, RealtimeScriptError, RealtimeConnectCall
+
+// logging
+realtime::debug::{dont_log_model_data, dont_log_tool_data, set_dont_log_model_data,
+    set_dont_log_tool_data, reset_dont_log_model_data, reset_dont_log_tool_data}
 
 // data
 RealtimeItem, RealtimeMessageItem, RealtimeToolCallItem, RealtimeContent, RealtimeMessageRole
 RealtimeSessionModelSettings, RealtimeRunConfig<C>, RealtimeFunctionToolSpec,
 RealtimeTurnDetectionConfig, RealtimeInputAudioTranscriptionConfig,
 RealtimeNoiseReductionConfig, RealtimeModelTracing(+Config), RealtimeGuardrailsSettings,
-RealtimeToolExecutionConfig, RealtimeUserInput(+Content)
+RealtimeToolExecutionConfig, RealtimeUserInput(+Content), RealtimeAudioStorage
 DEFAULT_REALTIME_MODEL ("gpt-realtime-2.1"), DEFAULT_REALTIME_VOICE,
 DEFAULT_INPUT_AUDIO_TRANSCRIPTION_MODEL, DEFAULT_DEBOUNCE_TEXT_LENGTH
 calculate_audio_length_ms
@@ -236,19 +333,25 @@ calculate_audio_length_ms
     a barge-in truncate error arrives; this port is deliberately stricter.
   - a send failure also releases the in-flight slot, so a transient socket error cannot wedge the
     session.
-- **Invocation-identity and data-redaction machinery** (`_tool_identity`, `_tool_invocation`,
-  `_clear_data_redacted_error_traceback`, duplicate-call-id detection). None of it exists in the
-  Rust core; approvals are keyed by `(agent, tool, call_id)` through `RunContext` as elsewhere in
-  this crate.
-- **`RealtimeStep`/`ScriptedRealtimeModel` strict scripting** (the fake model records sends and
-  emits on demand instead), **audio-storage history config** (a `TODO` upstream) and **`_debug` log
-  redaction**. `send_event_if` *is* now ported, as the generation-scoped feedback needs it.
+- **The internals of `_tool_identity` / `_tool_invocation`** (lookup keys, namespaces, SHA-256
+  semantic fingerprints, hosted-MCP approval scopes) and Python's redacted-traceback plumbing
+  (`_clear_data_redacted_error_traceback`, `_detach_data_redacted_error_traceback`). None of it
+  exists in this crate's core, and none of it is observable through realtime events; the observable
+  duplicate-call and cached-output behavior *is* ported, see **Phase 3** above. Approvals stay
+  keyed by `(agent, tool, call_id)` through `RunContext`, as elsewhere in this crate.
+- Nothing from `testing.py`, the audio-storage TODO or `_debug` remains outstanding; see
+  **Phase 3** above. `send_event_if` is ported too, as the generation-scoped feedback needs it.
 - **`RealtimePlaybackTracker` assertion semantics.** Python's `get_state` asserts that elapsed time
   is set once an item is current; the port returns `elapsed_ms: None` instead of panicking.
 - **Hosted tools on realtime agents.** `RealtimeAgent::function_tools` silently skips non-function
   tools instead of raising, because the realtime API only accepts function tools.
-- **Tool-guardrail `RaiseException`** emits a `RealtimeSessionEvent::Error` instead of aborting the
-  session: a realtime session has no caller to raise into. `RejectContent` behaves as in Python.
+- **Python's `_stored_exception` does not end the session here.** In Python a failed tool-call task,
+  a transport `exception` event, or a tool-guardrail `RaiseException` sets `_stored_exception`, and
+  the next iteration of `__aiter__` closes the session and raises it at the caller. This port emits
+  a `RealtimeSessionEvent::Error` (or, for the transport, a `RawModelEvent` carrying
+  `RealtimeModelEvent::Exception`) and keeps the session running, because `recv()` returns
+  `Option<Event>` and has nowhere to raise. Applications decide whether an `Error` is fatal and call
+  `close()` themselves. `RejectContent` behaves as in Python.
 
 ## Behavior worth calling out
 
@@ -283,12 +386,18 @@ calculate_audio_length_ms
 3. **No `pub`/`pub(crate)` visibility changes were needed.** `crate::util::BoxFuture`,
    `crate::models::default_openai_key()` and the rest were reachable from inside the crate.
 
-4. **Optional cleanup, unrelated to this module:** `cargo doc` warns about the `[`mcp`]`
+4. **A crate-wide `_debug` equivalent would be worth having.** `realtime::debug` is scoped to this
+   module because `src/**` outside `src/realtime` is off limits, but
+   `OPENAI_AGENTS_DONT_LOG_MODEL_DATA` / `OPENAI_AGENTS_DONT_LOG_TOOL_DATA` are crate-wide concerns
+   in Python. If a shared module appears, `realtime::debug` should delegate to it and keep its
+   current names as re-exports.
+
+5. **Optional cleanup, unrelated to this module:** `cargo doc` warns about the `[`mcp`]`
    intra-doc link in `src/lib.rs` when the `mcp` feature is off.
 
 ## Test coverage
 
-`tests/realtime_tests.rs` (18 tests, all event waits wrapped in `tokio::time::timeout`, no sleeps,
+`tests/realtime_tests.rs` (28 tests, all event waits wrapped in `tokio::time::timeout`, no sleeps,
 no network beyond `127.0.0.1`, dummy key `sk-test`):
 
 1. `tool_call_runs_end_to_end_and_sends_function_call_output` — tool advertised in the connect
@@ -334,7 +443,31 @@ no network beyond `127.0.0.1`, dummy key `sk-test`):
    resulting `conversation.item.truncate` carries `audio_end_ms: 30` (not a wall-clock value), that
    the format reached the tracker, and that the interruption reset it.
 
-Plus 33 unit tests in `src/realtime/**`, covering the cancel gate (not running, mismatched response
+16. `a_duplicate_tool_call_id_runs_the_tool_only_once` — a redelivered `function_call` is dropped;
+   the tool body counts its own runs.
+17. `reusing_a_call_id_for_a_different_invocation_is_an_error` — the same id with a different tool
+   raises the reuse error and sends no second output.
+18. `an_undelivered_tool_output_is_cached_and_resent` — a scripted transport fails the first tool
+   output; the session reports it, then a retry of that call id resends the cached output without
+   starting the tool again.
+19. `the_scripted_model_enforces_the_expected_exchange` — a predicate step, the credential-free
+   connect snapshot, `assert_complete`, and the refusal of an unscripted send.
+20. `the_scripted_model_reports_unconsumed_steps` — `UnconsumedSteps` and the "expected an event of
+   kind" message.
+21. `discarding_history_audio_keeps_transcripts` — both `RealtimeAudioStorage` modes over the same
+   item.
+22. `log_redaction_overrides_beat_the_environment` — the override round-trips and the reset falls
+   back to the environment.
+23. `a_call_redelivered_while_its_approved_tool_runs_is_ignored` — the approved tool is gated on a
+   semaphore; the redelivery produces no `Error` and the tool body runs once.
+24. `reusing_a_rejected_call_id_for_another_tool_is_an_error` — an id answered without running a
+   tool still owns its route.
+25. `an_undelivered_handoff_output_resends_its_session_update` — a scripted transport fails the
+   handoff's `session.update`; the agent still switches, and the retry resends the update before
+   the output.
+
+Plus 39 unit tests in `src/realtime/**`, covering URL sanitizing, the send matchers, the
+emit-and-fail rule, the redaction flags, audio stripping, the cancel gate (not running, mismatched response
 id, duplicate cancel, released after a failed send, allowed again for the next response), the
 playback tracker's accumulation and byte conversion, the `ModelAudioTracker`'s per-response indexes and their selective release, audio
 ownership across responses, playback position with and without an application tracker, the

@@ -27,6 +27,7 @@ use crate::realtime::config::{
     RealtimeModelTracing, RealtimeRunConfig, RealtimeSessionModelSettings,
     RealtimeTurnDetectionConfig,
 };
+use crate::realtime::debug::{log_model_action_error, log_model_data_debug};
 use crate::realtime::items::{
     RealtimeContent, RealtimeItem, RealtimeMessageItem, RealtimeMessageRole, RealtimeToolCallItem,
 };
@@ -503,10 +504,18 @@ impl RealtimeModel for OpenAIRealtimeWebSocketModel {
                 match message {
                     Ok(Message::Text(text)) => match serde_json::from_str::<Value>(text.as_str()) {
                         Ok(value) => Box::pin(reader_inner.handle_server_event(value)).await,
-                        Err(error) => reader_inner.emit(RealtimeModelEvent::Exception {
-                            message: error.to_string(),
-                            context: Some("Failed to parse WebSocket message as JSON".to_string()),
-                        }),
+                        Err(error) => {
+                            log_model_action_error(
+                                "Failed to parse a realtime server message as JSON",
+                                &error,
+                            );
+                            reader_inner.emit(RealtimeModelEvent::Exception {
+                                message: error.to_string(),
+                                context: Some(
+                                    "Failed to parse WebSocket message as JSON".to_string(),
+                                ),
+                            });
+                        }
                     },
                     Ok(_) => {}
                     Err(error) => {
@@ -1298,6 +1307,10 @@ impl WsInner {
                     return;
                 }
                 let Ok(data) = BASE64.decode(string_field(&event, "delta")) else {
+                    log_model_action_error(
+                        "Failed to decode a realtime audio delta",
+                        &"invalid base64",
+                    );
                     self.emit(RealtimeModelEvent::Exception {
                         message: "Invalid base64 audio delta".to_string(),
                         context: Some("response.output_audio.delta".to_string()),
@@ -1628,7 +1641,7 @@ fn audio_format_payload(format: &str) -> Option<Value> {
         "g711_ulaw" | "audio/pcmu" | "pcmu" => Some(json!({"type": "audio/pcmu"})),
         "g711_alaw" | "audio/pcma" | "pcma" => Some(json!({"type": "audio/pcma"})),
         other => {
-            log::debug!("Unknown realtime audio format: {other}");
+            log_model_data_debug("Unknown realtime audio format", &other);
             None
         }
     }

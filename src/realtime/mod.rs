@@ -27,6 +27,11 @@
 //! }
 //! ```
 //!
+//! # Logging
+//!
+//! Transcripts, audio and tool arguments are kept out of logs by default. See
+//! [`debug`] to opt in.
+//!
 //! # Interruptions and playback
 //!
 //! Realtime models generate audio far faster than it is played, so an interruption must truncate
@@ -52,6 +57,7 @@
 
 pub mod agent;
 pub mod config;
+pub mod debug;
 pub mod events;
 pub mod handoffs;
 pub mod items;
@@ -64,13 +70,18 @@ pub mod session;
 pub mod testing;
 
 pub use agent::{RealtimeAgent, RealtimeInstructions};
+pub use debug::{
+    dont_log_model_data, dont_log_tool_data, reset_dont_log_model_data, reset_dont_log_tool_data,
+    set_dont_log_model_data, set_dont_log_tool_data,
+};
+
 pub use config::{
     DEFAULT_DEBOUNCE_TEXT_LENGTH, DEFAULT_INPUT_AUDIO_TRANSCRIPTION_MODEL, DEFAULT_REALTIME_MODEL,
-    DEFAULT_REALTIME_VOICE, RealtimeFunctionToolSpec, RealtimeGuardrailsSettings,
-    RealtimeInputAudioTranscriptionConfig, RealtimeModelTracing, RealtimeModelTracingConfig,
-    RealtimeNoiseReductionConfig, RealtimeRunConfig, RealtimeSessionModelSettings,
-    RealtimeToolExecutionConfig, RealtimeTurnDetectionConfig, RealtimeUserInput,
-    RealtimeUserInputContent,
+    DEFAULT_REALTIME_VOICE, RealtimeAudioStorage, RealtimeFunctionToolSpec,
+    RealtimeGuardrailsSettings, RealtimeInputAudioTranscriptionConfig, RealtimeModelTracing,
+    RealtimeModelTracingConfig, RealtimeNoiseReductionConfig, RealtimeRunConfig,
+    RealtimeSessionModelSettings, RealtimeToolExecutionConfig, RealtimeTurnDetectionConfig,
+    RealtimeUserInput, RealtimeUserInputContent,
 };
 pub use events::{RealtimeEventInfo, RealtimeSessionEvent};
 pub use handoffs::{RealtimeHandoff, realtime_handoff};
@@ -89,4 +100,7 @@ pub use model_inputs::{RealtimeInterrupt, RealtimeModelSendEvent};
 pub use openai_model::{OpenAIRealtimeSIPModel, OpenAIRealtimeWebSocketModel};
 pub use runner::RealtimeRunner;
 pub use session::RealtimeSession;
-pub use testing::{FakeRealtimeModel, fake_realtime_model};
+pub use testing::{
+    FakeRealtimeModel, RealtimeConnectCall, RealtimeScriptError, RealtimeSendMatcher, RealtimeStep,
+    ScriptedRealtimeModel, fake_realtime_model,
+};

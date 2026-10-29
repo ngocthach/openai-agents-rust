@@ -17,14 +17,17 @@ use crate::guardrail::{OutputGuardrail, OutputGuardrailResult};
 use crate::items::{FunctionCall, ToolApprovalItem};
 use crate::realtime::agent::RealtimeAgent;
 use crate::realtime::config::{
-    RealtimeFunctionToolSpec, RealtimeModelTracing, RealtimeRunConfig,
+    RealtimeAudioStorage, RealtimeFunctionToolSpec, RealtimeModelTracing, RealtimeRunConfig,
     RealtimeSessionModelSettings, RealtimeUserInput,
+};
+use crate::realtime::debug::{
+    log_model_action_warning, log_tool_action_error, log_tool_action_warning,
 };
 use crate::realtime::events::{RealtimeEventInfo, RealtimeSessionEvent};
 use crate::realtime::handoffs::RealtimeHandoff;
 use crate::realtime::items::{
     RealtimeItem, RealtimeToolCallItem, apply_assistant_transcript, apply_input_transcription,
-    merge_item,
+    merge_item, strip_audio,
 };
 use crate::realtime::model::{RealtimeModel, RealtimeModelConfig};
 use crate::realtime::model_events::{RealtimeModelEvent, RealtimeModelToolCallEvent};
@@ -37,6 +40,67 @@ use crate::tool_context::ToolContext;
 use crate::tool_guardrails::{
     ToolGuardrailBehavior, ToolInputGuardrailData, ToolOutputGuardrailData,
 };
+
+/// What identifies one realtime tool invocation.
+///
+/// The realtime API correlates a call and its output by `call_id` alone, so a model that reuses a
+/// call id for a different tool, role or arguments would silently collide with the first call. The
+/// Python SDK fingerprints the same fields through `tool_invocation_identity`; comparing them
+/// directly gives the same answers without hashing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InvocationIdentity {
+    name: String,
+    role: InvocationRole,
+    arguments: String,
+}
+
+/// Whether a call id was dispatched to a function tool or to a handoff.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InvocationRole {
+    Function,
+    Handoff,
+    /// Not resolved yet, or resolved to neither.
+    Unknown,
+}
+
+impl InvocationIdentity {
+    /// Whether two dispatches of one call id are the same invocation.
+    ///
+    /// A role that could not be resolved matches anything, so a call that arrives before its tool
+    /// is enabled is not mistaken for a different invocation.
+    fn matches(&self, other: &InvocationIdentity) -> bool {
+        self.name == other.name
+            && self.arguments == other.arguments
+            && (self.role == other.role
+                || self.role == InvocationRole::Unknown
+                || other.role == InvocationRole::Unknown)
+    }
+}
+
+/// What [`SessionInner::begin_invocation`] decided about a tool call.
+enum InvocationAdmission {
+    /// Dispatch it.
+    Proceed,
+    /// Drop it: it is a duplicate of a call already handled or awaiting approval.
+    Ignore,
+    /// Resend the output cached from an earlier attempt instead of running the tool again.
+    ResendCachedOutput,
+}
+
+/// A tool output the session produced but could not deliver.
+///
+/// The call already ran, so a retry must resend this output instead of running it again.
+struct PendingToolOutput<C> {
+    output: ToolOutput,
+    agent: Arc<RealtimeAgent<C>>,
+    /// The tool to report in `tool_end`; `None` for a handoff or an unknown tool.
+    tool: Option<Arc<FunctionTool<C>>>,
+    start_response: bool,
+    /// Settings that must reach the model before the output starts a new response.
+    session_update: Option<Box<RealtimeSessionModelSettings>>,
+    /// Emit an `error` event with this message once the output lands.
+    error_message: Option<String>,
+}
 
 /// What a function tool's input guardrails decided.
 enum ToolInputVerdict {
@@ -54,6 +118,7 @@ struct PendingToolCall<C> {
     agent: Arc<RealtimeAgent<C>>,
     tool: Arc<FunctionTool<C>>,
     approval_item: ToolApprovalItem,
+    identity: InvocationIdentity,
 }
 
 /// Mutable session state. Guards are never held across an `await`.
@@ -63,6 +128,17 @@ struct SessionState<C> {
     handoffs: Vec<RealtimeHandoff<C>>,
     history: Vec<RealtimeItem>,
     pending_tool_calls: HashMap<String, PendingToolCall<C>>,
+    /// Call ids currently dispatching, with what they were dispatched as.
+    active_tool_invocations: HashMap<String, InvocationIdentity>,
+    /// What every call id this session admitted was dispatched as, kept for the session's life so
+    /// a later reuse of the id is recognized even after the call was answered.
+    tool_invocation_routes: HashMap<String, InvocationIdentity>,
+    /// Call ids whose tool already ran, whether or not the output was delivered.
+    executed_tool_calls: HashMap<String, InvocationIdentity>,
+    /// Call ids whose output reached the model.
+    committed_tool_calls: HashSet<String>,
+    /// Outputs that were produced but could not be sent, keyed by call id.
+    pending_tool_outputs: HashMap<String, PendingToolOutput<C>>,
     item_transcripts: HashMap<String, String>,
     item_guardrail_runs: HashMap<String, usize>,
     interrupted_response_ids: HashSet<String>,
@@ -195,6 +271,11 @@ impl<C: Send + Sync + 'static> RealtimeSession<C> {
                 handoffs: Vec::new(),
                 history: Vec::new(),
                 pending_tool_calls: HashMap::new(),
+                active_tool_invocations: HashMap::new(),
+                tool_invocation_routes: HashMap::new(),
+                executed_tool_calls: HashMap::new(),
+                committed_tool_calls: HashSet::new(),
+                pending_tool_outputs: HashMap::new(),
                 item_transcripts: HashMap::new(),
                 item_guardrail_runs: HashMap::new(),
                 interrupted_response_ids: HashSet::new(),
@@ -296,15 +377,18 @@ impl<C: Send + Sync + 'static> RealtimeSession<C> {
     /// The call runs before this future resolves, so `tool_start` and `tool_end` are already
     /// queued when it returns.
     pub async fn approve_tool_call(&self, call_id: &str, always: bool) -> Result<()> {
-        let Some(pending) = self.inner.take_pending(call_id) else {
+        let Some(pending) = self.inner.take_pending_and_reserve(call_id) else {
             return Ok(());
         };
         self.inner
             .context
             .approve_tool(&pending.approval_item, always);
-        self.inner
+        let result = self
+            .inner
             .execute_tool(pending.agent, pending.tool, pending.call)
-            .await
+            .await;
+        self.inner.release_invocation(call_id);
+        result
     }
 
     /// Reject a pending tool call and tell the model it was not approved.
@@ -316,15 +400,18 @@ impl<C: Send + Sync + 'static> RealtimeSession<C> {
         always: bool,
         rejection_message: Option<String>,
     ) -> Result<()> {
-        let Some(pending) = self.inner.take_pending(call_id) else {
+        let Some(pending) = self.inner.take_pending_and_reserve(call_id) else {
             return Ok(());
         };
         self.inner
             .context
             .reject_tool(&pending.approval_item, always, rejection_message);
-        self.inner
+        let result = self
+            .inner
             .send_tool_rejection(&pending.agent, &pending.tool, &pending.call)
-            .await
+            .await;
+        self.inner.release_invocation(call_id);
+        result
     }
 
     /// Wait for the next session event, or `None` once the session is closed and drained.
@@ -367,6 +454,11 @@ impl<C: Send + Sync + 'static> RealtimeSession<C> {
         {
             let mut state = self.inner.state.lock().expect("realtime session poisoned");
             state.pending_tool_calls.clear();
+            state.active_tool_invocations.clear();
+            state.tool_invocation_routes.clear();
+            state.executed_tool_calls.clear();
+            state.committed_tool_calls.clear();
+            state.pending_tool_outputs.clear();
             state.item_transcripts.clear();
             state.item_guardrail_runs.clear();
             state.interrupted_response_ids.clear();
@@ -536,12 +628,27 @@ impl<C: Send + Sync + 'static> SessionInner<C> {
         });
     }
 
-    fn take_pending(&self, call_id: &str) -> Option<PendingToolCall<C>> {
+    /// Take a call awaiting approval and reserve its id in one step.
+    ///
+    /// Reserving under the same lock keeps a redelivered `function_call` from racing the decision:
+    /// without it the redelivery would either run the tool a second time or draw a spurious
+    /// "already executed" error.
+    fn take_pending_and_reserve(&self, call_id: &str) -> Option<PendingToolCall<C>> {
+        let mut state = self.state.lock().expect("realtime session poisoned");
+        let pending = state.pending_tool_calls.remove(call_id)?;
+        state
+            .active_tool_invocations
+            .insert(call_id.to_string(), pending.identity.clone());
+        Some(pending)
+    }
+
+    /// Release a reserved call id, whatever the outcome was.
+    fn release_invocation(&self, call_id: &str) {
         self.state
             .lock()
             .expect("realtime session poisoned")
-            .pending_tool_calls
-            .remove(call_id)
+            .active_tool_invocations
+            .remove(call_id);
     }
 
     /// Build the settings sent to the model for `agent`.
@@ -705,7 +812,10 @@ impl<C: Send + Sync + 'static> SessionInner<C> {
                 self.spawn_output_guardrails(&item_id, &response_id, false);
             }
             RealtimeModelEvent::ItemUpdated { item } => {
-                let item = *item;
+                let mut item = *item;
+                if self.run_config.history_audio_storage == RealtimeAudioStorage::DiscardAudio {
+                    strip_audio(&mut item);
+                }
                 let (is_new, stored) = {
                     let mut state = self.state.lock().expect("realtime session poisoned");
                     let is_new = !state
@@ -813,6 +923,107 @@ impl<C: Send + Sync + 'static> SessionInner<C> {
             )
         };
 
+        let role = if tools.iter().any(|tool| tool.name == call.name) {
+            InvocationRole::Function
+        } else if handoffs.iter().any(|h| h.tool_name == call.name) {
+            InvocationRole::Handoff
+        } else {
+            InvocationRole::Unknown
+        };
+        let identity = InvocationIdentity {
+            name: call.name.clone(),
+            role,
+            arguments: call.arguments.clone(),
+        };
+        match self.begin_invocation(&call.call_id, &identity)? {
+            InvocationAdmission::Proceed => {}
+            InvocationAdmission::Ignore => return Ok(()),
+            InvocationAdmission::ResendCachedOutput => {
+                return self.resend_pending_output(&call).await;
+            }
+        }
+
+        let result = self
+            .dispatch_tool_call(call.clone(), agent, tools, handoffs)
+            .await;
+        self.state
+            .lock()
+            .expect("realtime session poisoned")
+            .active_tool_invocations
+            .remove(&call.call_id);
+        result
+    }
+
+    /// Decide whether a tool call may run, mirroring the realtime duplicate-call checks.
+    fn begin_invocation(
+        &self,
+        call_id: &str,
+        identity: &InvocationIdentity,
+    ) -> Result<InvocationAdmission> {
+        let mut state = self.state.lock().expect("realtime session poisoned");
+
+        // A call id names one invocation; a different name, role or arguments under the same id
+        // would silently collide with the first call's output. The route survives the call, so an
+        // id answered without running a tool (rejected, guardrail-blocked or not found) is still
+        // recognized when it is reused.
+        if let Some(recorded) = state.tool_invocation_routes.get(call_id)
+            && !recorded.matches(identity)
+        {
+            return Err(AgentsError::model_behavior(
+                "Model reused a Realtime tool call ID for a different invocation. \
+                 Use a unique call ID for each tool invocation.",
+            ));
+        }
+
+        if state.pending_tool_outputs.contains_key(call_id) {
+            // The call already ran but its output never landed; resend it rather than rerun it.
+            return Ok(InvocationAdmission::ResendCachedOutput);
+        }
+        if state.active_tool_invocations.contains_key(call_id)
+            || state.pending_tool_calls.contains_key(call_id)
+            || state.committed_tool_calls.contains(call_id)
+        {
+            // A redelivered call, an approval still awaiting a decision, or one already answered.
+            return Ok(InvocationAdmission::Ignore);
+        }
+        if state.executed_tool_calls.contains_key(call_id) {
+            return Err(AgentsError::model_behavior(
+                "A Realtime tool call already executed, but its output was not committed. \
+                 Start a new call instead of retrying the invocation.",
+            ));
+        }
+
+        state
+            .active_tool_invocations
+            .insert(call_id.to_string(), identity.clone());
+        state
+            .tool_invocation_routes
+            .insert(call_id.to_string(), identity.clone());
+        Ok(InvocationAdmission::Proceed)
+    }
+
+    /// Resend an output that was produced but never delivered.
+    async fn resend_pending_output(&self, call: &RealtimeModelToolCallEvent) -> Result<()> {
+        let pending = {
+            self.state
+                .lock()
+                .expect("realtime session poisoned")
+                .pending_tool_outputs
+                .remove(&call.call_id)
+        };
+        let Some(pending) = pending else {
+            return Ok(());
+        };
+        self.commit_tool_output(call, pending).await
+    }
+
+    async fn dispatch_tool_call(
+        &self,
+        call: RealtimeModelToolCallEvent,
+        agent: Arc<RealtimeAgent<C>>,
+        tools: Vec<Arc<FunctionTool<C>>>,
+        handoffs: Vec<RealtimeHandoff<C>>,
+    ) -> Result<()> {
         if let Some(tool) = tools.iter().find(|tool| tool.name == call.name).cloned() {
             let approval_item = approval_item(&agent.name, &tool.name, &call);
             let needs_approval = tool
@@ -871,6 +1082,11 @@ impl<C: Send + Sync + 'static> SessionInner<C> {
                                     agent: agent.clone(),
                                     tool: tool.clone(),
                                     approval_item,
+                                    identity: InvocationIdentity {
+                                        name: call.name.clone(),
+                                        role: InvocationRole::Function,
+                                        arguments: call.arguments.clone(),
+                                    },
                                 },
                             );
                         }
@@ -899,15 +1115,19 @@ impl<C: Send + Sync + 'static> SessionInner<C> {
         }
 
         let message = format!("Tool {} not found", call.name);
-        self.model
-            .send_event(RealtimeModelSendEvent::ToolOutput {
-                tool_call: call,
-                output: message.clone(),
+        self.commit_tool_output(
+            &call,
+            PendingToolOutput {
+                output: ToolOutput::Text(message.clone()),
+                agent,
+                tool: None,
+                // A tool the session cannot run should not prompt a new response.
                 start_response: false,
-            })
-            .await?;
-        self.emit_error(message);
-        Ok(())
+                session_update: None,
+                error_message: Some(message),
+            },
+        )
+        .await
     }
 
     /// Run a function tool's input guardrails and report what they decided.
@@ -970,6 +1190,7 @@ impl<C: Send + Sync + 'static> SessionInner<C> {
             arguments: call.arguments.clone(),
             info: self.info(),
         });
+        self.mark_executed(&call, InvocationRole::Function);
 
         let invocation = tool.invoke(tool_context.clone(), call.arguments.clone());
         let result = match tool.timeout {
@@ -1003,7 +1224,10 @@ impl<C: Send + Sync + 'static> SessionInner<C> {
         let mut output = match result {
             Ok(output) => output,
             Err(error) => match &tool.failure_error_function {
-                Some(f) => ToolOutput::Text(f(&self.context, &error)),
+                Some(f) => {
+                    log_tool_action_error(&format!("Realtime tool {} failed", tool.name), &error);
+                    ToolOutput::Text(f(&self.context, &error))
+                }
                 None => return Err(error),
             },
         };
@@ -1043,29 +1267,115 @@ impl<C: Send + Sync + 'static> SessionInner<C> {
         call: &RealtimeModelToolCallEvent,
         output: ToolOutput,
     ) -> Result<()> {
-        let serialized = output.to_model_string();
-        self.model
-            .send_event(RealtimeModelSendEvent::ToolOutput {
-                tool_call: call.clone(),
-                output: serialized.clone(),
+        self.commit_tool_output(
+            call,
+            PendingToolOutput {
+                output,
+                agent: agent.clone(),
+                tool: Some(tool.clone()),
                 start_response: true,
-            })
-            .await?;
+                session_update: None,
+                error_message: None,
+            },
+        )
+        .await
+    }
+
+    /// Deliver a tool output, caching it for a retry when the send fails.
+    ///
+    /// The call has already run by this point, so a failed send must not lose the output: the
+    /// session keeps it under the call id and resends it if the model retries that call.
+    async fn commit_tool_output(
+        &self,
+        call: &RealtimeModelToolCallEvent,
+        pending: PendingToolOutput<C>,
+    ) -> Result<()> {
+        let serialized = pending.output.to_model_string();
+        if let Err(error) = self.send_pending_output(call, &pending, &serialized).await {
+            log_tool_action_warning(
+                "Realtime tool output send failed; the cached output will be retried",
+                &error,
+            );
+            self.state
+                .lock()
+                .expect("realtime session poisoned")
+                .pending_tool_outputs
+                .insert(call.call_id.clone(), pending);
+            self.emit_error("Tool output send failed; cached output will be retried");
+            return Ok(());
+        }
         {
             let mut state = self.state.lock().expect("realtime session poisoned");
+            state.committed_tool_calls.insert(call.call_id.clone());
             merge_item(
                 &mut state.history,
                 tool_call_history_item(call, &serialized),
             );
         }
-        self.emit(RealtimeSessionEvent::ToolEnd {
-            agent: agent.clone(),
-            tool: tool.clone(),
-            arguments: call.arguments.clone(),
-            output,
-            info: self.info(),
-        });
+        if let Some(tool) = &pending.tool {
+            self.emit(RealtimeSessionEvent::ToolEnd {
+                agent: pending.agent.clone(),
+                tool: tool.clone(),
+                arguments: call.arguments.clone(),
+                output: pending.output,
+                info: self.info(),
+            });
+        }
+        if let Some(message) = pending.error_message {
+            self.emit_error(message);
+        }
         Ok(())
+    }
+
+    /// Send a pending output, preceded by the session update it depends on.
+    async fn send_pending_output(
+        &self,
+        call: &RealtimeModelToolCallEvent,
+        pending: &PendingToolOutput<C>,
+        serialized: &str,
+    ) -> Result<()> {
+        if let Some(settings) = &pending.session_update {
+            // The new agent's settings must land before the output starts a new response.
+            self.model
+                .send_event(RealtimeModelSendEvent::SessionUpdate {
+                    session_settings: settings.clone(),
+                })
+                .await?;
+        }
+        self.send_tool_output(call, serialized, pending.start_response)
+            .await
+    }
+
+    /// Send one `function_call_output` to the model.
+    async fn send_tool_output(
+        &self,
+        call: &RealtimeModelToolCallEvent,
+        output: &str,
+        start_response: bool,
+    ) -> Result<()> {
+        self.model
+            .send_event(RealtimeModelSendEvent::ToolOutput {
+                tool_call: call.clone(),
+                output: output.to_string(),
+                start_response,
+            })
+            .await
+    }
+
+    /// Record that a call's tool ran, so a retry cannot run it twice.
+    fn mark_executed(&self, call: &RealtimeModelToolCallEvent, role: InvocationRole) {
+        self.state
+            .lock()
+            .expect("realtime session poisoned")
+            .executed_tool_calls
+            .insert(
+                call.call_id.clone(),
+                InvocationIdentity {
+                    name: call.name.clone(),
+                    role,
+                    arguments: call.arguments.clone(),
+                },
+            );
     }
 
     /// Tell the model a call was not approved.
@@ -1090,6 +1400,7 @@ impl<C: Send + Sync + 'static> SessionInner<C> {
         handoff: RealtimeHandoff<C>,
         call: RealtimeModelToolCallEvent,
     ) -> Result<()> {
+        self.mark_executed(&call, InvocationRole::Handoff);
         let to_agent = handoff
             .invoke(self.context.clone(), call.arguments.clone())
             .await?;
@@ -1107,23 +1418,19 @@ impl<C: Send + Sync + 'static> SessionInner<C> {
             info: self.info(),
         });
 
-        // The session update must reach the model before the tool output starts a new response.
-        self.model
-            .send_event(RealtimeModelSendEvent::session_update(resolved.settings))
-            .await?;
         let output = RealtimeHandoff::<C>::transfer_message(&to_agent.name);
-        self.model
-            .send_event(RealtimeModelSendEvent::ToolOutput {
-                tool_call: call.clone(),
-                output: output.clone(),
+        self.commit_tool_output(
+            &call,
+            PendingToolOutput {
+                output: ToolOutput::Text(output),
+                agent: to_agent,
+                tool: None,
                 start_response: true,
-            })
-            .await?;
-        {
-            let mut state = self.state.lock().expect("realtime session poisoned");
-            merge_item(&mut state.history, tool_call_history_item(&call, &output));
-        }
-        Ok(())
+                session_update: Some(Box::new(resolved.settings)),
+                error_message: None,
+            },
+        )
+        .await
     }
 
     /// Open an output-response generation for deltas that arrive before `turn_started`.
@@ -1237,9 +1544,12 @@ impl<C: Send + Sync + 'static> SessionInner<C> {
                 Ok(result) if result.output.tripwire_triggered => triggered.push(result),
                 Ok(_) => {}
                 Err(error) => {
-                    log::warn!(
-                        "Realtime output guardrail {} failed, skipping it: {error}",
-                        guardrail.name
+                    log_model_action_warning(
+                        &format!(
+                            "Realtime output guardrail {} raised an error; skipping it",
+                            guardrail.name
+                        ),
+                        &error,
                     );
                 }
             }
