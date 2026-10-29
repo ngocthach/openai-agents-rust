@@ -121,3 +121,112 @@ async fn runs_agent_over_one_reused_websocket() {
     use openai_agents_sdk::models::Model;
     model.close().await;
 }
+
+#[tokio::test]
+async fn hosted_multi_agent_pauses_and_injects_function_outputs() {
+    use openai_agents_sdk::extensions::hosted_multi_agent::{
+        HostedMultiAgentConfig, OpenAIHostedMultiAgentModel,
+    };
+    openai_agents_sdk::tracing::set_tracing_disabled(true);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let frames: Arc<Mutex<Vec<Value>>> = Arc::default();
+    let beta: Arc<Mutex<Vec<String>>> = Arc::default();
+    let (f2, b2) = (frames.clone(), beta.clone());
+    tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.unwrap();
+        let cb = move |req: &Request, resp: Response| {
+            let h = req
+                .headers()
+                .get("openai-beta")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            b2.lock().unwrap().push(h);
+            Ok(resp)
+        };
+        let mut ws = tokio_tungstenite::accept_hdr_async(tcp, cb).await.unwrap();
+        while let Some(Ok(msg)) = ws.next().await {
+            let Message::Text(t) = msg else { continue };
+            let frame: Value = serde_json::from_str(&t).unwrap();
+            f2.lock().unwrap().push(frame.clone());
+            let events = match frame["type"].as_str().unwrap() {
+                "response.create" => vec![
+                    json!({"type": "response.created", "response": {"id": "resp_h", "object": "response", "status": "in_progress", "output": []}}),
+                    json!({"type": "response.output_item.done", "item": {"type": "agent_message", "id": "am_1"}}),
+                    json!({"type": "response.output_item.done", "item": {"type": "function_call", "id": "fc_1",
+                        "call_id": "call_1", "name": "lookup", "arguments": "{}", "status": "completed",
+                        "agent": {"agent_name": "/root/researcher"}}}),
+                ],
+                "response.inject" => vec![
+                    json!({"type": "response.inject.created"}),
+                    json!({"type": "response.output_item.done", "item": {"type": "message", "id": "msg_1", "role": "assistant",
+                        "status": "completed", "phase": "final_answer", "agent": {"agent_name": "/root"},
+                        "content": [{"type": "output_text", "text": "found it", "annotations": []}]}}),
+                    completed(
+                        "resp_h",
+                        json!([
+                        {"type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "lookup", "arguments": "{}"},
+                        {"type": "message", "id": "msg_1", "role": "assistant", "status": "completed", "phase": "final_answer",
+                         "agent": {"agent_name": "/root"}, "content": [{"type": "output_text", "text": "found it", "annotations": []}]}]),
+                    ),
+                ],
+                _ => vec![],
+            };
+            for e in events {
+                ws.send(Message::text(e.to_string())).await.unwrap();
+            }
+        }
+    });
+
+    let seen_agent = Arc::new(Mutex::new(None));
+    let s2 = seen_agent.clone();
+    let client = OpenAIClient::new("sk-test").with_base_url(format!("http://{addr}/v1"));
+    let model = OpenAIHostedMultiAgentModel::new("gpt-test", client)
+        .with_config(HostedMultiAgentConfig {
+            max_concurrent_subagents: Some(2),
+        })
+        .unwrap();
+    let agent = Agent::<()>::new("Root")
+        .with_tool(FunctionTool::<()>::new_no_args("lookup", "Look up", move |ctx| {
+            let s2 = s2.clone();
+            async move {
+                let meta = openai_agents_sdk::extensions::hosted_multi_agent::get_hosted_agent_metadata_for_tool(&ctx);
+                *s2.lock().unwrap() = meta.map(|m| m.agent_name);
+                Ok("42")
+            }
+        }))
+        .with_model_instance(Arc::new(model));
+    let result = Runner::run(&agent, "find the answer").await.unwrap();
+    assert_eq!(result.final_output_text().as_deref(), Some("found it"));
+    assert_eq!(
+        seen_agent.lock().unwrap().as_deref(),
+        Some("/root/researcher")
+    );
+    assert_eq!(
+        beta.lock().unwrap().as_slice(),
+        ["responses_multi_agent=v1"]
+    );
+    let frames = frames.lock().unwrap().clone();
+    assert_eq!(frames[0]["type"], "response.create");
+    assert_eq!(
+        frames[0]["multi_agent"],
+        json!({"enabled": true, "max_concurrent_subagents": 2})
+    );
+    assert!(frames[0].get("stream").is_none());
+    assert_eq!(frames[1]["type"], "response.inject");
+    assert_eq!(frames[1]["response_id"], "resp_h");
+    assert_eq!(frames[1]["input"][0]["output"], "42");
+    // The function call delivered in the pause is not repeated in the final output.
+    let calls = result
+        .new_items
+        .iter()
+        .filter(|i| {
+            matches!(
+                i.kind,
+                openai_agents_sdk::items::RunItemKind::ToolCall { .. }
+            )
+        })
+        .count();
+    assert_eq!(calls, 1);
+}
