@@ -1694,6 +1694,9 @@ mod tests {
                 .with_root(DEFAULT_BLAXEL_WORKSPACE_ROOT)
                 .with_entry("cache", Entry::dir().with_ephemeral(true)),
         );
-        assert_eq!(session.tar_exclude_args(), "--exclude ./cache");
+        assert_eq!(
+            session.tar_exclude_args(),
+            "--exclude ./.sandbox-rclone-config --exclude ./cache"
+        );
     }
 }
