@@ -195,21 +195,15 @@ All three report `MountCredentialAuthority::MountScoped` when they carry credent
 acknowledgement applies.
 
 Credentials never reach a command line, because anything in argv is readable from the sandbox's
-process table and, on Vercel, is recorded in the provider's command log. `rclone` reads them from
-a `600` configuration file written through the session's file API; `mount-s3` reads them from a
-`600` file that the mount command sources with `set -a` and removes before `mount-s3` runs, under
-a `trap … EXIT INT TERM HUP` so a failure between staging and mounting still removes it; the Rust
-side removes it too when the command never ran.
-`ExecRequest` has no `env` field, which is why the file detour is needed (see *Requested core
-changes*). Both files live under the workspace root, matching Python's
-`RcloneMountPattern.config_file_path`, which also resolves relative paths inside the workspace —
-the session's path guard rejects writes outside the root, so `/tmp` is not an option for them.
-Both staged files live under the workspace root, so `workspace_excludes` adds
-`./.openai-agents-rclone-*` and `./.openai-agents-mount-s3-*` to every provider's `tar --exclude`
-list: a `persist_workspace` taken while a mount is attached can never capture them. The rclone
-configuration file name is derived from a hash of the mount path, so two mounts in one workspace
-cannot overwrite each other's credentials. Mount failures never echo the command back, because it
-names the remote.
+process table and, on Vercel, is recorded in the provider's command log. `mount-s3` receives them
+through `ExecRequest::env`; `rclone` reads them from a `600` configuration file written through
+the session's file API, because that is the only channel `rclone mount` offers. That file lives
+under the workspace root (the session's path guard rejects writes outside it, so `/tmp` is not an
+option) in `.sandbox-rclone-config/`, which `workspace_archive_excludes` keeps out of every
+provider's `persist_workspace` archive. Its name is derived from a hash of the mount path, so two
+mounts in one workspace cannot overwrite each other's credentials, and the mount's own copy is
+always separate from any configuration the caller placed, so teardown never deletes the caller's
+file. Mount failures never echo the command back, because it names the remote.
 
 ## Divergences from Python
 
@@ -228,12 +222,9 @@ names the remote.
 5. **Vercel exec user**: Python rejects any `user` argument. This port maps `root` onto the API's
    `sudo` flag (so the provider's own `mount-s3` strategy can run) and still rejects every other
    user with `ErrorCode::SandboxConfigInvalid`.
-6. **`RcloneMountPattern` is at parity** on modes, flags, configuration placement and teardown.
-   Two smaller things are still not ported: deriving a remote name from the session id when the
-   caller pins none (the Rust pattern requires the name as an option), and reading the
-   configuration from a file the caller already placed in the workspace. Daytona installs
-   `rclone` from the distribution package rather than the pinned release, matching its own
-   Python `mounts.py`.
+6. **`RcloneMountPattern` is at parity** on modes, flags, remote-name derivation, configuration
+   sources, placement and teardown (see *Phase 3*). Daytona installs `rclone` from the
+   distribution package rather than the pinned release, matching its own Python `mounts.py`.
 7. **Daytona's default workspace root** (`/home/daytona/workspace`) replaces the SDK default only
    when the caller supplies no manifest at all, as in Python; Vercel's replaces the SDK default
    whenever the manifest still carries it, also as in Python. Resume resolves the root the same
@@ -369,6 +360,26 @@ shell script assembled from twenty pieces would otherwise only surface inside a 
 | An E2B envd Connect error body carries a string `code` | **Verified** — `e2b` 2.62.0 `envd/client_shared.py` distinguishes a string `code` (a Connect error) from an integer one (a plain HTTP error page), and `sandbox_async/filesystem.py` `make_dir` branches on `Code.ALREADY_EXISTS`. The port tolerates the named codes, and a plain 409/404 maps the same way the vendor's `PLAIN_HTTP_ERROR_CODES` table does. |
 | Daytona `files/folder` is idempotent | **Inferred, not verified.** The generated client documents only a 201 and the vendor SDK catches nothing, while the Python Agents SDK creates the workspace root twice through it — so the daemon almost certainly uses a `MkdirAll`-style create. The port additionally treats a 409 as success, so either behaviour works. |
 
+### A caller-placed configuration is not excluded from archives
+
+`workspace_archive_excludes` excludes `.sandbox-rclone-config/`, which covers every configuration
+the pattern writes. A file the caller places through `config_file_path` is somewhere else in the
+workspace by definition, so `persist_workspace` and snapshots capture it along with whatever
+credentials it holds. Python has the same shape (`register_persist_workspace_skip_path` only
+covers the generated directory), so this is parity, not a regression, but a caller who puts
+credentials in the workspace should expect them in the archive. Fixing it would mean letting a
+pattern register its own skip path, which is `session.rs`, outside this phase's scope.
+
+### Remote-name derivation has no in-tree caller
+
+The pattern is at parity, but nothing in this tree reaches the derivation yet. Python exercises it
+from `entries/mounts/providers/{s3,gcs,r2,azure_blob,box}.py`, which build the configuration at
+activation time with the derived name in the `[section]` header; none of those entries is ported.
+The two Rust providers that use `RcloneMountPattern` (E2B, Daytona) pin a name, and an inline
+`config_text` is built before a session id exists. So the derivation is reachable today only
+through `config_file_path`, where the caller names the section themselves, or by a future port of
+those entries. Porting them is outside this phase.
+
 ### Archive exclusions beyond these three providers
 
 `workspace_archive_excludes` now backs the core default `persist_workspace` (Docker and
@@ -377,6 +388,65 @@ unix-local) and all three overrides here. **Cloudflare, Blaxel and Modal still o
 `RcloneMountPattern` is in the core, those backends can use it, so their archives could capture a
 staged mount credential. Routing them through `workspace_archive_excludes` is a one-line change
 each and is left for the controller.
+
+## Phase 3: the last two `RcloneMountPattern` gaps
+
+### Deriving the remote name from the session
+
+`RcloneMountPattern::resolve_remote_name(session_id, config)` ports Python's
+`resolve_remote_name`. A name pinned through the `remote_name` option wins, because the provider
+that set it also generated the matching `[section]`; then one pinned on the pattern itself through
+the new `remote_name` field; with neither, the name is `sandbox_{remote_kind}_{session_id}` from
+the new `RCLONE_OPTION_REMOTE_KIND` option, and a mount with no kind either fails with
+`MountConfigInvalid`, as Python's does. E2B and Daytona pin a name, so their behaviour is
+unchanged.
+
+The derivation is per session, so two sessions built from one workspace image never share a
+mutable configuration section, and it is stable across a resume of any of these three providers,
+whose `session.id()` is the client-side id carried in `SandboxSessionState` (E2B
+`with_session_id(state.session_id)`, Daytona and Vercel the same). Only the teardown `pkill`
+depends on that stability; removing the configuration is keyed on the mount path. Two deliberate
+additions to Python:
+
+- The resolved name is rejected when it contains whitespace or `:`, `/`, `[`, `]` or `\`. The name
+  becomes both an INI section header and the `name:path` argument, so a separator inside it would
+  silently attach a different remote. Python never validates it.
+- Python uses `session_id.hex`; these sessions carry a hyphenated UUID string, so the derived name
+  keeps the hyphens. rclone accepts them in a remote name.
+
+`unapply` resolves the name the same way, so the `pkill` that reaps a daemonized `rclone mount`
+still matches when the name was derived.
+
+### Reading a configuration the caller placed in the workspace
+
+`RcloneMountPattern::config_file_path` names a configuration the caller has already written into
+the workspace; `read_config_text(session, remote_name)` reads it. A relative path resolves inside
+the workspace root, as Python's `_resolve_config_path` does. The file must not be blank and must
+declare the `[remote_name]` section this mount attaches, so a configuration for a different remote
+fails before any credential is staged; both checks return `MountConfigInvalid`, while a missing
+file keeps `WorkspaceReadNotFound`, matching Python's re-raise of `WorkspaceReadNotFoundError`.
+The section test is `line.trim() == "[name]"` over the file's lines, which is what Python's
+`^\s*\[name\]\s*$` with `MULTILINE` matches, without needing a regex dependency.
+
+Python resolves the text one layer above `apply`, in `_build_rclone_config`; this port does it in
+`apply`, where the session is already in hand, with the same precedence:
+
+| `config_file_path` | `config_text` | Result |
+| --- | --- | --- |
+| set | set | the file, with the provider's settings merged into its `[remote]` section |
+| set | unset | the file as written |
+| unset | set | the provider's text (what every current caller does) |
+| unset | unset | `MountConfigInvalid` |
+
+The merge is `supplement_rclone_config_text`, a port of Python's
+`_supplement_rclone_config_text`: the provider's settings are appended to that one section, after
+dropping the header it repeats, so the sections of other remotes in the same file keep their
+values and rclone's last-wins parsing lets the provider override what the caller wrote.
+
+The text always goes into the mount's own `600` copy under `.sandbox-rclone-config/`, as Python
+does, so a shared source configuration is never mutated and teardown never removes it. `apply`
+refuses a `config_file_path` that resolves to the generated path, and `unapply` skips the removal
+in that case too, so neither half can delete the caller's file.
 
 ## Verification
 
@@ -431,8 +501,11 @@ stream that stays open past the first yield window.
   `as_any` with its `{cols, rows}` body; and `ExecRequest::with_env` reaching all three
   providers' wire formats with a per-command variable overriding the manifest.
 
-Unit tests additionally cover the core `RcloneMountPattern`'s FUSE and NFS command construction
-and per-mount configuration paths, the HTTP error-body shapes, the pinned installer's
+Unit tests additionally cover the core `RcloneMountPattern`'s FUSE and NFS command construction,
+per-mount configuration paths, remote-name resolution (pinned, derived, rejected) and the
+validation and merging of a caller-placed configuration; one of them drives `read_config_text`
+end to end against a real `unix_local` session, which is the only way to check that a missing file
+keeps `WorkspaceReadNotFound`. Others cover the HTTP error-body shapes, the pinned installer's
 architecture table and checksum ordering (plus an `sh -n` parse of the generated script), and the
 Vercel mount credentials staying out of argv while appearing in the command environment.
 

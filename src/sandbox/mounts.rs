@@ -678,6 +678,10 @@ mod tests {
 pub const RCLONE_OPTION_REMOTE_NAME: &str = "remote_name";
 /// `MountPatternConfig` option holding the path inside the remote, for example a bucket name.
 pub const RCLONE_OPTION_REMOTE_PATH: &str = "remote_path";
+/// `MountPatternConfig` option naming the kind of remote (`s3`, `gcs`, `azureblob`, ...).
+///
+/// It is only consulted when no remote name is pinned, to derive a per-session one.
+pub const RCLONE_OPTION_REMOTE_KIND: &str = "remote_kind";
 /// `MountPatternConfig` option set to `true` when the mount must be read-only.
 pub const RCLONE_OPTION_READ_ONLY: &str = "read_only";
 
@@ -716,6 +720,8 @@ pub enum RcloneMountMode {
 pub struct RcloneMountPattern {
     /// How the remote is exposed.
     pub mode: RcloneMountMode,
+    /// Remote name pinned on the pattern; `None` falls back to the config options.
+    pub remote_name: Option<String>,
     /// Extra arguments appended to the `rclone` command.
     pub extra_args: Vec<String>,
     /// Address `rclone serve nfs` listens on, in `nfs` mode.
@@ -724,16 +730,24 @@ pub struct RcloneMountPattern {
     pub nfs_mount_options: Option<Vec<String>>,
     /// Workspace-relative configuration path; `None` derives one per mount path.
     pub config_path: Option<String>,
+    /// A configuration the caller already placed in the workspace, read when the mount activates.
+    ///
+    /// This is the *source* the caller provides, in contrast with
+    /// [`config_path`](Self::config_path), which is where the mount's own isolated copy is
+    /// written. A relative path resolves inside the workspace root.
+    pub config_file_path: Option<String>,
 }
 
 impl Default for RcloneMountPattern {
     fn default() -> Self {
         RcloneMountPattern {
             mode: RcloneMountMode::Fuse,
+            remote_name: None,
             extra_args: Vec::new(),
             nfs_addr: None,
             nfs_mount_options: None,
             config_path: None,
+            config_file_path: None,
         }
     }
 }
@@ -750,6 +764,18 @@ impl RcloneMountPattern {
             mode: RcloneMountMode::Nfs,
             ..Default::default()
         }
+    }
+
+    /// Pin the remote name instead of deriving one from the session.
+    pub fn with_remote_name(mut self, remote_name: impl Into<String>) -> Self {
+        self.remote_name = Some(remote_name.into());
+        self
+    }
+
+    /// Read the remote configuration from a file the caller placed in the workspace.
+    pub fn with_config_file_path(mut self, config_file_path: impl Into<String>) -> Self {
+        self.config_file_path = Some(config_file_path.into());
+        self
     }
 
     /// Append an argument to the `rclone` command.
@@ -806,24 +832,123 @@ impl RcloneMountPattern {
         })
     }
 
-    /// The remote this mount attaches, as `name:path`.
-    fn remote(&self, config: &MountPatternConfig) -> SandboxResult<(String, String)> {
-        let remote_name = config
-            .options
-            .get(RCLONE_OPTION_REMOTE_NAME)
-            .filter(|name| !name.is_empty())
-            .ok_or_else(|| {
+    /// Read the remote configuration the caller placed in the workspace.
+    ///
+    /// Mirrors Python's `read_config_text`: a relative [`config_file_path`](Self::config_file_path)
+    /// resolves inside the workspace root, the file must not be blank, and it must declare the
+    /// `[remote_name]` section this mount attaches, so a configuration for a different remote
+    /// fails before any credential is staged. A missing file keeps its own error code.
+    pub async fn read_config_text(
+        &self,
+        session: &dyn SandboxSession,
+        remote_name: &str,
+    ) -> SandboxResult<String> {
+        let source = self.config_file_path.as_deref().ok_or_else(|| {
+            SandboxError::new(
+                ErrorCode::MountConfigInvalid,
+                "an rclone mount has no `config_file_path` to read",
+            )
+        })?;
+        let source_path = session.normalize_path(source)?;
+        let raw = session.read_file(&source_path).await?;
+        validate_rclone_config_text(&String::from_utf8_lossy(&raw), remote_name, &source_path)
+    }
+
+    /// The configuration text written into the sandbox for one activation.
+    ///
+    /// A caller-placed file is the base when the pattern names one, and the provider's own
+    /// settings are merged into its remote section, mirroring Python's
+    /// `_build_rclone_config`. Either source alone is enough; with neither there is nothing to
+    /// authenticate the remote with.
+    async fn resolve_config_text(
+        &self,
+        session: &dyn SandboxSession,
+        remote_name: &str,
+        generated_path: &str,
+        config: &MountPatternConfig,
+    ) -> SandboxResult<String> {
+        let Some(source) = self.config_file_path.as_deref() else {
+            return config.config_text().map(str::to_string).ok_or_else(|| {
                 SandboxError::new(
                     ErrorCode::MountConfigInvalid,
-                    format!("an rclone mount requires the `{RCLONE_OPTION_REMOTE_NAME}` option"),
+                    "an rclone mount requires the remote configuration text or a \
+                     `config_file_path`",
                 )
-            })?;
-        let remote_path = config
+            });
+        };
+        // The isolated copy is removed when the mount detaches, so it must never be the
+        // caller's own file.
+        if session.normalize_path(source)? == generated_path {
+            return Err(SandboxError::new(
+                ErrorCode::MountConfigInvalid,
+                "an rclone `config_file_path` must differ from the generated configuration path",
+            ));
+        }
+        let base = self.read_config_text(session, remote_name).await?;
+        match config.config_text() {
+            Some(required) => supplement_rclone_config_text(&base, remote_name, required),
+            None => Ok(base),
+        }
+    }
+
+    /// The rclone remote this mount attaches.
+    ///
+    /// A name pinned through the [`RCLONE_OPTION_REMOTE_NAME`] option wins, because the provider
+    /// that set it also generated the matching `[section]`; then one pinned on the pattern
+    /// itself. With neither, the name is derived from the kind of remote and the session, as
+    /// Python's `resolve_remote_name` does, so two sessions sharing a workspace image never share
+    /// a mutable configuration section.
+    pub fn resolve_remote_name(
+        &self,
+        session_id: &str,
+        config: &MountPatternConfig,
+    ) -> SandboxResult<String> {
+        let pinned = config
+            .options
+            .get(RCLONE_OPTION_REMOTE_NAME)
+            .map(String::as_str)
+            .filter(|name| !name.is_empty())
+            .or_else(|| self.remote_name.as_deref().filter(|name| !name.is_empty()));
+        let remote_name = match pinned {
+            Some(name) => name.to_string(),
+            None => {
+                let kind = config
+                    .options
+                    .get(RCLONE_OPTION_REMOTE_KIND)
+                    .filter(|kind| !kind.is_empty())
+                    .ok_or_else(|| {
+                        SandboxError::new(
+                            ErrorCode::MountConfigInvalid,
+                            format!(
+                                "an rclone mount requires the `{RCLONE_OPTION_REMOTE_NAME}` or \
+                                 `{RCLONE_OPTION_REMOTE_KIND}` option"
+                            ),
+                        )
+                    })?;
+                format!("sandbox_{kind}_{session_id}")
+            }
+        };
+        // The name becomes both a `[section]` header and the `name:path` argument, so a
+        // separator inside it would silently attach the wrong remote.
+        if remote_name
+            .chars()
+            .any(|c| c.is_whitespace() || matches!(c, ':' | '/' | '[' | ']' | '\\'))
+        {
+            return Err(SandboxError::new(
+                ErrorCode::MountConfigInvalid,
+                format!("`{remote_name}` is not a usable rclone remote name"),
+            ));
+        }
+        Ok(remote_name)
+    }
+
+    /// The path inside the remote, for example a bucket and prefix.
+    fn remote_path(config: &MountPatternConfig) -> String {
+        config
             .options
             .get(RCLONE_OPTION_REMOTE_PATH)
             .cloned()
-            .unwrap_or_default();
-        Ok((remote_name.clone(), remote_path))
+            .unwrap_or_default()
     }
 
     fn read_only(config: &MountPatternConfig) -> bool {
@@ -839,9 +964,10 @@ impl RcloneMountPattern {
         &self,
         mount_path: &str,
         config_path: &str,
+        remote_name: &str,
         config: &MountPatternConfig,
-    ) -> SandboxResult<Vec<String>> {
-        let (remote_name, remote_path) = self.remote(config)?;
+    ) -> Vec<String> {
+        let remote_path = Self::remote_path(config);
         let mut argv = vec![
             "rclone".to_string(),
             "mount".to_string(),
@@ -857,7 +983,7 @@ impl RcloneMountPattern {
             "--daemon".to_string(),
         ]);
         argv.extend(self.extra_args.iter().cloned());
-        Ok(argv)
+        argv
     }
 
     /// The `rclone serve nfs` argument vector.
@@ -865,9 +991,10 @@ impl RcloneMountPattern {
         &self,
         config_path: &str,
         nfs_addr: &str,
+        remote_name: &str,
         config: &MountPatternConfig,
-    ) -> SandboxResult<Vec<String>> {
-        let (remote_name, remote_path) = self.remote(config)?;
+    ) -> Vec<String> {
+        let remote_path = Self::remote_path(config);
         let mut argv = vec![
             "rclone".to_string(),
             "serve".to_string(),
@@ -882,7 +1009,7 @@ impl RcloneMountPattern {
             argv.push("--read-only".to_string());
         }
         argv.extend(self.extra_args.iter().cloned());
-        Ok(argv)
+        argv
     }
 
     /// The `mount -t nfs` command that attaches the served remote.
@@ -947,22 +1074,20 @@ impl MountPattern for RcloneMountPattern {
                 "rclone is not installed in the sandbox image",
             ));
         }
-        let config_text = config.config_text().ok_or_else(|| {
-            SandboxError::new(
-                ErrorCode::MountConfigInvalid,
-                "an rclone mount requires the remote configuration text",
-            )
-        })?;
+        let remote_name = self.resolve_remote_name(session.id(), config)?;
         // A relative configuration path resolves inside the workspace, so the session's own file
         // API can write it; a path outside the workspace root would be rejected.
         let config_path = session.normalize_path(&self.config_path_for(mount_path))?;
+        let config_text = self
+            .resolve_config_text(session, &remote_name, &config_path, config)
+            .await?;
         let nfs_addr = self
             .nfs_addr
             .clone()
             .unwrap_or_else(|| "127.0.0.1:2049".to_string());
         let command = match self.mode {
             RcloneMountMode::Fuse => {
-                shell_command(&self.fuse_argv(mount_path, &config_path, config)?)
+                shell_command(&self.fuse_argv(mount_path, &config_path, &remote_name, config))
             }
             RcloneMountMode::Nfs => {
                 // Not every build of rclone ships the NFS server.
@@ -992,8 +1117,12 @@ impl MountPattern for RcloneMountPattern {
                 format!(
                     // The server runs in the background, then the client mounts what it serves.
                     "{server} & {client}",
-                    server =
-                        shell_command(&self.nfs_server_argv(&config_path, &nfs_addr, config)?),
+                    server = shell_command(&self.nfs_server_argv(
+                        &config_path,
+                        &nfs_addr,
+                        &remote_name,
+                        config,
+                    )),
                     client = self.nfs_client_command(mount_path, &nfs_addr, timeout.ok()),
                 )
             }
@@ -1088,7 +1217,7 @@ impl MountPattern for RcloneMountPattern {
             )
             .await?;
         // A daemonized `rclone mount` or a backgrounded `serve nfs` outlives the unmount.
-        if let Ok((remote_name, _)) = self.remote(config) {
+        if let Ok(remote_name) = self.resolve_remote_name(session.id(), config) {
             let pkill = format!(
                 "pkill -f -- {} >/dev/null 2>&1 || true",
                 shell_quote(&format!("rclone (mount|serve nfs) {remote_name}:"))
@@ -1097,12 +1226,103 @@ impl MountPattern for RcloneMountPattern {
                 .exec(ExecRequest::argv(["sh", "-lc", pkill.as_str()]).with_shell(ExecShell::None))
                 .await?;
         }
-        // The credentials must not outlive the mount.
+        // The credentials must not outlive the mount, but only the copy this mount wrote: a
+        // configuration the caller placed in the workspace stays theirs.
         if let Ok(config_path) = session.normalize_path(&self.config_path_for(mount_path)) {
-            let _ = session.rm(&config_path, false).await;
+            let caller_placed = self
+                .config_file_path
+                .as_deref()
+                .and_then(|source| session.normalize_path(source).ok())
+                .is_some_and(|source| source == config_path);
+            if !caller_placed {
+                let _ = session.rm(&config_path, false).await;
+            }
         }
         Ok(())
     }
+}
+
+/// Whether `line` is the `[remote_name]` header, as Python's `^\s*\[name\]\s*$` matches it.
+fn is_remote_section(line: &str, remote_name: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        == Some(remote_name)
+}
+
+/// Whether `line` opens any section.
+fn is_any_section(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed.len() > 2 && trimmed.starts_with('[') && trimmed.ends_with(']')
+}
+
+/// Check a caller-placed rclone configuration before it is staged as a credential.
+fn validate_rclone_config_text(
+    config_text: &str,
+    remote_name: &str,
+    source_path: &str,
+) -> SandboxResult<String> {
+    if config_text.trim().is_empty() {
+        return Err(SandboxError::new(
+            ErrorCode::MountConfigInvalid,
+            format!("the rclone configuration at `{source_path}` is empty"),
+        ));
+    }
+    if !config_text
+        .lines()
+        .any(|line| is_remote_section(line, remote_name))
+    {
+        return Err(SandboxError::new(
+            ErrorCode::MountConfigInvalid,
+            format!("the rclone configuration at `{source_path}` has no `[{remote_name}]` section"),
+        ));
+    }
+    Ok(config_text.to_string())
+}
+
+/// Merge a provider's settings into the `[remote_name]` section of a caller's configuration.
+///
+/// Mirrors Python's `_supplement_rclone_config_text`: the settings are appended to that section
+/// only, so the sections of other remotes in the same file keep their own values, and rclone's
+/// last-wins parsing lets the provider override what the caller wrote.
+fn supplement_rclone_config_text(
+    config_text: &str,
+    remote_name: &str,
+    required: &str,
+) -> SandboxResult<String> {
+    let lines: Vec<&str> = config_text.lines().collect();
+    let start = lines
+        .iter()
+        .position(|line| is_remote_section(line, remote_name))
+        .ok_or_else(|| {
+            SandboxError::new(
+                ErrorCode::MountConfigInvalid,
+                format!("the rclone configuration has no `[{remote_name}]` section"),
+            )
+        })?;
+    let end = lines[start + 1..]
+        .iter()
+        .position(|line| is_any_section(line))
+        .map_or(lines.len(), |offset| start + 1 + offset);
+
+    let mut section: Vec<&str> = lines[start..end].to_vec();
+    while section.last().is_some_and(|line| line.trim().is_empty()) {
+        section.pop();
+    }
+    // The provider repeats the header it generated; the caller's file already has one.
+    let mut additions = required.lines().peekable();
+    if additions.peek().is_some_and(|line| is_any_section(line)) {
+        additions.next();
+    }
+
+    let mut merged: Vec<&str> = lines[..start].to_vec();
+    merged.extend(section);
+    merged.extend(additions.filter(|line| !line.trim().is_empty()));
+    merged.extend(&lines[end..]);
+    let mut text = merged.join("\n");
+    text.push('\n');
+    Ok(text)
 }
 
 /// Join an argument vector into a single POSIX shell command.
@@ -1128,9 +1348,12 @@ mod rclone_tests {
     #[test]
     fn builds_fuse_mount_arguments() {
         let pattern = RcloneMountPattern::new().with_extra_args(["--allow-other", "--uid", "1000"]);
-        let argv = pattern
-            .fuse_argv("/workspace/data", "/workspace/rclone.conf", &config())
-            .unwrap();
+        let argv = pattern.fuse_argv(
+            "/workspace/data",
+            "/workspace/rclone.conf",
+            "bucket",
+            &config(),
+        );
         assert_eq!(
             argv,
             vec![
@@ -1152,9 +1375,12 @@ mod rclone_tests {
     #[test]
     fn builds_nfs_server_and_client_commands() {
         let pattern = RcloneMountPattern::nfs();
-        let argv = pattern
-            .nfs_server_argv("/workspace/rclone.conf", "127.0.0.1:2049", &config())
-            .unwrap();
+        let argv = pattern.nfs_server_argv(
+            "/workspace/rclone.conf",
+            "127.0.0.1:2049",
+            "bucket",
+            &config(),
+        );
         assert_eq!(
             argv,
             vec![
@@ -1184,13 +1410,152 @@ mod rclone_tests {
     }
 
     #[test]
-    fn requires_a_remote_name() {
+    fn requires_a_remote_name_or_a_remote_kind() {
         let pattern = RcloneMountPattern::new();
         let bare = MountPatternConfig::new().with_config_text("[bucket]\n");
-        let error = pattern
-            .fuse_argv("/workspace/data", "/workspace/rclone.conf", &bare)
-            .unwrap_err();
+        let error = pattern.resolve_remote_name("session-1", &bare).unwrap_err();
         assert_eq!(error.code, ErrorCode::MountConfigInvalid);
+    }
+
+    #[test]
+    fn derives_a_remote_name_from_the_session() {
+        let pattern = RcloneMountPattern::new();
+        let kind_only = MountPatternConfig::new().with_option(RCLONE_OPTION_REMOTE_KIND, "s3");
+        assert_eq!(
+            pattern.resolve_remote_name("1f2e3d", &kind_only).unwrap(),
+            "sandbox_s3_1f2e3d"
+        );
+        // Two sessions sharing one workspace image never share a configuration section.
+        assert_ne!(
+            pattern.resolve_remote_name("other", &kind_only).unwrap(),
+            pattern.resolve_remote_name("1f2e3d", &kind_only).unwrap()
+        );
+        // A name the provider pinned alongside its generated section wins over the derivation,
+        // and over one pinned on the pattern.
+        assert_eq!(
+            RcloneMountPattern::new()
+                .with_remote_name("pattern")
+                .resolve_remote_name("1f2e3d", &config())
+                .unwrap(),
+            "bucket"
+        );
+        assert_eq!(
+            RcloneMountPattern::new()
+                .with_remote_name("pattern")
+                .resolve_remote_name("1f2e3d", &kind_only)
+                .unwrap(),
+            "pattern"
+        );
+        // An empty option is an unset option, not a pin that hides the pattern's own name.
+        assert_eq!(
+            RcloneMountPattern::new()
+                .with_remote_name("pattern")
+                .resolve_remote_name(
+                    "1f2e3d",
+                    &MountPatternConfig::new().with_option(RCLONE_OPTION_REMOTE_NAME, "")
+                )
+                .unwrap(),
+            "pattern"
+        );
+    }
+
+    #[test]
+    fn rejects_a_remote_name_that_would_split_the_remote_argument() {
+        let pattern = RcloneMountPattern::new();
+        for value in ["s3:evil", "a b", "with/slash"] {
+            let broken = MountPatternConfig::new().with_option(RCLONE_OPTION_REMOTE_KIND, value);
+            let error = pattern.resolve_remote_name("session", &broken).unwrap_err();
+            assert_eq!(error.code, ErrorCode::MountConfigInvalid, "{value}");
+        }
+    }
+
+    #[test]
+    fn validates_a_caller_placed_configuration() {
+        assert!(
+            validate_rclone_config_text("  [bucket]  \ntype = s3\n", "bucket", "c.conf").is_ok()
+        );
+        for rejected in ["", "   \n\n", "[bucket2]\ntype = s3\n", "# [bucket]\n"] {
+            let error = validate_rclone_config_text(rejected, "bucket", "c.conf").unwrap_err();
+            assert_eq!(error.code, ErrorCode::MountConfigInvalid, "{rejected:?}");
+        }
+    }
+
+    #[test]
+    fn supplements_only_the_mounted_remote_section() {
+        let caller =
+            "[other]\ntype = s3\nregion = us-east-1\n\n[bucket]\ntype = s3\n\n[last]\ntype = s3\n";
+        let merged = supplement_rclone_config_text(
+            caller,
+            "bucket",
+            "[bucket]\naccess_key_id = AK\nsecret_access_key = SK\n",
+        )
+        .unwrap();
+        assert_eq!(
+            merged,
+            "[other]\ntype = s3\nregion = us-east-1\n\n[bucket]\ntype = s3\naccess_key_id = \
+             AK\nsecret_access_key = SK\n[last]\ntype = s3\n"
+        );
+        // A configuration whose section is last keeps the settings at the end.
+        let trailing =
+            supplement_rclone_config_text("[bucket]\ntype = s3\n", "bucket", "a = 1\n").unwrap();
+        assert_eq!(trailing, "[bucket]\ntype = s3\na = 1\n");
+        assert_eq!(
+            supplement_rclone_config_text("[other]\n", "bucket", "a = 1\n")
+                .unwrap_err()
+                .code,
+            ErrorCode::MountConfigInvalid
+        );
+    }
+
+    #[tokio::test]
+    async fn reads_a_caller_placed_configuration_from_the_workspace() {
+        use crate::sandbox::sandboxes::unix_local::UnixLocalSandboxClient;
+        use crate::sandbox::session::SandboxClient;
+
+        let session = UnixLocalSandboxClient::new().create(None).await.unwrap();
+        session.start().await.unwrap();
+        let pattern = RcloneMountPattern::new().with_config_file_path("rclone.conf");
+
+        // A file the caller has not placed yet keeps the workspace error code.
+        assert_eq!(
+            pattern
+                .read_config_text(session.as_ref(), "bucket")
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::WorkspaceReadNotFound
+        );
+
+        session
+            .write_file("rclone.conf", b"[bucket]\ntype = s3\n")
+            .await
+            .unwrap();
+        assert_eq!(
+            pattern
+                .read_config_text(session.as_ref(), "bucket")
+                .await
+                .unwrap(),
+            "[bucket]\ntype = s3\n"
+        );
+        // A configuration for a different remote fails before a credential is staged.
+        assert_eq!(
+            pattern
+                .read_config_text(session.as_ref(), "other")
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::MountConfigInvalid
+        );
+        // So does a pattern with no file to read.
+        assert_eq!(
+            RcloneMountPattern::new()
+                .read_config_text(session.as_ref(), "bucket")
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::MountConfigInvalid
+        );
+        session.shutdown().await.unwrap();
     }
 
     #[test]
