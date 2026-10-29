@@ -18,7 +18,7 @@ This crate is not affiliated with or endorsed by OpenAI.
 
 ```toml
 [dependencies]
-openai-agents-sdk = "0.1"
+openai-agents-sdk = "0.2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
@@ -26,8 +26,16 @@ Optional features:
 
 | Feature | Adds |
 | --- | --- |
-| `sqlite` | `memory::SqliteSession` (same schema as the Python `SQLiteSession`) |
-| `mcp` | Local MCP servers over stdio and Streamable HTTP (via [`rmcp`](https://crates.io/crates/rmcp)) |
+| `sqlite` | `memory::SqliteSession` and `memory::AdvancedSqliteSession` (same schemas as Python) |
+| `mcp` | Local MCP servers over stdio, Streamable HTTP and legacy HTTP+SSE (via [`rmcp`](https://crates.io/crates/rmcp)) |
+| `websocket` | Responses API over WebSocket (`OpenAIResponsesWSModel`, `ResponsesWebSocketSession`) and the experimental hosted multi-agent model |
+| `realtime` | Realtime agents and sessions over the OpenAI realtime WebSocket API |
+| `voice` | Voice pipeline with OpenAI speech-to-text and text-to-speech |
+| `sandbox` | Sandbox agents with unix-local and Docker workspaces |
+| `encrypt` | `memory::EncryptedSession` (XChaCha20-Poly1305, not wire-compatible with Python's Fernet) |
+| `redis` / `mongodb` / `sqlx` | `RedisSession`, `MongoDBSession`, `SqlxSession` (PostgreSQL/MySQL; needs Rust 1.94) |
+
+`DaprSession` and `OpenAIResponsesCompactionSession` need no feature.
 
 Set your API key before running agents:
 
@@ -77,7 +85,13 @@ let result = Runner::run(&agent, "What's the weather in Tokyo?").await?;
 ```
 
 Hosted OpenAI tools are available too: `WebSearchTool`, `FileSearchTool`, `CodeInterpreterTool`,
-`ImageGenerationTool` and `HostedMCPTool`.
+`ImageGenerationTool`, `HostedMCPTool`, `ToolSearchTool` and `ProgrammaticToolCallingTool`.
+Group function tools with `tool_namespace` and defer them with `with_defer_loading`.
+
+Local runtime tools run on your machine through the runner, with the same approval flow as
+function tools: `ShellTool` (your executor, or `ShellTool::with_system_shell`),
+`LocalShellTool`, `ApplyPatchTool` (any `editor::ApplyPatchEditor`, e.g. `WorkspaceEditor`),
+`ComputerTool` (any `computer::Computer`) and `CustomTool` (raw string input).
 
 ## Handoffs and agents as tools
 
@@ -218,19 +232,30 @@ per-attempt timeouts and raw request extras.
 | `SQLiteSession` | `memory::SqliteSession` (feature `sqlite`) |
 | `MCPServerStdio` / `MCPServerStreamableHttp` | `mcp::MCPServerStdio` / `mcp::MCPServerStreamableHttp` (feature `mcp`) |
 | `agents.testing` | `testing::FakeModel` |
+| `ShellTool` / `ApplyPatchTool` / `ComputerTool` | `tool::ShellTool` / `tool::ApplyPatchTool` / `tool::ComputerTool` |
+| `retry_policies.any(...)` | `retry::retry_policies::any(vec![...])` |
+| `RealtimeAgent` / `RealtimeRunner` | `realtime::RealtimeAgent` / `realtime::RealtimeRunner` (feature `realtime`) |
+| `VoicePipeline` | `voice::VoicePipeline` (feature `voice`) |
+| `SandboxAgent` | `sandbox::SandboxAgent` (feature `sandbox`) |
+| `codex_tool(...)` | `extensions::codex::codex_tool(...)` |
 
-## Not yet ported
+## Not ported
 
-Realtime agents, voice pipelines, sandbox agents, the Codex tool, local computer/shell/apply-patch
-tool execution, hosted multi-agent, Responses WebSocket transport, third-party adapters (LiteLLM,
-Any-LLM), and the MCP HTTP+SSE transport (deprecated upstream). See
-[`docs/project-roadmap.md`](docs/project-roadmap.md).
+- LiteLLM and Any-LLM adapters: they wrap Python libraries. Use `OpenAIChatCompletionsModel`
+  with `OpenAIClient::with_base_url` for OpenAI-compatible providers, or implement `Model`.
+- Cloud sandbox providers (E2B, Modal, Daytona, Vercel, Cloudflare, Blaxel), sandbox mounts and
+  PTY sessions.
+- A `#[function_tool]` attribute macro: `FunctionTool::new` with a typed closure covers it.
+
+See [`docs/project-roadmap.md`](docs/project-roadmap.md) for details.
 
 ## Examples
 
 See [`examples/`](examples): `hello_world`, `tools`, `handoffs`, `structured_output`,
 `stream_text`, `stream_items`, `guardrails`, `human_in_the_loop`, `agents_as_tools`,
-`sessions_sqlite`, `chat_completions_provider`, `mcp_stdio`, `custom_trace_processor`.
+`sessions_sqlite`, `sessions_encrypted`, `chat_completions_provider`, `mcp_stdio`,
+`custom_trace_processor`, `shell_and_apply_patch`, `responses_websocket`, `realtime_text`,
+`voice_static`, `sandbox_local`, `codex_tool`.
 
 ```bash
 cargo run --example hello_world

@@ -28,4 +28,5 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.89
-      - run: cargo check --all-features
+      # sqlx 0.9 needs Rust 1.94; every other feature supports the 1.89 MSRV.
+      - run: cargo check --features sqlite,mcp,websocket,realtime,voice,sandbox,encrypt,redis,mongodb

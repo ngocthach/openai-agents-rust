@@ -13,19 +13,30 @@ Last updated: 2026-10-29.
 - MCP stdio and Streamable HTTP servers, tool filters, approvals, manager
 - Extensions: handoff filters, recommended prompt, DOT visualization, REPL, FakeModel
 
-## Not yet ported
+## 0.2.0 (released)
 
-| Area | Notes |
+- Local runtime tools: `ShellTool`, `LocalShellTool`, `ApplyPatchTool` (V4A `apply_diff`,
+  `WorkspaceEditor`), `ComputerTool`, `CustomTool`, with approvals and `on_approval`
+- `ToolSearchTool`, `tool_namespace`, deferred loading validation, `ProgrammaticToolCallingTool`
+- Responses WebSocket transport and `ResponsesWebSocketSession` (feature `websocket`)
+- Retry policies (`retry::retry_policies`) with provider advice and replay-safety vetoes
+- Chat Completions `reasoning_content` parsing, streaming and DeepSeek replay
+- Tool name collision policy, output guardrail blocked-output redaction, agent harness id
+- Realtime agents (feature `realtime`), voice pipeline (feature `voice`), sandbox agents with
+  unix-local and Docker clients (feature `sandbox`)
+- Sessions: advanced SQLite, OpenAI Responses compaction, encrypted, Redis, MongoDB, sqlx, Dapr
+- MCP legacy HTTP+SSE transport
+- Extensions: tool output trimmer, Codex tool, hosted multi-agent (experimental)
+
+## Not ported
+
+| Area | Reason |
 | --- | --- |
-| Realtime agents | WebSocket realtime sessions and audio |
-| Voice pipeline | STT / TTS workflows |
-| Sandbox agents | Workspace manifests, sandbox clients |
-| Local execution tools | `ComputerTool`, `ShellTool`, `LocalShellTool`, `ApplyPatchTool` loops |
-| Tool search / programmatic tool calling | `ToolSearchTool`, namespaces, deferred loading beyond the `defer_loading` flag |
-| Responses WebSocket transport | `responses_websocket_session` |
-| Hosted multi-agent (experimental) | Responses beta |
-| Codex tool | Experimental upstream |
-| Third-party adapters | LiteLLM, Any-LLM |
-| Extra sessions | Redis, SQLAlchemy-equivalent, MongoDB, Dapr, encrypted, compaction |
-| MCP HTTP+SSE transport | Deprecated by the MCP project; `rmcp` 3 does not ship a client |
+| LiteLLM / Any-LLM adapters | Wrap Python libraries; use `OpenAIChatCompletionsModel` with a base URL or a custom `Model` |
+| Cloud sandbox providers (E2B, Modal, Daytona, Vercel, Cloudflare, Blaxel) | Vendor SDK integrations; implement `SandboxClient` for a provider |
+| Sandbox mounts, PTY sessions, sandbox memory and skills | Large provider-specific surface; PTY needs `unsafe` |
+| Realtime SIP model and playback tracker | Telephony-specific |
 | `#[function_tool]` macro | Closure-based `FunctionTool::new` covers the same need |
+| Retry-after header capture | `AgentsError::ApiError` does not carry response headers; policies use body hints and backoff |
+
+Module-level divergences are listed in `plans/reports/*-port-report.md`.

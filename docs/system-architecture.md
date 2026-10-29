@@ -11,10 +11,15 @@ Last updated: 2026-10-29. Port of `openai-agents` (Python) 0.24.0.
 | Agent loop | `run_internal` (private) | Turn loop, tool execution, approvals, handoffs, sessions, tracing spans |
 | Models | `models::{interface, openai_client, openai_responses, openai_chatcompletions, openai_provider, multi_provider, default_models}` | `Model`/`ModelProvider` traits and OpenAI HTTP implementations |
 | Data | `items`, `usage`, `model_settings`, `agent_output`, `strict_schema` | Responses-format items, usage, settings, structured output schemas |
-| Memory | `memory` | `Session` trait, in-memory, SQLite (feature `sqlite`), OpenAI Conversations |
+| Local tools | `tool::local`, `computer`, `editor`, `apply_diff`, `run_internal::local_tools` | Shell, local shell, apply patch (V4A diffs), computer and custom tools, namespaces, tool search |
+| Retries | `retry` | Retry policies, provider advice, replay-safety vetoes |
+| Memory | `memory` | `Session` trait; in-memory, SQLite, advanced SQLite, OpenAI Conversations, compaction, encrypted, Redis, MongoDB, sqlx, Dapr |
 | Tracing | `tracing` | Traces/spans, task-local scope, processors, OpenAI exporter |
-| MCP | `mcp` (feature `mcp`) | stdio / Streamable HTTP servers on `rmcp`, tool conversion |
-| Extensions | `extensions`, `repl`, `testing` | Handoff filters and prompts, DOT visualization, REPL, scripted `FakeModel` |
+| MCP | `mcp` (feature `mcp`) | stdio, Streamable HTTP and legacy HTTP+SSE servers on `rmcp`, tool conversion |
+| Realtime | `realtime` (feature `realtime`) | Realtime agents, sessions, OpenAI realtime WebSocket model |
+| Voice | `voice` (feature `voice`) | Voice pipeline, OpenAI STT/TTS, single-agent workflow |
+| Sandbox | `sandbox` (feature `sandbox`) | Sandbox agents, manifests, capabilities, unix-local and Docker clients |
+| Extensions | `extensions`, `repl`, `testing` | Handoff filters and prompts, DOT visualization, tool output trimmer, Codex tool, hosted multi-agent (feature `websocket`), REPL, scripted `FakeModel` |
 
 ## Run loop
 
@@ -30,6 +35,7 @@ Runner::run* -> run_internal::run_loop
       call_model_input_filter -> model call (retry, timeout, streaming)
       classify output: messages, reasoning, function calls, handoffs, hosted items
       execute function tools (approvals, tool guardrails, hooks, timeouts)
+      execute local tools (computer, shell, apply patch, custom) with approvals
       hosted MCP approvals
       -> Interruption | Handoff (input filter / nested history) | tool_use_behavior | final output | run again
     output guardrails, agent end hooks, session save
@@ -51,4 +57,9 @@ Runner::run* -> run_internal::run_loop
   surfaces the interruption and resumes the nested run later.
 - **Tracing export runs on a dedicated thread** with its own runtime, so exports survive the
   caller's runtime. `flush_traces()` must be called before process exit.
+- **Local tool calls are approval items too.** Shell, apply patch and custom calls that need
+  approval are stored as `ToolApprovalItem`s whose raw item keeps the original type, so
+  `RunState` approval and resume work the same way as for function tools.
+- **Feature-gated transports.** WebSocket-based code (Responses WebSocket, realtime, voice,
+  hosted multi-agent) only compiles with its feature, keeping the default build small.
 - **Large futures are boxed** in the loop to keep stack usage low in debug builds.
