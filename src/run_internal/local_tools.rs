@@ -90,7 +90,7 @@ fn copy_caller(call: &Value, output: &mut Value) {
 
 enum Gate {
     Proceed,
-    Pending(ToolApprovalItem),
+    Pending(Box<ToolApprovalItem>),
     Rejected(String),
 }
 
@@ -128,7 +128,7 @@ async fn approval_gate<C: Send + Sync + 'static>(
         }
         status = env.ctx.is_tool_approved(agent, tool_name, &call_id);
         if status.is_none() {
-            return Gate::Pending(item);
+            return Gate::Pending(Box::new(item));
         }
     }
     match status {
@@ -437,7 +437,7 @@ async fn run_shell<C: Send + Sync + 'static>(
     )
     .await;
     match gate {
-        Gate::Pending(item) => return Ok(LocalOutcome::Interruption(item)),
+        Gate::Pending(item) => return Ok(LocalOutcome::Interruption(*item)),
         Gate::Rejected(message) => return Ok(shell_rejection(&raw, &call_id, message)),
         Gate::Proceed => {}
     }
@@ -614,7 +614,7 @@ async fn run_apply_patch<C: Send + Sync + 'static>(
     )
     .await;
     match gate {
-        Gate::Pending(item) => return Ok(LocalOutcome::Interruption(item)),
+        Gate::Pending(item) => return Ok(LocalOutcome::Interruption(*item)),
         Gate::Rejected(message) => {
             let mut raw_item = json!({
                 "type": "apply_patch_call_output",
@@ -731,7 +731,7 @@ async fn run_custom<C: Send + Sync + 'static>(
     )
     .await;
     match gate {
-        Gate::Pending(item) => return Ok(LocalOutcome::Interruption(item)),
+        Gate::Pending(item) => return Ok(LocalOutcome::Interruption(*item)),
         Gate::Rejected(message) => return Ok(output_item(message)),
         Gate::Proceed => {}
     }

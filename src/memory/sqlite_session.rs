@@ -115,6 +115,21 @@ impl SqliteSession {
         .map_err(sql_err)
     }
 
+    /// The shared connection, for sessions in this module that extend the base schema.
+    pub(super) fn connection(&self) -> &Arc<Mutex<Connection>> {
+        &self.conn
+    }
+
+    /// The name of the session metadata table.
+    pub(super) fn sessions_table(&self) -> &str {
+        &self.sessions_table
+    }
+
+    /// The name of the message table.
+    pub(super) fn messages_table(&self) -> &str {
+        &self.messages_table
+    }
+
     async fn blocking<T, F>(&self, f: F) -> Result<T>
     where
         T: Send + 'static,

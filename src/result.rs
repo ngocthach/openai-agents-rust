@@ -108,6 +108,8 @@ impl<C> RunResult<C> {
 }
 
 /// Messages sent from the background run task to a streamed result.
+// Events are the common case; boxing each one would cost an allocation per event.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum StreamMsg<C> {
     Event(StreamEvent<C>),
     Done(Box<Result<RunResult<C>>>),

@@ -1,8 +1,20 @@
 //! Session memory: conversation history persisted across runs. Mirrors `agents.memory`.
 
+#[cfg(feature = "sqlite")]
+mod advanced_sqlite_session;
+mod dapr_session;
+#[cfg(feature = "encrypt")]
+mod encrypted_session;
+#[cfg(feature = "mongodb")]
+mod mongodb_session;
 mod openai_conversations_session;
+mod openai_responses_compaction_session;
+#[cfg(feature = "redis")]
+mod redis_session;
 #[cfg(feature = "sqlite")]
 mod sqlite_session;
+#[cfg(feature = "sqlx")]
+mod sqlx_session;
 
 use std::fmt;
 use std::sync::Mutex;
@@ -13,9 +25,32 @@ use serde::{Deserialize, Serialize};
 use crate::error::Result;
 use crate::items::InputItem;
 
+#[cfg(feature = "sqlite")]
+pub use advanced_sqlite_session::{
+    AdvancedSqliteSession, BranchInfo, ConversationTurn, MAIN_BRANCH, SessionUsage, ToolUsage,
+    TurnUsage,
+};
+pub use dapr_session::{
+    DEFAULT_DAPR_HTTP_ENDPOINT, DaprConsistency, DaprSession, dapr_session_keys,
+};
+#[cfg(feature = "encrypt")]
+pub use encrypted_session::EncryptedSession;
+#[cfg(feature = "mongodb")]
+pub use mongodb_session::{
+    DEFAULT_MESSAGES_COLLECTION, DEFAULT_SESSIONS_COLLECTION, MongoDBSession, generation_filter,
+};
 pub use openai_conversations_session::OpenAIConversationsSession;
+pub use openai_responses_compaction_session::{
+    CompactionContext, CompactionMode, DEFAULT_COMPACTION_THRESHOLD, OpenAIResponsesCompactionArgs,
+    OpenAIResponsesCompactionSession, ResolvedCompactionMode, ShouldTriggerCompaction,
+    default_should_trigger_compaction, is_openai_model_name, select_compaction_candidate_items,
+};
+#[cfg(feature = "redis")]
+pub use redis_session::{DEFAULT_KEY_PREFIX, RedisSession, redis_session_keys};
 #[cfg(feature = "sqlite")]
 pub use sqlite_session::SqliteSession;
+#[cfg(feature = "sqlx")]
+pub use sqlx_session::{DEFAULT_MESSAGES_TABLE, DEFAULT_SESSIONS_TABLE, SqlxDialect, SqlxSession};
 
 /// Settings controlling how history is retrieved.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

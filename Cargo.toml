@@ -85,3 +85,7 @@ required-features = ["voice"]
 [[example]]
 name = "realtime_text"
 required-features = ["realtime"]
+
+[[example]]
+name = "sessions_encrypted"
+required-features = ["encrypt"]

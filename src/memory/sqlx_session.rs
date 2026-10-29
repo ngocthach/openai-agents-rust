@@ -1,0 +1,533 @@
+//! PostgreSQL / MySQL session on top of `sqlx` (feature `sqlx`).
+//! Mirrors `agents.extensions.memory.sqlalchemy_session`.
+
+use std::fmt;
+
+use async_trait::async_trait;
+use sqlx::AnyPool;
+use sqlx::{AssertSqlSafe, Row};
+
+use super::{Session, SessionSettings};
+use crate::error::{AgentsError, Result};
+use crate::items::InputItem;
+
+/// Default name of the table holding session metadata.
+pub const DEFAULT_SESSIONS_TABLE: &str = "agent_sessions";
+/// Default name of the table holding conversation history.
+pub const DEFAULT_MESSAGES_TABLE: &str = "agent_messages";
+
+fn sqlx_err(e: sqlx::Error) -> AgentsError {
+    AgentsError::other(format!("SQL error: {e}"))
+}
+
+fn valid_identifier(name: &str) -> bool {
+    !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// The SQL dialect a [`SqlxSession`] generates statements for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SqlxDialect {
+    /// PostgreSQL, with `$n` placeholders.
+    Postgres,
+    /// MySQL or MariaDB, with `?` placeholders.
+    MySql,
+}
+
+impl SqlxDialect {
+    /// The dialect a connection URL selects.
+    ///
+    /// SQLite is rejected: `rusqlite` owns the `sqlite3` link in this crate, so use
+    /// [`SqliteSession`](super::SqliteSession) for SQLite instead.
+    pub fn from_url(url: &str) -> Result<Self> {
+        let scheme = url.split(':').next().unwrap_or_default();
+        match scheme {
+            "postgres" | "postgresql" => Ok(SqlxDialect::Postgres),
+            "mysql" | "mariadb" => Ok(SqlxDialect::MySql),
+            "sqlite" => Err(AgentsError::user(
+                "SqlxSession does not support SQLite; use SqliteSession (feature `sqlite`) instead",
+            )),
+            other => Err(AgentsError::user(format!(
+                "Unsupported database URL scheme for SqlxSession: {other}"
+            ))),
+        }
+    }
+
+    /// The placeholder for bind parameter `n` (one-based).
+    pub fn placeholder(self, n: usize) -> String {
+        match self {
+            SqlxDialect::Postgres => format!("${n}"),
+            SqlxDialect::MySql => "?".to_string(),
+        }
+    }
+}
+
+/// Statement templates for one dialect and table pair.
+#[derive(Debug, Clone)]
+struct Schema {
+    dialect: SqlxDialect,
+    sessions_table: String,
+    messages_table: String,
+}
+
+impl Schema {
+    /// `CREATE TABLE` / index statements, run in order.
+    fn create_tables(&self) -> Vec<String> {
+        let (s, m) = (&self.sessions_table, &self.messages_table);
+        match self.dialect {
+            SqlxDialect::Postgres => vec![
+                format!(
+                    "CREATE TABLE IF NOT EXISTS {s} (
+                        session_id TEXT PRIMARY KEY,
+                        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                     )"
+                ),
+                format!(
+                    "CREATE TABLE IF NOT EXISTS {m} (
+                        id BIGSERIAL PRIMARY KEY,
+                        session_id TEXT NOT NULL REFERENCES {s} (session_id) ON DELETE CASCADE,
+                        message_data TEXT NOT NULL,
+                        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                     )"
+                ),
+                format!(
+                    "CREATE INDEX IF NOT EXISTS idx_{m}_session_time ON {m} (session_id, created_at)"
+                ),
+            ],
+            SqlxDialect::MySql => vec![
+                format!(
+                    "CREATE TABLE IF NOT EXISTS {s} (
+                        session_id VARCHAR(255) PRIMARY KEY,
+                        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                     )"
+                ),
+                format!(
+                    "CREATE TABLE IF NOT EXISTS {m} (
+                        id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                        session_id VARCHAR(255) NOT NULL,
+                        message_data LONGTEXT NOT NULL,
+                        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        INDEX idx_{m}_session_time (session_id, created_at),
+                        FOREIGN KEY (session_id) REFERENCES {s} (session_id) ON DELETE CASCADE
+                     )"
+                ),
+            ],
+        }
+    }
+
+    /// Insert the session row, ignoring an existing one.
+    fn insert_session(&self) -> String {
+        let (s, p1) = (&self.sessions_table, self.dialect.placeholder(1));
+        match self.dialect {
+            SqlxDialect::Postgres => format!(
+                "INSERT INTO {s} (session_id) VALUES ({p1}) ON CONFLICT (session_id) DO NOTHING"
+            ),
+            SqlxDialect::MySql => format!("INSERT IGNORE INTO {s} (session_id) VALUES ({p1})"),
+        }
+    }
+
+    fn insert_message(&self) -> String {
+        format!(
+            "INSERT INTO {} (session_id, message_data) VALUES ({}, {})",
+            self.messages_table,
+            self.dialect.placeholder(1),
+            self.dialect.placeholder(2)
+        )
+    }
+
+    fn touch_session(&self) -> String {
+        format!(
+            "UPDATE {} SET updated_at = CURRENT_TIMESTAMP WHERE session_id = {}",
+            self.sessions_table,
+            self.dialect.placeholder(1)
+        )
+    }
+
+    fn select_all(&self) -> String {
+        format!(
+            "SELECT message_data FROM {} WHERE session_id = {} ORDER BY created_at ASC, id ASC",
+            self.messages_table,
+            self.dialect.placeholder(1)
+        )
+    }
+
+    fn select_latest(&self) -> String {
+        format!(
+            "SELECT message_data FROM {} WHERE session_id = {} \
+             ORDER BY created_at DESC, id DESC LIMIT {}",
+            self.messages_table,
+            self.dialect.placeholder(1),
+            self.dialect.placeholder(2)
+        )
+    }
+
+    fn select_tail(&self) -> String {
+        format!(
+            "SELECT id, message_data FROM {} WHERE session_id = {} \
+             ORDER BY created_at DESC, id DESC LIMIT 1",
+            self.messages_table,
+            self.dialect.placeholder(1)
+        )
+    }
+
+    fn delete_message(&self) -> String {
+        format!(
+            "DELETE FROM {} WHERE id = {}",
+            self.messages_table,
+            self.dialect.placeholder(1)
+        )
+    }
+
+    fn delete_messages(&self) -> String {
+        format!(
+            "DELETE FROM {} WHERE session_id = {}",
+            self.messages_table,
+            self.dialect.placeholder(1)
+        )
+    }
+
+    fn delete_session(&self) -> String {
+        format!(
+            "DELETE FROM {} WHERE session_id = {}",
+            self.sessions_table,
+            self.dialect.placeholder(1)
+        )
+    }
+}
+
+/// Conversation history stored in PostgreSQL or MySQL through `sqlx`.
+///
+/// The schema matches the Python `SQLAlchemySession`: an `agent_sessions` table keyed by
+/// `session_id` with `created_at`/`updated_at`, and an `agent_messages` table holding one JSON
+/// item per row with an `idx_agent_messages_session_time` index on `(session_id, created_at)`.
+/// Databases are therefore interchangeable with the Python backend.
+///
+/// # SQLite
+///
+/// SQLite is intentionally unsupported. This crate already links `sqlite3` through `rusqlite`
+/// for [`SqliteSession`](super::SqliteSession), and linking it a second time through
+/// `sqlx-sqlite` is not sound; [`SqlxSession::from_url`] rejects `sqlite:` URLs.
+pub struct SqlxSession {
+    session_id: String,
+    pool: AnyPool,
+    schema: Schema,
+    settings: Option<SessionSettings>,
+}
+
+impl fmt::Debug for SqlxSession {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SqlxSession")
+            .field("session_id", &self.session_id)
+            .field("dialect", &self.schema.dialect)
+            .field("sessions_table", &self.schema.sessions_table)
+            .field("messages_table", &self.schema.messages_table)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SqlxSession {
+    /// Connect to `url` and, when `create_tables` is set, create the schema if it is missing.
+    ///
+    /// `url` must be a PostgreSQL or MySQL URL; see the type documentation about SQLite.
+    pub async fn from_url(
+        session_id: impl Into<String>,
+        url: &str,
+        create_tables: bool,
+    ) -> Result<Self> {
+        let dialect = SqlxDialect::from_url(url)?;
+        sqlx::any::install_default_drivers();
+        let pool = AnyPool::connect(url).await.map_err(sqlx_err)?;
+        Self::with_pool(session_id, pool, dialect, create_tables).await
+    }
+
+    /// Use a pool the application already manages.
+    pub async fn with_pool(
+        session_id: impl Into<String>,
+        pool: AnyPool,
+        dialect: SqlxDialect,
+        create_tables: bool,
+    ) -> Result<Self> {
+        let session = SqlxSession {
+            session_id: session_id.into(),
+            pool,
+            schema: Schema {
+                dialect,
+                sessions_table: DEFAULT_SESSIONS_TABLE.to_string(),
+                messages_table: DEFAULT_MESSAGES_TABLE.to_string(),
+            },
+            settings: None,
+        };
+        if create_tables {
+            session.create_tables().await?;
+        }
+        Ok(session)
+    }
+
+    /// Use custom table names (ASCII letters, digits and underscores only).
+    ///
+    /// Call this before [`SqlxSession::create_tables`]; the constructors create the default
+    /// tables when asked to.
+    pub fn with_tables(mut self, sessions_table: &str, messages_table: &str) -> Result<Self> {
+        if !valid_identifier(sessions_table) || !valid_identifier(messages_table) {
+            return Err(AgentsError::user("Invalid SQL table name"));
+        }
+        self.schema.sessions_table = sessions_table.to_string();
+        self.schema.messages_table = messages_table.to_string();
+        Ok(self)
+    }
+
+    /// Set default session settings.
+    pub fn with_settings(mut self, settings: SessionSettings) -> Self {
+        self.settings = Some(settings);
+        self
+    }
+
+    /// The connection pool.
+    pub fn pool(&self) -> &AnyPool {
+        &self.pool
+    }
+
+    /// The dialect statements are generated for.
+    pub fn dialect(&self) -> SqlxDialect {
+        self.schema.dialect
+    }
+
+    /// Create the session and message tables if they do not exist.
+    pub async fn create_tables(&self) -> Result<()> {
+        for statement in self.schema.create_tables() {
+            sqlx::query(AssertSqlSafe(statement))
+                .execute(&self.pool)
+                .await
+                .map_err(sqlx_err)?;
+        }
+        Ok(())
+    }
+
+    /// Decode serialized rows, skipping corrupted ones.
+    fn decode(raw: &[String]) -> Vec<InputItem> {
+        raw.iter()
+            .filter_map(|r| serde_json::from_str(r).ok().map(InputItem))
+            .collect()
+    }
+}
+
+#[async_trait]
+impl Session for SqlxSession {
+    fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    fn session_settings(&self) -> Option<SessionSettings> {
+        self.settings.clone()
+    }
+
+    async fn get_items(&self, limit: Option<usize>) -> Result<Vec<InputItem>> {
+        let Some(limit) = limit else {
+            let rows = sqlx::query(AssertSqlSafe(self.schema.select_all()))
+                .bind(self.session_id.clone())
+                .fetch_all(&self.pool)
+                .await
+                .map_err(sqlx_err)?;
+            let raw: Vec<String> = rows.iter().filter_map(|r| r.try_get(0).ok()).collect();
+            return Ok(Self::decode(&raw));
+        };
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        // Corrupted rows must not consume the caller's budget, so widen the window until
+        // `limit` valid items are found or the history is exhausted.
+        let mut window = limit;
+        loop {
+            let rows = sqlx::query(AssertSqlSafe(self.schema.select_latest()))
+                .bind(self.session_id.clone())
+                .bind(window as i64)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(sqlx_err)?;
+            let mut raw: Vec<String> = rows.iter().filter_map(|r| r.try_get(0).ok()).collect();
+            raw.reverse();
+            let items = Self::decode(&raw);
+            if items.len() >= limit {
+                return Ok(items[items.len() - limit..].to_vec());
+            }
+            if rows.len() < window {
+                return Ok(items);
+            }
+            window = window.saturating_mul(2);
+        }
+    }
+
+    async fn add_items(&self, items: Vec<InputItem>) -> Result<()> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        let mut tx = self.pool.begin().await.map_err(sqlx_err)?;
+        sqlx::query(AssertSqlSafe(self.schema.insert_session()))
+            .bind(self.session_id.clone())
+            .execute(&mut *tx)
+            .await
+            .map_err(sqlx_err)?;
+        for item in &items {
+            sqlx::query(AssertSqlSafe(self.schema.insert_message()))
+                .bind(self.session_id.clone())
+                .bind(serde_json::to_string(item.as_value())?)
+                .execute(&mut *tx)
+                .await
+                .map_err(sqlx_err)?;
+        }
+        sqlx::query(AssertSqlSafe(self.schema.touch_session()))
+            .bind(self.session_id.clone())
+            .execute(&mut *tx)
+            .await
+            .map_err(sqlx_err)?;
+        tx.commit().await.map_err(sqlx_err)
+    }
+
+    async fn pop_item(&self) -> Result<Option<InputItem>> {
+        let mut tx = self.pool.begin().await.map_err(sqlx_err)?;
+        let row = sqlx::query(AssertSqlSafe(self.schema.select_tail()))
+            .bind(self.session_id.clone())
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(sqlx_err)?;
+        let Some(row) = row else {
+            tx.commit().await.map_err(sqlx_err)?;
+            return Ok(None);
+        };
+        let id: i64 = row.try_get(0).map_err(sqlx_err)?;
+        let data: String = row.try_get(1).map_err(sqlx_err)?;
+        sqlx::query(AssertSqlSafe(self.schema.delete_message()))
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .map_err(sqlx_err)?;
+        tx.commit().await.map_err(sqlx_err)?;
+        Ok(serde_json::from_str(&data).ok().map(InputItem))
+    }
+
+    async fn clear_session(&self) -> Result<()> {
+        let mut tx = self.pool.begin().await.map_err(sqlx_err)?;
+        sqlx::query(AssertSqlSafe(self.schema.delete_messages()))
+            .bind(self.session_id.clone())
+            .execute(&mut *tx)
+            .await
+            .map_err(sqlx_err)?;
+        sqlx::query(AssertSqlSafe(self.schema.delete_session()))
+            .bind(self.session_id.clone())
+            .execute(&mut *tx)
+            .await
+            .map_err(sqlx_err)?;
+        tx.commit().await.map_err(sqlx_err)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn schema(dialect: SqlxDialect) -> Schema {
+        Schema {
+            dialect,
+            sessions_table: DEFAULT_SESSIONS_TABLE.to_string(),
+            messages_table: DEFAULT_MESSAGES_TABLE.to_string(),
+        }
+    }
+
+    #[test]
+    fn dialects_come_from_the_url_scheme() {
+        assert_eq!(
+            SqlxDialect::from_url("postgres://u:p@h/db").unwrap(),
+            SqlxDialect::Postgres
+        );
+        assert_eq!(
+            SqlxDialect::from_url("postgresql://h/db").unwrap(),
+            SqlxDialect::Postgres
+        );
+        assert_eq!(
+            SqlxDialect::from_url("mysql://h/db").unwrap(),
+            SqlxDialect::MySql
+        );
+        let sqlite = SqlxDialect::from_url("sqlite://x.db").unwrap_err();
+        assert!(sqlite.to_string().contains("SqliteSession"));
+        assert!(SqlxDialect::from_url("mssql://h/db").is_err());
+    }
+
+    #[test]
+    fn placeholders_follow_the_dialect() {
+        assert_eq!(SqlxDialect::Postgres.placeholder(2), "$2");
+        assert_eq!(SqlxDialect::MySql.placeholder(2), "?");
+    }
+
+    #[test]
+    fn postgres_statements_use_numbered_placeholders_and_on_conflict() {
+        let s = schema(SqlxDialect::Postgres);
+        assert_eq!(
+            s.insert_message(),
+            "INSERT INTO agent_messages (session_id, message_data) VALUES ($1, $2)"
+        );
+        assert!(
+            s.insert_session()
+                .contains("ON CONFLICT (session_id) DO NOTHING")
+        );
+        assert!(s.select_latest().ends_with("LIMIT $2"));
+        let ddl = s.create_tables();
+        assert_eq!(ddl.len(), 3);
+        assert!(ddl[1].contains("BIGSERIAL"));
+        assert!(ddl[2].contains("CREATE INDEX IF NOT EXISTS idx_agent_messages_session_time"));
+    }
+
+    #[test]
+    fn mysql_statements_use_question_marks_and_inline_index() {
+        let s = schema(SqlxDialect::MySql);
+        assert_eq!(
+            s.insert_message(),
+            "INSERT INTO agent_messages (session_id, message_data) VALUES (?, ?)"
+        );
+        assert!(s.insert_session().starts_with("INSERT IGNORE INTO"));
+        assert!(s.select_latest().ends_with("LIMIT ?"));
+        let ddl = s.create_tables();
+        assert_eq!(ddl.len(), 2);
+        assert!(ddl[0].contains("VARCHAR(255) PRIMARY KEY"));
+        assert!(ddl[1].contains("AUTO_INCREMENT"));
+        assert!(ddl[1].contains("INDEX idx_agent_messages_session_time (session_id, created_at)"));
+    }
+
+    #[test]
+    fn table_names_are_validated() {
+        let s = Schema {
+            dialect: SqlxDialect::Postgres,
+            sessions_table: "s".into(),
+            messages_table: "m".into(),
+        };
+        assert!(valid_identifier(&s.sessions_table));
+        assert!(!valid_identifier("drop table; --"));
+        assert!(!valid_identifier(""));
+    }
+
+    /// Integration coverage against a real server; skipped unless `DATABASE_URL` is set.
+    #[tokio::test]
+    async fn sqlx_round_trip() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            return;
+        };
+        let s = SqlxSession::from_url("rust-test-session", &url, true)
+            .await
+            .unwrap();
+        s.clear_session().await.unwrap();
+        s.add_items(vec![InputItem::user("a"), InputItem::assistant("b")])
+            .await
+            .unwrap();
+        assert_eq!(s.get_items(None).await.unwrap().len(), 2);
+        assert_eq!(
+            s.get_items(Some(1)).await.unwrap()[0].role(),
+            Some("assistant")
+        );
+        assert_eq!(
+            s.pop_item().await.unwrap().unwrap().role(),
+            Some("assistant")
+        );
+        s.clear_session().await.unwrap();
+        assert!(s.get_items(None).await.unwrap().is_empty());
+    }
+}
