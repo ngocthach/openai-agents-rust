@@ -3,6 +3,7 @@
 
 pub mod handoff_filters;
 pub mod handoff_prompt;
+pub mod models;
 pub mod tool_output_trimmer;
 pub mod visualization;
 
