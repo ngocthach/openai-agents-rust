@@ -152,7 +152,7 @@ async fn mcp_approvals_and_prefixed_names() {
     assert_eq!(manager.active_servers().len(), 1);
 
     let model = Arc::new(FakeModel::new());
-    model.add_turn(vec![function_call("ops_add", r#"{"a":1,"b":2}"#)]);
+    model.add_turn(vec![function_call("mcp_ops__add", r#"{"a":1,"b":2}"#)]);
     let agent = Agent::<()>::new("Ops")
         .with_mcp_server(server.clone())
         .with_mcp_config(MCPConfig {

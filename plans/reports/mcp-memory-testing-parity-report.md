@@ -75,12 +75,18 @@ Audit rows addressed: 46, 62, 67, 73, 103, 104, 123, 125, 126, 127.
   so a title-only MCP tool no longer reaches the model as a blank function.
 - `f.mcp_server_name` is now the sanitized log name (it only feeds span `mcp_data.server`;
   nothing looks servers up by it — verified by grep).
-- **Hash disambiguation** replaces the hard `Duplicate tool names` error when
-  `include_server_in_tool_names` is on: `shorten_tool_name` /
+- **Derived tool names now match Python exactly.** With `include_server_in_tool_names` on, the
+  base name is `mcp_<server>__<tool>` (was `<server>_<tool>`), each part sanitized to ASCII
+  alphanumerics/`_`/`-` and trimmed of leading and trailing separators, with the server part
+  taken from the sanitized log name. `shorten_tool_name` /
   `build_prefixed_tool_name_overrides` allocate bounded (≤ 64 char), collision-free names
-  deterministically, honoring a `reserved` set. New public
-  `get_all_function_tools_with_reserved(..., reserved)`; `get_all_function_tools` delegates
-  with an empty set.
+  deterministically, honoring a `reserved` set, replacing the hard `Duplicate tool names`
+  error. The disambiguation suffix is `hashlib.sha1(seed).hexdigest()[:8]` — the Rust side
+  uses the `sha1` crate and `src/mcp/util.rs::tests::hashes_match_python_sha1` plus the exact
+  expected names in `disambiguates_prefixed_tool_names` pin it byte for byte against values
+  computed with CPython. Explicit names (`include_server_in_tool_names` off) are unchanged.
+  New public `get_all_function_tools_with_reserved(..., reserved)`; `get_all_function_tools`
+  delegates with an empty set.
 
 **`tests/fixtures/mock_mcp_server.py`** gained `resources/list`, `resources/templates/list`,
 `resources/read`, a title-only tool (`titled_only`) and an `echo_meta` tool that echoes the
@@ -197,18 +203,14 @@ each backend calls `resolve_session_limit(limit, self.session_settings)`.
    `__init__` when wrapping an `OpenAIConversationsSession`. Changing `new` to return `Result`
    is a breaking public change, so `try_new` was added and `new` defers the same `UserError` to
    first use. If a breaking change is acceptable, `new` should become `try_new`.
-2. **Derived MCP tool names keep the `{server}_{tool}` base format.** Python uses
-   `mcp_{server}__{tool}`. Switching would rename every persisted/prompted tool name, so it is
-   left as a user decision; only the *disambiguation* behaviour was brought to parity. Two
-   smaller name changes **do** happen, both matching Python: the server part is now the
-   sanitized log name (so a URL-derived server name loses its credentials and query), and
-   leading/trailing `_`/`-` are trimmed from each part (a server literally named `srv_` now
-   yields `srv_tool`, not `srv__tool`).
-3. **Tool-name hash suffix is FNV-1a, not SHA-1.** Python truncates a SHA-1 hex digest. No hash
-   crate is available under the `mcp` feature and `Cargo.toml` is off-limits, so a deterministic
-   built-in hash is used. Suffix *values* therefore differ from Python; collision behaviour and
-   length bounds match. If SHA-1 parity matters:
-   `NEEDS_CONTEXT: Cargo.toml line 26 — mcp = ["dep:rmcp", "dep:sha1"]` (plus a `sha1` dependency entry).
+2. **Derived MCP tool names switched to Python's `mcp_{server}__{tool}`** (coordinator
+   decision). This renames every tool an agent exposes with `include_server_in_tool_names`
+   on: `ops_add` is now `mcp_ops__add`. Explicit names are untouched. `MCPConfig
+   ::include_server_in_tool_names` is documented in `src/agent.rs` (another agent's file) as
+   "Prefix local MCP tool names with their server name", which stays accurate; the exact
+   format is documented on `mcp::util::prefixed_tool_base_name`.
+3. **Tool-name hash suffix is SHA-1, matching Python byte for byte** (coordinator decision;
+   `sha1` 0.11 is now enabled by the `mcp` feature).
 4. **`ConversationTurn.content` is now a 100-char preview** (was the full text) and the struct
    gained two fields. `full_content` carries what `content` used to. In-repo callers were
    updated.
@@ -286,8 +288,22 @@ cargo test   --features mcp,sqlite,encrypt,redis,voice
 Also run: `cargo check --offline --features mongodb,sqlx` (the two backends edited for
 `resolve_session_limit` that are outside the verification feature set) — clean.
 
-Result: all 21 test targets pass (including 14 doctests). Clippy reports **no diagnostics in
-any file in this scope**; it fails overall only on pre-existing issues in
-`src/run_internal/{history,items,mod,tool_caller}.rs`, which belong to another agent. Because
-`-D warnings` makes the lib build fail there, the integration-test targets are skipped under
-the exact command; they were linted separately without `-D warnings` and are clean.
+Result: the full suite passes (21 targets incl. 14 doctests), `cargo clippy --features
+mcp,sqlite,encrypt,redis,voice --all-targets -- -D warnings` exits 0 across the workspace, and
+`cargo check --offline --features mongodb,sqlx` is clean.
+
+Known flake, pre-existing and unrelated: `tests/mcp_tests.rs::agent_calls_tools_over_legacy_sse`
+failed once under full-suite parallelism with a transport send error against its in-test mock
+SSE server (the mock serves one connection per accept and races teardown). It passed in three
+consecutive isolated runs and in every other full-suite run.
+
+## Follow-up applied after the coordinator's decisions
+
+- Derived tool names now use Python's `mcp_{server}__{tool}`; `tests/mcp_tests.rs` was updated
+  (`ops_add` → `mcp_ops__add`).
+- The disambiguation hash is SHA-1 via the `sha1` crate, pinned against CPython-computed values
+  in `src/mcp/util.rs::tests::{hashes_match_python_sha1, disambiguates_prefixed_tool_names}`.
+- `_ignore_ids_for_matching` landed in `src/memory/openai_responses_compaction_session.rs` from
+  the core-runner agent while this was in flight; its unit tests were briefly out of sync with
+  the new `match_model_exchange_suffix` arity and that agent fixed them. Nothing was changed
+  here for it.

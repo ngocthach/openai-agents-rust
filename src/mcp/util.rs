@@ -42,18 +42,19 @@ fn safe_tool_name_part(value: &str, fallback: &str) -> String {
     }
 }
 
-/// A stable 64-bit FNV-1a digest of `seed`, rendered as lowercase hex.
+/// The first [`TOOL_NAME_HASH_LENGTH`] hex characters of `seed`'s SHA-1 digest.
 ///
-/// Only used to disambiguate derived tool names, so the digest needs to be deterministic across
-/// processes, not cryptographic. Python uses a truncated SHA-1 for the same purpose; the Rust
-/// port has no hash dependency under the `mcp` feature, so the suffix values differ.
+/// Only used to disambiguate derived tool names, so what matters is that it is deterministic and
+/// matches Python's `hashlib.sha1(seed.encode("utf-8")).hexdigest()[:8]` byte for byte.
 fn name_hash(seed: &str) -> String {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in seed.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x1000_0000_01b3);
+    use sha1::{Digest, Sha1};
+    let digest = Sha1::digest(seed.as_bytes());
+    let mut hex = String::with_capacity(TOOL_NAME_HASH_LENGTH);
+    for byte in digest.iter().take(TOOL_NAME_HASH_LENGTH.div_ceil(2)) {
+        hex.push_str(&format!("{byte:02x}"));
     }
-    format!("{hash:016x}")[..TOOL_NAME_HASH_LENGTH].to_string()
+    hex.truncate(TOOL_NAME_HASH_LENGTH);
+    hex
 }
 
 /// Shorten `base_name` to the tool-name length limit, appending a hash of `seed`.
@@ -76,10 +77,10 @@ fn shorten_tool_name(base_name: &str, seed: &str, force_hash: bool) -> String {
     format!("{stem}{suffix}")
 }
 
-/// The base public name of an MCP tool exposed with its server name.
+/// The base public name of an MCP tool exposed with its server name: `mcp_<server>__<tool>`.
 fn prefixed_tool_base_name(server_name: &str, tool_name: &str) -> String {
     format!(
-        "{}_{}",
+        "mcp_{}__{}",
         safe_tool_name_part(server_name, "server"),
         safe_tool_name_part(tool_name, "tool")
     )
@@ -432,8 +433,18 @@ mod tests {
                 vec!["x".repeat(80), "plain".to_string()],
             ),
         ];
-        let reserved: HashSet<String> = ["long_plain".to_string()].into_iter().collect();
+        let reserved: HashSet<String> = ["mcp_long__plain".to_string()].into_iter().collect();
         let names = build_prefixed_tool_name_overrides(&batches, &reserved);
+
+        // The exact names Python's `_build_prefixed_tool_name_overrides` produces for this
+        // batch, hash suffixes included.
+        assert_eq!(names[&(0, 0)], "mcp_my_server__read_9e4bab56");
+        assert_eq!(names[&(1, 0)], "mcp_my_server__read_97f2cfe8");
+        assert_eq!(
+            names[&(2, 0)],
+            format!("mcp_long__{}_ad4e26c9", "x".repeat(45))
+        );
+        assert_eq!(names[&(2, 1)], "mcp_long__plain_a2634f9a");
 
         let allocated: Vec<&String> = names.values().collect();
         let unique: HashSet<&String> = allocated.iter().copied().collect();
@@ -444,21 +455,11 @@ mod tests {
         );
         assert!(allocated.iter().all(|n| n.len() <= TOOL_NAME_MAX_LENGTH));
         assert!(
-            !unique.contains(&"long_plain".to_string()),
+            !unique.contains(&"mcp_long__plain".to_string()),
             "reserved name reused"
         );
-        // The 80-character tool name is cut down to the limit, hash suffix included.
+        // The 80-character tool name is cut down to exactly the limit, hash suffix included.
         assert_eq!(names[&(2, 0)].len(), TOOL_NAME_MAX_LENGTH);
-        // A short, unique, unreserved name keeps its base form.
-        assert_eq!(
-            names[&(0, 0)].len(),
-            TOOL_NAME_MAX_LENGTH.min(names[&(0, 0)].len())
-        );
-        assert!(
-            names[&(0, 0)].starts_with("my_server_read_"),
-            "{:?}",
-            names[&(0, 0)]
-        );
         // Allocation is deterministic.
         assert_eq!(
             build_prefixed_tool_name_overrides(&batches, &reserved),
@@ -467,9 +468,25 @@ mod tests {
     }
 
     #[test]
+    fn hashes_match_python_sha1() {
+        // `hashlib.sha1(seed.encode("utf-8")).hexdigest()[:8]`.
+        assert_eq!(name_hash("srv\u{0}tool"), "f1a04abf");
+        assert_eq!(name_hash("long\u{0}plain"), "a2634f9a");
+        // A short, unique, unreserved name keeps its base form.
+        assert_eq!(
+            shorten_tool_name("mcp_srv__tool", "srv\u{0}tool", false),
+            "mcp_srv__tool"
+        );
+        assert_eq!(
+            shorten_tool_name("mcp_srv__tool", "srv\u{0}tool", true),
+            "mcp_srv__tool_f1a04abf"
+        );
+    }
+
+    #[test]
     fn sanitizes_name_parts() {
         assert_eq!(safe_tool_name_part("__", "fallback"), "fallback");
         assert_eq!(safe_tool_name_part("a b/c", "x"), "a_b_c");
-        assert_eq!(prefixed_tool_base_name("srv", "tool"), "srv_tool");
+        assert_eq!(prefixed_tool_base_name("srv", "tool"), "mcp_srv__tool");
     }
 }
