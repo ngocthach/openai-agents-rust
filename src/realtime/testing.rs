@@ -8,7 +8,10 @@ use tokio::sync::mpsc;
 
 use crate::error::{AgentsError, Result};
 use crate::realtime::config::RealtimeSessionModelSettings;
-use crate::realtime::model::{RealtimeModel, RealtimeModelConfig, RealtimeModelEvents};
+use crate::realtime::model::{
+    RealtimeModel, RealtimeModelConfig, RealtimeModelEvents, RealtimePlaybackTracker,
+    RealtimeSendCondition,
+};
 use crate::realtime::model_events::RealtimeModelEvent;
 use crate::realtime::model_inputs::RealtimeModelSendEvent;
 
@@ -19,6 +22,8 @@ struct FakeState {
     sender: Option<mpsc::UnboundedSender<RealtimeModelEvent>>,
     connected: bool,
     close_calls: usize,
+    skipped_conditional_sends: usize,
+    retired_responses: Vec<String>,
 }
 
 /// A [`RealtimeModel`] that records what the session sends and emits exactly what a test asks for.
@@ -121,6 +126,33 @@ impl FakeRealtimeModel {
             .collect()
     }
 
+    /// The interruptions the session sent, in order.
+    pub fn interrupts(&self) -> Vec<crate::realtime::model_inputs::RealtimeInterrupt> {
+        self.lock()
+            .sent_events
+            .iter()
+            .filter_map(|event| event.as_interrupt().cloned())
+            .collect()
+    }
+
+    /// Responses whose transport audio the session asked to release, in order.
+    pub fn retired_responses(&self) -> Vec<String> {
+        self.lock().retired_responses.clone()
+    }
+
+    /// How many conditional sends were dropped because their condition no longer held.
+    pub fn skipped_conditional_sends(&self) -> usize {
+        self.lock().skipped_conditional_sends
+    }
+
+    /// The playback tracker the session connected with, if any.
+    pub fn playback_tracker(&self) -> Option<Arc<RealtimePlaybackTracker>> {
+        self.lock()
+            .connect_calls
+            .last()
+            .and_then(|call| call.playback_tracker.clone())
+    }
+
     /// The outputs the session sent back for tool calls, as `(call_id, output)` pairs.
     pub fn tool_outputs(&self) -> Vec<(String, String)> {
         self.lock()
@@ -149,6 +181,8 @@ impl FakeRealtimeModel {
         let mut state = self.lock();
         state.connect_calls.clear();
         state.sent_events.clear();
+        state.retired_responses.clear();
+        state.skipped_conditional_sends = 0;
     }
 }
 
@@ -174,6 +208,31 @@ impl RealtimeModel for FakeRealtimeModel {
             ));
         }
         state.sent_events.push(event);
+        Ok(())
+    }
+
+    async fn send_event_if(
+        &self,
+        event: RealtimeModelSendEvent,
+        condition: RealtimeSendCondition,
+    ) -> Result<bool> {
+        let mut state = self.lock();
+        if !state.connected {
+            return Err(AgentsError::user(
+                "The fake realtime model is not connected.",
+            ));
+        }
+        // The fake transport has no write boundary to race with, so the check is exact.
+        if !condition() {
+            state.skipped_conditional_sends += 1;
+            return Ok(false);
+        }
+        state.sent_events.push(event);
+        Ok(true)
+    }
+
+    async fn retire_response_audio(&self, response_id: &str) -> Result<()> {
+        self.lock().retired_responses.push(response_id.to_string());
         Ok(())
     }
 

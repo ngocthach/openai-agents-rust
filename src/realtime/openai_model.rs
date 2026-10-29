@@ -1,5 +1,6 @@
 //! The OpenAI realtime WebSocket transport. Mirrors `agents.realtime.openai_realtime`.
 
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -20,21 +21,26 @@ use tokio_tungstenite::tungstenite::protocol::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 use crate::error::{AgentsError, Result};
+use crate::realtime::agent::RealtimeAgent;
 use crate::realtime::config::{
     DEFAULT_INPUT_AUDIO_TRANSCRIPTION_MODEL, DEFAULT_REALTIME_MODEL, DEFAULT_REALTIME_VOICE,
-    RealtimeModelTracing, RealtimeSessionModelSettings, RealtimeTurnDetectionConfig,
+    RealtimeModelTracing, RealtimeRunConfig, RealtimeSessionModelSettings,
+    RealtimeTurnDetectionConfig,
 };
 use crate::realtime::items::{
     RealtimeContent, RealtimeItem, RealtimeMessageItem, RealtimeMessageRole, RealtimeToolCallItem,
 };
 use crate::realtime::model::{
-    RealtimeModel, RealtimeModelConfig, RealtimeModelEvents, calculate_audio_length_ms,
+    RealtimeModel, RealtimeModelConfig, RealtimeModelEvents, RealtimePlaybackState,
+    RealtimePlaybackTracker, RealtimeSendCondition, calculate_audio_length_ms,
 };
 use crate::realtime::model_events::{
     RealtimeConnectionStatus, RealtimeModelAudioEvent, RealtimeModelEvent,
     RealtimeModelToolCallEvent,
 };
-use crate::realtime::model_inputs::RealtimeModelSendEvent;
+use crate::realtime::model_inputs::{RealtimeInterrupt, RealtimeModelSendEvent};
+use crate::realtime::session::build_model_settings_from_agent;
+use crate::run_context::RunContext;
 use crate::usage::Usage;
 
 /// The default realtime WebSocket endpoint.
@@ -42,69 +48,134 @@ const DEFAULT_REALTIME_URL: &str = "wss://api.openai.com/v1/realtime";
 
 type WsSink = SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>;
 
-/// What the transport knows about the audio it has received.
-#[derive(Debug, Default)]
-struct AudioTracker {
-    format: Option<String>,
-    last_item: Option<(String, usize)>,
-    length_ms: f64,
-    first_received: Option<Instant>,
+/// What the transport received for one `(item_id, content_index)` pair.
+#[derive(Debug, Clone)]
+struct ModelAudioState {
+    initial_received: Instant,
+    audio_length_ms: f64,
+    response_id: Option<String>,
 }
 
-impl AudioTracker {
-    fn on_delta(&mut self, item_id: &str, content_index: usize, bytes: &[u8]) {
+/// The transport's own record of the audio it has sent out, keyed by item and by response.
+///
+/// Port of `agents.realtime._default_tracker.ModelAudioTracker`. Response-scoped bookkeeping is
+/// what lets an interruption target one response without disturbing a newer one.
+#[derive(Debug, Default)]
+struct ModelAudioTracker {
+    format: Option<String>,
+    states: HashMap<(String, usize), ModelAudioState>,
+    last_audio_item: Option<(String, usize)>,
+    items_by_response: HashMap<String, Vec<(String, usize)>>,
+}
+
+impl ModelAudioTracker {
+    fn set_audio_format(&mut self, format: impl Into<String>) {
+        self.format = Some(format.into());
+    }
+
+    fn on_audio_delta(
+        &mut self,
+        item_id: &str,
+        content_index: usize,
+        bytes: &[u8],
+        response_id: Option<&str>,
+    ) {
         let ms = calculate_audio_length_ms(self.format.as_deref(), bytes);
         let key = (item_id.to_string(), content_index);
-        if self.last_item.as_ref() != Some(&key) {
-            self.last_item = Some(key);
-            self.length_ms = ms;
-            self.first_received = Some(Instant::now());
-        } else {
-            self.length_ms += ms;
+        self.last_audio_item = Some(key.clone());
+        if let Some(response_id) = response_id {
+            let items = self
+                .items_by_response
+                .entry(response_id.to_string())
+                .or_default();
+            if !items.contains(&key) {
+                items.push(key.clone());
+            }
+        }
+        match self.states.get_mut(&key) {
+            Some(state) => {
+                state.audio_length_ms += ms;
+                if let Some(response_id) = response_id {
+                    state.response_id = Some(response_id.to_string());
+                }
+            }
+            None => {
+                self.states.insert(
+                    key,
+                    ModelAudioState {
+                        initial_received: Instant::now(),
+                        audio_length_ms: ms,
+                        response_id: response_id.map(str::to_string),
+                    },
+                );
+            }
         }
     }
 
     fn on_interrupted(&mut self) {
-        self.last_item = None;
-        self.length_ms = 0.0;
-        self.first_received = None;
+        if let Some(last) = self.last_audio_item.take()
+            && let Some(state) = self.states.get(&last)
+            && let Some(response_id) = state.response_id.clone()
+        {
+            self.items_by_response.remove(&response_id);
+        }
     }
 
-    /// The item being played and how much of it the client has had time to play.
-    fn playback_state(&self) -> Option<PlaybackState> {
-        let (item_id, content_index) = self.last_item.clone()?;
-        let elapsed_ms = self.first_received?.elapsed().as_secs_f64() * 1000.0;
-        Some(PlaybackState {
-            item_id,
-            content_index,
-            elapsed_ms: elapsed_ms.clamp(0.0, self.length_ms),
-            length_ms: self.length_ms,
-        })
+    /// Release the indexes of one response, keeping a newer response's audio intact.
+    fn on_response_interrupted(&mut self, response_id: &str) {
+        if let Some(items) = self.items_by_response.remove(response_id)
+            && let Some(last) = self.last_audio_item.as_ref()
+            && items.contains(last)
+        {
+            self.last_audio_item = None;
+        }
+    }
+
+    fn on_response_done(&mut self, response_id: &str) {
+        self.items_by_response.remove(response_id);
+    }
+
+    fn state(&self, item_id: &str, content_index: usize) -> Option<&ModelAudioState> {
+        self.states.get(&(item_id.to_string(), content_index))
+    }
+
+    fn last_audio_item(&self) -> Option<(String, usize)> {
+        self.last_audio_item.clone()
+    }
+
+    fn audio_items_for_response(&self, response_id: &str) -> Vec<(String, usize)> {
+        self.items_by_response
+            .get(response_id)
+            .cloned()
+            .unwrap_or_default()
     }
 }
 
-/// How far the client has had time to play the audio it received.
-#[derive(Debug, Clone, PartialEq)]
-struct PlaybackState {
-    item_id: String,
-    content_index: usize,
-    elapsed_ms: f64,
-    length_ms: f64,
+/// Where playback is, from the tracker the application supplied or the transport's own estimate.
+#[derive(Debug, Clone, PartialEq, Default)]
+struct PlaybackPosition {
+    item_id: Option<String>,
+    content_index: Option<usize>,
+    elapsed_ms: Option<f64>,
 }
 
-impl PlaybackState {
-    /// Where to truncate the item, never past the audio the client actually received.
-    fn truncate_ms(&self) -> i64 {
-        let max_ms = self.length_ms.ceil();
-        self.elapsed_ms.floor().clamp(0.0, max_ms) as i64
+impl PlaybackPosition {
+    /// The item being played, with its content index defaulted as Python does.
+    fn audio_item(&self) -> Option<(String, usize)> {
+        Some((
+            self.item_id.clone()?,
+            self.content_index.unwrap_or_default(),
+        ))
     }
+}
 
-    /// Whether the client has played everything the model sent.
-    ///
-    /// `elapsed_ms` is clamped to `length_ms` when the state is built, so equality means the
-    /// client has had time to play every byte received.
-    fn is_complete(&self) -> bool {
-        self.elapsed_ms >= self.length_ms
+impl From<RealtimePlaybackState> for PlaybackPosition {
+    fn from(value: RealtimePlaybackState) -> Self {
+        PlaybackPosition {
+            item_id: value.current_item_id,
+            content_index: value.current_item_content_index,
+            elapsed_ms: value.elapsed_ms,
+        }
     }
 }
 
@@ -113,8 +184,13 @@ struct WsState {
     model: String,
     tracing: Option<RealtimeModelTracing>,
     call_id: Option<String>,
-    audio: AudioTracker,
+    audio: ModelAudioTracker,
+    /// Responses whose buffered audio was interrupted; their later deltas are dropped.
+    interrupted_audio_response_ids: HashSet<String>,
     ongoing_response: bool,
+    ongoing_response_id: Option<String>,
+    /// A `response.cancel` was sent for the active response and not yet resolved.
+    cancel_requested: bool,
     /// A `response.create` was sent and neither `response.created` nor a matching error arrived.
     create_in_flight: Option<String>,
     /// A response was requested while one was running or in flight.
@@ -143,14 +219,88 @@ impl WsState {
         event_id
     }
 
-    fn on_response_created(&mut self) {
+    fn on_response_created(&mut self, response_id: Option<&str>) {
         self.create_in_flight = None;
         self.ongoing_response = true;
+        self.ongoing_response_id = response_id.map(str::to_string);
+        self.cancel_requested = false;
+    }
+
+    /// Whether a `response.cancel` should go out now, mirroring `begin_cancel_response`.
+    ///
+    /// The server rejects a cancel when no response is active, so a barge-in that lands after the
+    /// response ended, a duplicate cancel, or a cancel aimed at a response that is no longer the
+    /// active one must stay local.
+    fn begin_cancel(&mut self, response_id: Option<&str>) -> bool {
+        if !self.ongoing_response || self.cancel_requested {
+            return false;
+        }
+        if let (Some(requested), Some(ongoing)) = (response_id, self.ongoing_response_id.as_deref())
+            && requested != ongoing
+        {
+            return false;
+        }
+        self.cancel_requested = true;
+        true
+    }
+
+    /// Release the cancel slot when the send failed, so a later attempt is not swallowed.
+    fn release_cancel(&mut self) {
+        self.cancel_requested = false;
+    }
+
+    /// Whether the response now generating is the one that produced this item's audio.
+    ///
+    /// Interruption is preserved when ownership is unknown: with known identities, only the
+    /// response that produced an item can extend its received audio.
+    fn ongoing_response_owns_audio(&self, item_id: &str, content_index: usize) -> bool {
+        if !self.ongoing_response {
+            return false;
+        }
+        let (Some(response_id), Some(state)) = (
+            self.ongoing_response_id.as_deref(),
+            self.audio.state(item_id, content_index),
+        ) else {
+            return true;
+        };
+        match state.response_id.as_deref() {
+            None => true,
+            Some(owner) => owner == response_id,
+        }
+    }
+
+    /// The millisecond ceiling of the audio actually received for an item.
+    fn max_audio_ms(&self, item_id: &str, content_index: usize) -> Option<i64> {
+        self.audio
+            .state(item_id, content_index)
+            .map(|state| state.audio_length_ms.ceil() as i64)
+    }
+
+    /// Where playback is, from the application's tracker or the transport's own estimate.
+    fn playback_position(
+        &self,
+        playback_tracker: Option<&RealtimePlaybackTracker>,
+    ) -> PlaybackPosition {
+        if let Some(tracker) = playback_tracker {
+            return tracker.state().into();
+        }
+        if let Some((item_id, content_index)) = self.audio.last_audio_item()
+            && let Some(state) = self.audio.state(&item_id, content_index)
+        {
+            return PlaybackPosition {
+                item_id: Some(item_id),
+                content_index: Some(content_index),
+                elapsed_ms: Some(state.initial_received.elapsed().as_secs_f64() * 1000.0),
+            };
+        }
+        PlaybackPosition::default()
     }
 
     /// Clear the active response and return the `event_id` of a deferred create to send now.
     fn on_response_done(&mut self) -> Option<String> {
         self.ongoing_response = false;
+        self.ongoing_response_id = None;
+        self.cancel_requested = false;
         if self.pending_response_create && self.create_in_flight.is_none() {
             self.pending_response_create = false;
             return Some(self.begin_response_create());
@@ -198,6 +348,7 @@ impl WsState {
 
 struct WsInner {
     sink: tokio::sync::Mutex<Option<WsSink>>,
+    playback_tracker: Mutex<Option<Arc<RealtimePlaybackTracker>>>,
     events: Mutex<Option<mpsc::UnboundedSender<RealtimeModelEvent>>>,
     state: Mutex<WsState>,
     reader: Mutex<Option<JoinHandle<()>>>,
@@ -235,6 +386,7 @@ impl OpenAIRealtimeWebSocketModel {
         OpenAIRealtimeWebSocketModel {
             inner: Arc::new(WsInner {
                 sink: tokio::sync::Mutex::new(None),
+                playback_tracker: Mutex::new(None),
                 events: Mutex::new(None),
                 state: Mutex::new(WsState {
                     model: DEFAULT_REALTIME_MODEL.to_string(),
@@ -274,6 +426,11 @@ impl RealtimeModel for OpenAIRealtimeWebSocketModel {
             ));
         }
 
+        *self
+            .inner
+            .playback_tracker
+            .lock()
+            .expect("realtime model poisoned") = config.playback_tracker.clone();
         {
             let mut state = self.inner.state.lock().expect("realtime model poisoned");
             if let Some(model) = &settings.model_name {
@@ -287,15 +444,17 @@ impl RealtimeModel for OpenAIRealtimeWebSocketModel {
                     .unwrap_or(RealtimeModelTracing::Auto),
             );
             state.ongoing_response = false;
+            state.ongoing_response_id = None;
+            state.cancel_requested = false;
             state.pending_response_create = false;
             state.create_in_flight = None;
         }
 
-        let url = match (&config.url, &config.call_id) {
-            (Some(url), _) => url.clone(),
-            (None, Some(call_id)) => format!("{DEFAULT_REALTIME_URL}?call_id={call_id}"),
-            (None, None) => format!("{DEFAULT_REALTIME_URL}?model={}", self.model_name()),
-        };
+        let url = connect_url(
+            config.url.as_deref(),
+            config.call_id.as_deref(),
+            &self.model_name(),
+        );
 
         let mut request = url
             .clone()
@@ -429,13 +588,47 @@ impl RealtimeModel for OpenAIRealtimeWebSocketModel {
                 }
                 Ok(())
             }
-            RealtimeModelSendEvent::Interrupt {
-                force_response_cancel,
-            } => self.inner.send_interrupt(force_response_cancel).await,
+            RealtimeModelSendEvent::Interrupt(interrupt) => {
+                self.inner.send_interrupt(&interrupt).await
+            }
             RealtimeModelSendEvent::SessionUpdate { session_settings } => {
                 self.inner.send_session_update(&session_settings).await
             }
         }
+    }
+
+    async fn send_event_if(
+        &self,
+        event: RealtimeModelSendEvent,
+        condition: RealtimeSendCondition,
+    ) -> Result<bool> {
+        // Only user input is safe to recheck here: it is the one event whose payload does not
+        // depend on transport state captured before the await.
+        let RealtimeModelSendEvent::UserInput { user_input } = &event else {
+            return Ok(false);
+        };
+        // A deferred `response.create` means the model has not answered the previous input yet.
+        let pending = {
+            let state = self.inner.state.lock().expect("realtime model poisoned");
+            state.pending_response_create || state.create_in_flight.is_some()
+        };
+        if pending || !condition() {
+            return Ok(false);
+        }
+        let message = json!({
+            "type": "conversation.item.create",
+            "item": user_input.to_conversation_item(),
+        });
+        if !self.inner.send_raw_if(message, condition.as_ref()).await? {
+            return Ok(false);
+        }
+        self.inner.request_response_create().await?;
+        Ok(true)
+    }
+
+    async fn retire_response_audio(&self, response_id: &str) -> Result<()> {
+        self.inner.retire_response_audio_state(response_id);
+        Ok(())
     }
 
     async fn close(&self) -> Result<()> {
@@ -453,12 +646,164 @@ impl RealtimeModel for OpenAIRealtimeWebSocketModel {
             reader.abort();
         }
         *self.inner.events.lock().expect("realtime model poisoned") = None;
+        if let Some(tracker) = self
+            .inner
+            .playback_tracker
+            .lock()
+            .expect("realtime model poisoned")
+            .take()
+        {
+            // A reused model must not report the closed session's item on its next connection.
+            tracker.on_interrupted();
+        }
         let mut state = self.inner.state.lock().expect("realtime model poisoned");
-        state.audio = AudioTracker::default();
+        state.audio = ModelAudioTracker::default();
+        state.interrupted_audio_response_ids.clear();
         state.ongoing_response = false;
+        state.ongoing_response_id = None;
+        state.cancel_requested = false;
         state.pending_response_create = false;
         state.create_in_flight = None;
         Ok(())
+    }
+}
+
+/// A realtime transport that attaches to an existing SIP-originated call.
+///
+/// The Realtime Calls API hands your webhook a `call_id`. Accept the call by POSTing a session
+/// payload to `/v1/realtime/calls/{call_id}/accept`, then attach this transport with the same
+/// `call_id`: it connects to `wss://api.openai.com/v1/realtime?call_id=...` instead of starting a
+/// new session, and leaves the audio formats to the ones the call negotiated.
+///
+/// Build the accept payload with
+/// [`OpenAIRealtimeSIPModel::build_initial_session_payload`] so the call starts with the same
+/// instructions, tools and handoffs the session would later send.
+///
+/// ```no_run
+/// # use std::sync::Arc;
+/// # use openai_agents_sdk::realtime::{
+/// #     OpenAIRealtimeSIPModel, RealtimeAgent, RealtimeModelConfig, RealtimeRunner,
+/// # };
+/// # async fn demo(call_id: &str) -> Result<(), Box<dyn std::error::Error>> {
+/// let agent = RealtimeAgent::<()>::new("Assistant")
+///     .with_instructions("You answer the phone politely")
+///     .into_arc();
+///
+/// // 1. Accept the call with the agent's own session payload.
+/// let payload =
+///     OpenAIRealtimeSIPModel::build_initial_session_payload(&agent, (), None, None, None).await?;
+/// // POST `payload` to /v1/realtime/calls/{call_id}/accept with your HTTP client of choice.
+/// assert_eq!(payload["type"], "realtime");
+///
+/// // 2. Attach to the accepted call.
+/// let session = RealtimeRunner::new(agent)
+///     .with_model(Arc::new(OpenAIRealtimeSIPModel::new()))
+///     .with_model_config(RealtimeModelConfig::new().with_call_id(call_id))
+///     .run(())
+///     .await?;
+/// # let _ = session;
+/// # Ok(())
+/// # }
+/// ```
+pub struct OpenAIRealtimeSIPModel {
+    inner: OpenAIRealtimeWebSocketModel,
+}
+
+impl Default for OpenAIRealtimeSIPModel {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Debug for OpenAIRealtimeSIPModel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OpenAIRealtimeSIPModel")
+            .field("model", &self.inner.model_name())
+            .finish_non_exhaustive()
+    }
+}
+
+impl OpenAIRealtimeSIPModel {
+    /// A disconnected SIP transport.
+    pub fn new() -> Self {
+        OpenAIRealtimeSIPModel {
+            inner: OpenAIRealtimeWebSocketModel::new(),
+        }
+    }
+
+    /// The realtime model name this transport reports.
+    pub fn model_name(&self) -> String {
+        self.inner.model_name()
+    }
+
+    /// Build the session payload that accepts a SIP call, mirroring what a session would send.
+    ///
+    /// `overrides` is applied last, after the run config, the connect-time settings and the
+    /// agent's own instructions, tools and handoffs. Port of `build_initial_session_payload`.
+    pub async fn build_initial_session_payload<C: Send + Sync + 'static>(
+        agent: &Arc<RealtimeAgent<C>>,
+        context: C,
+        model_config: Option<&RealtimeModelConfig>,
+        run_config: Option<&RealtimeRunConfig<C>>,
+        overrides: Option<&RealtimeSessionModelSettings>,
+    ) -> Result<Value> {
+        let starting = model_config.and_then(|config| config.initial_model_settings.clone());
+        let mut base = run_config
+            .and_then(|config| config.model_settings.clone())
+            .unwrap_or_default();
+        if let Some(starting) = &starting {
+            base.merge(starting);
+        }
+
+        let run_context = RunContext::new(context);
+        let mut resolved = build_model_settings_from_agent(
+            agent,
+            &run_context,
+            &base,
+            starting.as_ref(),
+            run_config.is_some_and(|config| config.tracing_disabled),
+        )
+        .await?;
+        if let Some(overrides) = overrides {
+            resolved.settings.merge(overrides);
+        }
+
+        // A fresh transport, so the payload reflects only the settings, never a live connection.
+        Ok(OpenAIRealtimeWebSocketModel::new()
+            .inner
+            .session_payload(&resolved.settings))
+    }
+}
+
+#[async_trait]
+impl RealtimeModel for OpenAIRealtimeSIPModel {
+    async fn connect(&self, config: RealtimeModelConfig) -> Result<RealtimeModelEvents> {
+        if config.call_id.as_deref().unwrap_or_default().is_empty() {
+            return Err(AgentsError::user(
+                "OpenAIRealtimeSIPModel requires `call_id` in the model configuration.",
+            ));
+        }
+        self.inner.connect(config).await
+    }
+
+    async fn send_event(&self, event: RealtimeModelSendEvent) -> Result<()> {
+        self.inner.send_event(event).await
+    }
+
+    async fn send_event_if(
+        &self,
+        event: RealtimeModelSendEvent,
+        condition: RealtimeSendCondition,
+    ) -> Result<bool> {
+        self.inner.send_event_if(event, condition).await
+    }
+
+    async fn retire_response_audio(&self, response_id: &str) -> Result<()> {
+        self.inner.retire_response_audio(response_id).await
+    }
+
+    async fn close(&self) -> Result<()> {
+        self.inner.close().await
     }
 }
 
@@ -480,10 +825,47 @@ impl WsInner {
             .map_err(|e| AgentsError::other(format!("Realtime send failed: {e}")))
     }
 
+    /// Recheck `condition` at the write boundary, so the decision and the send are atomic.
+    async fn send_raw_if(
+        &self,
+        message: Value,
+        condition: &(dyn Fn() -> bool + Send + Sync),
+    ) -> Result<bool> {
+        let payload = message.to_string();
+        let mut guard = self.sink.lock().await;
+        let sink = guard
+            .as_mut()
+            .ok_or_else(|| AgentsError::user("The realtime model is not connected."))?;
+        if !condition() {
+            return Ok(false);
+        }
+        sink.send(Message::text(payload))
+            .await
+            .map_err(|e| AgentsError::other(format!("Realtime send failed: {e}")))?;
+        Ok(true)
+    }
+
     async fn send_session_update(&self, settings: &RealtimeSessionModelSettings) -> Result<()> {
         let session = self.session_payload(settings);
         self.send_raw(json!({"type": "session.update", "session": session}))
             .await
+    }
+
+    /// Record the audio format the session negotiated on both audio trackers.
+    fn set_audio_format(&self, format: &str) {
+        self.state
+            .lock()
+            .expect("realtime model poisoned")
+            .audio
+            .set_audio_format(format);
+        if let Some(tracker) = self
+            .playback_tracker
+            .lock()
+            .expect("realtime model poisoned")
+            .as_deref()
+        {
+            tracker.set_audio_format(format);
+        }
     }
 
     /// Build the `session` object of a `session.update`, mirroring `_get_session_config`.
@@ -644,12 +1026,17 @@ impl WsInner {
     }
 
     /// Tell the server how much of an item's audio the client actually played.
-    async fn send_truncate(&self, playback: &PlaybackState) -> Result<()> {
+    async fn send_truncate(
+        &self,
+        item_id: &str,
+        content_index: usize,
+        audio_end_ms: i64,
+    ) -> Result<()> {
         self.send_raw(json!({
             "type": "conversation.item.truncate",
-            "item_id": playback.item_id,
-            "content_index": playback.content_index,
-            "audio_end_ms": playback.truncate_ms(),
+            "item_id": item_id,
+            "content_index": content_index,
+            "audio_end_ms": audio_end_ms,
         }))
         .await
     }
@@ -669,33 +1056,221 @@ impl WsInner {
         result
     }
 
-    async fn send_interrupt(&self, force_response_cancel: bool) -> Result<()> {
-        let (playback, ongoing, automatic) = {
-            let state = self.state.lock().expect("realtime model poisoned");
-            (
-                state.audio.playback_state(),
-                state.ongoing_response,
-                state.automatic_response_cancellation,
-            )
+    /// Stop audio playback, truncating the item at the point the user actually heard.
+    ///
+    /// Port of `_interrupt_audio_playback`. A response-scoped interruption only touches audio that
+    /// response produced, so a guardrail tripping on an older response cannot cut off a newer one.
+    async fn interrupt_audio_playback(&self, interrupt: &RealtimeInterrupt) -> Result<()> {
+        let playback_tracker = {
+            self.playback_tracker
+                .lock()
+                .expect("realtime model poisoned")
+                .clone()
         };
+        let response_scoped = interrupt.response_id.as_deref();
 
-        if let Some(playback) = playback {
-            self.emit(RealtimeModelEvent::AudioInterrupted {
-                item_id: playback.item_id.clone(),
-                content_index: playback.content_index,
-            });
-            self.send_truncate(&playback).await?;
+        let mut source_items: Vec<(String, usize)> = Vec::new();
+        if let Some(response_id) = response_scoped {
+            source_items = {
+                self.state
+                    .lock()
+                    .expect("realtime model poisoned")
+                    .audio
+                    .audio_items_for_response(response_id)
+            };
+            if source_items.is_empty() {
+                // This response produced no audio the transport still owns.
+                return Ok(());
+            }
+            for (item_id, content_index) in &source_items {
+                self.emit(RealtimeModelEvent::AudioInterrupted {
+                    item_id: item_id.clone(),
+                    content_index: *content_index,
+                });
+            }
+        }
+
+        let mut position = {
             self.state
                 .lock()
                 .expect("realtime model poisoned")
-                .audio
-                .on_interrupted();
+                .playback_position(playback_tracker.as_deref())
+        };
+        if let Some(response_id) = response_scoped
+            && !source_items.contains(&position.audio_item().unwrap_or_default())
+        {
+            // Playback may have moved on between the two reads; look once more before giving up.
+            position = {
+                self.state
+                    .lock()
+                    .expect("realtime model poisoned")
+                    .playback_position(playback_tracker.as_deref())
+            };
+            if !source_items.contains(&position.audio_item().unwrap_or_default()) {
+                self.state
+                    .lock()
+                    .expect("realtime model poisoned")
+                    .audio
+                    .on_response_interrupted(response_id);
+                return Ok(());
+            }
         }
 
-        if ongoing && (force_response_cancel || !automatic) {
-            self.send_raw(json!({"type": "response.cancel"})).await?;
+        let interrupted_item = match (position.item_id.clone(), position.elapsed_ms) {
+            (Some(item_id), Some(elapsed_ms)) => Some((item_id, elapsed_ms)),
+            _ => {
+                log::debug!(
+                    "Skipping realtime interrupt; item id {:?}, elapsed ms {:?}",
+                    position.item_id,
+                    position.elapsed_ms
+                );
+                None
+            }
+        };
+
+        let mut truncate_error = None;
+        if let Some((item_id, elapsed_ms)) = interrupted_item.clone() {
+            let content_index = position.content_index.unwrap_or_default();
+            if elapsed_ms >= 0.0 {
+                if response_scoped.is_none() {
+                    self.emit(RealtimeModelEvent::AudioInterrupted {
+                        item_id: item_id.clone(),
+                        content_index,
+                    });
+                }
+                let (max_audio_ms, owns_audio) = {
+                    let state = self.state.lock().expect("realtime model poisoned");
+                    (
+                        state.max_audio_ms(&item_id, content_index),
+                        state.ongoing_response_owns_audio(&item_id, content_index),
+                    )
+                };
+                let mut truncated_ms = (elapsed_ms as i64).max(0);
+                let should_truncate = (!interrupt.playback_only && owns_audio)
+                    || max_audio_ms.is_none_or(|max_ms| truncated_ms < max_ms);
+                if should_truncate {
+                    if let Some(max_ms) = max_audio_ms {
+                        truncated_ms = truncated_ms.min(max_ms);
+                    }
+                    truncate_error = self
+                        .send_truncate(&item_id, content_index, truncated_ms)
+                        .await
+                        .err();
+                } else {
+                    log::debug!(
+                        "Skipping realtime truncate; playback of {item_id} appears complete"
+                    );
+                }
+            } else {
+                log::debug!("Skipping realtime truncate; elapsed ms is negative");
+            }
         }
-        Ok(())
+
+        if interrupted_item.is_some() {
+            {
+                let mut state = self.state.lock().expect("realtime model poisoned");
+                match response_scoped {
+                    Some(response_id) => state.audio.on_response_interrupted(response_id),
+                    None => state.audio.on_interrupted(),
+                }
+            }
+            if let Some(tracker) = playback_tracker.as_deref() {
+                let latest = tracker.state().current_item_id.map(|item_id| {
+                    (
+                        item_id,
+                        tracker
+                            .state()
+                            .current_item_content_index
+                            .unwrap_or_default(),
+                    )
+                });
+                let still_ours = response_scoped.is_none()
+                    || latest.is_some_and(|item| source_items.contains(&item));
+                if still_ours {
+                    tracker.on_interrupted();
+                }
+            }
+        }
+
+        match truncate_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    async fn send_interrupt(&self, interrupt: &RealtimeInterrupt) -> Result<()> {
+        interrupt.validate()?;
+
+        if interrupt.cancel_response_only {
+            return self.cancel_response(interrupt.response_id.as_deref()).await;
+        }
+
+        if let Some(response_id) = &interrupt.response_id {
+            self.state
+                .lock()
+                .expect("realtime model poisoned")
+                .interrupted_audio_response_ids
+                .insert(response_id.clone());
+        }
+
+        let playback_error = self.interrupt_audio_playback(interrupt).await.err();
+
+        if !interrupt.playback_only {
+            let automatic = {
+                self.state
+                    .lock()
+                    .expect("realtime model poisoned")
+                    .automatic_response_cancellation
+            };
+            // Without server-side cancellation the response keeps producing audio, so stop it
+            // here; `cancel_response` decides whether a cancel may actually go out.
+            if interrupt.force_response_cancel || !automatic {
+                let cancel_error = self
+                    .cancel_response(interrupt.response_id.as_deref())
+                    .await
+                    .err();
+                if let Some(error) = playback_error.or(cancel_error) {
+                    return Err(error);
+                }
+                return Ok(());
+            }
+        }
+
+        match playback_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    async fn cancel_response(&self, response_id: Option<&str>) -> Result<()> {
+        let allowed = {
+            self.state
+                .lock()
+                .expect("realtime model poisoned")
+                .begin_cancel(response_id)
+        };
+        if !allowed {
+            return Ok(());
+        }
+        let mut message = json!({"type": "response.cancel"});
+        if let Some(response_id) = response_id {
+            message["response_id"] = Value::String(response_id.to_string());
+        }
+        let result = self.send_raw(message).await;
+        if result.is_err() {
+            self.state
+                .lock()
+                .expect("realtime model poisoned")
+                .release_cancel();
+        }
+        result
+    }
+
+    /// Release the audio bookkeeping held for a response once guardrails have settled.
+    fn retire_response_audio_state(&self, response_id: &str) {
+        let mut state = self.state.lock().expect("realtime model poisoned");
+        state.interrupted_audio_response_ids.remove(response_id);
+        state.audio.on_response_done(response_id);
     }
 
     /// Translate one server event into model events, reacting where the protocol requires it.
@@ -713,6 +1288,15 @@ impl WsInner {
                 let item_id = string_field(&event, "item_id");
                 let content_index = usize_field(&event, "content_index");
                 let response_id = string_field(&event, "response_id");
+                if self
+                    .state
+                    .lock()
+                    .expect("realtime model poisoned")
+                    .interrupted_audio_response_ids
+                    .contains(&response_id)
+                {
+                    return;
+                }
                 let Ok(data) = BASE64.decode(string_field(&event, "delta")) else {
                     self.emit(RealtimeModelEvent::Exception {
                         message: "Invalid base64 audio delta".to_string(),
@@ -724,7 +1308,7 @@ impl WsInner {
                     .lock()
                     .expect("realtime model poisoned")
                     .audio
-                    .on_delta(&item_id, content_index, &data);
+                    .on_audio_delta(&item_id, content_index, &data, Some(&response_id));
                 self.emit(RealtimeModelEvent::audio(RealtimeModelAudioEvent {
                     data,
                     response_id,
@@ -760,7 +1344,7 @@ impl WsInner {
                 self.state
                     .lock()
                     .expect("realtime model poisoned")
-                    .on_response_created();
+                    .on_response_created(response_id.as_deref());
                 self.emit(RealtimeModelEvent::TurnStarted { response_id });
             }
             "response.done" => {
@@ -769,10 +1353,11 @@ impl WsInner {
                     .and_then(Value::as_str)
                     .map(str::to_string);
                 let deferred = {
-                    self.state
-                        .lock()
-                        .expect("realtime model poisoned")
-                        .on_response_done()
+                    let mut state = self.state.lock().expect("realtime model poisoned");
+                    if let Some(response_id) = &response_id {
+                        state.interrupted_audio_response_ids.remove(response_id);
+                    }
+                    state.on_response_done()
                 };
                 if let Some(usage) = event.pointer("/response/usage")
                     && let Some(usage) = convert_usage(usage)
@@ -787,6 +1372,12 @@ impl WsInner {
                 }
             }
             "session.created" | "session.updated" => {
+                if let Some(format) = event
+                    .pointer("/session/audio/output/format")
+                    .and_then(read_format_type)
+                {
+                    self.set_audio_format(&format);
+                }
                 if let Some(interrupt) = event
                     .pointer("/session/audio/input/turn_detection/interrupt_response")
                     .and_then(Value::as_bool)
@@ -855,40 +1446,93 @@ impl WsInner {
                 });
             }
             "input_audio_buffer.speech_started" => {
-                // Barge-in: stop local playback so the user is not talked over.
-                let (playback, ongoing, automatic) = {
-                    let state = self.state.lock().expect("realtime model poisoned");
-                    (
-                        state.audio.playback_state(),
-                        state.ongoing_response,
-                        state.automatic_response_cancellation,
-                    )
-                };
-                if let Some(playback) = playback {
-                    self.emit(RealtimeModelEvent::AudioInterrupted {
-                        item_id: playback.item_id.clone(),
-                        content_index: playback.content_index,
-                    });
-                    // Truncating audio the client already finished playing is a no-op the server
-                    // can reject, so skip it unless a response is still producing audio.
-                    if !playback.is_complete() || ongoing {
-                        let _ = self.send_truncate(&playback).await;
-                    }
-                    self.state
-                        .lock()
-                        .expect("realtime model poisoned")
-                        .audio
-                        .on_interrupted();
-                    if !automatic {
-                        // The server will not stop on its own, so stop it here.
-                        let _ = self.send_raw(json!({"type": "response.cancel"})).await;
-                    }
-                }
+                // Barge-in: stop local playback at once so the user is not talked over. The
+                // server reports where its own VAD heard speech start, which beats a local
+                // real-time estimate when it is available.
+                self.handle_speech_started(event.get("audio_end_ms").and_then(Value::as_f64))
+                    .await;
             }
             "conversation.item.input_audio_transcription.delta"
             | "response.function_call_arguments.delta"
             | "conversation.item.truncated" => {}
             _ => self.emit(RealtimeModelEvent::Other { data: event }),
+        }
+    }
+
+    /// Interrupt playback when the server's VAD hears the user start speaking.
+    ///
+    /// Port of the `input_audio_buffer.speech_started` branch, which differs from a requested
+    /// interrupt: it reports the tracker's last audio item, prefers the server's `audio_end_ms`
+    /// over a local estimate, and rounds rather than floors.
+    async fn handle_speech_started(&self, audio_end_ms: Option<f64>) {
+        let playback_tracker = {
+            self.playback_tracker
+                .lock()
+                .expect("realtime model poisoned")
+                .clone()
+        };
+        let (last_audio, position, automatic) = {
+            let state = self.state.lock().expect("realtime model poisoned");
+            (
+                state.audio.last_audio_item(),
+                state.playback_position(playback_tracker.as_deref()),
+                state.automatic_response_cancellation,
+            )
+        };
+        let Some((item_id, content_index)) = last_audio else {
+            return;
+        };
+
+        self.emit(RealtimeModelEvent::AudioInterrupted {
+            item_id,
+            content_index,
+        });
+
+        let effective_elapsed_ms = match audio_end_ms {
+            Some(server_ms) if server_ms > 0.0 => Some(server_ms),
+            _ => position.elapsed_ms,
+        };
+        if let (Some(playback_item_id), Some(elapsed_ms)) =
+            (position.item_id.as_deref(), effective_elapsed_ms)
+        {
+            let playback_content_index = position.content_index.unwrap_or_default();
+            let (max_audio_ms, owns_audio) = {
+                let state = self.state.lock().expect("realtime model poisoned");
+                (
+                    state.max_audio_ms(playback_item_id, playback_content_index),
+                    state.ongoing_response_owns_audio(playback_item_id, playback_content_index),
+                )
+            };
+            let mut truncated_ms = (elapsed_ms.round() as i64).max(0);
+            let playback_complete =
+                max_audio_ms.is_some_and(|max_ms| truncated_ms >= max_ms) && !owns_audio;
+            if playback_complete {
+                log::debug!(
+                    "Skipping realtime truncate; playback of {playback_item_id} appears complete"
+                );
+            } else {
+                if let Some(max_ms) = max_audio_ms {
+                    truncated_ms = truncated_ms.min(max_ms);
+                }
+                let _ = self
+                    .send_truncate(playback_item_id, playback_content_index, truncated_ms)
+                    .await;
+            }
+        }
+
+        // Reset both trackers so later playback queries do not reference interrupted audio.
+        self.state
+            .lock()
+            .expect("realtime model poisoned")
+            .audio
+            .on_interrupted();
+        if let Some(tracker) = playback_tracker.as_deref() {
+            tracker.on_interrupted();
+        }
+
+        if !automatic {
+            // The server will not stop on its own, so stop it here.
+            let _ = self.cancel_response(None).await;
         }
     }
 
@@ -957,6 +1601,15 @@ impl WsInner {
     }
 }
 
+/// The URL to connect to: an explicit override, then an existing call, then a new session.
+fn connect_url(url: Option<&str>, call_id: Option<&str>, model: &str) -> String {
+    match (url, call_id) {
+        (Some(url), _) => url.to_string(),
+        (None, Some(call_id)) => format!("{DEFAULT_REALTIME_URL}?call_id={call_id}"),
+        (None, None) => format!("{DEFAULT_REALTIME_URL}?model={model}"),
+    }
+}
+
 /// The API key for a realtime connection: explicit, then the SDK default, then the environment.
 fn resolve_api_key(explicit: Option<&str>) -> Option<String> {
     if let Some(key) = explicit {
@@ -978,6 +1631,18 @@ fn audio_format_payload(format: &str) -> Option<Value> {
             log::debug!("Unknown realtime audio format: {other}");
             None
         }
+    }
+}
+
+/// The format name of a GA `audio.format` value, in either its object or string spelling.
+fn read_format_type(format: &Value) -> Option<String> {
+    match format {
+        Value::String(name) => Some(name.clone()),
+        Value::Object(_) => format
+            .get("type")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        _ => None,
     }
 }
 
@@ -1107,9 +1772,43 @@ mod tests {
         let model = OpenAIRealtimeWebSocketModel::new();
         assert_eq!(model.model_name(), "gpt-realtime-2.1");
         assert_eq!(
-            format!("{DEFAULT_REALTIME_URL}?model={}", model.model_name()),
+            connect_url(None, None, &model.model_name()),
             "wss://api.openai.com/v1/realtime?model=gpt-realtime-2.1"
         );
+    }
+
+    #[test]
+    fn a_call_id_attaches_to_an_existing_call_instead_of_a_new_session() {
+        assert_eq!(
+            connect_url(None, Some("call_789"), DEFAULT_REALTIME_MODEL),
+            "wss://api.openai.com/v1/realtime?call_id=call_789"
+        );
+        // An explicit URL always wins, which is what the tests and proxies rely on.
+        assert_eq!(
+            connect_url(Some("ws://127.0.0.1:9/x"), Some("call_789"), "m"),
+            "ws://127.0.0.1:9/x"
+        );
+    }
+
+    #[test]
+    fn a_call_leaves_the_audio_formats_to_the_negotiated_session() {
+        let model = OpenAIRealtimeWebSocketModel::new();
+        model.inner.state.lock().expect("poisoned").call_id = Some("call_1".to_string());
+        let payload = model
+            .inner
+            .session_payload(&RealtimeSessionModelSettings::new());
+        assert!(
+            payload["audio"]["input"].get("format").is_none(),
+            "a call must not override the format it negotiated"
+        );
+        assert!(payload["audio"]["output"].get("format").is_none());
+
+        // An explicitly configured format is still sent.
+        let payload = model.inner.session_payload(&RealtimeSessionModelSettings {
+            input_audio_format: Some("g711_ulaw".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(payload["audio"]["input"]["format"]["type"], "audio/pcmu");
     }
 
     #[test]
@@ -1223,7 +1922,7 @@ mod sequencing_tests {
         assert_eq!(state.request_response_create(), None);
         assert!(state.pending_response_create);
 
-        state.on_response_created();
+        state.on_response_created(Some("resp_1"));
         assert_eq!(state.create_in_flight, None);
         assert!(state.ongoing_response);
 
@@ -1263,26 +1962,119 @@ mod sequencing_tests {
         assert!(!state.error_rejects_pending_create(&json!({"message": "input buffer too small"})));
 
         // An error arriving while a response runs is never a create rejection.
-        state.on_response_created();
+        state.on_response_created(Some("resp_1"));
         assert!(!state.error_rejects_pending_create(&json!({"code": "bad_response_create"})));
     }
 
     #[test]
-    fn truncation_never_exceeds_the_received_audio() {
-        let playback = PlaybackState {
-            item_id: "item_1".to_string(),
-            content_index: 0,
-            elapsed_ms: 10.2,
-            length_ms: 10.2,
-        };
-        assert_eq!(playback.truncate_ms(), 10);
-        assert!(playback.is_complete());
+    fn a_cancel_is_only_sent_for_the_active_response() {
+        let mut state = state();
 
-        let partial = PlaybackState {
-            elapsed_ms: 4.9,
-            ..playback
-        };
-        assert_eq!(partial.truncate_ms(), 4);
-        assert!(!partial.is_complete());
+        // Nothing to cancel before a response starts.
+        assert!(!state.begin_cancel(None));
+
+        state.on_response_created(Some("resp_1"));
+        // A cancel aimed at a different response must stay local.
+        assert!(!state.begin_cancel(Some("resp_2")));
+        assert!(state.begin_cancel(Some("resp_1")));
+        // A second cancel for the same response would be rejected by the server.
+        assert!(!state.begin_cancel(Some("resp_1")));
+        assert!(!state.begin_cancel(None));
+
+        // A failed send releases the slot so a later attempt still goes out.
+        state.release_cancel();
+        assert!(state.begin_cancel(None));
+
+        // The next response may be cancelled again.
+        state.on_response_done();
+        assert!(!state.begin_cancel(None));
+        state.on_response_created(Some("resp_2"));
+        assert!(state.begin_cancel(None));
+    }
+
+    #[test]
+    fn response_scoped_indexes_track_audio_per_response() {
+        let mut tracker = ModelAudioTracker::default();
+        tracker.set_audio_format("pcm16");
+        tracker.on_audio_delta("item_1", 0, &[0u8; 48], Some("resp_1"));
+        tracker.on_audio_delta("item_1", 0, &[0u8; 48], Some("resp_1"));
+        tracker.on_audio_delta("item_2", 0, &[0u8; 48], Some("resp_2"));
+
+        // Each delta extends the item it belongs to.
+        let state = tracker.state("item_1", 0).expect("item_1 state");
+        assert!((state.audio_length_ms - 2.0).abs() < 1e-9);
+        assert_eq!(state.response_id.as_deref(), Some("resp_1"));
+        assert_eq!(
+            tracker.audio_items_for_response("resp_1"),
+            vec![("item_1".to_string(), 0)]
+        );
+        assert_eq!(tracker.last_audio_item(), Some(("item_2".to_string(), 0)));
+
+        // Interrupting an older response leaves the newer one playing.
+        tracker.on_response_interrupted("resp_1");
+        assert!(tracker.audio_items_for_response("resp_1").is_empty());
+        assert_eq!(tracker.last_audio_item(), Some(("item_2".to_string(), 0)));
+
+        // Interrupting the response that owns the current item clears it.
+        tracker.on_response_interrupted("resp_2");
+        assert_eq!(tracker.last_audio_item(), None);
+    }
+
+    #[test]
+    fn retiring_a_response_releases_only_its_indexes() {
+        let mut tracker = ModelAudioTracker::default();
+        tracker.on_audio_delta("item_1", 0, &[0u8; 48], Some("resp_1"));
+        tracker.on_audio_delta("item_2", 0, &[0u8; 48], Some("resp_2"));
+        tracker.on_response_done("resp_1");
+        assert!(tracker.audio_items_for_response("resp_1").is_empty());
+        assert_eq!(
+            tracker.audio_items_for_response("resp_2"),
+            vec![("item_2".to_string(), 0)]
+        );
+    }
+
+    #[test]
+    fn audio_ownership_decides_whether_a_finished_item_is_truncated() {
+        let mut state = state();
+        state.audio.set_audio_format("pcm16");
+        state
+            .audio
+            .on_audio_delta("item_1", 0, &[0u8; 48], Some("resp_1"));
+        assert_eq!(state.max_audio_ms("item_1", 0), Some(1));
+
+        // No response running: nothing can still be extending this audio.
+        assert!(!state.ongoing_response_owns_audio("item_1", 0));
+
+        state.on_response_created(Some("resp_1"));
+        assert!(state.ongoing_response_owns_audio("item_1", 0));
+
+        // A different response is running, so the old item's audio is final.
+        state.on_response_created(Some("resp_2"));
+        assert!(!state.ongoing_response_owns_audio("item_1", 0));
+
+        // Ownership is unknown for an item the tracker never saw, so interruption is preserved.
+        assert!(state.ongoing_response_owns_audio("item_unknown", 0));
+    }
+
+    #[test]
+    fn playback_position_prefers_the_application_tracker() {
+        let mut state = state();
+        state.audio.set_audio_format("pcm16");
+        state
+            .audio
+            .on_audio_delta("item_1", 0, &[0u8; 480], Some("resp_1"));
+
+        // Without a tracker the transport assumes real-time playback from first arrival.
+        let own = state.playback_position(None);
+        assert_eq!(own.item_id.as_deref(), Some("item_1"));
+        assert_eq!(own.audio_item(), Some(("item_1".to_string(), 0)));
+        assert!(own.elapsed_ms.is_some_and(|ms| ms >= 0.0));
+
+        let tracker = RealtimePlaybackTracker::new();
+        tracker.on_play_ms("item_9", 2, 42.0);
+        let tracked = state.playback_position(Some(&tracker));
+        assert_eq!(tracked.item_id.as_deref(), Some("item_9"));
+        assert_eq!(tracked.content_index, Some(2));
+        assert_eq!(tracked.elapsed_ms, Some(42.0));
     }
 }

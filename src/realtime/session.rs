@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use futures::Stream;
@@ -28,7 +28,7 @@ use crate::realtime::items::{
 };
 use crate::realtime::model::{RealtimeModel, RealtimeModelConfig};
 use crate::realtime::model_events::{RealtimeModelEvent, RealtimeModelToolCallEvent};
-use crate::realtime::model_inputs::RealtimeModelSendEvent;
+use crate::realtime::model_inputs::{RealtimeInterrupt, RealtimeModelSendEvent};
 use crate::run_context::RunContext;
 use crate::tool::{
     DEFAULT_APPROVAL_REJECTION_MESSAGE, FunctionTool, ToolOutput, ToolTimeoutBehavior,
@@ -68,6 +68,12 @@ struct SessionState<C> {
     interrupted_response_ids: HashSet<String>,
     active_response_id: Option<String>,
     active_response_agent: Option<Arc<RealtimeAgent<C>>>,
+    /// Generation of the response currently producing output, if any.
+    active_output_response_generation: Option<u64>,
+    /// Guardrail runs still in flight, per response.
+    guardrail_runs_by_response: HashMap<String, usize>,
+    /// Responses whose transport audio may be released once their guardrails finish.
+    responses_awaiting_guardrail_cleanup: HashSet<String>,
 }
 
 struct SessionInner<C> {
@@ -81,6 +87,19 @@ struct SessionInner<C> {
     closed: AtomicBool,
     pump: Mutex<Option<JoinHandle<()>>>,
     guardrail_tasks: Mutex<Vec<JoinHandle<()>>>,
+    /// Monotonic counter of output responses, readable from a transport send-boundary check.
+    latest_generation: Arc<AtomicU64>,
+}
+
+impl<C> SessionInner<C> {
+    /// Start a new output-response generation and return it.
+    fn next_generation(&self) -> u64 {
+        self.latest_generation.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    fn latest_generation(&self) -> u64 {
+        self.latest_generation.load(Ordering::SeqCst)
+    }
 }
 
 /// A live connection to a realtime model.
@@ -181,11 +200,15 @@ impl<C: Send + Sync + 'static> RealtimeSession<C> {
                 interrupted_response_ids: HashSet::new(),
                 active_response_id: None,
                 active_response_agent: None,
+                active_output_response_generation: None,
+                guardrail_runs_by_response: HashMap::new(),
+                responses_awaiting_guardrail_cleanup: HashSet::new(),
             }),
             sender: Mutex::new(None),
             closed: AtomicBool::new(false),
             pump: Mutex::new(None),
             guardrail_tasks: Mutex::new(Vec::new()),
+            latest_generation: Arc::new(AtomicU64::new(0)),
         });
 
         let starting = model_config.initial_model_settings.clone();
@@ -246,9 +269,7 @@ impl<C: Send + Sync + 'static> RealtimeSession<C> {
     pub async fn interrupt(&self) -> Result<()> {
         self.inner
             .model
-            .send_event(RealtimeModelSendEvent::Interrupt {
-                force_response_cancel: true,
-            })
+            .send_event(RealtimeModelSendEvent::interrupt())
             .await
     }
 
@@ -349,6 +370,11 @@ impl<C: Send + Sync + 'static> RealtimeSession<C> {
             state.item_transcripts.clear();
             state.item_guardrail_runs.clear();
             state.interrupted_response_ids.clear();
+            state.guardrail_runs_by_response.clear();
+            state.responses_awaiting_guardrail_cleanup.clear();
+            state.active_output_response_generation = None;
+            state.active_response_id = None;
+            state.active_response_agent = None;
         }
         self.inner.model.close().await
     }
@@ -397,10 +423,73 @@ impl<C> RealtimeSession<C> {
 }
 
 /// Settings plus the tools and handoffs they were built from.
-struct ResolvedSettings<C> {
-    settings: RealtimeSessionModelSettings,
-    tools: Vec<Arc<FunctionTool<C>>>,
-    handoffs: Vec<RealtimeHandoff<C>>,
+pub(crate) struct ResolvedSettings<C> {
+    pub(crate) settings: RealtimeSessionModelSettings,
+    pub(crate) tools: Vec<Arc<FunctionTool<C>>>,
+    pub(crate) handoffs: Vec<RealtimeHandoff<C>>,
+}
+
+/// Resolve `agent`'s instructions, tools and handoffs into realtime session settings.
+///
+/// `base` is the run config's settings merged with the connect-time settings; `starting` is
+/// applied last so connect-time overrides win over the agent, as in Python. Port of
+/// `_build_model_settings_from_agent`.
+pub(crate) async fn build_model_settings_from_agent<C: Send + Sync + 'static>(
+    agent: &Arc<RealtimeAgent<C>>,
+    context: &RunContext<C>,
+    base: &RealtimeSessionModelSettings,
+    starting: Option<&RealtimeSessionModelSettings>,
+    tracing_disabled: bool,
+) -> Result<ResolvedSettings<C>> {
+    let mut settings = base.clone();
+    if let Some(agent_settings) = &agent.model_settings {
+        settings.merge(agent_settings);
+    }
+
+    settings.instructions = Some(agent.get_system_prompt(context).await?.unwrap_or_default());
+    if let Some(prompt) = &agent.prompt {
+        settings.prompt = Some(prompt.clone());
+    }
+
+    let mut tools = Vec::new();
+    for tool in agent.function_tools() {
+        if tool.is_enabled.evaluate(context, &agent.name).await {
+            tools.push(tool);
+        }
+    }
+    let mut handoffs = Vec::new();
+    for handoff in &agent.handoffs {
+        if handoff.is_enabled.evaluate(context, &agent.name).await {
+            handoffs.push(handoff.clone());
+        }
+    }
+
+    let mut specs: Vec<RealtimeFunctionToolSpec> = tools
+        .iter()
+        .map(|tool| {
+            RealtimeFunctionToolSpec::new(
+                tool.name.clone(),
+                tool.description.clone(),
+                tool.params_json_schema.clone(),
+            )
+        })
+        .collect();
+    specs.extend(handoffs.iter().map(RealtimeHandoff::to_spec));
+    validate_tool_names(&specs)?;
+    settings.tools = Some(specs);
+
+    if let Some(starting) = starting {
+        settings.merge(starting);
+    }
+    if tracing_disabled {
+        settings.tracing = Some(RealtimeModelTracing::Disabled);
+    }
+
+    Ok(ResolvedSettings {
+        settings,
+        tools,
+        handoffs,
+    })
 }
 
 impl<C: Send + Sync + 'static> SessionInner<C> {
@@ -461,64 +550,14 @@ impl<C: Send + Sync + 'static> SessionInner<C> {
         agent: &Arc<RealtimeAgent<C>>,
         starting: Option<&RealtimeSessionModelSettings>,
     ) -> Result<ResolvedSettings<C>> {
-        let mut settings = self.base_settings.clone();
-        if let Some(agent_settings) = &agent.model_settings {
-            settings.merge(agent_settings);
-        }
-
-        settings.instructions = Some(
-            agent
-                .get_system_prompt(&self.context)
-                .await?
-                .unwrap_or_default(),
-        );
-        if let Some(prompt) = &agent.prompt {
-            settings.prompt = Some(prompt.clone());
-        }
-
-        let mut tools = Vec::new();
-        for tool in agent.function_tools() {
-            if tool.is_enabled.evaluate(&self.context, &agent.name).await {
-                tools.push(tool);
-            }
-        }
-        let mut handoffs = Vec::new();
-        for handoff in &agent.handoffs {
-            if handoff
-                .is_enabled
-                .evaluate(&self.context, &agent.name)
-                .await
-            {
-                handoffs.push(handoff.clone());
-            }
-        }
-
-        let mut specs: Vec<RealtimeFunctionToolSpec> = tools
-            .iter()
-            .map(|tool| {
-                RealtimeFunctionToolSpec::new(
-                    tool.name.clone(),
-                    tool.description.clone(),
-                    tool.params_json_schema.clone(),
-                )
-            })
-            .collect();
-        specs.extend(handoffs.iter().map(RealtimeHandoff::to_spec));
-        validate_tool_names(&specs)?;
-        settings.tools = Some(specs);
-
-        if let Some(starting) = starting {
-            settings.merge(starting);
-        }
-        if self.run_config.tracing_disabled {
-            settings.tracing = Some(RealtimeModelTracing::Disabled);
-        }
-
-        Ok(ResolvedSettings {
-            settings,
-            tools,
-            handoffs,
-        })
+        build_model_settings_from_agent(
+            agent,
+            &self.context,
+            &self.base_settings,
+            starting,
+            self.run_config.tracing_disabled,
+        )
+        .await
     }
 
     /// Read transport events until the connection ends.
@@ -633,6 +672,7 @@ impl<C: Send + Sync + 'static> SessionInner<C> {
                 delta,
                 response_id,
             } => {
+                self.reconcile_output_response(&response_id);
                 let transcript = {
                     let mut state = self.state.lock().expect("realtime session poisoned");
                     state
@@ -646,13 +686,14 @@ impl<C: Send + Sync + 'static> SessionInner<C> {
                     let mut state = self.state.lock().expect("realtime session poisoned");
                     apply_assistant_transcript(&mut state.history, &item_id, &transcript);
                 }
-                self.spawn_output_guardrails(&item_id, &response_id);
+                self.spawn_output_guardrails(&item_id, &response_id, true);
             }
             RealtimeModelEvent::OutputTextDelta {
                 item_id,
                 delta,
                 response_id,
             } => {
+                self.reconcile_output_response(&response_id);
                 {
                     let mut state = self.state.lock().expect("realtime session poisoned");
                     state
@@ -661,7 +702,7 @@ impl<C: Send + Sync + 'static> SessionInner<C> {
                         .or_default()
                         .push_str(&delta);
                 }
-                self.spawn_output_guardrails(&item_id, &response_id);
+                self.spawn_output_guardrails(&item_id, &response_id, false);
             }
             RealtimeModelEvent::ItemUpdated { item } => {
                 let item = *item;
@@ -700,8 +741,16 @@ impl<C: Send + Sync + 'static> SessionInner<C> {
             RealtimeModelEvent::TurnStarted { response_id } => {
                 let agent = {
                     let mut state = self.state.lock().expect("realtime session poisoned");
-                    state.active_response_id = response_id;
-                    state.active_response_agent = Some(state.agent.clone());
+                    // A `turn_started` for the response whose deltas already opened a generation
+                    // is a late start, not a new turn.
+                    let late_start = response_id.is_some()
+                        && response_id == state.active_response_id
+                        && state.active_output_response_generation.is_some();
+                    if !late_start {
+                        state.active_output_response_generation = Some(self.next_generation());
+                        state.active_response_id = response_id;
+                        state.active_response_agent = Some(state.agent.clone());
+                    }
                     state.agent.clone()
                 };
                 self.emit(RealtimeSessionEvent::AgentStart {
@@ -713,23 +762,32 @@ impl<C: Send + Sync + 'static> SessionInner<C> {
                 self.context.add_usage(&usage);
             }
             RealtimeModelEvent::TurnEnded { response_id } => {
-                let agent = {
+                let (agent, ended_response_id) = {
                     let mut state = self.state.lock().expect("realtime session poisoned");
+                    let ended_response_id = response_id
+                        .clone()
+                        .or_else(|| state.active_response_id.clone());
                     let is_active =
                         response_id.is_none() || response_id == state.active_response_id;
                     if !is_active {
-                        None
+                        (None, ended_response_id)
                     } else {
                         state.item_transcripts.clear();
                         state.item_guardrail_runs.clear();
+                        // A handoff inside the response already moved `agent`, so the turn is
+                        // attributed to the agent captured when it started.
                         let agent = state
                             .active_response_agent
                             .take()
                             .unwrap_or_else(|| state.agent.clone());
                         state.active_response_id = None;
-                        Some(agent)
+                        state.active_output_response_generation = None;
+                        (Some(agent), ended_response_id)
                     }
                 };
+                if let Some(response_id) = ended_response_id {
+                    self.finish_response_guardrail_lifecycle(&response_id).await;
+                }
                 if let Some(agent) = agent {
                     self.emit(RealtimeSessionEvent::AgentEnd {
                         agent,
@@ -1068,13 +1126,32 @@ impl<C: Send + Sync + 'static> SessionInner<C> {
         Ok(())
     }
 
+    /// Open an output-response generation for deltas that arrive before `turn_started`.
+    ///
+    /// Port of `_reconcile_output_response`.
+    fn reconcile_output_response(&self, response_id: &str) {
+        let mut state = self.state.lock().expect("realtime session poisoned");
+        if state.active_output_response_generation.is_none() {
+            state.active_output_response_generation = Some(self.next_generation());
+            state.active_response_id = Some(response_id.to_string());
+            state.active_response_agent = Some(state.agent.clone());
+        } else if state.active_response_id.is_none() {
+            state.active_response_id = Some(response_id.to_string());
+        }
+    }
+
     /// Run output guardrails once the accumulated transcript crosses the debounce threshold.
     ///
     /// The run happens on its own task so a slow guardrail cannot stall delivery of the audio and
     /// transcript events queued behind it, which is what the Python SDK's background tasks buy.
-    fn spawn_output_guardrails(self: &Arc<Self>, item_id: &str, response_id: &str) {
+    fn spawn_output_guardrails(
+        self: &Arc<Self>,
+        item_id: &str,
+        response_id: &str,
+        is_audio_output: bool,
+    ) {
         let threshold = self.debounce_text_length;
-        let (text, agent) = {
+        let (text, agent, generation) = {
             let mut state = self.state.lock().expect("realtime session poisoned");
             let Some(text) = state.item_transcripts.get(item_id).cloned() else {
                 return;
@@ -1095,15 +1172,21 @@ impl<C: Send + Sync + 'static> SessionInner<C> {
                 .active_response_agent
                 .clone()
                 .unwrap_or_else(|| state.agent.clone());
-            (text, agent)
+            let generation = state.active_output_response_generation;
+            *state
+                .guardrail_runs_by_response
+                .entry(response_id.to_string())
+                .or_default() += 1;
+            (text, agent, generation)
         };
 
         let inner = self.clone();
         let response_id = response_id.to_string();
         let task = tokio::spawn(async move {
             inner
-                .run_output_guardrails(&text, &response_id, &agent)
+                .run_output_guardrails(&text, &response_id, &agent, generation, is_audio_output)
                 .await;
+            inner.finish_guardrail_run(&response_id).await;
         });
         let mut tasks = self
             .guardrail_tasks
@@ -1113,11 +1196,18 @@ impl<C: Send + Sync + 'static> SessionInner<C> {
         tasks.push(task);
     }
 
+    /// Run the agent's and the run config's output guardrails on `text`.
+    ///
+    /// `generation` scopes the interruption: a guardrail that trips on a response the model has
+    /// already moved past must not cancel the newer one, so it only stops that response's audio
+    /// playback. Port of `_run_output_guardrails`.
     async fn run_output_guardrails(
         &self,
         text: &str,
         response_id: &str,
         agent: &Arc<RealtimeAgent<C>>,
+        generation: Option<u64>,
+        is_audio_output: bool,
     ) {
         let mut guardrails: Vec<OutputGuardrail<C>> = agent.output_guardrails.clone();
         guardrails.extend(self.run_config.output_guardrails.iter().cloned());
@@ -1167,39 +1257,130 @@ impl<C: Send + Sync + 'static> SessionInner<C> {
                 return;
             }
         }
+        let latest_generation = self.latest_generation();
 
         let names: Vec<String> = triggered
             .iter()
             .map(|result| result.guardrail_name.clone())
             .collect();
-        self.emit(RealtimeSessionEvent::GuardrailTripped {
+        if !self.emit(RealtimeSessionEvent::GuardrailTripped {
             guardrail_results: triggered,
             message: text.to_string(),
             info: self.info(),
-        });
+        }) {
+            return;
+        }
 
-        if let Err(error) = self
-            .model
-            .send_event(RealtimeModelSendEvent::Interrupt {
-                force_response_cancel: true,
-            })
-            .await
+        let active_generation = {
+            self.state
+                .lock()
+                .expect("realtime session poisoned")
+                .active_output_response_generation
+        };
+        let superseded = generation.is_some_and(|generation| generation != latest_generation);
+        let interrupt = match generation {
+            // Without a known generation there is nothing newer to protect.
+            None => Some(RealtimeInterrupt::forced()),
+            Some(_) if superseded => {
+                // The model moved on: silence this response's audio but leave the new one running.
+                is_audio_output.then(|| RealtimeInterrupt::playback_only(response_id))
+            }
+            Some(generation) if Some(generation) == active_generation => Some(
+                RealtimeInterrupt::forced_for_response(response_id, is_audio_output),
+            ),
+            Some(_) => is_audio_output.then(|| RealtimeInterrupt::playback_only(response_id)),
+        };
+        if let Some(interrupt) = interrupt
+            && let Err(error) = self
+                .model
+                .send_event(RealtimeModelSendEvent::Interrupt(interrupt))
+                .await
         {
             self.emit_error(error.to_string());
             return;
         }
-        if let Err(error) = self
-            .model
-            .send_event(RealtimeModelSendEvent::UserInput {
-                user_input: RealtimeUserInput::Text(format!(
-                    "guardrail triggered: {}",
-                    names.join(", ")
-                )),
-            })
-            .await
-        {
+        if superseded {
+            // Telling a newer response about an older response's guardrail would confuse it.
+            return;
+        }
+
+        let feedback = RealtimeModelSendEvent::UserInput {
+            user_input: RealtimeUserInput::Text(format!(
+                "guardrail triggered: {}",
+                names.join(", ")
+            )),
+        };
+        let result = match generation {
+            None => self.model.send_event(feedback).await.map(|()| true),
+            Some(generation) => {
+                // Recheck at the transport's write boundary: a response may start in between.
+                let latest = Arc::clone(&self.latest_generation);
+                self.model
+                    .send_event_if(
+                        feedback,
+                        Box::new(move || generation == latest.load(Ordering::SeqCst)),
+                    )
+                    .await
+            }
+        };
+        if let Err(error) = result {
             self.emit_error(error.to_string());
         }
+    }
+
+    /// Note that one guardrail run finished, releasing transport audio when the last one does.
+    async fn finish_guardrail_run(&self, response_id: &str) {
+        let should_retire = {
+            let mut state = self.state.lock().expect("realtime session poisoned");
+            let remaining = match state.guardrail_runs_by_response.get_mut(response_id) {
+                Some(count) => {
+                    *count = count.saturating_sub(1);
+                    *count
+                }
+                None => 0,
+            };
+            if remaining == 0 {
+                state.guardrail_runs_by_response.remove(response_id);
+                state
+                    .responses_awaiting_guardrail_cleanup
+                    .remove(response_id)
+            } else {
+                false
+            }
+        };
+        if should_retire {
+            self.retire_response_audio(response_id).await;
+        }
+    }
+
+    /// A response ended: release its transport audio, or wait for its guardrails to finish first.
+    async fn finish_response_guardrail_lifecycle(&self, response_id: &str) {
+        let pending = {
+            let mut state = self.state.lock().expect("realtime session poisoned");
+            if state.guardrail_runs_by_response.contains_key(response_id) {
+                state
+                    .responses_awaiting_guardrail_cleanup
+                    .insert(response_id.to_string());
+                true
+            } else {
+                false
+            }
+        };
+        if !pending {
+            self.retire_response_audio(response_id).await;
+        }
+    }
+
+    /// Let the transport drop the audio bookkeeping it held for a finished response.
+    async fn retire_response_audio(&self, response_id: &str) {
+        if let Err(error) = self.model.retire_response_audio(response_id).await {
+            self.emit_error(format!("Response audio cleanup failed: {error}"));
+        }
+        self.state
+            .lock()
+            .expect("realtime session poisoned")
+            .interrupted_response_ids
+            .remove(response_id);
     }
 }
 

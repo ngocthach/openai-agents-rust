@@ -4,27 +4,32 @@ Date: 2026-10-29
 Scope: port of Python `agents.realtime` (openai-agents 0.24) into `openai_agents_sdk::realtime`
 (feature `realtime`).
 
+Phase 1 ported the agent, runner, session, events, items, handoffs, the OpenAI WebSocket transport
+and the fake transport. **Phase 2 closed the three parity gaps Phase 1 had listed as not ported:
+the SIP / call-accept flow, the playback tracker, and Python's generation-scoped guardrail
+interrupt branching.** Both phases are reflected below.
+
 ## Files
 
 Created (all under the allowed scope):
 
 | File | Lines | Contents |
 | --- | --- | --- |
-| `src/realtime/mod.rs` | 76 | Module docs, submodules, re-exports |
+| `src/realtime/mod.rs` | 92 | Module docs, submodules, re-exports |
 | `src/realtime/items.rs` | 421 | `RealtimeItem`, message/tool-call items, history merge helpers |
 | `src/realtime/config.rs` | 470 | `RealtimeSessionModelSettings`, `RealtimeRunConfig`, turn detection, tracing, user input |
 | `src/realtime/model_events.rs` | 216 | `RealtimeModelEvent` and payload types |
-| `src/realtime/model_inputs.rs` | 88 | `RealtimeModelSendEvent` |
-| `src/realtime/model.rs` | 150 | `RealtimeModel` trait, `RealtimeModelConfig`, audio length math |
+| `src/realtime/model_inputs.rs` | 224 | `RealtimeModelSendEvent`, `RealtimeInterrupt` |
+| `src/realtime/model.rs` | 339 | `RealtimeModel` trait, `RealtimeModelConfig`, `RealtimePlaybackTracker`, audio length math |
 | `src/realtime/agent.rs` | 217 | `RealtimeAgent<C>`, `RealtimeInstructions<C>` |
 | `src/realtime/handoffs.rs` | 271 | `RealtimeHandoff<C>`, `realtime_handoff` |
 | `src/realtime/events.rs` | 421 | `RealtimeSessionEvent<C>`, `RealtimeEventInfo<C>` |
-| `src/realtime/session.rs` | 1288 | `RealtimeSession<C>`: history, tools, approvals, handoffs, guardrails |
-| `src/realtime/openai_model.rs` | 1286 | `OpenAIRealtimeWebSocketModel` (GA protocol over `tokio-tungstenite`) |
+| `src/realtime/session.rs` | 1464 | `RealtimeSession<C>`: history, tools, approvals, handoffs, guardrails |
+| `src/realtime/openai_model.rs` | 1950 | `OpenAIRealtimeWebSocketModel`, `OpenAIRealtimeSIPModel`, `ModelAudioTracker` |
 | `src/realtime/runner.rs` | 107 | `RealtimeRunner<C>` |
-| `src/realtime/testing.rs` | 192 | `FakeRealtimeModel` (port of `testing.py`) |
-| `tests/realtime_tests.rs` | 919 | 11 integration tests |
-| `examples/realtime_text.rs` | 91 | Text-only realtime session example |
+| `src/realtime/testing.rs` | 251 | `FakeRealtimeModel` (port of `testing.py`) |
+| `tests/realtime_tests.rs` | 1395 | 18 integration tests |
+| `examples/realtime_text.rs` | 83 | Text-only realtime session example |
 
 Nothing outside `src/realtime/**`, `tests/realtime_tests.rs` and `examples/realtime_text.rs` was
 touched.
@@ -34,9 +39,9 @@ touched.
 ```
 export CARGO_TARGET_DIR=/Users/ngocthach/.cache/oars-build/realtime
 cargo clippy --features realtime --all-targets -- -D warnings   # clean
-cargo test --features realtime --test realtime_tests            # 11 passed
-cargo test --features realtime --lib realtime                   # 23 passed
-cargo test --features realtime --doc                            # 4 realtime doctests compile
+cargo test --features realtime --test realtime_tests            # 18 passed
+cargo test --features realtime --lib realtime                   # 33 passed
+cargo test --features realtime --doc                            # 5 realtime doctests compile
 cargo doc --features realtime --no-deps                         # no warnings in src/realtime
 cargo check --all-targets                                       # clean without the feature
 rustfmt --edition 2024 --check <all files above>                # clean
@@ -44,6 +49,82 @@ rustfmt --edition 2024 --check <all files above>                # clean
 
 `cargo doc` still reports one pre-existing warning in `src/lib.rs` (`unresolved link to 'mcp'`,
 because the `mcp` feature is off); it is not in this module.
+
+## Phase 2: the three closed gaps
+
+### SIP / call-accept flow
+
+`OpenAIRealtimeSIPModel` attaches to a call the Realtime Calls API already created. It wraps
+`OpenAIRealtimeWebSocketModel` by composition (Rust has no inheritance) and delegates every trait
+method, overriding `connect` to require a non-empty `call_id`.
+
+- With a `call_id` and no URL override the transport connects to
+  `wss://api.openai.com/v1/realtime?call_id=<id>` instead of `?model=<name>`; the URL choice is a
+  pure `connect_url` helper, unit-tested in `--lib`.
+- A call has already negotiated its audio formats, so with a `call_id` set the session payload
+  omits `audio.input.format` and `audio.output.format` unless the settings name one explicitly —
+  the same carve-out Python makes in `_get_session_config`.
+- `OpenAIRealtimeSIPModel::build_initial_session_payload(agent, context, model_config, run_config,
+  overrides)` builds the accept-call body, applying run config, connect-time settings, the agent's
+  instructions/tools/handoffs, and then `overrides`. It is a port of Python's
+  `build_initial_session_payload`.
+- The HTTP POST to `/v1/realtime/calls/{call_id}/accept` stays in application code, exactly as in
+  Python, where it lives in the Twilio SIP example rather than the SDK. The `OpenAIRealtimeSIPModel`
+  doc comment shows the two-step flow. Adding an HTTP surface here would duplicate the client and
+  base-URL resolution the controller owns in `src/models/**`.
+
+### Playback tracker
+
+Both halves of Python's audio bookkeeping are now ported:
+
+- `RealtimePlaybackTracker` (public, from `model.py`): `on_play_bytes`, `on_play_ms`,
+  `on_interrupted`, `set_audio_format`, `audio_format`, `state() -> RealtimePlaybackState`, plus
+  `shared()` for the `Arc` the config wants. It is interior-mutable so the application can report
+  progress through a shared handle while the transport reads it. Supply it through
+  `RealtimeModelConfig::playback_tracker`.
+- `ModelAudioTracker` (private, from `_default_tracker.py`): per-`(item_id, content_index)` state
+  holding the first arrival time, the accumulated audio length and the owning response, plus the
+  last audio item and the per-response index lists. This replaces Phase 1's single-item tracker.
+- The transport learns the negotiated output format from `session.created`/`session.updated` and
+  sets it on both trackers, so `on_play_bytes` converts bytes with the right sample rate.
+- `_get_playback_state`, `_ongoing_response_owns_audio`, `_get_audio_limits` and
+  `_interrupt_audio_playback` are ported, including the re-read of the playback position when the
+  first read falls outside the response being interrupted, and the skip of a truncate for audio the
+  user has finished hearing that no running response still owns.
+- `close()` resets the model's tracker and calls `on_interrupted()` on the application's, so a
+  reused model never reports a closed session's item.
+
+### Generation-scoped guardrail interrupts
+
+`RealtimeModelSendEvent::Interrupt` now carries a `RealtimeInterrupt` with Python's four modes
+(`force_response_cancel`, `response_id`, `cancel_response_only`, `playback_only`) and a `validate()`
+that rejects the contradictory combinations Python raises `ValueError` for. The session tracks
+`latest_output_response_generation` (an `AtomicU64`, so the send-boundary check needs no lock),
+`active_output_response_generation`, `active_response_id` and `active_response_agent`, and ports
+`_reconcile_output_response` so text and transcript deltas open a generation even when they arrive
+before `turn_started`.
+
+When a guardrail trips, the branch matches Python exactly:
+
+| Situation | Action |
+| --- | --- |
+| No generation known | forced interrupt |
+| Generation superseded by a newer response, audio output | `playback_only` for that response, no feedback message |
+| Generation superseded, text output | nothing; the newer response is left alone |
+| Generation is the active one | forced interrupt scoped to the response, `cancel_response_only` when the output was text |
+| Generation is still the latest but no longer active (`turn_ended` cleared it, nothing newer started), audio output | `playback_only` for that response |
+
+The `guardrail triggered: <names>` feedback goes out through the new
+`RealtimeModel::send_event_if`, which rechecks the generation at the transport's write boundary —
+the WebSocket model serializes the payload, rechecks, then writes, and declines when a
+`response.create` is still pending. The default trait implementation sends nothing and returns
+`false`, as Python's does.
+
+Guardrail lifecycle is ported too: in-flight runs are counted per response
+(`guardrail_runs_by_response`), `turn_ended` either releases the response's transport audio at once
+or records it in `responses_awaiting_guardrail_cleanup`, and the last guardrail run to finish
+triggers `RealtimeModel::retire_response_audio` (a new trait method, default no-op) plus the
+`interrupted_response_ids` discard.
 
 ## Public API
 
@@ -69,11 +150,18 @@ RealtimeSessionEvent<C>     // agent_start, agent_end, handoff, tool_start, tool
 RealtimeEventInfo<C>
 
 // transports
-trait RealtimeModel { connect(config) -> RealtimeModelEvents; send_event(..); close(); }
+trait RealtimeModel {
+    connect(config) -> RealtimeModelEvents;
+    send_event(..);
+    send_event_if(event, condition) -> bool;   // default: sends nothing, returns false
+    retire_response_audio(response_id);        // default: no-op
+    close();
+}
 RealtimeModelConfig, RealtimeModelEvents (= mpsc::UnboundedReceiver<RealtimeModelEvent>)
-RealtimeModelEvent, RealtimeModelSendEvent, RealtimeModelToolCallEvent,
-RealtimeModelAudioEvent, RealtimeConnectionStatus
-OpenAIRealtimeWebSocketModel, FakeRealtimeModel, fake_realtime_model()
+RealtimeModelEvent, RealtimeModelSendEvent, RealtimeInterrupt, RealtimeModelToolCallEvent,
+RealtimeModelAudioEvent, RealtimeConnectionStatus, RealtimeSendCondition
+RealtimePlaybackTracker, RealtimePlaybackState
+OpenAIRealtimeWebSocketModel, OpenAIRealtimeSIPModel, FakeRealtimeModel, fake_realtime_model()
 
 // data
 RealtimeItem, RealtimeMessageItem, RealtimeToolCallItem, RealtimeContent, RealtimeMessageRole
@@ -116,7 +204,10 @@ calculate_audio_length_ms
    already queued when it returns. This is documented on the method.
    **Output guardrails do run on spawned tasks**, as in Python: a slow, LLM-backed guardrail would
    otherwise stall delivery of every queued `Audio` event roughly every `debounce_text_length`
-   characters. The handles live in `SessionInner::guardrail_tasks` and `close()` aborts them. The
+   characters. The handles live in `SessionInner::guardrail_tasks`; `close()` aborts them and
+   clears the response bookkeeping (`guardrail_runs_by_response`,
+   `responses_awaiting_guardrail_cleanup` and the active generation), mirroring
+   `_clear_response_bookkeeping`. The
    "already interrupted" bookkeeping uses a `HashSet::insert` return value, so concurrent
    guardrail runs on one response still emit `guardrail_tripped` exactly once.
 7. **Tri-state settings.** `turn_detection` and `input_audio_noise_reduction` are
@@ -128,13 +219,6 @@ calculate_audio_length_ms
 
 ## Intentionally not ported
 
-- **`OpenAIRealtimeSIPModel`** and `build_initial_session_payload`. `RealtimeModelConfig::call_id`
-  is supported (it switches the connect URL to `?call_id=` and stops defaulting the audio
-  formats), but the SIP subclass and its payload helper add no behavior the trait does not.
-- **`RealtimePlaybackTracker`.** The transport keeps the equivalent of Python's default tracker
-  internally (last audio item, received length, arrival time) so `interrupt()` can send
-  `conversation.item.truncate` with a sensible `audio_end_ms`. A user-supplied tracker for
-  delayed or remote playback is not exposed.
 - **`_ResponseCreateSequencer`'s generation ordering.** Python orders many concurrent manual and
   automatic `response.create` requests by generation and target version. The port keeps a smaller
   state machine on `WsState` (`ongoing_response`, `create_in_flight: Option<event_id>`,
@@ -152,17 +236,15 @@ calculate_audio_length_ms
     a barge-in truncate error arrives; this port is deliberately stricter.
   - a send failure also releases the in-flight slot, so a transient socket error cannot wedge the
     session.
-- **Response-generation guardrail branching.** Python scopes guardrail interrupts by
-  `output_response_generation` and `cancel_response_only`/`playback_only`. The port keeps the
-  interrupted-response-id de-duplication and sends a plain forced interrupt, which matches the
-  single-response case that `RealtimeModelSendInterrupt` models here.
 - **Invocation-identity and data-redaction machinery** (`_tool_identity`, `_tool_invocation`,
   `_clear_data_redacted_error_traceback`, duplicate-call-id detection). None of it exists in the
   Rust core; approvals are keyed by `(agent, tool, call_id)` through `RunContext` as elsewhere in
   this crate.
-- **`send_event_if`** (conditional commit at the transport boundary), **`RealtimeStep`/
-  `ScriptedRealtimeModel` strict scripting** (the fake model records sends and emits on demand
-  instead), **audio-storage history config** (a `TODO` upstream) and **`_debug` log redaction**.
+- **`RealtimeStep`/`ScriptedRealtimeModel` strict scripting** (the fake model records sends and
+  emits on demand instead), **audio-storage history config** (a `TODO` upstream) and **`_debug` log
+  redaction**. `send_event_if` *is* now ported, as the generation-scoped feedback needs it.
+- **`RealtimePlaybackTracker` assertion semantics.** Python's `get_state` asserts that elapsed time
+  is set once an item is current; the port returns `elapsed_ms: None` instead of panicking.
 - **Hosted tools on realtime agents.** `RealtimeAgent::function_tools` silently skips non-function
   tools instead of raising, because the realtime API only accepts function tools.
 - **Tool-guardrail `RaiseException`** emits a `RealtimeSessionEvent::Error` instead of aborting the
@@ -175,27 +257,26 @@ calculate_audio_length_ms
   answers the model and emits `tool_end` without ever asking a human, and the same guardrails run
   again before the tool executes after approval. Covered by
   `pre_approval_input_guardrails_block_a_call_before_a_human_sees_it`.
-- **Barge-in parity (`input_audio_buffer.speech_started`).** The transport emits
-  `audio_interrupted`, truncates at `floor(elapsed_ms)` clamped to the audio actually received
-  (never past it), skips the truncate when playback has caught up and no response is still
-  producing audio, resets its audio tracker, and sends `response.cancel` when the negotiated
-  session does not cancel automatically (`turn_detection.interrupt_response != true`).
+- **Barge-in (`input_audio_buffer.speech_started`) is its own path**, as in Python, not a reuse of
+  the requested-interrupt path. It reports `audio_interrupted` for the *tracker's last audio item*,
+  prefers the server's `audio_end_ms` over a local estimate when that value is above zero, rounds
+  rather than floors the truncate point, clamps it to the audio actually received, skips the
+  truncate when playback has caught up and no running response still owns that audio, resets both
+  trackers, and cancels the response when the negotiated session does not cancel automatically
+  (`turn_detection.interrupt_response != true`).
+- **`response.cancel` is gated like Python's `begin_cancel_response`.** A cancel is only sent when
+  a response is actually running, no cancel is already outstanding, and the target response is the
+  active one; a failed send releases the slot. Without this, a barge-in landing after a response
+  ended, a duplicate interrupt, or a cancel aimed at a superseded response would each draw a
+  server error.
 
 ## Requests for core changes (not made here)
 
-1. **`Cargo.toml`: add an example entry.**
+1. **`Cargo.toml` example entry — done by the controller.** `[[example]] name = "realtime_text"`
+   with `required-features = ["realtime"]` is present, so the example's `cfg` fallback `main` was
+   removed.
 
-   ```toml
-   [[example]]
-   name = "realtime_text"
-   required-features = ["realtime"]
-   ```
-
-   Worked around for now by gating the example body behind `#[cfg(feature = "realtime")]` with a
-   fallback `main` that prints how to enable the feature, so `cargo check --all-targets` passes
-   without the feature. The entry would let the fallback be deleted.
-
-2. **`src/lib.rs`: re-export the realtime surface** alongside the other modules, e.g.
+2. **`src/lib.rs`: optionally re-export the realtime surface**, e.g.
    `pub use realtime::{RealtimeAgent, RealtimeRunner, RealtimeSession};` under
    `#[cfg(feature = "realtime")]`. Not required — `openai_agents_sdk::realtime::*` already works.
 
@@ -207,7 +288,7 @@ calculate_audio_length_ms
 
 ## Test coverage
 
-`tests/realtime_tests.rs` (11 tests, all event waits wrapped in `tokio::time::timeout`, no sleeps,
+`tests/realtime_tests.rs` (18 tests, all event waits wrapped in `tokio::time::timeout`, no sleeps,
 no network beyond `127.0.0.1`, dummy key `sk-test`):
 
 1. `tool_call_runs_end_to_end_and_sends_function_call_output` — tool advertised in the connect
@@ -236,7 +317,28 @@ no network beyond `127.0.0.1`, dummy key `sk-test`):
    `TranscriptDelta`; checks that `session.created` triggers the tracing `session.update`.
 10. `custom_headers_replace_the_bearer_token` — supplying headers suppresses `Authorization`.
 
-Plus 23 unit tests in `src/realtime/**`, covering the response-create state machine (deferral,
+9. `a_guardrail_on_text_output_cancels_the_response_without_touching_audio` — a text-output
+   guardrail on the active response sends `cancel_response_only`, leaving audio untouched.
+10. `a_guardrail_on_a_superseded_response_only_stops_that_response_audio` — a guardrail gated on a
+   semaphore so a newer response starts first; asserts `playback_only` for the old response, that
+   the newer response is *not* told about the older guardrail, and that the response's transport
+   audio is retired only once the guardrail settles.
+11. `a_response_with_no_guardrails_releases_its_audio_immediately` — the other lifecycle branch.
+12. `the_sip_model_builds_an_accept_payload_from_the_agent` — instructions, tools, turn detection,
+   `overrides` winning, and run-config base settings.
+13. `the_sip_model_requires_a_call_id`.
+14. `the_sip_model_attaches_to_a_call_and_forwards_events` — mock server; asserts the attach
+   payload omits the formats the call already negotiated and that server events still map.
+15. `the_playback_tracker_decides_where_audio_is_truncated` — mock server negotiates `audio/pcm`
+   and sends 100 ms of audio; the test reports 30 ms played through the tracker and asserts the
+   resulting `conversation.item.truncate` carries `audio_end_ms: 30` (not a wall-clock value), that
+   the format reached the tracker, and that the interruption reset it.
+
+Plus 33 unit tests in `src/realtime/**`, covering the cancel gate (not running, mismatched response
+id, duplicate cancel, released after a failed send, allowed again for the next response), the
+playback tracker's accumulation and byte conversion, the `ModelAudioTracker`'s per-response indexes and their selective release, audio
+ownership across responses, playback position with and without an application tracker, the
+`call_id` URL branch, the call carve-out for audio formats, `RealtimeInterrupt` validation, covering the response-create state machine (deferral,
 flush on `response.done`, unrelated errors keeping a deferred create, code/message matching) and
 truncation clamping, as well as the default model name and URL
 (`wss://api.openai.com/v1/realtime?model=gpt-realtime-2.1`), the session payload defaults, audio

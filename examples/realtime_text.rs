@@ -3,14 +3,6 @@
 //!
 //! The agent answers in text instead of audio, which keeps the example readable in a terminal.
 
-#[cfg(not(feature = "realtime"))]
-fn main() {
-    eprintln!(
-        "This example needs the `realtime` feature: cargo run --features realtime --example realtime_text"
-    );
-}
-
-#[cfg(feature = "realtime")]
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     use openai_agents_sdk::realtime::{

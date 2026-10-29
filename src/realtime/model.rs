@@ -1,6 +1,8 @@
 //! The realtime transport interface. Mirrors `agents.realtime.model`.
 
 use std::collections::BTreeMap;
+use std::fmt;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use tokio::sync::mpsc;
@@ -18,8 +20,121 @@ use crate::realtime::model_inputs::RealtimeModelSendEvent;
 /// [`crate::realtime::RealtimeSessionEvent::RawModelEvent`].
 pub type RealtimeModelEvents = mpsc::UnboundedReceiver<RealtimeModelEvent>;
 
-/// Options used when connecting to a realtime model.
+/// How much of the model's audio the user has actually heard.
 #[derive(Debug, Clone, Default, PartialEq)]
+pub struct RealtimePlaybackState {
+    /// The item being played.
+    pub current_item_id: Option<String>,
+    /// Index of the audio content inside that item.
+    pub current_item_content_index: Option<usize>,
+    /// Milliseconds of that item played so far.
+    pub elapsed_ms: Option<f64>,
+}
+
+/// Tracks audio playback progress on the application's behalf.
+///
+/// The transport generates audio far faster than it is played, so on an interruption it must know
+/// how much the user actually heard in order to truncate the item at the right point. Without a
+/// tracker the transport assumes audio plays immediately, at real-time speed, which is right for
+/// low-latency local playback. Pass a tracker through
+/// [`RealtimeModelConfig::playback_tracker`] when playback is delayed or remote, such as a phone
+/// call, and call [`RealtimePlaybackTracker::on_play_bytes`] or
+/// [`RealtimePlaybackTracker::on_play_ms`] as audio is played.
+#[derive(Default)]
+pub struct RealtimePlaybackTracker {
+    inner: Mutex<PlaybackInner>,
+}
+
+#[derive(Default)]
+struct PlaybackInner {
+    format: Option<String>,
+    current_item: Option<(String, usize)>,
+    elapsed_ms: Option<f64>,
+}
+
+impl fmt::Debug for RealtimePlaybackTracker {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RealtimePlaybackTracker")
+            .field("state", &self.state())
+            .finish()
+    }
+}
+
+impl RealtimePlaybackTracker {
+    /// A tracker with no audio played yet.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// A shared tracker, ready for [`RealtimeModelConfig::with_playback_tracker`].
+    pub fn shared() -> Arc<Self> {
+        Arc::new(Self::new())
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, PlaybackInner> {
+        self.inner.lock().expect("playback tracker poisoned")
+    }
+
+    /// Record that `bytes` of `item_id` have been played.
+    pub fn on_play_bytes(&self, item_id: &str, content_index: usize, bytes: &[u8]) {
+        let ms = {
+            let format = self.lock().format.clone();
+            calculate_audio_length_ms(format.as_deref(), bytes)
+        };
+        self.on_play_ms(item_id, content_index, ms);
+    }
+
+    /// Record that `ms` milliseconds of `item_id` have been played.
+    pub fn on_play_ms(&self, item_id: &str, content_index: usize, ms: f64) {
+        let mut inner = self.lock();
+        let key = (item_id.to_string(), content_index);
+        match inner.current_item.as_ref() {
+            Some(current) if *current == key => {
+                *inner.elapsed_ms.get_or_insert(0.0) += ms;
+            }
+            _ => {
+                inner.current_item = Some(key);
+                inner.elapsed_ms = Some(ms);
+            }
+        }
+    }
+
+    /// Called by the transport when playback was interrupted.
+    pub fn on_interrupted(&self) {
+        let mut inner = self.lock();
+        inner.current_item = None;
+        inner.elapsed_ms = None;
+    }
+
+    /// Called by the transport once the session negotiates an audio format.
+    pub fn set_audio_format(&self, format: impl Into<String>) {
+        self.lock().format = Some(format.into());
+    }
+
+    /// The audio format the transport reported, if any.
+    pub fn audio_format(&self) -> Option<String> {
+        self.lock().format.clone()
+    }
+
+    /// The current playback position.
+    pub fn state(&self) -> RealtimePlaybackState {
+        let inner = self.lock();
+        match inner.current_item.as_ref() {
+            None => RealtimePlaybackState::default(),
+            Some((item_id, content_index)) => RealtimePlaybackState {
+                current_item_id: Some(item_id.clone()),
+                current_item_content_index: Some(*content_index),
+                elapsed_ms: inner.elapsed_ms,
+            },
+        }
+    }
+}
+
+/// A condition rechecked at the transport's send boundary.
+pub type RealtimeSendCondition = Box<dyn Fn() -> bool + Send + Sync>;
+
+/// Options used when connecting to a realtime model.
+#[derive(Debug, Clone, Default)]
 pub struct RealtimeModelConfig {
     /// API key to authenticate with. Falls back to the SDK default key, then `OPENAI_API_KEY`.
     pub api_key: Option<String>,
@@ -31,6 +146,24 @@ pub struct RealtimeModelConfig {
     pub initial_model_settings: Option<RealtimeSessionModelSettings>,
     /// Attach to an existing realtime call instead of creating a session.
     pub call_id: Option<String>,
+    /// Tracks how much audio the user has heard, for accurate interruption truncation.
+    pub playback_tracker: Option<Arc<RealtimePlaybackTracker>>,
+}
+
+impl PartialEq for RealtimeModelConfig {
+    /// Trackers compare by identity, since they hold mutable playback progress.
+    fn eq(&self, other: &Self) -> bool {
+        self.api_key == other.api_key
+            && self.url == other.url
+            && self.headers == other.headers
+            && self.initial_model_settings == other.initial_model_settings
+            && self.call_id == other.call_id
+            && match (&self.playback_tracker, &other.playback_tracker) {
+                (None, None) => true,
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                _ => false,
+            }
+    }
 }
 
 impl RealtimeModelConfig {
@@ -70,6 +203,12 @@ impl RealtimeModelConfig {
         self.call_id = Some(call_id.into());
         self
     }
+
+    /// Track playback progress with `tracker` instead of assuming real-time local playback.
+    pub fn with_playback_tracker(mut self, tracker: Arc<RealtimePlaybackTracker>) -> Self {
+        self.playback_tracker = Some(tracker);
+        self
+    }
 }
 
 /// A transport that connects to a realtime model and exchanges events with it.
@@ -85,6 +224,24 @@ pub trait RealtimeModel: Send + Sync + std::fmt::Debug {
 
     /// Send an event to the model.
     async fn send_event(&self, event: RealtimeModelSendEvent) -> Result<()>;
+
+    /// Send an event only if `condition` still holds at the transport's send boundary.
+    ///
+    /// Returns whether the event was committed. The default implementation sends nothing and
+    /// returns `false`, because checking a condition before an `await` is not atomic: a transport
+    /// that supports conditional sends must recheck `condition` where it actually writes.
+    async fn send_event_if(
+        &self,
+        _event: RealtimeModelSendEvent,
+        _condition: RealtimeSendCondition,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// Release transport state held for `response_id` once the session's guardrails have settled.
+    async fn retire_response_audio(&self, _response_id: &str) -> Result<()> {
+        Ok(())
+    }
 
     /// Close the connection.
     async fn close(&self) -> Result<()>;
@@ -140,6 +297,38 @@ mod tests {
         assert!((ms - 1.0).abs() < 1e-9);
         let ms = calculate_audio_length_ms(Some("audio/pcma"), &[0u8; 8]);
         assert!((ms - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn playback_tracker_accumulates_within_one_item() {
+        let tracker = RealtimePlaybackTracker::new();
+        assert_eq!(tracker.state(), RealtimePlaybackState::default());
+
+        tracker.on_play_ms("item_1", 0, 100.0);
+        tracker.on_play_ms("item_1", 0, 50.0);
+        let state = tracker.state();
+        assert_eq!(state.current_item_id.as_deref(), Some("item_1"));
+        assert_eq!(state.current_item_content_index, Some(0));
+        assert_eq!(state.elapsed_ms, Some(150.0));
+
+        // A new item restarts the count rather than adding to the old one.
+        tracker.on_play_ms("item_2", 1, 20.0);
+        let state = tracker.state();
+        assert_eq!(state.current_item_id.as_deref(), Some("item_2"));
+        assert_eq!(state.current_item_content_index, Some(1));
+        assert_eq!(state.elapsed_ms, Some(20.0));
+
+        tracker.on_interrupted();
+        assert_eq!(tracker.state(), RealtimePlaybackState::default());
+    }
+
+    #[test]
+    fn playback_tracker_converts_bytes_with_the_session_format() {
+        let tracker = RealtimePlaybackTracker::new();
+        tracker.set_audio_format("g711_ulaw");
+        assert_eq!(tracker.audio_format().as_deref(), Some("g711_ulaw"));
+        tracker.on_play_bytes("item_1", 0, &[0u8; 8]);
+        assert_eq!(tracker.state().elapsed_ms, Some(1.0));
     }
 
     #[test]

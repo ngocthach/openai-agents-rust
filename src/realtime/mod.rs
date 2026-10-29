@@ -27,6 +27,20 @@
 //! }
 //! ```
 //!
+//! # Interruptions and playback
+//!
+//! Realtime models generate audio far faster than it is played, so an interruption must truncate
+//! the item where the user actually stopped hearing it. By default the transport assumes audio is
+//! played immediately at real-time speed, which is right for local playback. For delayed or remote
+//! playback, such as a phone call, pass a [`RealtimePlaybackTracker`] through
+//! [`RealtimeModelConfig::playback_tracker`] and report progress as audio is played.
+//!
+//! # Telephony
+//!
+//! [`OpenAIRealtimeSIPModel`] attaches to a call the Realtime Calls API already created. Build the
+//! accept payload with [`OpenAIRealtimeSIPModel::build_initial_session_payload`], POST it to
+//! `/v1/realtime/calls/{call_id}/accept`, then attach with the same `call_id`.
+//!
 //! # Differences from the Python SDK
 //!
 //! - Transports deliver events through a channel instead of listener objects, so a slow consumer
@@ -34,6 +48,7 @@
 //! - [`RealtimeSessionModelSettings`] carries [`RealtimeFunctionToolSpec`]s rather than
 //!   `Tool` values, which keeps [`RealtimeModel`] object safe and free of the context type.
 //! - [`RealtimeRunner::run`] connects before returning; there is no separate "enter" step.
+//! - Interruption modes live in one [`RealtimeInterrupt`] value rather than four loose flags.
 
 pub mod agent;
 pub mod config;
@@ -63,14 +78,15 @@ pub use items::{
     RealtimeContent, RealtimeItem, RealtimeMessageItem, RealtimeMessageRole, RealtimeToolCallItem,
 };
 pub use model::{
-    RealtimeModel, RealtimeModelConfig, RealtimeModelEvents, calculate_audio_length_ms,
+    RealtimeModel, RealtimeModelConfig, RealtimeModelEvents, RealtimePlaybackState,
+    RealtimePlaybackTracker, RealtimeSendCondition, calculate_audio_length_ms,
 };
 pub use model_events::{
     RealtimeConnectionStatus, RealtimeModelAudioEvent, RealtimeModelEvent,
     RealtimeModelToolCallEvent,
 };
-pub use model_inputs::RealtimeModelSendEvent;
-pub use openai_model::OpenAIRealtimeWebSocketModel;
+pub use model_inputs::{RealtimeInterrupt, RealtimeModelSendEvent};
+pub use openai_model::{OpenAIRealtimeSIPModel, OpenAIRealtimeWebSocketModel};
 pub use runner::RealtimeRunner;
 pub use session::RealtimeSession;
 pub use testing::{FakeRealtimeModel, fake_realtime_model};

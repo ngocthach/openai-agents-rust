@@ -8,11 +8,12 @@ use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
 use openai_agents_sdk::realtime::{
-    FakeRealtimeModel, OpenAIRealtimeWebSocketModel, RealtimeAgent, RealtimeContent,
-    RealtimeMessageItem, RealtimeMessageRole, RealtimeModel, RealtimeModelConfig,
-    RealtimeModelEvent, RealtimeModelToolCallEvent, RealtimeRunConfig, RealtimeRunner,
-    RealtimeSession, RealtimeSessionEvent, RealtimeSessionModelSettings,
-    RealtimeToolExecutionConfig, realtime_handoff,
+    FakeRealtimeModel, OpenAIRealtimeSIPModel, OpenAIRealtimeWebSocketModel, RealtimeAgent,
+    RealtimeContent, RealtimeInterrupt, RealtimeMessageItem, RealtimeMessageRole, RealtimeModel,
+    RealtimeModelConfig, RealtimeModelEvent, RealtimeModelSendEvent, RealtimeModelToolCallEvent,
+    RealtimePlaybackTracker, RealtimeRunConfig, RealtimeRunner, RealtimeSession,
+    RealtimeSessionEvent, RealtimeSessionModelSettings, RealtimeToolExecutionConfig,
+    RealtimeUserInput, realtime_handoff,
 };
 use openai_agents_sdk::tool::FunctionTool;
 use openai_agents_sdk::tool_guardrails::{ToolGuardrailFunctionOutput, ToolInputGuardrail};
@@ -409,24 +410,21 @@ async fn transcript_deltas_build_history_and_trip_output_guardrails() {
         other => panic!("expected guardrail_tripped, got {other:?}"),
     }
 
-    // The session interrupted the model and told it which guardrail tripped.
+    // The response is still the active one, so it is cancelled outright and its audio stopped.
     let sent = model.sent_events();
-    assert!(
-        sent.iter().any(|event| matches!(
-            event,
-            openai_agents_sdk::realtime::RealtimeModelSendEvent::Interrupt {
-                force_response_cancel: true
-            }
-        )),
-        "expected an interrupt, saw {:?}",
+    let interrupts = model.interrupts();
+    assert_eq!(
+        interrupts,
+        vec![RealtimeInterrupt::forced_for_response("resp_1", true)],
+        "expected a forced, response-scoped interrupt, saw {:?}",
         sent.iter()
-            .map(openai_agents_sdk::realtime::RealtimeModelSendEvent::event_type)
+            .map(RealtimeModelSendEvent::event_type)
             .collect::<Vec<_>>()
     );
     assert!(sent.iter().any(|event| matches!(
         event,
-        openai_agents_sdk::realtime::RealtimeModelSendEvent::UserInput {
-            user_input: openai_agents_sdk::realtime::RealtimeUserInput::Text(text),
+        RealtimeModelSendEvent::UserInput {
+            user_input: RealtimeUserInput::Text(text),
         } if text == "guardrail triggered: no-secrets"
     )));
 
@@ -561,12 +559,22 @@ async fn dynamic_instructions_and_run_config_settings_reach_the_model() {
         ),
         ..Default::default()
     };
+    let tracker = RealtimePlaybackTracker::shared();
     let session = RealtimeRunner::new(agent)
         .with_model(model.clone())
         .with_config(config)
+        .with_model_config(RealtimeModelConfig::new().with_playback_tracker(tracker.clone()))
         .run(())
         .await
         .unwrap();
+
+    // The runner's model config, including the playback tracker, reaches the transport.
+    assert!(
+        model
+            .playback_tracker()
+            .is_some_and(|forwarded| Arc::ptr_eq(&forwarded, &tracker)),
+        "the session must forward the playback tracker to the transport"
+    );
 
     let settings = model.last_session_settings().unwrap();
     assert_eq!(settings.instructions.as_deref(), Some("You are Assistant"));
@@ -679,6 +687,484 @@ async fn pre_approval_input_guardrails_block_a_call_before_a_human_sees_it() {
     .await;
 
     session.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_guardrail_on_text_output_cancels_the_response_without_touching_audio() {
+    let guardrail = OutputGuardrail::<()>::new("no-secrets", |_ctx, _agent, output| async move {
+        let text = output.as_str().unwrap_or_default().to_string();
+        Ok(GuardrailFunctionOutput::new(
+            Value::Null,
+            text.contains("secret"),
+        ))
+    });
+    let model = Arc::new(FakeRealtimeModel::new());
+    let agent = RealtimeAgent::<()>::new("Assistant")
+        .with_output_guardrail(guardrail)
+        .into_arc();
+    let config = RealtimeRunConfig::<()> {
+        guardrails_settings: openai_agents_sdk::realtime::RealtimeGuardrailsSettings {
+            debounce_text_length: 6,
+        },
+        ..Default::default()
+    };
+    let session = RealtimeRunner::new(agent)
+        .with_model(model.clone())
+        .with_config(config)
+        .run(())
+        .await
+        .unwrap();
+
+    // Text deltas open a generation on their own, without a `turn_started`.
+    assert!(model.emit(RealtimeModelEvent::OutputTextDelta {
+        item_id: "item_1".to_string(),
+        delta: "the secret is out".to_string(),
+        response_id: "resp_1".to_string(),
+    }));
+
+    wait_for(&session, |event| {
+        matches!(event, RealtimeSessionEvent::GuardrailTripped { .. })
+    })
+    .await;
+
+    let deadline = std::time::Instant::now() + EVENT_TIMEOUT;
+    let interrupts = loop {
+        let interrupts = model.interrupts();
+        if !interrupts.is_empty() || std::time::Instant::now() > deadline {
+            break interrupts;
+        }
+        tokio::task::yield_now().await;
+    };
+    // There is no audio to stop, so only the response is cancelled.
+    assert_eq!(
+        interrupts,
+        vec![RealtimeInterrupt::forced_for_response("resp_1", false)]
+    );
+    assert!(interrupts[0].cancel_response_only);
+
+    session.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_guardrail_on_a_superseded_response_only_stops_that_response_audio() {
+    // The guardrail blocks until the test releases it, so a newer response can start first.
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let guardrail_gate = gate.clone();
+    let guardrail = OutputGuardrail::<()>::new("no-secrets", move |_ctx, _agent, output| {
+        let gate = guardrail_gate.clone();
+        async move {
+            let permit = gate.acquire().await.expect("gate stays open");
+            permit.forget();
+            let text = output.as_str().unwrap_or_default().to_string();
+            Ok(GuardrailFunctionOutput::new(
+                Value::Null,
+                text.contains("secret"),
+            ))
+        }
+    });
+    let model = Arc::new(FakeRealtimeModel::new());
+    let agent = RealtimeAgent::<()>::new("Assistant")
+        .with_output_guardrail(guardrail)
+        .into_arc();
+    let config = RealtimeRunConfig::<()> {
+        guardrails_settings: openai_agents_sdk::realtime::RealtimeGuardrailsSettings {
+            debounce_text_length: 6,
+        },
+        ..Default::default()
+    };
+    let session = RealtimeRunner::new(agent)
+        .with_model(model.clone())
+        .with_config(config)
+        .run(())
+        .await
+        .unwrap();
+
+    // Generation 1 produces offending text, but the guardrail has not finished yet.
+    assert!(model.emit_all([
+        RealtimeModelEvent::TurnStarted {
+            response_id: Some("resp_1".to_string()),
+        },
+        RealtimeModelEvent::TranscriptDelta {
+            item_id: "item_1".to_string(),
+            delta: "the secret is out".to_string(),
+            response_id: "resp_1".to_string(),
+        },
+        RealtimeModelEvent::TurnEnded {
+            response_id: Some("resp_1".to_string()),
+        },
+        // Generation 2 starts, so generation 1 is now superseded.
+        RealtimeModelEvent::TurnStarted {
+            response_id: Some("resp_2".to_string()),
+        },
+    ]));
+    wait_for(&session, |event| {
+        matches!(event, RealtimeSessionEvent::AgentEnd { .. })
+    })
+    .await;
+
+    // The first response's audio is still owed cleanup while its guardrail runs.
+    assert!(model.retired_responses().is_empty());
+
+    gate.add_permits(1);
+    let (tripped, _) = wait_for(&session, |event| {
+        matches!(event, RealtimeSessionEvent::GuardrailTripped { .. })
+    })
+    .await;
+    match tripped {
+        RealtimeSessionEvent::GuardrailTripped { message, .. } => {
+            assert_eq!(message, "the secret is out");
+        }
+        other => panic!("expected guardrail_tripped, got {other:?}"),
+    }
+
+    // Only the superseded response's playback is stopped; the live response keeps going.
+    let deadline = std::time::Instant::now() + EVENT_TIMEOUT;
+    let interrupts = loop {
+        let interrupts = model.interrupts();
+        if !interrupts.is_empty() || std::time::Instant::now() > deadline {
+            break interrupts;
+        }
+        tokio::task::yield_now().await;
+    };
+    assert_eq!(
+        interrupts,
+        vec![RealtimeInterrupt::playback_only("resp_1")],
+        "a superseded response must not be cancelled, only silenced"
+    );
+    assert!(
+        !model.sent_events().iter().any(|event| matches!(
+            event,
+            RealtimeModelSendEvent::UserInput {
+                user_input: RealtimeUserInput::Text(text),
+            } if text.starts_with("guardrail triggered")
+        )),
+        "the newer response must not be told about an older response's guardrail"
+    );
+
+    // Once the guardrail settles, the transport may release that response's audio.
+    let deadline = std::time::Instant::now() + EVENT_TIMEOUT;
+    while model.retired_responses().is_empty() && std::time::Instant::now() < deadline {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(model.retired_responses(), vec!["resp_1".to_string()]);
+
+    session.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_response_with_no_guardrails_releases_its_audio_immediately() {
+    let model = Arc::new(FakeRealtimeModel::new());
+    let agent = RealtimeAgent::<()>::new("Assistant").into_arc();
+    let session = start_session(model.clone(), agent).await;
+
+    assert!(model.emit_all([
+        RealtimeModelEvent::TurnStarted {
+            response_id: Some("resp_1".to_string()),
+        },
+        RealtimeModelEvent::TurnEnded {
+            response_id: Some("resp_1".to_string()),
+        },
+    ]));
+    wait_for(&session, |event| {
+        matches!(event, RealtimeSessionEvent::AgentEnd { .. })
+    })
+    .await;
+
+    assert_eq!(model.retired_responses(), vec!["resp_1".to_string()]);
+    session.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn the_sip_model_builds_an_accept_payload_from_the_agent() {
+    let agent = RealtimeAgent::<()>::new("Phone")
+        .with_instructions("Answer politely")
+        .with_tool(weather_tool())
+        .into_arc();
+
+    let payload =
+        OpenAIRealtimeSIPModel::build_initial_session_payload(&agent, (), None, None, None)
+            .await
+            .unwrap();
+    assert_eq!(payload["type"], "realtime");
+    assert_eq!(payload["model"], "gpt-realtime-2.1");
+    assert_eq!(payload["instructions"], "Answer politely");
+    assert_eq!(payload["tools"][0]["name"], "get_weather");
+    assert_eq!(
+        payload["audio"]["input"]["turn_detection"]["type"],
+        "semantic_vad"
+    );
+
+    // Overrides are applied after the agent and the configs.
+    let payload = OpenAIRealtimeSIPModel::build_initial_session_payload(
+        &agent,
+        (),
+        None,
+        None,
+        Some(&RealtimeSessionModelSettings::new().with_voice("marin")),
+    )
+    .await
+    .unwrap();
+    assert_eq!(payload["audio"]["output"]["voice"], "marin");
+
+    // The run config supplies the base settings, and tracing_disabled suppresses tracing.
+    let run_config = RealtimeRunConfig::<()> {
+        model_settings: Some(RealtimeSessionModelSettings::new().with_output_modalities(["text"])),
+        tracing_disabled: true,
+        ..Default::default()
+    };
+    let payload = OpenAIRealtimeSIPModel::build_initial_session_payload(
+        &agent,
+        (),
+        None,
+        Some(&run_config),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(payload["output_modalities"], json!(["text"]));
+}
+
+#[tokio::test]
+async fn the_sip_model_requires_a_call_id() {
+    let model = OpenAIRealtimeSIPModel::new();
+    let error = model
+        .connect(RealtimeModelConfig::new().with_api_key("sk-test"))
+        .await
+        .expect_err("a SIP attach without a call id is rejected");
+    assert!(
+        error.to_string().contains("requires `call_id`"),
+        "unexpected error: {error}"
+    );
+    assert_eq!(model.model_name(), "gpt-realtime-2.1");
+}
+
+#[tokio::test]
+async fn the_sip_model_attaches_to_a_call_and_forwards_events() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (client_tx, mut client_rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
+
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+        while let Some(Ok(message)) = ws.next().await {
+            if let Message::Text(text) = message {
+                let value: Value = serde_json::from_str(text.as_str()).unwrap();
+                let first = value["type"] == "session.update";
+                let _ = client_tx.send(value);
+                if first {
+                    break;
+                }
+            }
+        }
+        ws.send(Message::text(
+            json!({
+                "type": "conversation.item.deleted",
+                "item_id": "item_gone",
+            })
+            .to_string(),
+        ))
+        .await
+        .unwrap();
+        while ws.next().await.is_some() {}
+    });
+
+    let model = OpenAIRealtimeSIPModel::new();
+    let mut events = model
+        .connect(
+            RealtimeModelConfig::new()
+                .with_api_key("sk-test")
+                .with_call_id("call_789")
+                .with_url(format!(
+                    "ws://127.0.0.1:{port}/v1/realtime?call_id=call_789"
+                )),
+        )
+        .await
+        .expect("attaches to the call");
+
+    let update = tokio::time::timeout(EVENT_TIMEOUT, client_rx.recv())
+        .await
+        .expect("session.update received")
+        .unwrap();
+    assert_eq!(update["type"], "session.update");
+    // A call already negotiated its audio formats, so the attach must not override them.
+    assert!(update["session"]["audio"]["input"].get("format").is_none());
+    assert!(update["session"]["audio"]["output"].get("format").is_none());
+
+    let deleted = tokio::time::timeout(EVENT_TIMEOUT, async {
+        loop {
+            if let RealtimeModelEvent::ItemDeleted { item_id } =
+                events.recv().await.expect("stream stays open")
+            {
+                return item_id;
+            }
+        }
+    })
+    .await
+    .expect("item_deleted mapped");
+    assert_eq!(deleted, "item_gone");
+
+    model.close().await.unwrap();
+    server.abort();
+}
+
+#[tokio::test]
+async fn the_playback_tracker_decides_where_audio_is_truncated() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (client_tx, mut client_rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
+
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+        while let Some(Ok(message)) = ws.next().await {
+            if let Message::Text(text) = message {
+                let value: Value = serde_json::from_str(text.as_str()).unwrap();
+                let first = value["type"] == "session.update";
+                let _ = client_tx.send(value);
+                if first {
+                    break;
+                }
+            }
+        }
+        // Negotiate pcm16, then send 100 ms of audio (24 kHz, 2 bytes per sample).
+        ws.send(Message::text(
+            json!({
+                "type": "session.created",
+                "session": {
+                    "type": "realtime",
+                    "model": "gpt-realtime-2.1",
+                    "audio": {"output": {"format": {"type": "audio/pcm", "rate": 24000}}},
+                },
+            })
+            .to_string(),
+        ))
+        .await
+        .unwrap();
+        let silence = base64_encode(&vec![0u8; 4800]);
+        ws.send(Message::text(
+            json!({
+                "type": "response.output_audio.delta",
+                "item_id": "item_1",
+                "content_index": 0,
+                "response_id": "resp_1",
+                "delta": silence,
+            })
+            .to_string(),
+        ))
+        .await
+        .unwrap();
+        while let Some(Ok(message)) = ws.next().await {
+            if let Message::Text(text) = message
+                && let Ok(value) = serde_json::from_str::<Value>(text.as_str())
+            {
+                let _ = client_tx.send(value);
+            }
+        }
+    });
+
+    let tracker = RealtimePlaybackTracker::shared();
+    let model = OpenAIRealtimeWebSocketModel::new();
+    let mut events = model
+        .connect(
+            RealtimeModelConfig::new()
+                .with_api_key("sk-test")
+                .with_url(format!("ws://127.0.0.1:{port}/v1/realtime"))
+                .with_playback_tracker(tracker.clone()),
+        )
+        .await
+        .expect("connects to the mock server");
+
+    // Wait for the audio to arrive before reporting playback.
+    let audio = tokio::time::timeout(EVENT_TIMEOUT, async {
+        loop {
+            if let RealtimeModelEvent::Audio(audio) =
+                events.recv().await.expect("stream stays open")
+            {
+                return audio;
+            }
+        }
+    })
+    .await
+    .expect("audio delta mapped");
+    assert_eq!(audio.data.len(), 4800);
+    assert_eq!(audio.item_id, "item_1");
+
+    // The transport told the tracker which format the session negotiated.
+    assert_eq!(tracker.audio_format().as_deref(), Some("audio/pcm"));
+
+    // The user heard only 30 ms of the 100 ms the model sent.
+    tracker.on_play_ms("item_1", 0, 30.0);
+    assert_eq!(tracker.state().elapsed_ms, Some(30.0));
+
+    model
+        .send_event(RealtimeModelSendEvent::interrupt())
+        .await
+        .unwrap();
+
+    let truncate = tokio::time::timeout(EVENT_TIMEOUT, async {
+        while let Some(value) = client_rx.recv().await {
+            if value["type"] == "conversation.item.truncate" {
+                return value;
+            }
+        }
+        panic!("conversation.item.truncate never arrived");
+    })
+    .await
+    .expect("truncate received");
+    assert_eq!(truncate["item_id"], "item_1");
+    assert_eq!(truncate["content_index"], 0);
+    assert_eq!(
+        truncate["audio_end_ms"], 30,
+        "the truncate point comes from the tracker, not from wall-clock time"
+    );
+
+    // Interrupting resets the tracker so later playback queries do not reference stale audio.
+    assert_eq!(tracker.state().current_item_id, None);
+
+    // The transport also emitted the interruption to the application.
+    let interrupted = tokio::time::timeout(EVENT_TIMEOUT, async {
+        loop {
+            if let RealtimeModelEvent::AudioInterrupted { item_id, .. } =
+                events.recv().await.expect("stream stays open")
+            {
+                return item_id;
+            }
+        }
+    })
+    .await
+    .expect("audio_interrupted emitted");
+    assert_eq!(interrupted, "item_1");
+
+    model.close().await.unwrap();
+    server.abort();
+}
+
+/// Minimal base64 encoder, so the mock server does not need the `base64` crate.
+fn base64_encode(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        out.push(ALPHABET[(n >> 18) as usize & 63] as char);
+        out.push(ALPHABET[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 {
+            ALPHABET[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
 }
 
 /// What the mock server captured from the client handshake.
