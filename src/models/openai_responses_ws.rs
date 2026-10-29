@@ -385,6 +385,58 @@ impl Model for OpenAIResponsesWSModel {
     }
 }
 
+/// Pins runs to a shared WebSocket-enabled OpenAI provider so consecutive turns and runs reuse
+/// one connection per model. Port of `responses_websocket_session()`.
+///
+/// ```no_run
+/// # async fn demo() -> openai_agents_sdk::Result<()> {
+/// use openai_agents_sdk::models::openai_responses_ws::ResponsesWebSocketSession;
+/// use openai_agents_sdk::{Agent, RunOptions, Runner};
+///
+/// let ws = ResponsesWebSocketSession::from_env();
+/// let agent = Agent::<()>::new("Assistant");
+/// let opts = RunOptions::new(()).run_config(ws.run_config());
+/// let result = Runner::run_with_options(&agent, "Hello", opts).await?;
+/// ws.close().await;
+/// # Ok(()) }
+/// ```
+#[derive(Debug, Clone)]
+pub struct ResponsesWebSocketSession {
+    provider: super::openai_provider::OpenAIProvider,
+}
+
+impl ResponsesWebSocketSession {
+    /// A session using `client`.
+    pub fn new(client: OpenAIClient) -> Self {
+        ResponsesWebSocketSession {
+            provider: super::openai_provider::OpenAIProvider::new()
+                .with_client(client)
+                .with_use_responses(true)
+                .with_responses_websocket(true),
+        }
+    }
+
+    /// A session using the default client configuration (`OPENAI_API_KEY`, ...).
+    pub fn from_env() -> Self {
+        Self::new(OpenAIClient::from_env())
+    }
+
+    /// The WebSocket-enabled provider.
+    pub fn provider(&self) -> &super::openai_provider::OpenAIProvider {
+        &self.provider
+    }
+
+    /// A run config whose model provider is this session's provider.
+    pub fn run_config<C: Send + Sync + 'static>(&self) -> crate::run_config::RunConfig<C> {
+        crate::run_config::RunConfig::new().with_model_provider(Arc::new(self.provider.clone()))
+    }
+
+    /// Close cached models and their WebSocket connections.
+    pub async fn close(&self) {
+        self.provider.close_websocket_models().await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

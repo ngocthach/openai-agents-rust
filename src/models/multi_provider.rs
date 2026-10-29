@@ -72,6 +72,10 @@ impl MultiProvider {
 }
 
 impl ModelProvider for MultiProvider {
+    fn agent_harness_id(&self) -> Option<String> {
+        self.openai.agent_harness_id()
+    }
+
     fn get_model(&self, model_name: Option<&str>) -> Result<Arc<dyn Model>> {
         let Some(name) = model_name else {
             return self.openai.get_model(None);

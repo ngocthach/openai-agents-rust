@@ -42,6 +42,25 @@ static DEFAULT_CLIENT: RwLock<Option<OpenAIClient>> = RwLock::new(None);
 static DEFAULT_API: RwLock<OpenAIApi> = RwLock::new(OpenAIApi::Responses);
 static DEFAULT_USE_FOR_TRACING: RwLock<bool> = RwLock::new(true);
 
+static DEFAULT_HARNESS: RwLock<Option<String>> = RwLock::new(None);
+
+/// Set the default OpenAI agent harness id recorded as `agent_harness_id` in trace metadata
+/// (falls back to the `OPENAI_AGENT_HARNESS_ID` environment variable).
+pub fn set_default_openai_harness(harness_id: Option<String>) {
+    *DEFAULT_HARNESS.write().expect("poisoned") = harness_id;
+}
+
+fn non_empty(s: Option<String>) -> Option<String> {
+    s.map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
+}
+
+/// Resolve the agent harness id: the provider's, then the global default, then the env var.
+pub(crate) fn resolve_openai_harness_id(provider: &dyn interface::ModelProvider) -> Option<String> {
+    non_empty(provider.agent_harness_id())
+        .or_else(|| non_empty(DEFAULT_HARNESS.read().expect("poisoned").clone()))
+        .or_else(|| non_empty(std::env::var("OPENAI_AGENT_HARNESS_ID").ok()))
+}
+
 /// Set the default OpenAI API key used for model requests (and tracing, unless overridden).
 pub fn set_default_openai_key(key: impl Into<String>) {
     *DEFAULT_KEY.write().expect("poisoned") = Some(key.into());

@@ -336,8 +336,18 @@ pub(crate) async fn run_loop<C: Send + Sync + 'static>(
         if let Some(g) = &lp.config.group_id {
             b = b.group_id(g.clone());
         }
-        if let Some(m) = &lp.config.trace_metadata {
-            b = b.metadata(m.clone());
+        let mut metadata = lp.config.trace_metadata.clone();
+        if let Some(h) = crate::models::resolve_openai_harness_id(lp.config.model_provider.as_ref())
+            && !metadata
+                .as_ref()
+                .is_some_and(|m| m.contains_key("agent_harness_id"))
+        {
+            metadata
+                .get_or_insert_with(Default::default)
+                .insert("agent_harness_id".into(), Value::String(h));
+        }
+        if let Some(m) = metadata {
+            b = b.metadata(m);
         }
         if let Some(k) = &lp.config.tracing_api_key {
             b = b.tracing_api_key(k.clone());

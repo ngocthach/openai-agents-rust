@@ -80,4 +80,27 @@ async fn run_produces_trace_and_nested_spans() {
         .expect("task span");
     assert_eq!(agent_spans[0]["parent_id"], task["id"]);
     assert!(task["parent_id"].is_null());
+
+    // The OpenAI agent harness id configured on the provider is recorded in trace metadata
+    // and routed onto spans.
+    model.add_turn(vec![assistant_message("harnessed")]);
+    let config = openai_agents_sdk::RunConfig::<()>::new().with_model_provider(Arc::new(
+        openai_agents_sdk::OpenAIProvider::new().with_agent_harness_id("harness_1"),
+    ));
+    Runner::run_with_options(
+        &agent,
+        "hi",
+        openai_agents_sdk::RunOptions::new(()).run_config(config),
+    )
+    .await
+    .unwrap();
+    let items = processor.items();
+    let last_trace = items.iter().rev().find(|i| i["object"] == "trace").unwrap();
+    assert_eq!(last_trace["metadata"]["agent_harness_id"], "harness_1");
+    let last_span = items
+        .iter()
+        .rev()
+        .find(|i| i["object"] == "trace.span")
+        .unwrap();
+    assert_eq!(last_span["metadata"]["agent_harness_id"], "harness_1");
 }

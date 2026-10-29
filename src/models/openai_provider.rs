@@ -19,6 +19,7 @@ type WebsocketModelCache =
 pub struct OpenAIProvider {
     client: Option<OpenAIClient>,
     use_responses: Option<bool>,
+    agent_harness_id: Option<String>,
     #[cfg(feature = "websocket")]
     use_responses_websocket: bool,
     #[cfg(feature = "websocket")]
@@ -52,6 +53,27 @@ impl OpenAIProvider {
         self
     }
 
+    /// Set the agent harness id recorded in trace metadata for runs using this provider.
+    pub fn with_agent_harness_id(mut self, harness_id: impl Into<String>) -> Self {
+        self.agent_harness_id = Some(harness_id.into());
+        self
+    }
+
+    /// Close the cached WebSocket models (and their connections).
+    #[cfg(feature = "websocket")]
+    pub async fn close_websocket_models(&self) {
+        let models: Vec<Arc<dyn Model>> = self
+            .websocket_models
+            .lock()
+            .expect("poisoned")
+            .drain()
+            .map(|(_, m)| m)
+            .collect();
+        for m in models {
+            m.close().await;
+        }
+    }
+
     fn client(&self) -> OpenAIClient {
         self.client
             .clone()
@@ -66,6 +88,10 @@ impl OpenAIProvider {
 }
 
 impl ModelProvider for OpenAIProvider {
+    fn agent_harness_id(&self) -> Option<String> {
+        self.agent_harness_id.clone()
+    }
+
     fn get_model(&self, model_name: Option<&str>) -> Result<Arc<dyn Model>> {
         let explicit = model_name.is_some();
         let name = model_name

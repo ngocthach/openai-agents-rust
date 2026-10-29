@@ -85,7 +85,8 @@ pub use model_settings::{MCPToolChoice, ModelSettings, Reasoning, ToolChoice};
 pub use models::{
     Model, ModelProvider, ModelRequest, ModelTracing, MultiProvider, OpenAIApi,
     OpenAIChatCompletionsModel, OpenAIClient, OpenAIProvider, OpenAIResponsesModel,
-    set_default_openai_api, set_default_openai_client, set_default_openai_key,
+    set_default_openai_api, set_default_openai_client, set_default_openai_harness,
+    set_default_openai_key,
 };
 pub use prompts::{Prompt, PromptVariable};
 pub use result::{CancelMode, RunResult, RunResultStreaming};

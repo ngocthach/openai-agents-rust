@@ -150,4 +150,9 @@ pub trait Model: Send + Sync + fmt::Debug {
 pub trait ModelProvider: Send + Sync + fmt::Debug {
     /// Get a model by name (`None` selects the provider default).
     fn get_model(&self, model_name: Option<&str>) -> Result<Arc<dyn Model>>;
+
+    /// The OpenAI agent harness id configured on this provider, if any.
+    fn agent_harness_id(&self) -> Option<String> {
+        None
+    }
 }
