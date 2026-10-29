@@ -1973,6 +1973,7 @@ dependencies = [
  "hmac",
  "log",
  "mongodb",
+ "openai-agents-sdk-macros",
  "portable-pty",
  "rand 0.9.5",
  "redis",
@@ -1992,6 +1993,15 @@ dependencies = [
  "tokio-tungstenite",
  "tokio-util",
  "uuid",
+]
+
+[[package]]
+name = "openai-agents-sdk-macros"
+version = "0.2.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]

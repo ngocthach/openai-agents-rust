@@ -1,0 +1,19 @@
+[package]
+name = "openai-agents-sdk-macros"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.89"
+description = "Procedural macros for openai-agents-sdk (#[function_tool])"
+license = "Apache-2.0"
+repository = "https://github.com/ngocthach/openai-agents-rust"
+documentation = "https://docs.rs/openai-agents-sdk-macros"
+keywords = ["openai", "agents", "llm", "macro"]
+categories = ["development-tools::procedural-macro-helpers"]
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "2", features = ["full"] }

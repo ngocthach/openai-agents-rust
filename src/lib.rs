@@ -118,5 +118,16 @@ pub use usage::{RequestUsage, Usage};
 
 /// Compiles the README examples as doctests.
 #[doc = include_str!("../README.md")]
+/// Turn a function into a [`FunctionTool`] (feature `macros`). See the macro crate docs.
+#[cfg(feature = "macros")]
+pub use openai_agents_sdk_macros::function_tool;
+
+#[doc(hidden)]
+pub mod __private {
+    pub use schemars;
+    pub use serde;
+    pub use serde_json;
+}
+
 #[cfg(doctest)]
 pub struct ReadmeDoctests;
