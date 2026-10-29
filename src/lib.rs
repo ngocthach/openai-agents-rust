@@ -91,7 +91,9 @@ pub use models::{
     set_default_openai_key,
 };
 pub use prompts::{Prompt, PromptVariable};
-pub use result::{CancelMode, RunResult, RunResultStreaming};
+pub use result::{
+    CancelMode, RunResult, RunResultStreaming, StreamCompletion, StreamCompletionHook,
+};
 pub use run::{DEFAULT_MAX_TURNS, IntoAgentArc, RunOptions, Runner};
 pub use run_config::{
     CallModelData, ModelInputData, RunConfig, ToolErrorFormatterArgs, ToolErrorKind,

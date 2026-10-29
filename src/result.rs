@@ -19,6 +19,7 @@ use crate::run_state::RunState;
 use crate::stream_events::StreamEvent;
 use crate::tool_guardrails::{ToolInputGuardrailResult, ToolOutputGuardrailResult};
 use crate::usage::Usage;
+use crate::util::BoxFuture;
 
 /// The result of a completed (or paused) run.
 pub struct RunResult<C> {
@@ -124,6 +125,39 @@ pub enum CancelMode {
     AfterTurn,
 }
 
+/// How a streamed run ended, handed to an
+/// [`on_complete`](RunResultStreaming::with_on_complete) hook.
+///
+/// Carries an owned snapshot of the run rather than the [`RunResult`] itself, so the hook can
+/// outlive the stream and record what happened without borrowing it.
+#[derive(Debug, Clone, Default)]
+pub struct StreamCompletion {
+    /// Whether the run produced a result rather than an error.
+    pub succeeded: bool,
+    /// Number of approval interruptions the run paused on.
+    pub interruptions: usize,
+    /// The input the run started from.
+    pub input: Vec<InputItem>,
+    /// Items generated during the run.
+    pub new_items: Vec<RunItem>,
+    /// The final output, when the run produced one.
+    pub final_output: Option<Value>,
+}
+
+impl StreamCompletion {
+    /// Whether the run paused waiting for approvals.
+    pub fn is_suspended(&self) -> bool {
+        self.interruptions > 0
+    }
+}
+
+/// An async callback run once a streamed run finishes.
+///
+/// Used to release resources a streamed run borrowed for its whole lifetime, such as a sandbox
+/// session, which cannot be dropped synchronously.
+pub type StreamCompletionHook =
+    Arc<dyn Fn(StreamCompletion) -> BoxFuture<'static, ()> + Send + Sync>;
+
 /// A streamed run. Consume [`RunResultStreaming::stream_events`] until it ends; afterwards the
 /// result fields are available.
 pub struct RunResultStreaming<C> {
@@ -133,6 +167,7 @@ pub struct RunResultStreaming<C> {
     cancel_after_turn: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
     complete: bool,
+    on_complete: Option<StreamCompletionHook>,
 }
 
 impl<C> fmt::Debug for RunResultStreaming<C> {
@@ -140,6 +175,7 @@ impl<C> fmt::Debug for RunResultStreaming<C> {
         f.debug_struct("RunResultStreaming")
             .field("current_agent", &self.current_agent.name)
             .field("is_complete", &self.complete)
+            .field("has_on_complete", &self.on_complete.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -158,13 +194,72 @@ impl<C: Send + Sync + 'static> RunResultStreaming<C> {
             cancel_after_turn,
             handle: Some(handle),
             complete: false,
+            on_complete: None,
+        }
+    }
+
+    /// Run `hook` once, when the stream finishes.
+    ///
+    /// The hook fires from [`stream_events`](Self::stream_events) when the run ends, and from
+    /// [`finish`](Self::finish). A run abandoned without draining its stream never fires it, so
+    /// a caller that cancels should still call `finish`.
+    pub fn with_on_complete(mut self, hook: StreamCompletionHook) -> Self {
+        self.on_complete = Some(hook);
+        self
+    }
+
+    /// Set the completion hook in place. See [`with_on_complete`](Self::with_on_complete).
+    pub fn set_on_complete(&mut self, hook: StreamCompletionHook) {
+        self.on_complete = Some(hook);
+    }
+
+    /// Drain any remaining events and run the completion hook.
+    ///
+    /// Returns the run error when the run failed. Calling this after the stream was already
+    /// drained only runs the hook, and the hook runs at most once.
+    pub async fn finish(&mut self) -> Result<()> {
+        let mut error = None;
+        if !self.complete {
+            let mut stream = std::pin::pin!(self.stream_events());
+            while let Some(event) = futures::StreamExt::next(&mut stream).await {
+                if let Err(e) = event {
+                    error = Some(e);
+                }
+            }
+        } else {
+            self.run_completion_hook().await;
+        }
+        match error {
+            None => Ok(()),
+            Some(error) => Err(error),
+        }
+    }
+
+    /// Run the completion hook, at most once.
+    async fn run_completion_hook(&mut self) {
+        if let Some(hook) = self.on_complete.take() {
+            let completion = match self.result.as_ref() {
+                None => StreamCompletion::default(),
+                Some(result) => StreamCompletion {
+                    succeeded: true,
+                    interruptions: result.interruptions.len(),
+                    input: result.input.clone(),
+                    new_items: result.new_items.clone(),
+                    final_output: result.final_output.clone(),
+                },
+            };
+            hook(completion).await;
         }
     }
 
     /// Stream events until the run completes. A run error is yielded as the last item.
+    ///
+    /// When the run ends, any hook installed with
+    /// [`with_on_complete`](Self::with_on_complete) runs before the stream terminates.
     pub fn stream_events(&mut self) -> impl Stream<Item = Result<StreamEvent<C>>> + Send + '_ {
         futures::stream::unfold(self, |this| async move {
             if this.complete {
+                this.run_completion_hook().await;
                 return None;
             }
             match this.rx.recv().await {
@@ -180,13 +275,22 @@ impl<C: Send + Sync + 'static> RunResultStreaming<C> {
                         Ok(r) => {
                             this.current_agent = r.last_agent.clone();
                             this.result = Some(r);
+                            this.run_completion_hook().await;
                             None
                         }
-                        Err(e) => Some((Err(e), this)),
+                        Err(e) => {
+                            // Run the hook before yielding the error: nothing obliges a consumer
+                            // to poll again after one, and `while let Some(ev) = next().await`
+                            // with `ev?` returns immediately. The hook is a no-op if the
+                            // consumer does poll again.
+                            this.run_completion_hook().await;
+                            Some((Err(e), this))
+                        }
                     }
                 }
                 None => {
                     this.complete = true;
+                    this.run_completion_hook().await;
                     None
                 }
             }

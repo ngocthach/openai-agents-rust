@@ -1,9 +1,9 @@
 //! Sandbox agents. Mirrors `agents.sandbox.sandbox_agent` and
 //! `agents.sandbox.runtime_agent_preparation`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock, Weak};
 
 use serde_json::{Map, Value};
 
@@ -47,7 +47,57 @@ pub struct SandboxAgent<C> {
     /// Targets added here are prepared against the same sandbox session as the starting agent,
     /// each with its own capabilities and `run_as`. Plain [`Agent`] handoffs configured on
     /// [`agent`](Self::agent) still work; they simply get no capability tools.
-    pub sandbox_handoffs: Vec<Arc<SandboxAgent<C>>>,
+    pub sandbox_handoffs: Vec<SandboxHandoffTarget<C>>,
+}
+
+/// Where one sandbox handoff points.
+///
+/// A by-value [`Agent`](SandboxHandoffTarget::Agent) target owns its agent, which cannot express
+/// a cycle. [`Named`](SandboxHandoffTarget::Named) closes one: it is resolved against the rest of
+/// the graph when it is prepared.
+pub enum SandboxHandoffTarget<C> {
+    /// A sandbox agent owned by this handoff.
+    Agent(Arc<SandboxAgent<C>>),
+    /// Another agent in the same graph, resolved by name when the graph is prepared.
+    Named(String),
+}
+
+impl<C> Clone for SandboxHandoffTarget<C> {
+    fn clone(&self) -> Self {
+        match self {
+            SandboxHandoffTarget::Agent(agent) => SandboxHandoffTarget::Agent(agent.clone()),
+            SandboxHandoffTarget::Named(name) => SandboxHandoffTarget::Named(name.clone()),
+        }
+    }
+}
+
+impl<C: Send + Sync + 'static> fmt::Debug for SandboxHandoffTarget<C> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SandboxHandoffTarget::Agent(agent) => {
+                f.debug_tuple("Agent").field(&agent.name()).finish()
+            }
+            SandboxHandoffTarget::Named(name) => f.debug_tuple("Named").field(name).finish(),
+        }
+    }
+}
+
+impl<C: Send + Sync + 'static> SandboxHandoffTarget<C> {
+    /// The name of the agent this handoff points at.
+    pub fn name(&self) -> &str {
+        match self {
+            SandboxHandoffTarget::Agent(agent) => agent.name(),
+            SandboxHandoffTarget::Named(name) => name,
+        }
+    }
+
+    /// The owned agent, when this target carries one.
+    pub fn agent(&self) -> Option<&Arc<SandboxAgent<C>>> {
+        match self {
+            SandboxHandoffTarget::Agent(agent) => Some(agent),
+            SandboxHandoffTarget::Named(_) => None,
+        }
+    }
 }
 
 impl<C> Clone for SandboxAgent<C> {
@@ -82,7 +132,7 @@ impl<C: Send + Sync + 'static> fmt::Debug for SandboxAgent<C> {
                 &self
                     .sandbox_handoffs
                     .iter()
-                    .map(|a| a.name().to_string())
+                    .map(|t| t.name().to_string())
                     .collect::<Vec<_>>(),
             )
             .finish_non_exhaustive()
@@ -173,7 +223,19 @@ impl<C: Send + Sync + 'static> SandboxAgent<C> {
     /// The target is prepared against the same session, so its capability tools act on the same
     /// workspace. Cycles are allowed: handoffs resolve lazily.
     pub fn with_sandbox_handoff(mut self, target: impl Into<Arc<SandboxAgent<C>>>) -> Self {
-        self.sandbox_handoffs.push(target.into());
+        self.sandbox_handoffs
+            .push(SandboxHandoffTarget::Agent(target.into()));
+        self
+    }
+
+    /// Add a handoff to another agent in the same graph, by name.
+    ///
+    /// This is how a cycle is expressed: `A` owns `B` through
+    /// [`with_sandbox_handoff`](Self::with_sandbox_handoff), and `B` points back at `A` by name.
+    /// The name must belong to an agent reachable in the graph, or preparation fails.
+    pub fn with_sandbox_handoff_to(mut self, agent_name: impl Into<String>) -> Self {
+        self.sandbox_handoffs
+            .push(SandboxHandoffTarget::Named(agent_name.into()));
         self
     }
 
@@ -235,52 +297,86 @@ impl<C: Send + Sync + 'static> SandboxAgent<C> {
     /// Prepare the whole sandbox handoff graph against one session.
     ///
     /// Every reachable [`sandbox_handoffs`](Self::sandbox_handoffs) target is prepared with its
-    /// own capabilities and `run_as`, bound to the same session, and wired in as a real handoff
-    /// to the prepared target.
+    /// own capabilities and `run_as`, bound to the same session.
     ///
-    /// Two constraints follow from how [`RunState`](crate::RunState) resumes a paused run: it
-    /// identifies the current agent by name and finds it by walking the handoff targets of the
-    /// starting agent. So agent names must be unique across the graph, and the graph must be
-    /// acyclic — targets are prepared before the agents that hand off to them.
+    /// Cyclic graphs are supported. [`RunState`](crate::RunState) resumes a paused run by
+    /// identifying the current agent by name and finding it through the handoff targets of the
+    /// starting agent, so every node has to be reachable by a chain of owning handoffs. The graph
+    /// is therefore prepared as a spanning tree: the edge that first discovers a node owns it,
+    /// and the edges that close a cycle resolve their target lazily through a `Weak` reference.
+    /// That keeps every node reachable for resume without creating a reference cycle that would
+    /// leak the prepared agents and the sandbox session with them.
+    ///
+    /// Agent names must still be unique across the graph, because a resumed run has only the
+    /// name to go on.
     pub async fn prepare_graph(
         &self,
         binding: &CapabilityBinding,
     ) -> Result<PreparedSandboxGraph<C>> {
         let root = Arc::new(self.clone());
-        let mut by_name: HashMap<String, Arc<SandboxAgent<C>>> = HashMap::new();
-        let mut order: Vec<Arc<SandboxAgent<C>>> = Vec::new();
-        let mut path: Vec<String> = Vec::new();
-        collect_graph(&root, &mut by_name, &mut order, &mut path)?;
+        let mut nodes: HashMap<String, GraphNode<C>> = HashMap::new();
+        let mut order: Vec<String> = Vec::new();
+        collect_graph(&root, &mut nodes, &mut order)?;
 
-        // `order` is post-order, so every handoff target is prepared before its referrer and can
-        // be wired in by value.
+        // Named targets are the cycle-closing edges: resolve them now that every node is known.
+        for node in nodes.values() {
+            for target in &node.agent.sandbox_handoffs {
+                if matches!(target, SandboxHandoffTarget::Named(_))
+                    && !nodes.contains_key(target.name())
+                {
+                    return Err(AgentsError::user(format!(
+                        "Sandbox handoff target `{}` is not part of the agent graph; add it with \
+                         `with_sandbox_handoff` somewhere before pointing at it by name",
+                        target.name()
+                    )));
+                }
+            }
+        }
+
+        // One cell per node, holding a `Weak` so a cycle-closing edge never keeps its target
+        // alive. The cells are filled once every node has been prepared.
+        let cells: HashMap<String, Arc<OnceLock<Weak<Agent<C>>>>> = order
+            .iter()
+            .map(|name| (name.clone(), Arc::new(OnceLock::new())))
+            .collect();
+
+        // `order` is the post-order of the spanning tree, so a node's owned targets always exist
+        // by the time it is prepared.
         let mut prepared: HashMap<String, Arc<Agent<C>>> = HashMap::new();
-        for node in &order {
-            let handoffs: Vec<Handoff<C>> = node
-                .sandbox_handoffs
-                .iter()
-                .map(|target| {
+        for name in &order {
+            let node = &nodes[name];
+            let mut handoffs: Vec<Handoff<C>> = Vec::new();
+            for (index, target) in node.agent.sandbox_handoffs.iter().enumerate() {
+                let handoff = if node.owned_edges.contains(&index) {
                     let agent = prepared.get(target.name()).cloned().ok_or_else(|| {
                         AgentsError::other(format!(
                             "sandbox handoff target `{}` was not prepared",
                             target.name()
                         ))
                     })?;
-                    let mut handoff = Handoff::new(agent);
-                    if let Some(description) = &target.agent.handoff_description {
-                        handoff = handoff.with_tool_description(
-                            crate::handoffs::default_tool_description(
-                                target.name(),
-                                Some(description),
-                            ),
-                        );
-                    }
-                    Ok(handoff)
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let node_binding = binding.clone().with_run_as(node.run_as.clone());
-            let agent = Arc::new(node.prepare_with_handoffs(&node_binding, handoffs).await?);
-            prepared.insert(node.name().to_string(), agent);
+                    Handoff::new(agent)
+                } else {
+                    weak_sandbox_handoff(target, cells[target.name()].clone())
+                };
+                // A named back-edge carries no agent of its own, so the description comes from
+                // the node it points at.
+                let described = nodes
+                    .get(target.name())
+                    .and_then(|n| n.agent.agent.handoff_description.clone());
+                handoffs.push(describe_handoff(handoff, target, described.as_deref()));
+            }
+            let node_binding = binding.clone().with_run_as(node.agent.run_as.clone());
+            let agent = Arc::new(
+                node.agent
+                    .prepare_with_handoffs(&node_binding, handoffs)
+                    .await?,
+            );
+            prepared.insert(name.clone(), agent);
+        }
+
+        for (name, agent) in &prepared {
+            // `set` only fails when the cell is already filled, which cannot happen here.
+            let _ = cells[name].set(Arc::downgrade(agent));
         }
 
         let starting_agent = prepared
@@ -289,7 +385,11 @@ impl<C: Send + Sync + 'static> SandboxAgent<C> {
             .ok_or_else(|| AgentsError::other("sandbox starting agent was not prepared"))?;
         Ok(PreparedSandboxGraph {
             starting_agent,
-            agents_by_name: by_name,
+            agents_by_name: nodes
+                .into_iter()
+                .map(|(name, node)| (name, node.agent))
+                .collect(),
+            prepared_by_name: prepared,
         })
     }
 
@@ -418,6 +518,9 @@ impl<C: Send + Sync + 'static> SandboxAgent<C> {
 pub struct PreparedSandboxGraph<C> {
     starting_agent: Arc<Agent<C>>,
     agents_by_name: HashMap<String, Arc<SandboxAgent<C>>>,
+    /// Strong references to every prepared agent, so a node reachable only through a
+    /// cycle-closing edge stays alive for as long as the graph does.
+    prepared_by_name: HashMap<String, Arc<Agent<C>>>,
 }
 
 impl<C> fmt::Debug for PreparedSandboxGraph<C> {
@@ -436,6 +539,7 @@ impl<C> Clone for PreparedSandboxGraph<C> {
         PreparedSandboxGraph {
             starting_agent: self.starting_agent.clone(),
             agents_by_name: self.agents_by_name.clone(),
+            prepared_by_name: self.prepared_by_name.clone(),
         }
     }
 }
@@ -451,6 +555,11 @@ impl<C: Send + Sync + 'static> PreparedSandboxGraph<C> {
         &self.agents_by_name
     }
 
+    /// The prepared agents in the graph, keyed by name.
+    pub fn prepared_by_name(&self) -> &HashMap<String, Arc<Agent<C>>> {
+        &self.prepared_by_name
+    }
+
     /// Apply the capability `process_context` chain of `agent_name` to a turn's model input.
     ///
     /// Unknown agent names (plain handoff targets, nested tool agents) pass through unchanged.
@@ -462,29 +571,26 @@ impl<C: Send + Sync + 'static> PreparedSandboxGraph<C> {
     }
 }
 
-/// Walk the sandbox handoff graph depth-first, producing a post-order list.
+/// One node of the sandbox handoff graph, with its handoff edges classified.
+struct GraphNode<C> {
+    agent: Arc<SandboxAgent<C>>,
+    /// Indices of the handoff edges that own their target, forming the spanning tree.
+    owned_edges: BTreeSet<usize>,
+}
+
+/// Walk the sandbox handoff graph depth-first, classifying each edge and producing the
+/// post-order of the spanning tree.
 ///
-/// `path` holds the names on the current DFS branch, so a cycle is reported with the loop it
-/// closes instead of recursing forever.
+/// The first edge to reach a node owns it; an edge to a node already on the stack (a cycle) or
+/// already discovered elsewhere resolves lazily instead.
 fn collect_graph<C: Send + Sync + 'static>(
     node: &Arc<SandboxAgent<C>>,
-    by_name: &mut HashMap<String, Arc<SandboxAgent<C>>>,
-    order: &mut Vec<Arc<SandboxAgent<C>>>,
-    path: &mut Vec<String>,
+    nodes: &mut HashMap<String, GraphNode<C>>,
+    order: &mut Vec<String>,
 ) -> Result<()> {
     let name = node.name().to_string();
-    if let Some(index) = path.iter().position(|n| *n == name) {
-        let mut loop_names = path[index..].to_vec();
-        loop_names.push(name);
-        return Err(AgentsError::user(format!(
-            "Sandbox handoff graph contains a cycle: {}. A paused run resumes by walking handoff \
-             targets, so the graph must be acyclic",
-            loop_names.join(" -> ")
-        )));
-    }
-    match by_name.get(&name) {
-        // Already prepared on another branch: a diamond is fine, a name clash is not.
-        Some(existing) if Arc::ptr_eq(existing, node) => return Ok(()),
+    match nodes.get(&name) {
+        Some(existing) if Arc::ptr_eq(&existing.agent, node) => return Ok(()),
         Some(_) => {
             return Err(AgentsError::user(format!(
                 "Sandbox handoff graph contains two agents named `{name}`; agent names must be \
@@ -493,14 +599,80 @@ fn collect_graph<C: Send + Sync + 'static>(
         }
         None => {}
     }
-    path.push(name.clone());
-    for target in &node.sandbox_handoffs {
-        collect_graph(target, by_name, order, path)?;
+    // Register before recursing so a cycle back to this node is seen as already discovered.
+    nodes.insert(
+        name.clone(),
+        GraphNode {
+            agent: node.clone(),
+            owned_edges: BTreeSet::new(),
+        },
+    );
+    let mut owned_edges = BTreeSet::new();
+    for (index, target) in node.sandbox_handoffs.iter().enumerate() {
+        let Some(agent) = target.agent() else {
+            // A named target is resolved after the whole graph is known.
+            continue;
+        };
+        let first_visit = !nodes.contains_key(agent.name());
+        collect_graph(agent, nodes, order)?;
+        if first_visit {
+            owned_edges.insert(index);
+        }
     }
-    path.pop();
-    by_name.insert(name, node.clone());
-    order.push(node.clone());
+    if let Some(entry) = nodes.get_mut(&name) {
+        entry.owned_edges = owned_edges;
+    }
+    order.push(name);
     Ok(())
+}
+
+/// Apply a handoff description to a handoff.
+///
+/// A named back-edge carries no agent of its own, so the caller looks the description up from the
+/// graph node the edge points at.
+fn describe_handoff<C: Send + Sync + 'static>(
+    handoff: Handoff<C>,
+    target: &SandboxHandoffTarget<C>,
+    description: Option<&str>,
+) -> Handoff<C> {
+    match description {
+        None => handoff,
+        Some(description) => handoff.with_tool_description(
+            crate::handoffs::default_tool_description(target.name(), Some(description)),
+        ),
+    }
+}
+
+/// A handoff that resolves its target through a `Weak`, used for the edges that close a cycle.
+fn weak_sandbox_handoff<C: Send + Sync + 'static>(
+    target: &SandboxHandoffTarget<C>,
+    cell: Arc<OnceLock<Weak<Agent<C>>>>,
+) -> Handoff<C> {
+    let name = target.name().to_string();
+    let description = target
+        .agent()
+        .and_then(|a| a.agent.handoff_description.clone());
+    let resolved_name = name.clone();
+    Handoff::custom(
+        crate::handoffs::default_tool_name(&name),
+        crate::handoffs::default_tool_description(&name, description.as_deref()),
+        name,
+        serde_json::json!({
+            "type": "object", "properties": {}, "required": [], "additionalProperties": false
+        }),
+        move |_ctx, _args| {
+            let cell = cell.clone();
+            let resolved_name = resolved_name.clone();
+            async move {
+                cell.get().and_then(Weak::upgrade).ok_or_else(|| {
+                    AgentsError::other(format!(
+                        "sandbox handoff target `{resolved_name}` is no longer available; the \
+                             prepared agent graph was dropped"
+                    ))
+                })
+            }
+        },
+    )
 }
 
 fn instruction_section(title: &str, body: &str) -> String {

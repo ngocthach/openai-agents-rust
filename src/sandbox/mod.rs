@@ -87,6 +87,7 @@ pub use pty::{PtyExecRequest, PtyExecUpdate, PtyManager, PtyWriteRequest};
 pub use remote_mount_policy::build_remote_mount_policy_instructions;
 pub use runtime::{
     PreparedSandboxRun, SandboxRunConfig, SandboxRunOutcome, SandboxRunner, SandboxSessionGuard,
+    SandboxStreamedRun,
 };
 pub use session::{ExecRequest, ExecShell, SandboxClient, SandboxSession};
 pub use snapshot::{

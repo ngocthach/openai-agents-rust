@@ -127,6 +127,7 @@ fn error_type_name(error: &crate::error::AgentsError) -> &'static str {
             "ToolOutputGuardrailTripwireTriggered"
         }
         AgentsError::ApiError { .. } => "ApiError",
+        AgentsError::Sandbox { .. } => "SandboxError",
         _ => "Error",
     }
 }

@@ -6,9 +6,11 @@ Port of the Python `agents.sandbox` package to Rust, inside `openai-agents-sdk` 
 
 Phase 1 ported the core (agent, manifest, capabilities, sessions, runner). Phase 2 completed
 parity for everything phase 1 had listed as not ported, except the cloud providers under
-`extensions/sandbox` (a separate task, which will build on the mount types here).
+`extensions/sandbox` (a separate task, which builds on the mount types here). Phase 3 closed the
+remaining gaps with two authorized core changes (plus their `lib.rs` re-exports) and two
+sandbox-side ones.
 
-Files created (nothing outside this list was touched):
+Files created (nothing outside this list and the phase-3 core changes was touched):
 
 - `src/sandbox/mod.rs`, `types.rs`, `errors.rs`, `workspace_paths.rs`, `util.rs`
 - `src/sandbox/entries.rs`, `manifest.rs`, `session.rs`, `editor.rs`, `agent.rs`, `runtime.rs`
@@ -19,15 +21,26 @@ Files created (nothing outside this list was touched):
 - `src/sandbox/instructions/prompt.md`, `src/sandbox/memory/prompts/*.md` (verbatim copies)
 - `tests/sandbox_tests.rs`, `examples/sandbox_local.rs`
 
+Core files changed in phase 3 (authorized, additive):
+
+- `src/error.rs` — the `AgentsError::Sandbox { code, message }` variant plus `sandbox()` and
+  `sandbox_code()`.
+- `src/result.rs` — `StreamCompletion`, `StreamCompletionHook`,
+  `RunResultStreaming::{with_on_complete, set_on_complete, finish}`.
+- `src/lib.rs` — re-exports for the two new result types.
+
 ## Verification
 
 | Check | Result |
 | --- | --- |
-| `cargo clippy --features sandbox --all-targets -- -D warnings` | clean (exit 0) |
+| `cargo clippy --features sandbox --all-targets -- -D warnings` | no diagnostics in any file owned here (the only remaining ones are in the concurrent `src/extensions/sandbox/**` work) |
 | `cargo clippy --all-targets` (default features) | no sandbox diagnostics |
-| `cargo test --features sandbox --test sandbox_tests` | 40 passed |
-| `cargo test --features sandbox --lib sandbox` | 81 `sandbox::*` tests passed |
-| `cargo test --features sandbox --doc sandbox` | passed |
+| `cargo test --features sandbox --test sandbox_tests` | 45 passed |
+| `cargo test --features sandbox --lib sandbox` | 152 passed (incl. the provider modules) |
+| `cargo test --features sandbox --doc sandbox` | 7 passed |
+| `cargo test --lib` (default features) | 106 passed — the core changes are feature-independent |
+| `cargo test --features sandbox --test runner_tests` | 27 passed — streaming is unchanged for existing callers |
+| `cargo test --features sandbox --test {local_tools,sessions,tracing}_tests` | 6 / 12 / 1 passed |
 | `rustfmt --edition 2024` on every new file | applied |
 
 The two Docker tests ran for real on this machine (`docker info` and
@@ -37,15 +50,13 @@ manifest materialization, `-v` bind mounts with `:ro` enforcement, and PTY comma
 locally, they print a skip notice and return — no image is ever pulled, so the default test run
 needs no network.
 
-One unrelated failure remains in the suite: `extensions::sandbox::blaxel::mounts::tests::builds_the_s3fs_mount_command`, a file owned by the concurrent cloud-provider work. It expects
-`shell_quote` to quote a comma-containing option string. `sandbox::session::shell_quote` matches
-Python's `shlex.quote` exactly — verified with `python3 -c "import shlex;
-print(shlex.quote('a,b=c:d/e-f.g'))"`, which returns the string unquoted, because `,` is in
-`shlex`'s safe set. The function is unchanged since phase 1, so this is that test's expectation,
-not a phase-2 regression; flagged for the controller rather than changed here.
+Phases 1 and 2 touched no core file; per-turn preparation uses the existing
+`RunConfig::call_model_input_filter` hook. Phase 3 added the three authorized core changes listed
+above. `src/run.rs`, `src/run_internal/**`, `src/models/**` and `src/retry.rs` are still
+untouched.
 
-No core file was edited. `src/run.rs`, `src/run_internal/**`, `src/result.rs` and `src/error.rs`
-are untouched; per-turn preparation uses the existing `RunConfig::call_model_input_filter` hook.
+The `shell_quote` conflict reported at the end of phase 2 is resolved: the whole
+`cargo test --features sandbox --lib sandbox` suite, provider modules included, now passes.
 
 ## What is ported
 
@@ -238,12 +249,14 @@ openai_agents_sdk::sandbox
   SandboxAgent<C>            new / from_agent / with_instructions / with_model(_instance) /
                              with_tool / with_default_manifest / with_base_instructions /
                              with_capabilities / with_capability / with_run_as /
-                             with_sandbox_handoff / map_agent / resolved_manifest /
+                             with_sandbox_handoff / with_sandbox_handoff_to / map_agent /
+                             resolved_manifest /
                              resolved_model_name / memory_capability / prepare_input /
                              prepare / prepare_graph
   PreparedSandboxGraph<C>    starting_agent / agents_by_name / process_context
   SandboxRunner              prepare / run / run_with_options / run_to_outcome /
-                             run_streamed_with_options
+                             run_streamed / run_streamed_with_options -> SandboxStreamedRun
+  SandboxStreamedRun<C>      streaming / sandbox_state / take_guard / restore_guard / finish
   SandboxRunConfig           with_client / with_session / session_state / manifest / cwd /
                              rollout_id
   SandboxRunOutcome<C>       result / sandbox_state / memory_manager
@@ -270,8 +283,10 @@ openai_agents_sdk::sandbox
   Snapshot (trait) / LocalSnapshot / NoopSnapshot / SnapshotSpec / resolve_snapshot /
   default_local_snapshot_base_dir / resolve_default_local_snapshot_spec /
   cleanup_stale_default_local_snapshots
-  SandboxSessionState        new / with_* / to_json_string / from_json_str / verify_manifest /
-                             may_remove_workspace_root   (+ manifest_digest)
+  SandboxSessionState        new / with_* (incl. with_rollout_id) / to_json_string /
+                             from_json_str / verify_manifest / may_remove_workspace_root
+                             (+ manifest_digest)
+  SandboxHandoffTarget<C>    Agent / Named + name / agent
   PtyManager / PtyExecRequest / PtyWriteRequest / PtyExecUpdate
   ExecRequest / ExecShell / ExecResult / FileEntry / Permissions / User / Group / file_mode
   SandboxWorkspaceScope / SandboxError / ErrorCode / SandboxResult / SandboxEditor
@@ -326,37 +341,84 @@ and covered:
    before the buffer and done checks, so a wakeup in that gap is no longer lost. Pruned and
    finished Docker PTY processes now also run their container-side `kill`, which previously leaked.
 
+## Phase 3: the authorized core changes
+
+1. **`AgentsError::Sandbox { code, message }`** (`src/error.rs`). Sandbox failures no longer
+   flatten into `UserError` / `Other("[code] …")`: `From<SandboxError>` now produces this variant,
+   `Display` renders `[exec_timeout] Command … timed out`, and `AgentsError::sandbox_code()`
+   returns the stable code so callers can branch on the cause. The code is a plain `String`, so
+   the variant needs no feature gate; with the `sandbox` feature on it is always one of
+   [`sandbox::ErrorCode::as_str`]. Covered by `errors::tests::{converts_into_the_sandbox_error_variant,
+   round_trips_the_code_through_the_agents_error}` and
+   `sandbox_errors_carry_a_machine_readable_code`.
+2. **An async completion hook on `RunResultStreaming`** (`src/result.rs`), purely additive:
+   `with_on_complete` / `set_on_complete` install an
+   `Arc<dyn Fn(StreamCompletion) -> BoxFuture<'static, ()>>` that fires once when the stream ends,
+   and `finish()` drains the stream and fires it for a caller that stopped early. It fires on the
+   error path too, *before* the error is yielded, because nothing obliges a consumer to poll again
+   after one — the usual `while let Some(ev) = next().await { ev?; }` returns immediately, and
+   without that ordering a failed streamed run would leave its workspace, container and PTYs
+   behind. `a_streamed_run_that_fails_still_releases_the_sandbox` covers it, and was confirmed to
+   fail against the pre-fix ordering.
+   `StreamCompletion` carries an owned snapshot of the run (`succeeded`, `interruptions`, `input`,
+   `new_items`, `final_output`) rather than the `RunResult`, which is not `Clone`, so the hook can
+   outlive the stream. Existing callers are unaffected — `runner_tests` passes untouched.
+   `SandboxRunner::run_streamed` / `run_streamed_with_options` now return a
+   `SandboxStreamedRun<C>` whose session is recorded, flushed and released (or suspended)
+   automatically when the stream finishes; `take_guard`/`restore_guard` hand the lifecycle back
+   for manual control. A failed run is not recorded as a rollout segment, since an empty segment
+   would trigger a phase-1 model call on nothing.
+3. **Memory on the streaming path, and one rollout per suspend.** The streaming completion hook
+   builds the rollout payload from the `StreamCompletion` snapshot and appends it before releasing
+   the session, so streamed runs now contribute memory exactly like buffered ones. The rollout id
+   is resolved once in `SandboxRunner::prepare` (config → resumed state → generated) and stored in
+   `SandboxSessionState::rollout_id`, so the two halves of a paused run append to the same
+   rollout. Covered by `a_streamed_run_that_pauses_suspends_the_sandbox` and
+   `a_suspended_run_keeps_both_halves_in_one_rollout`.
+4. **Cyclic sandbox handoff graphs are supported.** A `SandboxHandoffTarget` is either an owned
+   `Agent` or a `Named` reference resolved against the rest of the graph, so `A -> B -> A` is
+   expressible with `with_sandbox_handoff` plus `with_sandbox_handoff_to("A")` — a by-value
+   builder alone cannot express a loop.
+
+   The prepared graph is a **spanning tree with lazy back-edges**. `run_internal::find_agent`
+   locates a resumed agent by walking `Handoff.agent`, so every node must be reachable through
+   owning handoffs; meanwhile a cycle of strong `Arc<Agent>` handoffs would be a reference cycle
+   that leaks the prepared agents and the `Arc<dyn SandboxSession>` their tools hold. So the edge
+   that first discovers a node owns it (`Handoff::new`, strong — this is the spanning tree, and
+   it reaches every node), and every cycle-closing edge uses `Handoff::custom` resolving a
+   `Weak<Agent<C>>` from a `OnceLock` filled after preparation. The graph keeps strong references
+   to all prepared agents in `prepared_by_name`, so back-edges always upgrade while the graph is
+   alive and everything drops together when it is not. Named targets that are not in the graph are
+   rejected. Covered by `supports_cyclic_sandbox_handoff_graphs` (a four-hop loop that then runs a
+   shell call) and `rejects_named_handoffs_that_are_not_in_the_graph`.
+
 ## Requested core changes
 
-Phase 1 requested five; the controller applied two (the `[[example]]` entry and `base64` under the
-`sandbox` feature — the hand-rolled encoder is gone), and phase 2 solved two more inside
-`src/sandbox` (per-turn preparation through `call_model_input_filter`, and resume through
-`SandboxSessionState`). One remains, plus one new observation:
-
-1. **`AgentsError::Sandbox` variant.** `SandboxError` still flattens into
-   `AgentsError::UserError` / `AgentsError::Other("[code] message")`, so a caller who wants to
-   branch on an `ErrorCode` has to parse it out of a string. A
-   `Sandbox { code: String, message: String }` variant (or a boxed `source`) would fix that.
-   Worked around with `From<SandboxError> for AgentsError` in `src/sandbox/errors.rs`.
-2. **Async teardown for `RunResultStreaming`.** `result.rs` still has no hook for releasing a
-   resource when a stream finishes (Python attaches `result._sandbox_cleanup`). Worked around by
-   returning `(RunResultStreaming<C>, SandboxSessionGuard)` from `run_streamed_with_options`; the
-   caller closes or suspends the guard after draining.
+All of them are now resolved. Phase 1 requested five: the controller applied two (the
+`[[example]]` entry and `base64` under the `sandbox` feature — the hand-rolled encoder is gone),
+phase 2 solved two inside `src/sandbox` (per-turn preparation through
+`call_model_input_filter`, and resume through `SandboxSessionState`), and phase 3 landed the last
+one (`AgentsError::Sandbox`) together with the streaming teardown hook. Nothing is outstanding.
 
 ## Known gaps and open questions
 
-- **`shell_quote` and the blaxel test** (above): the controller should decide whether that test's
-  expectation or `shlex.quote` fidelity wins.
-- **The streaming path records no memory.** `run_streamed_with_options` hands back the guard, so
-  it neither appends a rollout segment nor flushes. A caller who wants memory from a streamed run
-  has to append the payload and flush through the manager itself. Non-streaming runs are covered.
-- **The generated `rollout_id` is not in `SandboxSessionState`.** Without a caller-supplied
-  `SandboxRunConfig::rollout_id`, a suspended run's two halves become two separate rollouts.
-  Storing the id in the state would fix it; it was left out to keep the state payload to things
-  resume strictly needs.
-- Should a streaming run that ends with interruptions suspend rather than close? The
-  non-streaming path decides this itself (`run_to_outcome`); the streaming path leaves the choice
-  to the caller, who holds the guard.
-- Memory generation runs inline on the closing path, so a slow phase-2 run delays the caller's
-  `run()` return. Python runs it on a background worker tied to the session; moving it to a
-  detached task would need somewhere to await it before process exit.
+- **`PtyManager::start` / `write_stdin` return `(PtyExecUpdate, Vec<String>)`.** The second
+  element holds the sandbox-side cleanup commands of processes that finished or were pruned; a
+  backend whose PTY process only proxies remote work (Docker, and the cloud providers) must run
+  them or it leaks remote processes. Provider backends that only need the update can discard it.
+- **Memory generation runs inline on the closing path**, so a slow phase-2 run delays the
+  caller's `run()` return. Python runs it on a background worker tied to the session; moving it to
+  a detached task would need somewhere to await it before process exit.
+- **A streamed run abandoned without draining never releases its session.** The hook fires when
+  the stream ends — including on the error path — and from `RunResultStreaming::finish`, so a
+  caller that cancels mid-stream should call `finish()`. `SandboxStreamedRun::take_guard` is the
+  manual escape hatch.
+- **`run_streamed_with_options` returns `SandboxStreamedRun<C>`**, not the
+  `(RunResultStreaming<C>, SandboxSessionGuard)` tuple phase 2 committed. A deliberate breaking
+  change to the sandbox API, so that the session teardown is automatic; the provider agent should
+  know.
+- **`rustfmt src/lib.rs` formats the whole crate.** rustfmt follows `mod` declarations, so an
+  earlier write-mode run on `src/lib.rs` reformatted every reachable module in place, including
+  `src/extensions/**`, `src/models/**` and `src/retry.rs`. The `lib.rs` change here is a
+  three-line `pub use` formatted by hand; `error.rs` and `result.rs` have no child modules and are
+  safe to format directly. Worth checking the other agents' files for unrequested churn.

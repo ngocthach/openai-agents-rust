@@ -67,6 +67,12 @@ pub struct SandboxSessionState {
     /// Ports exposed by the session.
     #[serde(default)]
     pub exposed_ports: Vec<u16>,
+    /// The memory rollout this session's runs belong to.
+    ///
+    /// Carried across a suspend so the two halves of a paused run are consolidated into one
+    /// memory artifact instead of two.
+    #[serde(default)]
+    pub rollout_id: Option<String>,
 }
 
 impl SandboxSessionState {
@@ -89,6 +95,7 @@ impl SandboxSessionState {
             snapshot: SnapshotSpec::Noop,
             manifest_digest: manifest_digest(manifest),
             exposed_ports: Vec::new(),
+            rollout_id: None,
         }
     }
 
@@ -107,6 +114,12 @@ impl SandboxSessionState {
     /// Attach the snapshot location.
     pub fn with_snapshot(mut self, snapshot: SnapshotSpec) -> Self {
         self.snapshot = snapshot;
+        self
+    }
+
+    /// Attach the memory rollout the session's runs belong to.
+    pub fn with_rollout_id(mut self, rollout_id: Option<String>) -> Self {
+        self.rollout_id = rollout_id;
         self
     }
 
@@ -268,12 +281,14 @@ mod tests {
         let manifest = Manifest::new().with_entry("a.txt", Entry::text_file("hello"));
         let state = state_for(&manifest)
             .with_provider_id(Some("container-1".into()))
+            .with_rollout_id(Some("rollout-7".into()))
             .with_snapshot(SnapshotSpec::Local {
                 base_path: "/tmp/snaps".into(),
             });
         let json = state.to_json_string().unwrap();
         assert_eq!(SandboxSessionState::from_json_str(&json).unwrap(), state);
         assert!(json.contains("$schemaVersion"));
+        assert!(json.contains("rollout-7"));
     }
 
     #[test]

@@ -133,6 +133,19 @@ pub enum AgentsError {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
+    /// A sandbox session, client, manifest entry or mount failed.
+    ///
+    /// `code` is the stable machine-readable code of the failure (one of
+    /// `sandbox::ErrorCode::as_str` when the `sandbox` feature is on), so callers can branch on
+    /// the cause without parsing the message.
+    #[error("[{code}] {message}")]
+    Sandbox {
+        /// Stable machine-readable error code, for example `exec_timeout`.
+        code: String,
+        /// Human-readable description of the failure.
+        message: String,
+    },
+
     /// A failure in a user-provided tool, hook, guardrail or callback.
     #[error("{0}")]
     Other(String),
@@ -158,6 +171,22 @@ impl AgentsError {
     /// Create a [`AgentsError::Other`].
     pub fn other(message: impl Into<String>) -> Self {
         AgentsError::Other(message.into())
+    }
+
+    /// Create a [`AgentsError::Sandbox`].
+    pub fn sandbox(code: impl Into<String>, message: impl Into<String>) -> Self {
+        AgentsError::Sandbox {
+            code: code.into(),
+            message: message.into(),
+        }
+    }
+
+    /// The sandbox error code, when this is a [`AgentsError::Sandbox`].
+    pub fn sandbox_code(&self) -> Option<&str> {
+        match self {
+            AgentsError::Sandbox { code, .. } => Some(code),
+            _ => None,
+        }
     }
 
     /// Attach run details to an error raised inside the runner.

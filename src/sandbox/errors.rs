@@ -170,16 +170,12 @@ impl fmt::Display for SandboxError {
 impl std::error::Error for SandboxError {}
 
 impl From<SandboxError> for AgentsError {
+    /// Convert into the dedicated [`AgentsError::Sandbox`] variant, keeping the error code
+    /// machine-readable so callers can branch on the cause.
     fn from(value: SandboxError) -> Self {
-        match value.code {
-            ErrorCode::InvalidManifestPath
-            | ErrorCode::ApplyPatchInvalidPath
-            | ErrorCode::SandboxConfigInvalid
-            | ErrorCode::SkillsConfigInvalid
-            | ErrorCode::MountConfigInvalid
-            | ErrorCode::SessionStateMismatch
-            | ErrorCode::SessionStateInvalid => AgentsError::user(value.to_string()),
-            _ => AgentsError::other(value.to_string()),
+        AgentsError::Sandbox {
+            code: value.code.as_str().to_string(),
+            message: value.message,
         }
     }
 }
@@ -192,12 +188,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn maps_path_errors_to_user_errors() {
+    fn converts_into_the_sandbox_error_variant() {
         let err: AgentsError =
             SandboxError::new(ErrorCode::InvalidManifestPath, "absolute path").into();
-        assert!(matches!(err, AgentsError::UserError { .. }));
+        assert_eq!(err.sandbox_code(), Some("invalid_manifest_path"));
+        assert_eq!(err.to_string(), "[invalid_manifest_path] absolute path");
+
         let err: AgentsError = SandboxError::new(ErrorCode::ExecTimeout, "slow").into();
-        assert!(matches!(err, AgentsError::Other(_)));
+        assert_eq!(err.sandbox_code(), Some("exec_timeout"));
+        assert!(matches!(err, AgentsError::Sandbox { .. }));
+
+        // Non-sandbox errors keep reporting no code.
+        assert_eq!(AgentsError::user("plain").sandbox_code(), None);
+    }
+
+    #[test]
+    fn round_trips_the_code_through_the_agents_error() {
+        for code in [
+            ErrorCode::ExecNonZero,
+            ErrorCode::MountConfigInvalid,
+            ErrorCode::SessionStateMismatch,
+            ErrorCode::PtySessionNotFound,
+        ] {
+            let err: AgentsError = SandboxError::new(code, "boom").into();
+            assert_eq!(err.sandbox_code(), Some(code.as_str()));
+        }
     }
 
     #[test]

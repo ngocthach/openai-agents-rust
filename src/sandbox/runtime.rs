@@ -2,7 +2,7 @@
 //! `agents.sandbox.runtime` and `agents.sandbox.runtime_session_manager`.
 
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::error::{AgentsError, Result};
 use crate::items::RunInput;
@@ -13,6 +13,9 @@ use crate::sandbox::agent::{PreparedSandboxGraph, SandboxAgent};
 use crate::sandbox::capabilities::CapabilityBinding;
 use crate::sandbox::manifest::Manifest;
 use crate::sandbox::memory::SandboxMemoryGenerationManager;
+use crate::sandbox::memory::rollouts::{
+    RolloutTerminalMetadata, TerminalState, build_rollout_payload,
+};
 use crate::sandbox::session::{
     ExecRequest, SandboxClient, SandboxSession, persist_session_snapshot,
 };
@@ -145,6 +148,12 @@ pub struct PreparedSandboxRun<C> {
     pub guard: SandboxSessionGuard,
     /// The memory generation manager for this session, when the agent enables generation.
     pub memory_manager: Option<Arc<SandboxMemoryGenerationManager>>,
+    /// The memory rollout every run against this session belongs to.
+    ///
+    /// Taken from [`SandboxRunConfig::rollout_id`], then from the resumed
+    /// [`SandboxSessionState::rollout_id`], and generated otherwise, so the two halves of a
+    /// paused run form one rollout.
+    pub rollout_id: String,
 }
 
 impl<C> fmt::Debug for PreparedSandboxRun<C> {
@@ -153,6 +162,7 @@ impl<C> fmt::Debug for PreparedSandboxRun<C> {
             .field("graph", &self.graph)
             .field("session", &self.guard.session().id())
             .field("memory_manager", &self.memory_manager.is_some())
+            .field("rollout_id", &self.rollout_id)
             .finish()
     }
 }
@@ -266,11 +276,22 @@ impl SandboxRunner {
                 return Err(error);
             }
         };
+        let rollout_id = config
+            .rollout_id
+            .clone()
+            .or_else(|| {
+                config
+                    .session_state
+                    .as_ref()
+                    .and_then(|state| state.rollout_id.clone())
+            })
+            .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
         match agent.prepare_graph(&binding).await {
             Ok(graph) => Ok(PreparedSandboxRun {
                 graph,
                 guard,
                 memory_manager,
+                rollout_id,
             }),
             Err(error) => {
                 let _ = guard.close().await;
@@ -324,17 +345,16 @@ impl SandboxRunner {
 
         // Record the run as a memory rollout segment, whether it finished or paused.
         let memory = prepared.memory_manager.clone();
-        if let (Some(manager), Ok(result)) = (&memory, &result) {
-            let rollout_id = config
-                .rollout_id
-                .clone()
-                .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
-            if let Err(error) = manager
-                .enqueue_result(prepared.guard.session().as_ref(), &rollout_id, result)
+        if let (Some(manager), Ok(result)) = (&memory, &result)
+            && let Err(error) = manager
+                .enqueue_result(
+                    prepared.guard.session().as_ref(),
+                    &prepared.rollout_id,
+                    result,
+                )
                 .await
-            {
-                log::warn!("Failed to record the sandbox memory rollout: {error}");
-            }
+        {
+            log::warn!("Failed to record the sandbox memory rollout: {error}");
         }
 
         let suspend = matches!(&result, Ok(result) if !result.interruptions.is_empty());
@@ -354,9 +374,12 @@ impl SandboxRunner {
             }
         }
 
+        let rollout_id = prepared.rollout_id.clone();
         let sandbox_state = if suspend {
             match prepared.guard.suspend().await {
-                Ok(state) => Some(state),
+                // Carry the rollout id across the suspend so the resumed half appends to the
+                // same rollout instead of starting a new one.
+                Ok(state) => Some(state.with_rollout_id(Some(rollout_id))),
                 Err(error) => {
                     log::warn!("Failed to suspend the sandbox session: {error}");
                     None
@@ -376,6 +399,15 @@ impl SandboxRunner {
         })
     }
 
+    /// Run a sandbox agent in streaming mode with a default app context.
+    pub async fn run_streamed<C: Default + Send + Sync + 'static>(
+        agent: &SandboxAgent<C>,
+        input: impl Into<RunInput>,
+        config: &SandboxRunConfig,
+    ) -> Result<SandboxStreamedRun<C>> {
+        Self::run_streamed_with_options(agent, input, config, RunOptions::default()).await
+    }
+
     /// Run a sandbox agent in streaming mode.
     ///
     /// The returned guard must be closed (or suspended) once the stream is drained; tearing the
@@ -385,13 +417,156 @@ impl SandboxRunner {
         input: impl Into<RunInput>,
         config: &SandboxRunConfig,
         options: RunOptions<C>,
-    ) -> Result<(RunResultStreaming<C>, SandboxSessionGuard)> {
+    ) -> Result<SandboxStreamedRun<C>> {
         let prepared = Self::prepare(agent, config).await?;
+        let model_provider = options.run_config.model_provider.clone();
         let options = install_per_turn_preparation(options, &prepared.graph);
         let starting_agent = prepared.graph.starting_agent().clone();
-        let streaming = Runner::run_streamed_with_options(starting_agent, input, options);
-        Ok((streaming, prepared.guard))
+        let mut streaming = Runner::run_streamed_with_options(starting_agent, input, options);
+
+        let sandbox_state = Arc::new(Mutex::new(None));
+        let PreparedSandboxRun {
+            guard,
+            memory_manager,
+            rollout_id,
+            ..
+        } = prepared;
+        let hook_state = sandbox_state.clone();
+        let guard = Arc::new(Mutex::new(Some(guard)));
+        let hook_guard = guard.clone();
+        streaming.set_on_complete(Arc::new(move |completion| {
+            let hook_state = hook_state.clone();
+            let hook_guard = hook_guard.clone();
+            let memory_manager = memory_manager.clone();
+            let model_provider = model_provider.clone();
+            let rollout_id = rollout_id.clone();
+            Box::pin(async move {
+                let Some(guard) = hook_guard.lock().expect("poisoned").take() else {
+                    return;
+                };
+                // Record the streamed run as a rollout segment before releasing the session. A
+                // failed run has nothing to extract, so it is not recorded: an empty segment
+                // would trigger a phase-1 model call on nothing.
+                if completion.succeeded
+                    && let Some(manager) = &memory_manager
+                {
+                    let payload = build_rollout_payload(
+                        &completion.input,
+                        &completion.new_items,
+                        completion.final_output.as_ref(),
+                        completion.interruptions,
+                        &RolloutTerminalMetadata::new(
+                            if completion.is_suspended() {
+                                TerminalState::Interrupted
+                            } else if completion.succeeded {
+                                TerminalState::Completed
+                            } else {
+                                TerminalState::Failed
+                            },
+                            completion.final_output.is_some(),
+                        ),
+                    );
+                    if let Err(error) = manager
+                        .enqueue_rollout_payload(guard.session().as_ref(), &rollout_id, &payload)
+                        .await
+                    {
+                        log::warn!("Failed to record the sandbox memory rollout: {error}");
+                    }
+                }
+                let state = finish_sandbox_run(
+                    guard,
+                    completion.is_suspended(),
+                    memory_manager,
+                    model_provider,
+                    rollout_id,
+                )
+                .await;
+                *hook_state.lock().expect("poisoned") = state;
+            })
+        }));
+
+        Ok(SandboxStreamedRun {
+            streaming,
+            guard,
+            sandbox_state,
+        })
     }
+}
+
+/// A streamed sandbox run and the sandbox state it leaves behind.
+///
+/// The sandbox session is released (or suspended) automatically when the stream finishes, through
+/// [`RunResultStreaming::with_on_complete`]. Drain [`streaming`](Self::streaming) to the end — or
+/// call [`RunResultStreaming::finish`] — and then read
+/// [`sandbox_state`](Self::sandbox_state).
+pub struct SandboxStreamedRun<C> {
+    /// The streamed run. Consume its events as usual.
+    pub streaming: RunResultStreaming<C>,
+    guard: Arc<Mutex<Option<SandboxSessionGuard>>>,
+    sandbox_state: Arc<Mutex<Option<SandboxSessionState>>>,
+}
+
+impl<C> fmt::Debug for SandboxStreamedRun<C> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SandboxStreamedRun")
+            .field("streaming", &self.streaming)
+            .field("released", &self.guard.lock().expect("poisoned").is_none())
+            .finish()
+    }
+}
+
+impl<C: Send + Sync + 'static> SandboxStreamedRun<C> {
+    /// The session state to persist, once the stream has finished and the run was suspended.
+    pub fn sandbox_state(&self) -> Option<SandboxSessionState> {
+        self.sandbox_state.lock().expect("poisoned").clone()
+    }
+
+    /// Take over the session lifecycle, disarming the automatic teardown.
+    ///
+    /// Returns `None` once the stream has already finished and released the session.
+    pub fn take_guard(&self) -> Option<SandboxSessionGuard> {
+        self.guard.lock().expect("poisoned").take()
+    }
+
+    /// Hand the session lifecycle back, re-arming the automatic teardown.
+    pub fn restore_guard(&self, guard: SandboxSessionGuard) {
+        *self.guard.lock().expect("poisoned") = Some(guard);
+    }
+
+    /// Drain the stream and release the sandbox session.
+    pub async fn finish(&mut self) -> Result<()> {
+        self.streaming.finish().await
+    }
+}
+
+/// Release a sandbox session after a run: record memory, then suspend or tear down.
+async fn finish_sandbox_run(
+    guard: SandboxSessionGuard,
+    suspend: bool,
+    memory_manager: Option<Arc<SandboxMemoryGenerationManager>>,
+    model_provider: Arc<dyn crate::models::ModelProvider>,
+    rollout_id: String,
+) -> Option<SandboxSessionState> {
+    if !suspend
+        && guard.owns_session()
+        && let Some(manager) = &memory_manager
+        && let Err(error) = manager.flush(guard.session().clone(), model_provider).await
+    {
+        log::warn!("Failed to generate sandbox memory: {error}");
+    }
+    if suspend {
+        match guard.suspend().await {
+            Ok(state) => return Some(state.with_rollout_id(Some(rollout_id))),
+            Err(error) => {
+                log::warn!("Failed to suspend the sandbox session: {error}");
+                return None;
+            }
+        }
+    }
+    if let Err(error) = guard.close().await {
+        log::warn!("Failed to tear down the sandbox session: {error}");
+    }
+    None
 }
 
 /// Install the capability `process_context` chain as a per-turn model input filter.

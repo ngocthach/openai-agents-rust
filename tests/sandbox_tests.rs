@@ -473,22 +473,63 @@ async fn streams_a_sandbox_run_and_closes_the_session_afterwards() {
     model.add_turn(vec![assistant_message("all good")]);
 
     let config = SandboxRunConfig::with_client(Arc::new(UnixLocalSandboxClient::new()));
-    let (mut streaming, guard) =
+    let mut run =
         SandboxRunner::run_streamed_with_options(&agent, "read it", &config, RunOptions::default())
             .await
             .unwrap();
-    let workspace = std::path::PathBuf::from(guard.session().workspace_root().to_string());
-    assert!(guard.owns_session());
+    let workspace = {
+        let guard = run.take_guard().expect("the session is still held");
+        let workspace = std::path::PathBuf::from(guard.session().workspace_root().to_string());
+        assert!(guard.owns_session());
+        // Put it back so the completion hook still owns the teardown.
+        run.restore_guard(guard);
+        workspace
+    };
+    assert!(workspace.exists());
 
     {
-        let stream = streaming.stream_events();
+        let stream = run.streaming.stream_events();
         futures::pin_mut!(stream);
         while stream.next().await.is_some() {}
     }
-    assert_eq!(streaming.final_output_text().as_deref(), Some("all good"));
+    assert_eq!(
+        run.streaming.final_output_text().as_deref(),
+        Some("all good")
+    );
 
-    guard.close().await.unwrap();
+    // Draining the stream released the session: no manual teardown needed.
     assert!(!workspace.exists());
+    assert!(run.sandbox_state().is_none());
+    assert!(run.take_guard().is_none());
+}
+
+#[tokio::test]
+async fn a_streamed_run_that_pauses_suspends_the_sandbox() {
+    let model = setup();
+    let agent = SandboxAgent::<()>::new("Engineer")
+        .with_model_instance(model.clone())
+        .with_capabilities(vec![Arc::new(
+            Shell::new().with_pty(false).with_needs_approval(true),
+        )])
+        .with_default_manifest(Manifest::new().with_entry("f.txt", Entry::text_file("kept")));
+    model.add_turn(vec![shell_call("c1", &["cat f.txt"])]);
+
+    let config = SandboxRunConfig::with_client(Arc::new(UnixLocalSandboxClient::new()))
+        .rollout_id("stream-rollout");
+    let mut run =
+        SandboxRunner::run_streamed_with_options(&agent, "read it", &config, RunOptions::default())
+            .await
+            .unwrap();
+    run.finish().await.unwrap();
+
+    let state = run
+        .sandbox_state()
+        .expect("a paused run suspends the sandbox");
+    assert_eq!(state.rollout_id.as_deref(), Some("stream-rollout"));
+    // The workspace is kept so the run can be resumed.
+    let workspace = std::path::PathBuf::from(state.workspace_root.clone());
+    assert!(workspace.exists());
+    std::fs::remove_dir_all(&workspace).ok();
 }
 
 // -------------------------------------------------------------------------------------------
@@ -1632,17 +1673,153 @@ async fn resumes_a_run_that_paused_inside_a_handoff_destination() {
 }
 
 #[tokio::test]
-async fn rejects_cyclic_sandbox_handoff_graphs() {
-    // A -> B -> A cannot be built by value, so this exercises the self-handoff, the one cycle a
-    // by-value builder can express.
+async fn supports_cyclic_sandbox_handoff_graphs() {
+    // Engineer owns Reviewer; Reviewer points back at Engineer by name. The back edge resolves
+    // lazily through a `Weak`, so the loop works without a reference cycle that would keep the
+    // prepared agents and the sandbox session alive forever.
     let model = setup();
-    let agent = Arc::new(SandboxAgent::<()>::new("Looper").with_model_instance(model.clone()));
-    let looping = SandboxAgent::<()>::new("Looper")
-        .with_model_instance(model)
-        .with_sandbox_handoff(agent);
+    let reviewer = Arc::new(
+        SandboxAgent::<()>::new("Reviewer")
+            .with_model_instance(model.clone())
+            .with_capabilities(vec![Arc::new(Shell::new().with_pty(false))])
+            .with_sandbox_handoff_to("Engineer"),
+    );
+    let engineer = SandboxAgent::<()>::new("Engineer")
+        .with_model_instance(model.clone())
+        .with_capabilities(vec![Arc::new(Shell::new().with_pty(false))])
+        .with_sandbox_handoff(reviewer)
+        .with_default_manifest(Manifest::new().with_entry("f.txt", Entry::text_file("cycled")));
+
+    // Engineer -> Reviewer -> Engineer -> Reviewer, then do some work.
+    for (call, tool) in [
+        ("c1", "transfer_to_Reviewer"),
+        ("c2", "transfer_to_Engineer"),
+        ("c3", "transfer_to_Reviewer"),
+    ] {
+        model.add_turn(vec![item(json!({
+            "type": "function_call", "call_id": call, "name": tool, "arguments": "{}"
+        }))]);
+    }
+    model.add_turn(vec![shell_call("c_shell", &["cat f.txt"])]);
+    model.add_turn(vec![assistant_message("looped")]);
+
     let config = SandboxRunConfig::with_client(Arc::new(UnixLocalSandboxClient::new()));
-    let err = SandboxRunner::run(&looping, "loop", &config)
+    let result = SandboxRunner::run_with_options(
+        &engineer,
+        "go round",
+        &config,
+        RunOptions::default().max_turns(Some(12)),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result.final_output_text().as_deref(), Some("looped"));
+    assert_eq!(result.last_agent.name, "Reviewer");
+    let shell_output = tool_outputs(&result)
+        .into_iter()
+        .find(|o| o["type"] == "shell_call_output")
+        .unwrap();
+    assert_eq!(shell_output["output"][0]["stdout"], "cycled");
+}
+
+#[tokio::test]
+async fn rejects_named_handoffs_that_are_not_in_the_graph() {
+    let model = setup();
+    let agent = SandboxAgent::<()>::new("Engineer")
+        .with_model_instance(model)
+        .with_sandbox_handoff_to("Nobody");
+    let config = SandboxRunConfig::with_client(Arc::new(UnixLocalSandboxClient::new()));
+    let err = SandboxRunner::run(&agent, "hi", &config).await.unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("`Nobody` is not part of the agent graph"),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn sandbox_errors_carry_a_machine_readable_code() {
+    let model = setup();
+    let agent = SandboxAgent::<()>::new("Engineer").with_model_instance(model);
+    let config =
+        SandboxRunConfig::with_client(Arc::new(UnixLocalSandboxClient::new())).cwd("../escape");
+    let err = SandboxRunner::run(&agent, "hi", &config).await.unwrap_err();
+    assert_eq!(err.sandbox_code(), Some("sandbox_config_invalid"));
+    assert!(err.to_string().starts_with("[sandbox_config_invalid]"));
+}
+
+#[tokio::test]
+async fn a_suspended_run_keeps_both_halves_in_one_rollout() {
+    let model = setup();
+    let agent = SandboxAgent::<()>::new("Engineer")
+        .with_model_instance(model.clone())
+        .with_capabilities(vec![Arc::new(
+            Shell::new().with_pty(false).with_needs_approval(true),
+        )]);
+    model.add_turn(vec![shell_call("c1", &["echo one"])]);
+
+    let config = SandboxRunConfig::with_client(Arc::new(UnixLocalSandboxClient::new()));
+    let outcome = SandboxRunner::run_to_outcome(&agent, "start", &config, RunOptions::default())
         .await
-        .unwrap_err();
-    assert!(err.to_string().contains("cycle"), "{err}");
+        .unwrap();
+    let state = outcome.sandbox_state.clone().unwrap();
+    // The generated rollout id travels with the state, so the resumed half appends to the same
+    // rollout instead of starting a second one.
+    let rollout_id = state.rollout_id.clone().expect("a rollout id is recorded");
+    assert!(!rollout_id.is_empty());
+
+    let resumed = SandboxRunner::prepare(
+        &agent,
+        &SandboxRunConfig::with_client(Arc::new(UnixLocalSandboxClient::new()))
+            .session_state(state),
+    )
+    .await
+    .unwrap();
+    assert_eq!(resumed.rollout_id, rollout_id);
+    resumed.guard.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_streamed_run_that_fails_still_releases_the_sandbox() {
+    use futures::StreamExt;
+
+    let model = setup();
+    let agent = SandboxAgent::<()>::new("Engineer")
+        .with_model_instance(model.clone())
+        .with_capabilities(vec![Arc::new(Shell::new().with_pty(false))]);
+    model.add_error("boom");
+
+    let config = SandboxRunConfig::with_client(Arc::new(UnixLocalSandboxClient::new()));
+    let mut run = SandboxRunner::run_streamed(&agent, "fail please", &config)
+        .await
+        .unwrap();
+    let workspace = {
+        let guard = run.take_guard().expect("the session is still held");
+        let workspace = std::path::PathBuf::from(guard.session().workspace_root().to_string());
+        run.restore_guard(guard);
+        workspace
+    };
+    assert!(workspace.exists());
+
+    // Stop at the first error, the way `ev?` in a loop does. The session must still be released.
+    let mut saw_error = false;
+    {
+        let stream = run.streaming.stream_events();
+        futures::pin_mut!(stream);
+        while let Some(event) = stream.next().await {
+            if event.is_err() {
+                saw_error = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        saw_error,
+        "the scripted model error should reach the stream"
+    );
+    assert!(
+        !workspace.exists(),
+        "an abandoned-after-error stream must still tear the workspace down"
+    );
+    assert!(run.sandbox_state().is_none());
 }
