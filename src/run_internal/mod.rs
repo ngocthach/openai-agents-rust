@@ -153,6 +153,78 @@ fn items_to_input(items: &[RunItem]) -> Vec<InputItem> {
         .collect()
 }
 
+/// Resolve collisions between bare function tool names and handoff names. The winner is the
+/// last handoff with the name, else the last tool.
+fn resolve_tool_name_collisions<C>(
+    tools: Vec<Tool<C>>,
+    handoffs: Vec<Handoff<C>>,
+    policy: crate::run_config::ToolNameCollisionPolicy,
+) -> Result<(Vec<Tool<C>>, Vec<Handoff<C>>)> {
+    // (is_handoff, index) owners per bare name.
+    let mut owners: HashMap<String, Vec<(bool, usize)>> = HashMap::new();
+    for (i, t) in tools.iter().enumerate() {
+        if let Some(f) = t.as_function()
+            && f.namespace().is_none()
+        {
+            owners.entry(f.name.clone()).or_default().push((false, i));
+        }
+    }
+    for (i, h) in handoffs.iter().enumerate() {
+        owners
+            .entry(h.tool_name.clone())
+            .or_default()
+            .push((true, i));
+    }
+    let mut drop_tools = HashSet::new();
+    let mut drop_handoffs = HashSet::new();
+    for (name, entries) in owners.iter().filter(|(_, e)| e.len() > 1) {
+        let kinds: Vec<&str> = entries
+            .iter()
+            .map(|(h, _)| if *h { "handoff" } else { "function tool" })
+            .collect();
+        let message = format!(
+            "Tool name collision: '{name}' is used by {}. Assign unique tool names (for example \
+             with `tool_name_override` on handoffs).",
+            kinds.join(", ")
+        );
+        if policy == crate::run_config::ToolNameCollisionPolicy::Error {
+            return Err(AgentsError::user(message));
+        }
+        log::warn!("{message}");
+        let winner = entries
+            .iter()
+            .rev()
+            .find(|(h, _)| *h)
+            .or(entries.last())
+            .copied()
+            .expect("non-empty");
+        for e in entries.iter().filter(|e| **e != winner) {
+            if e.0 {
+                drop_handoffs.insert(e.1);
+            } else {
+                drop_tools.insert(e.1);
+            }
+        }
+    }
+    if drop_tools.is_empty() && drop_handoffs.is_empty() {
+        return Ok((tools, handoffs));
+    }
+    Ok((
+        tools
+            .into_iter()
+            .enumerate()
+            .filter(|(i, _)| !drop_tools.contains(i))
+            .map(|(_, t)| t)
+            .collect(),
+        handoffs
+            .into_iter()
+            .enumerate()
+            .filter(|(i, _)| !drop_handoffs.contains(i))
+            .map(|(_, h)| h)
+            .collect(),
+    ))
+}
+
 /// The function tool key for a call: `namespace.name` for namespaced calls. Deferred top-level
 /// tools come back with `namespace == name` and resolve to the bare name.
 fn function_lookup_name(fc: &FunctionCall) -> String {
@@ -565,6 +637,11 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
                 self.resume_pending_tools = false;
                 let tools = self.current_agent.get_all_tools(&self.ctx).await?;
                 let handoffs = self.current_agent.get_enabled_handoffs(&self.ctx).await;
+                let (tools, handoffs) = resolve_tool_name_collisions(
+                    tools,
+                    handoffs,
+                    self.config.tool_name_collision_policy,
+                )?;
                 self.start_agent_span(&tools, &handoffs);
                 let span = self.agent_span.clone().expect("agent span");
                 scope::with_span(span, Box::pin(self.resume_tools(tools, handoffs))).await?
@@ -577,6 +654,11 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
                 self.current_turn += 1;
                 let tools = self.current_agent.get_all_tools(&self.ctx).await?;
                 let handoffs = self.current_agent.get_enabled_handoffs(&self.ctx).await;
+                let (tools, handoffs) = resolve_tool_name_collisions(
+                    tools,
+                    handoffs,
+                    self.config.tool_name_collision_policy,
+                )?;
                 self.start_agent_span(&tools, &handoffs);
                 let agent_span = self.agent_span.clone().expect("agent span");
                 if self.config.include_task_and_turn_spans && !self.config.tracing_disabled {
@@ -730,15 +812,12 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
                 }
             });
             let results = futures::future::join_all(futs).await;
+            let batch_start = self.output_guardrail_results.len();
             for r in results {
                 let r = r?;
                 self.output_guardrail_results.push(r.clone());
                 if r.output.tripwire_triggered {
-                    self.save_session().await?;
-                    return Err(AgentsError::OutputGuardrailTripwireTriggered {
-                        guardrail_result: Box::new(r),
-                        run_data: None,
-                    });
+                    return Err(self.block_output(&agent, r, batch_start).await?);
                 }
             }
         }
@@ -753,6 +832,90 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
         let mut r = self.build_result(Some(output), Vec::new());
         r.state.final_output = r.final_output.clone();
         Ok(r)
+    }
+
+    /// Handle an output guardrail tripwire. The blocked final turn is not persisted, except for
+    /// tool calls whose terminal output became the final output: those are kept with their
+    /// outputs (and the guardrail results) replaced by a data-free placeholder.
+    async fn block_output(
+        &mut self,
+        agent: &Arc<Agent<C>>,
+        tripped: OutputGuardrailResult,
+        batch_start: usize,
+    ) -> Result<AgentsError> {
+        let turn_start = self.turn_start.min(self.generated_items.len());
+        let terminal_tool_output = self.generated_items[turn_start..]
+            .iter()
+            .any(|i| matches!(i.kind, RunItemKind::ToolCallOutput { .. }));
+        if !terminal_tool_output {
+            // Persist earlier turns only.
+            let current = self.generated_items.split_off(turn_start);
+            self.save_session().await?;
+            self.generated_items.extend(current);
+            self.session_saved_items = turn_start;
+            return Ok(AgentsError::OutputGuardrailTripwireTriggered {
+                guardrail_result: Box::new(tripped),
+                run_data: None,
+            });
+        }
+        let default = crate::run_config::OUTPUT_GUARDRAIL_BLOCKED_TOOL_OUTPUT.to_string();
+        let message = match &self.config.output_guardrail_blocked_message {
+            None => default.clone(),
+            Some(crate::run_config::OutputGuardrailBlockedMessage::Text(t)) if !t.is_empty() => {
+                t.clone()
+            }
+            Some(crate::run_config::OutputGuardrailBlockedMessage::Formatter(f)) => {
+                f(&crate::run_config::OutputGuardrailBlockedMessageArgs {
+                    default_message: default.clone(),
+                    guardrail_name: tripped.guardrail_name.clone(),
+                    agent_name: agent.name.clone(),
+                })
+                .filter(|m| !m.is_empty())
+                .unwrap_or(default.clone())
+            }
+            Some(_) => default.clone(),
+        };
+        let sanitize = |r: &mut OutputGuardrailResult| {
+            r.agent_output = Value::String(message.clone());
+            r.output.output_info = Value::Null;
+        };
+        for r in &mut self.output_guardrail_results[batch_start..] {
+            sanitize(r);
+        }
+        let mut tripped = tripped;
+        sanitize(&mut tripped);
+        let redact = |items: &mut [RunItem], from: usize| {
+            for item in items.iter_mut().skip(from) {
+                if let RunItemKind::ToolCallOutput { raw_item, output } = &mut item.kind {
+                    if raw_item.get("output").is_some() {
+                        raw_item["output"] = Value::String(message.clone());
+                    }
+                    *output = Value::String(message.clone());
+                }
+            }
+        };
+        redact(&mut self.generated_items, turn_start);
+        let model_start = self
+            .model_items
+            .len()
+            .saturating_sub(self.generated_items.len() - turn_start);
+        redact(&mut self.model_items, model_start);
+        // Drop the model's own text of the blocked turn, keep the tool calls and outputs.
+        let current = self.generated_items.split_off(turn_start);
+        let retained: Vec<RunItem> = current
+            .iter()
+            .filter(|i| !matches!(i.kind, RunItemKind::MessageOutput { .. }))
+            .cloned()
+            .collect();
+        self.generated_items.extend(retained);
+        self.save_session().await?;
+        self.generated_items.truncate(turn_start);
+        self.generated_items.extend(current);
+        self.session_saved_items = self.generated_items.len();
+        Ok(AgentsError::OutputGuardrailTripwireTriggered {
+            guardrail_result: Box::new(tripped),
+            run_data: None,
+        })
     }
 
     fn build_result(

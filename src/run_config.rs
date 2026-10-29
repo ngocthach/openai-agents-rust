@@ -78,6 +78,50 @@ pub enum ToolNotFoundBehavior {
     ReturnErrorToModel,
 }
 
+/// What to do when a function tool and a handoff (or two tools) expose the same name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ToolNameCollisionPolicy {
+    /// Log a warning and expose only the dispatch winner (the last handoff, else the last
+    /// tool) (default).
+    #[default]
+    Warn,
+    /// Raise `UserError` before the model is called.
+    Error,
+}
+
+/// Default model-visible placeholder for a terminal tool output blocked by an output guardrail.
+pub const OUTPUT_GUARDRAIL_BLOCKED_TOOL_OUTPUT: &str = "Output withheld by an output guardrail.";
+
+/// Data passed to an output guardrail blocked-message formatter. It never includes the
+/// rejected output or the guardrail's `output_info`.
+#[derive(Debug, Clone)]
+pub struct OutputGuardrailBlockedMessageArgs {
+    /// The SDK default placeholder.
+    pub default_message: String,
+    /// The guardrail that tripped.
+    pub guardrail_name: String,
+    /// The agent whose output was blocked.
+    pub agent_name: String,
+}
+
+/// The placeholder kept in history for a terminal tool output blocked by an output guardrail.
+#[derive(Clone)]
+pub enum OutputGuardrailBlockedMessage {
+    /// A fixed non-empty message.
+    Text(String),
+    /// A formatter; returning `None` or an empty string uses the default.
+    Formatter(Arc<dyn Fn(&OutputGuardrailBlockedMessageArgs) -> Option<String> + Send + Sync>),
+}
+
+impl fmt::Debug for OutputGuardrailBlockedMessage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            OutputGuardrailBlockedMessage::Text(t) => f.debug_tuple("Text").field(t).finish(),
+            OutputGuardrailBlockedMessage::Formatter(_) => f.write_str("Formatter(..)"),
+        }
+    }
+}
+
 /// How reasoning item ids are handled when building next-turn input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ReasoningItemIdPolicy {
@@ -101,6 +145,10 @@ pub type HandoffHistoryMapper = Arc<dyn Fn(Vec<InputItem>) -> Vec<InputItem> + S
 pub struct RunConfig<C> {
     /// Model used for every agent in the run.
     pub model: Option<AgentModel>,
+    /// Function tool / handoff name collision handling.
+    pub tool_name_collision_policy: ToolNameCollisionPolicy,
+    /// Placeholder kept for a terminal tool output blocked by an output guardrail.
+    pub output_guardrail_blocked_message: Option<OutputGuardrailBlockedMessage>,
     /// Resolves model names (default: [`MultiProvider`]).
     pub model_provider: Arc<dyn ModelProvider>,
     /// Settings overlaid on each agent's settings.
@@ -173,6 +221,8 @@ impl<C> Clone for RunConfig<C> {
             reasoning_item_id_policy: self.reasoning_item_id_policy,
             tool_execution: self.tool_execution.clone(),
             tool_not_found_behavior: self.tool_not_found_behavior,
+            tool_name_collision_policy: self.tool_name_collision_policy,
+            output_guardrail_blocked_message: self.output_guardrail_blocked_message.clone(),
         }
     }
 }
@@ -221,6 +271,8 @@ impl<C> Default for RunConfig<C> {
             reasoning_item_id_policy: ReasoningItemIdPolicy::Preserve,
             tool_execution: ToolExecutionConfig::default(),
             tool_not_found_behavior: ToolNotFoundBehavior::RaiseError,
+            tool_name_collision_policy: ToolNameCollisionPolicy::Warn,
+            output_guardrail_blocked_message: None,
         }
     }
 }
@@ -343,6 +395,21 @@ impl<C: Send + Sync + 'static> RunConfig<C> {
     /// Set unknown tool handling.
     pub fn with_tool_not_found_behavior(mut self, behavior: ToolNotFoundBehavior) -> Self {
         self.tool_not_found_behavior = behavior;
+        self
+    }
+
+    /// Set the tool name collision policy.
+    pub fn with_tool_name_collision_policy(mut self, policy: ToolNameCollisionPolicy) -> Self {
+        self.tool_name_collision_policy = policy;
+        self
+    }
+
+    /// Set the placeholder kept for terminal tool outputs blocked by an output guardrail.
+    pub fn with_output_guardrail_blocked_message(
+        mut self,
+        message: OutputGuardrailBlockedMessage,
+    ) -> Self {
+        self.output_guardrail_blocked_message = Some(message);
         self
     }
 

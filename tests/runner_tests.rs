@@ -924,6 +924,106 @@ async fn model_retry_policies_decide_and_respect_budget() {
     assert_eq!(*attempts.lock().unwrap(), vec![1, 2]);
 }
 
+#[tokio::test]
+async fn output_guardrail_redacts_blocked_terminal_tool_output() {
+    use openai_agents_sdk::run_config::OutputGuardrailBlockedMessage;
+    let model = setup();
+    model.add_turn(vec![function_call("secret", "{}")]);
+    let tool = FunctionTool::<()>::new_no_args("secret", "Secret", |_c| async { Ok("pin=1234") });
+    let g = OutputGuardrail::new("no_pins", |_c, _a, out: Value| async move {
+        Ok(GuardrailFunctionOutput::new(
+            json!({"seen": out.clone()}),
+            out.as_str().unwrap_or("").contains("pin="),
+        ))
+    });
+    let agent = Agent::<()>::new("A")
+        .with_tool(tool)
+        .with_tool_use_behavior(ToolUseBehavior::StopOnFirstTool)
+        .with_output_guardrail(g)
+        .with_model_instance(model.clone());
+    let session: Arc<dyn Session> = Arc::new(InMemorySession::new("s"));
+    let config = RunConfig::new().with_output_guardrail_blocked_message(
+        OutputGuardrailBlockedMessage::Text("[withheld]".into()),
+    );
+    let err = Runner::run_with_options(
+        &agent,
+        "show the secret",
+        RunOptions::new(())
+            .session(session.clone())
+            .run_config(config),
+    )
+    .await
+    .unwrap_err();
+    let AgentsError::OutputGuardrailTripwireTriggered {
+        guardrail_result, ..
+    } = &err
+    else {
+        panic!("unexpected error {err}");
+    };
+    assert_eq!(guardrail_result.agent_output, json!("[withheld]"));
+    assert!(guardrail_result.output.output_info.is_null());
+    let stored: Vec<Value> = session
+        .get_items(None)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|i| i.0)
+        .collect();
+    assert!(stored.iter().any(|i| i["type"] == "function_call"));
+    let out = stored
+        .iter()
+        .find(|i| i["type"] == "function_call_output")
+        .unwrap();
+    assert_eq!(out["output"], "[withheld]");
+    assert!(!serde_json::to_string(&stored).unwrap().contains("1234"));
+
+    // A blocked assistant message is not persisted at all.
+    model.add_turn(vec![assistant_message("pin=9999")]);
+    let agent2 = Agent::<()>::new("B")
+        .with_output_guardrail(OutputGuardrail::new(
+            "no_pins",
+            |_c, _a, out: Value| async move {
+                Ok(GuardrailFunctionOutput::new(
+                    Value::Null,
+                    out.as_str().unwrap_or("").contains("pin="),
+                ))
+            },
+        ))
+        .with_model_instance(model.clone());
+    let s2: Arc<dyn Session> = Arc::new(InMemorySession::new("s2"));
+    assert!(
+        Runner::run_with_options(&agent2, "hi", RunOptions::new(()).session(s2.clone()))
+            .await
+            .is_err()
+    );
+    let stored = serde_json::to_string(&s2.get_items(None).await.unwrap()).unwrap();
+    assert!(stored.contains("hi"));
+    assert!(!stored.contains("9999"));
+}
+
+#[tokio::test]
+async fn tool_name_collisions_follow_policy() {
+    use openai_agents_sdk::run_config::ToolNameCollisionPolicy;
+    let model = setup();
+    let other = Arc::new(Agent::<()>::new("B"));
+    let dup = FunctionTool::<()>::new_no_args("transfer_to_B", "Dup", |_c| async { Ok("x") });
+    let agent = Agent::<()>::new("A")
+        .with_tool(dup)
+        .with_handoff(handoff(other))
+        .with_model_instance(model.clone());
+    model.add_turn(vec![assistant_message("hi")]);
+    Runner::run(&agent, "x").await.unwrap();
+    let call = model.last_call().unwrap();
+    assert!(call.tools.is_empty(), "the handoff wins the name");
+    assert_eq!(call.handoffs.len(), 1);
+
+    let config = RunConfig::new().with_tool_name_collision_policy(ToolNameCollisionPolicy::Error);
+    let err = Runner::run_with_options(&agent, "x", RunOptions::new(()).run_config(config))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("collision"));
+}
+
 #[test]
 fn run_sync_works_outside_runtime() {
     let model = setup();
