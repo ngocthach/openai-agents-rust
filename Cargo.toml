@@ -23,7 +23,7 @@ members = ["macros"]
 default = []
 macros = ["dep:openai-agents-sdk-macros"]
 sqlite = ["dep:rusqlite"]
-mcp = ["dep:rmcp"]
+mcp = ["dep:rmcp", "dep:sha1"]
 websocket = ["dep:tokio-tungstenite"]
 realtime = ["dep:tokio-tungstenite", "dep:base64"]
 voice = ["dep:base64", "dep:tokio-tungstenite", "reqwest/multipart"]
@@ -68,6 +68,8 @@ hmac = { version = "0.13", optional = true }
 portable-pty = { version = "0.9", optional = true }
 # Optional dependency for RedisSession (feature `redis`).
 redis = { version = "1", default-features = false, features = ["tokio-comp", "aio"], optional = true }
+# SHA-1 for MCP tool-name disambiguation hashes (parity with Python).
+sha1 = { version = "0.11", optional = true }
 # Optional dependency for MongoDBSession (feature `mongodb`).
 mongodb = { version = "3", default-features = false, features = ["compat-3-0-0", "rustls-tls-aws-lc", "dns-resolver"], optional = true }
 # Optional dependency for SqlxSession on PostgreSQL / MySQL (feature `sqlx`).
