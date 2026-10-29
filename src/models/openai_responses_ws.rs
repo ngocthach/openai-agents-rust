@@ -380,6 +380,13 @@ impl Model for OpenAIResponsesWSModel {
         Some(self.inner.model().to_string())
     }
 
+    fn get_retry_advice(
+        &self,
+        request: &crate::retry::ModelRetryAdviceRequest<'_>,
+    ) -> Option<crate::retry::ModelRetryAdvice> {
+        crate::retry::get_openai_retry_advice(request)
+    }
+
     async fn close(&self) {
         self.close_connection().await;
     }

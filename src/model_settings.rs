@@ -111,8 +111,10 @@ impl Default for ModelRetryBackoffSettings {
 
 /// Runner-managed retry settings for model calls (opt-in).
 ///
-/// Retries are attempted for network errors, timeouts and the HTTP statuses listed in
-/// `retry_statuses`. Streamed requests are only retried when no event has been received yet.
+/// With a [`policy`](Self::policy) (see [`crate::retry::retry_policies`]) the policy decides,
+/// with the model's retry advice and the runner's replay-safety rules applied. Without one,
+/// network errors, timeouts and the HTTP statuses in `retry_statuses` are retried (stateful
+/// requests only on 429). Streamed requests are only retried before any output event.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModelRetrySettings {
     /// Number of retries after the initial attempt.
@@ -123,6 +125,9 @@ pub struct ModelRetrySettings {
     /// HTTP status codes that trigger a retry.
     #[serde(default = "default_retry_statuses")]
     pub retry_statuses: Vec<u16>,
+    /// Runtime-only retry policy (not serialized).
+    #[serde(skip)]
+    pub policy: Option<crate::retry::RetryPolicy>,
 }
 
 fn default_retry_statuses() -> Vec<u16> {
@@ -135,11 +140,24 @@ impl Default for ModelRetrySettings {
             max_retries: 2,
             backoff: ModelRetryBackoffSettings::default(),
             retry_statuses: default_retry_statuses(),
+            policy: None,
         }
     }
 }
 
 impl ModelRetrySettings {
+    /// Use a retry policy.
+    pub fn with_policy(mut self, policy: crate::retry::RetryPolicy) -> Self {
+        self.policy = Some(policy);
+        self
+    }
+
+    /// Set the retry budget.
+    pub fn with_max_retries(mut self, max_retries: u32) -> Self {
+        self.max_retries = max_retries;
+        self
+    }
+
     /// Delay for the given retry attempt (1-based).
     pub fn delay_for_attempt(&self, attempt: u32) -> Duration {
         let b = &self.backoff;

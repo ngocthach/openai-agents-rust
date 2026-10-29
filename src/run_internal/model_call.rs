@@ -48,6 +48,9 @@ async fn with_timeout<T>(
     }
 }
 
+/// Stream events that do not block a retry (no user-visible output yet).
+const RETRY_SAFE_STREAM_EVENTS: &[&str] = &["response.created", "response.in_progress"];
+
 async fn consume_stream<C: Send + Sync + 'static>(
     model: &Arc<dyn Model>,
     request: ModelRequest,
@@ -59,7 +62,10 @@ async fn consume_stream<C: Send + Sync + 'static>(
     let mut final_response: Option<ModelResponse> = None;
     while let Some(ev) = stream.next().await {
         let ev = ev?;
-        *started = true;
+        let ty = ev.get("type").and_then(Value::as_str).unwrap_or_default();
+        if !RETRY_SAFE_STREAM_EVENTS.contains(&ty) {
+            *started = true;
+        }
         if ev.get("type").and_then(Value::as_str) == Some("response.completed")
             && let Some(r) = ev.get("response")
         {
@@ -109,6 +115,37 @@ pub(crate) async fn call_model<C: Send + Sync + 'static>(
         let Some(retry) = &settings.retry else {
             return Err(err);
         };
+        if let Some(policy) = &retry.policy {
+            let advice = model.get_retry_advice(&crate::retry::ModelRetryAdviceRequest {
+                error: &err,
+                attempt: attempt + 1,
+                stream: sink.is_some(),
+                previous_response_id: request.previous_response_id.as_deref(),
+                conversation_id: request.conversation_id.as_deref(),
+            });
+            let decision = crate::retry::evaluate_retry(
+                &err,
+                attempt + 1,
+                retry.max_retries,
+                policy,
+                sink.is_some(),
+                started,
+                advice.as_ref(),
+                request.previous_response_id.as_deref(),
+                request.conversation_id.as_deref(),
+            );
+            if !decision.retry {
+                return Err(err);
+            }
+            attempt += 1;
+            let delay = decision
+                .delay
+                .map(|d| Duration::from_secs_f64(d.max(0.0)))
+                .unwrap_or_else(|| retry.delay_for_attempt(attempt));
+            log::warn!("Retrying model call (attempt {attempt}) after error: {err}");
+            tokio::time::sleep(delay).await;
+            continue;
+        }
         if attempt >= retry.max_retries || !is_retryable(&err, &retry.retry_statuses, stateful) {
             return Err(err);
         }

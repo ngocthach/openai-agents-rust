@@ -44,6 +44,7 @@ pub mod prompts;
 pub mod realtime;
 pub mod repl;
 pub mod result;
+pub mod retry;
 pub mod run;
 pub mod run_config;
 pub mod run_context;

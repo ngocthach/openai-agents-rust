@@ -858,6 +858,72 @@ async fn model_retry_on_retryable_status() {
     assert_eq!(r.final_output_text().as_deref(), Some("recovered"));
 }
 
+#[tokio::test]
+async fn model_retry_policies_decide_and_respect_budget() {
+    use openai_agents_sdk::model_settings::{ModelRetryBackoffSettings, ModelRetrySettings};
+    use openai_agents_sdk::retry::{RetryDecision, RetryPolicy, retry_policies};
+    use openai_agents_sdk::testing::ModelStep;
+    let fast = ModelRetryBackoffSettings {
+        initial_delay: 0.0,
+        max_delay: 0.0,
+        multiplier: 1.0,
+        jitter: false,
+    };
+    let settings = |policy: RetryPolicy, max: u32| {
+        openai_agents_sdk::ModelSettings::default().with_retry(
+            ModelRetrySettings {
+                max_retries: max,
+                backoff: fast.clone(),
+                ..Default::default()
+            }
+            .with_policy(policy),
+        )
+    };
+
+    // A 418 is retried by an http_status policy.
+    let model = setup();
+    model.enqueue(ModelStep::ApiError(418));
+    model.add_turn(vec![assistant_message("ok")]);
+    let agent = Agent::<()>::new("A")
+        .with_model_settings(settings(retry_policies::http_status([418]), 1))
+        .with_model_instance(model.clone());
+    assert_eq!(
+        Runner::run(&agent, "x")
+            .await
+            .unwrap()
+            .final_output_text()
+            .as_deref(),
+        Some("ok")
+    );
+    assert_eq!(model.calls().len(), 2);
+
+    // The policy never retries a 503 and the budget limits a custom policy.
+    let model = setup();
+    model.enqueue(ModelStep::ApiError(503));
+    let agent = Agent::<()>::new("A")
+        .with_model_settings(settings(retry_policies::never(), 3))
+        .with_model_instance(model.clone());
+    assert!(Runner::run(&agent, "x").await.is_err());
+    assert_eq!(model.calls().len(), 1);
+
+    let model = setup();
+    for _ in 0..3 {
+        model.enqueue(ModelStep::ApiError(500));
+    }
+    let attempts = Arc::new(Mutex::new(Vec::new()));
+    let a2 = attempts.clone();
+    let custom = RetryPolicy::new(move |c| {
+        a2.lock().unwrap().push(c.attempt);
+        RetryDecision::retry().with_delay(0.0)
+    });
+    let agent = Agent::<()>::new("A")
+        .with_model_settings(settings(custom, 2))
+        .with_model_instance(model.clone());
+    assert!(Runner::run(&agent, "x").await.is_err());
+    assert_eq!(model.calls().len(), 3);
+    assert_eq!(*attempts.lock().unwrap(), vec![1, 2]);
+}
+
 #[test]
 fn run_sync_works_outside_runtime() {
     let model = setup();

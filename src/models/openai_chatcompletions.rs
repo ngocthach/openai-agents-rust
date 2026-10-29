@@ -1064,6 +1064,13 @@ impl Model for OpenAIChatCompletionsModel {
     fn model_name(&self) -> Option<String> {
         Some(self.model.clone())
     }
+
+    fn get_retry_advice(
+        &self,
+        request: &crate::retry::ModelRetryAdviceRequest<'_>,
+    ) -> Option<crate::retry::ModelRetryAdvice> {
+        crate::retry::get_openai_retry_advice(request)
+    }
 }
 
 #[cfg(test)]

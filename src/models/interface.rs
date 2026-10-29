@@ -142,6 +142,14 @@ pub trait Model: Send + Sync + fmt::Debug {
             .map(|n| crate::models::default_models::get_default_model_settings(Some(&n)))
     }
 
+    /// Provider-specific retry guidance for a failed call, used by retry policies.
+    fn get_retry_advice(
+        &self,
+        _request: &crate::retry::ModelRetryAdviceRequest<'_>,
+    ) -> Option<crate::retry::ModelRetryAdvice> {
+        None
+    }
+
     /// Release resources held by the model.
     async fn close(&self) {}
 }
