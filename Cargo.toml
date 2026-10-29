@@ -1,0 +1,46 @@
+[package]
+name = "openai-agents-sdk"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Unofficial Rust port of the OpenAI Agents SDK: agents, tools, handoffs, guardrails, sessions, tracing, MCP"
+license = "MIT"
+repository = "https://github.com/ngocthach/openai-agents-rust"
+homepage = "https://github.com/ngocthach/openai-agents-rust"
+documentation = "https://docs.rs/openai-agents-sdk"
+readme = "README.md"
+keywords = ["openai", "agents", "llm", "ai", "mcp"]
+categories = ["api-bindings", "asynchronous"]
+exclude = ["plans/", ".claude/", ".github/"]
+
+[package.metadata.docs.rs]
+all-features = true
+
+[features]
+default = []
+sqlite = ["dep:rusqlite"]
+mcp = ["dep:rmcp"]
+
+[dependencies]
+async-trait = "0.1"
+bytes = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+futures = "0.3"
+log = "0.4"
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls", "http2", "charset", "system-proxy"] }
+schemars = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-util", "io-std"] }
+tokio-stream = "0.1"
+tokio-util = "0.7"
+uuid = { version = "1", features = ["v4"] }
+rand = "0.9"
+rusqlite = { version = "0.41", features = ["bundled"], optional = true }
+rmcp = { version = "3", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "client-side-sse", "reqwest"], optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+env_logger = "0.11"
+tempfile = "3"
