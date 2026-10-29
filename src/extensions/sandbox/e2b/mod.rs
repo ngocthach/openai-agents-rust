@@ -55,7 +55,7 @@ pub mod rclone;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use base64::Engine as _;
@@ -63,27 +63,29 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use futures::StreamExt as _;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::sync::Notify;
 
 use crate::sandbox::errors::{ErrorCode, SandboxError, SandboxResult};
+use crate::sandbox::http::{expect_success, http_error, parse_json, transport};
 use crate::sandbox::manifest::Manifest;
 use crate::sandbox::mounts::{
     InContainerMountStrategy, Mount, MountCredentialAuthority, MountPatternConfig, MountStrategy,
+    RCLONE_OPTION_READ_ONLY, RCLONE_OPTION_REMOTE_NAME, RCLONE_OPTION_REMOTE_PATH, RcloneMountMode,
+    RcloneMountPattern,
 };
 use crate::sandbox::pty::{
-    PTY_PROCESS_ID_MAX_EXCLUSIVE, PTY_PROCESS_ID_MIN, PTY_PROCESSES_MAX,
-    PTY_PROCESSES_PROTECTED_RECENT, PtyExecRequest, PtyExecUpdate, PtyWriteRequest,
-    clamp_pty_yield_time_ms, resolve_pty_write_yield_time_ms,
+    PtyExecRequest, PtyExecUpdate, PtyWriteRequest, RemotePtyManager, RemotePtyProcess,
+    resolve_pty_write_yield_time_ms,
 };
 use crate::sandbox::session::{
     ExecRequest, SandboxClient, SandboxSession, restore_session_snapshot, shell_quote,
+    workspace_archive_excludes,
 };
 use crate::sandbox::snapshot::{Snapshot, SnapshotSpec, resolve_snapshot};
 use crate::sandbox::state::SandboxSessionState;
 use crate::sandbox::types::{ExecResult, FileEntry, Permissions};
-use crate::sandbox::util::truncate_text_by_tokens;
+use crate::sandbox::workspace_paths::provider_scratch_path;
 
-use self::rclone::{RcloneMountMode, RcloneMountPattern, ensure_fuse_support, ensure_rclone};
+use self::rclone::{ensure_fuse_support, ensure_rclone};
 
 /// The backend identifier reported by this client and its sessions.
 pub const BACKEND_ID: &str = "e2b";
@@ -679,7 +681,9 @@ pub struct E2BSandboxSession {
     started: AtomicBool,
     paused: AtomicBool,
     released: tokio::sync::Mutex<bool>,
-    ptys: PtyRegistry,
+    ptys: RemotePtyManager,
+    /// Sandbox-side pid of each live PTY session, for `SendInput` and `SendSignal`.
+    pty_pids: Arc<Mutex<HashMap<u32, u32>>>,
     snapshot: Option<SnapshotSpec>,
     snapshot_id: String,
     resuming: bool,
@@ -723,7 +727,8 @@ impl E2BSandboxSession {
             started: AtomicBool::new(false),
             paused: AtomicBool::new(false),
             released: tokio::sync::Mutex::new(false),
-            ptys: PtyRegistry::default(),
+            ptys: RemotePtyManager::new(),
+            pty_pids: Arc::new(Mutex::new(HashMap::new())),
             snapshot,
             resuming: false,
         }
@@ -817,6 +822,16 @@ impl E2BSandboxSession {
         ))
     }
 
+    /// The environment one command runs with: the session's, then the request's own.
+    ///
+    /// The session environment is the client options' plus the manifest's, which is what Python
+    /// passes per command; `ExecRequest::env` then overrides individual names.
+    fn request_envs(&self, request: &ExecRequest) -> BTreeMap<String, String> {
+        let mut envs = self.command_envs();
+        envs.extend(request.env.iter().map(|(k, v)| (k.clone(), v.clone())));
+        envs
+    }
+
     /// The environment every command runs with.
     fn command_envs(&self) -> BTreeMap<String, String> {
         let mut envs = self.options.envs.clone();
@@ -840,6 +855,7 @@ impl E2BSandboxSession {
         &self,
         argv: &[String],
         cwd: Option<String>,
+        env: &BTreeMap<String, String>,
         pty: Option<(u16, u16)>,
         stdin: bool,
     ) -> Value {
@@ -847,7 +863,7 @@ impl E2BSandboxSession {
             .split_first()
             .map(|(cmd, args)| (cmd.clone(), args.to_vec()))
             .unwrap_or_else(|| ("true".to_string(), Vec::new()));
-        let mut process = json!({ "cmd": cmd, "args": args, "envs": self.command_envs() });
+        let mut process = json!({ "cmd": cmd, "args": args, "envs": env });
         if let Some(cwd) = cwd {
             process
                 .as_object_mut()
@@ -912,12 +928,13 @@ impl E2BSandboxSession {
         &self,
         argv: Vec<String>,
         cwd: Option<String>,
+        env: &BTreeMap<String, String>,
         timeout: Option<Duration>,
         user: Option<String>,
     ) -> SandboxResult<ExecResult> {
         let what = "run a command in the E2B sandbox";
         let envd_timeout = self.envd_timeout(timeout);
-        let request = self.start_request(&argv, cwd, None, false);
+        let request = self.start_request(&argv, cwd, env, None, false);
         let response = self
             .open_process_stream(request, user.as_deref(), envd_timeout, what)
             .await?;
@@ -985,6 +1002,41 @@ impl E2BSandboxSession {
         )
         .await
         .map(|_| ())
+    }
+
+    /// The sandbox-side pid of one PTY session.
+    fn pty_pid(&self, session_id: u32) -> Option<u32> {
+        self.pty_pids
+            .lock()
+            .expect("poisoned")
+            .get(&session_id)
+            .copied()
+    }
+
+    /// Drop the bookkeeping of a session whose process has exited.
+    fn forget_finished_pty(&self, update: &PtyExecUpdate, session_id: u32) {
+        if update.process_id.is_none() {
+            self.ptys.remove(session_id);
+            self.pty_pids.lock().expect("poisoned").remove(&session_id);
+        }
+    }
+
+    /// Kill the sandbox-side processes behind the given PTY sessions, best effort.
+    async fn release_pty_processes(&self, processes: &[Arc<RemotePtyProcess>]) {
+        let pids: Vec<(u32, Option<u32>)> = processes
+            .iter()
+            .map(|process| (process.id(), self.pty_pid(process.id())))
+            .collect();
+        for (session_id, pid) in pids {
+            // Releasing a session the model can no longer reach must also stop its stream.
+            if let Some(process) = processes.iter().find(|p| p.id() == session_id) {
+                process.close(None);
+            }
+            self.pty_pids.lock().expect("poisoned").remove(&session_id);
+            if let Some(pid) = pid {
+                self.signal_pty_processes(&[pid]).await;
+            }
+        }
     }
 
     /// Kill the listed sandbox-side PTY processes, best effort.
@@ -1189,7 +1241,7 @@ impl E2BSandboxSession {
     async fn persist_workspace_tar(&self) -> SandboxResult<Vec<u8>> {
         let root = self.manifest.root().to_string();
         let mut command = format!("tar -czf - -C {}", shell_quote(&root));
-        for exclude in workspace_excludes(&self.manifest, &root) {
+        for exclude in workspace_archive_excludes(&self.manifest, &root) {
             command.push_str(&format!(" --exclude {}", shell_quote(&exclude)));
         }
         // envd reports command output as text, so the archive travels base64-encoded.
@@ -1198,6 +1250,7 @@ impl E2BSandboxSession {
             .exec_at(
                 vec!["sh".into(), "-lc".into(), command],
                 Some(root.clone()),
+                &self.command_envs(),
                 Some(self.options.timeouts.snapshot_tar),
                 None,
             )
@@ -1234,6 +1287,10 @@ impl SandboxSession for E2BSandboxSession {
         BACKEND_ID
     }
 
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
+    }
+
     async fn start(&self) -> SandboxResult<()> {
         let root = self.manifest.root().to_string();
         // The filesystem API can create roots the command user cannot, so it goes first; the
@@ -1251,6 +1308,7 @@ impl SandboxSession for E2BSandboxSession {
             .exec_at(
                 vec!["mkdir".into(), "-p".into(), "--".into(), root.clone()],
                 Some("/".to_string()),
+                &self.command_envs(),
                 Some(self.options.timeouts.fast_op),
                 None,
             )
@@ -1334,12 +1392,14 @@ impl SandboxSession for E2BSandboxSession {
         let cwd = self.resolve_cwd(&request.cwd)?;
         let user = request.user.as_ref().map(|user| user.name.clone());
         // envd takes the user out of band, so the `sudo` wrapper must not be built here.
+        let env = self.request_envs(&request);
         let argv = ExecRequest {
             user: None,
             ..request.clone()
         }
         .resolved_argv();
-        self.exec_at(argv, Some(cwd), request.timeout, user).await
+        self.exec_at(argv, Some(cwd), &env, request.timeout, user)
+            .await
     }
 
     async fn read_file(&self, path: &str) -> SandboxResult<Vec<u8>> {
@@ -1395,6 +1455,7 @@ impl SandboxSession for E2BSandboxSession {
             .exec_at(
                 command.clone(),
                 Some("/".to_string()),
+                &self.command_envs(),
                 Some(self.options.timeouts.fast_op),
                 None,
             )
@@ -1420,12 +1481,13 @@ impl SandboxSession for E2BSandboxSession {
     async fn pty_exec_start(&self, request: PtyExecRequest) -> SandboxResult<PtyExecUpdate> {
         let cwd = self.resolve_cwd(&request.cwd)?;
         let user = request.user.as_ref().map(|user| user.name.clone());
+        let env = self.command_envs();
         let argv = PtyExecRequest {
             user: None,
             ..request.clone()
         }
         .resolved_argv();
-        let start = self.start_request(&argv, Some(cwd), Some((24, 80)), request.tty);
+        let start = self.start_request(&argv, Some(cwd), &env, Some((24, 80)), request.tty);
         let response = self
             .open_process_stream(
                 start,
@@ -1434,19 +1496,25 @@ impl SandboxSession for E2BSandboxSession {
                 "start a PTY process in the E2B sandbox",
             )
             .await?;
-        let (process, evicted) = self.ptys.insert(request.tty)?;
-        // A pruned process keeps running inside the sandbox until it is signalled.
-        self.signal_pty_processes(&evicted).await;
-        process.clone().pump(response.bytes_stream());
-        Ok(process
-            .collect(request.yield_time_ms, request.max_output_tokens, &self.ptys)
-            .await)
+        let (process, pruned) = self.ptys.register(request.tty)?;
+        // A pruned session keeps running inside the sandbox until it is signalled.
+        self.release_pty_processes(&pruned).await;
+        pump_pty_stream(
+            process.clone(),
+            self.pty_pids.clone(),
+            response.bytes_stream(),
+        );
+        let update = process
+            .collect(request.yield_time_ms, request.max_output_tokens)
+            .await;
+        self.forget_finished_pty(&update, process.id());
+        Ok(update)
     }
 
     async fn pty_write_stdin(&self, request: PtyWriteRequest) -> SandboxResult<PtyExecUpdate> {
         let process = self.ptys.get(request.session_id)?;
         if !request.chars.is_empty() {
-            if !process.tty {
+            if !process.tty() {
                 return Err(SandboxError::new(
                     ErrorCode::PtyStdinUnavailable,
                     format!(
@@ -1455,7 +1523,7 @@ impl SandboxSession for E2BSandboxSession {
                     ),
                 ));
             }
-            let pid = process.pid().ok_or_else(|| {
+            let pid = self.pty_pid(request.session_id).ok_or_else(|| {
                 SandboxError::new(
                     ErrorCode::PtySessionNotFound,
                     format!(
@@ -1476,14 +1544,16 @@ impl SandboxSession for E2BSandboxSession {
         }
         let yield_time_ms =
             resolve_pty_write_yield_time_ms(request.yield_time_ms, request.chars.is_empty());
-        Ok(process
-            .collect(yield_time_ms, request.max_output_tokens, &self.ptys)
-            .await)
+        let update = process
+            .collect(yield_time_ms, request.max_output_tokens)
+            .await;
+        self.forget_finished_pty(&update, process.id());
+        Ok(update)
     }
 
     async fn pty_terminate_all(&self) -> SandboxResult<()> {
-        let pids = self.ptys.terminate_all();
-        self.signal_pty_processes(&pids).await;
+        let processes = self.ptys.take_all();
+        self.release_pty_processes(&processes).await;
         Ok(())
     }
 
@@ -1515,7 +1585,10 @@ impl SandboxSession for E2BSandboxSession {
             return self.restore_native_snapshot(&snapshot_id).await;
         }
         let root = self.manifest.root().to_string();
-        let archive_path = format!("/tmp/openai-agents-{}.tar.gz", self.session_id);
+        let archive_path = self.resolve_internal_path(&provider_scratch_path(&format!(
+            "{}.tar.gz",
+            self.session_id
+        )))?;
         self.upload_at(&archive_path, archive).await?;
         let script = format!(
             "mkdir -p {root} && tar -xzf {archive} -C {root}",
@@ -1526,6 +1599,7 @@ impl SandboxSession for E2BSandboxSession {
             .exec_at(
                 vec!["sh".into(), "-lc".into(), script],
                 Some("/".to_string()),
+                &self.command_envs(),
                 Some(self.options.timeouts.snapshot_tar),
                 None,
             )
@@ -1551,6 +1625,27 @@ impl SandboxSession for E2BSandboxSession {
 // Cloud bucket mounts
 // -------------------------------------------------------------------------------------------
 
+/// Refuse a mount on any backend other than E2B.
+///
+/// Mirrors Python's `_assert_e2b_session`: the strategy's preflight assumes this
+/// provider's image and its privilege model, so running it elsewhere would be guesswork.
+fn assert_e2b_session(session: &dyn SandboxSession) -> SandboxResult<()> {
+    let matches = session
+        .as_any()
+        .is_some_and(|any| any.is::<E2BSandboxSession>());
+    if !matches {
+        return Err(SandboxError::new(
+            ErrorCode::MountConfigInvalid,
+            format!(
+                "a E2B cloud bucket mount requires a E2B sandbox session, not the \
+                 `{}` backend",
+                session.backend_id()
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// Mounts rclone-backed cloud storage inside an E2B sandbox. Mirrors
 /// `agents.extensions.sandbox.e2b.mounts.E2BCloudBucketMountStrategy`.
 ///
@@ -1565,6 +1660,8 @@ pub struct E2BCloudBucketMountStrategy {
     pub pattern: RcloneMountPattern,
     /// The secret-bearing rclone configuration and the remote selection options.
     pub config: MountPatternConfig,
+    /// Whether a missing `rclone` (or `fuse3`) may be installed into the sandbox.
+    pub install_tools: bool,
 }
 
 impl E2BCloudBucketMountStrategy {
@@ -1576,16 +1673,23 @@ impl E2BCloudBucketMountStrategy {
     ) -> Self {
         E2BCloudBucketMountStrategy {
             pattern: RcloneMountPattern::new(),
+            install_tools: true,
             config: MountPatternConfig::new()
                 .with_config_text(config_text)
-                .with_option(rclone::OPTION_REMOTE_NAME, remote_name)
-                .with_option(rclone::OPTION_REMOTE_PATH, remote_path),
+                .with_option(RCLONE_OPTION_REMOTE_NAME, remote_name)
+                .with_option(RCLONE_OPTION_REMOTE_PATH, remote_path),
         }
     }
 
     /// Replace the rclone pattern.
     pub fn with_pattern(mut self, pattern: RcloneMountPattern) -> Self {
         self.pattern = pattern;
+        self
+    }
+
+    /// Whether a missing `rclone` (or `fuse3`) may be installed into the sandbox.
+    pub fn with_install_tools(mut self, install_tools: bool) -> Self {
+        self.install_tools = install_tools;
         self
     }
 
@@ -1598,18 +1702,33 @@ impl E2BCloudBucketMountStrategy {
     fn delegate(&self, mount: &Mount) -> InContainerMountStrategy {
         let mut config = self.config.clone();
         config.options.insert(
-            rclone::OPTION_READ_ONLY.to_string(),
+            RCLONE_OPTION_READ_ONLY.to_string(),
             mount.read_only.to_string(),
         );
-        InContainerMountStrategy::new(Arc::new(self.pattern.clone()), config)
+        InContainerMountStrategy::new(Arc::new(self.fuse_pattern()), config)
+    }
+
+    /// The pattern with the flags this provider's images need.
+    ///
+    /// Mirrors Python's `rclone_pattern_for_session`: a FUSE mount is made readable by the
+    /// sandbox's command user, which is not the root user the mount command runs as.
+    fn fuse_pattern(&self) -> RcloneMountPattern {
+        if self.pattern.mode != RcloneMountMode::Fuse {
+            return self.pattern.clone();
+        }
+        let mut pattern = self.pattern.clone();
+        if !pattern.extra_args.iter().any(|arg| arg == "--allow-other") {
+            pattern.extra_args.push("--allow-other".to_string());
+        }
+        pattern
     }
 
     /// Run the preflight the provider's image needs before an rclone mount.
     async fn preflight(&self, session: &dyn SandboxSession) -> SandboxResult<()> {
         if self.pattern.mode == RcloneMountMode::Fuse {
-            ensure_fuse_support(session, self.pattern.install_if_missing).await?;
+            ensure_fuse_support(session, self.install_tools).await?;
         }
-        ensure_rclone(session, self.pattern.install_if_missing).await
+        ensure_rclone(session, self.install_tools).await
     }
 }
 
@@ -1637,6 +1756,7 @@ impl MountStrategy for E2BCloudBucketMountStrategy {
         session: &dyn SandboxSession,
         mount_path: &str,
     ) -> SandboxResult<()> {
+        assert_e2b_session(session)?;
         session.authorize_mount_activation(mount, mount_path)?;
         self.preflight(session).await?;
         self.delegate(mount)
@@ -1650,6 +1770,7 @@ impl MountStrategy for E2BCloudBucketMountStrategy {
         session: &dyn SandboxSession,
         mount_path: &str,
     ) -> SandboxResult<()> {
+        assert_e2b_session(session)?;
         self.delegate(mount)
             .deactivate(mount, session, mount_path)
             .await
@@ -1661,6 +1782,7 @@ impl MountStrategy for E2BCloudBucketMountStrategy {
         session: &dyn SandboxSession,
         mount_path: &str,
     ) -> SandboxResult<()> {
+        assert_e2b_session(session)?;
         session.authorize_mount_activation(mount, mount_path)?;
         self.preflight(session).await?;
         self.delegate(mount)
@@ -1673,234 +1795,58 @@ impl MountStrategy for E2BCloudBucketMountStrategy {
 // Remote PTY bookkeeping
 // -------------------------------------------------------------------------------------------
 
-/// One PTY process running inside the sandbox, with the output collected so far.
-struct PtyProcess {
-    id: u32,
-    tty: bool,
-    pid: Mutex<Option<u32>>,
-    buffer: Mutex<Vec<u8>>,
-    exit_code: Mutex<Option<i32>>,
-    closed: AtomicBool,
-    notify: Notify,
-    last_used: Mutex<Instant>,
-}
-
-impl PtyProcess {
-    fn pid(&self) -> Option<u32> {
-        *self.pid.lock().expect("poisoned")
-    }
-
-    fn is_done(&self) -> bool {
-        self.closed.load(Ordering::SeqCst)
-    }
-
-    fn touch(&self) {
-        *self.last_used.lock().expect("poisoned") = Instant::now();
-    }
-
-    fn take_output(&self, keep_partial_utf8: bool) -> Vec<u8> {
-        let mut buffer = self.buffer.lock().expect("poisoned");
-        if keep_partial_utf8 {
-            let keep = crate::sandbox::pty::incomplete_utf8_suffix_length(&buffer);
-            let split = buffer.len() - keep;
-            let tail = buffer.split_off(split);
-            let output = std::mem::replace(&mut *buffer, tail);
-            return output;
-        }
-        std::mem::take(&mut *buffer)
-    }
-
-    /// Decode the Connect response stream into the process buffer on a background task.
-    fn pump<S>(self: Arc<Self>, stream: S)
-    where
-        S: futures::Stream<Item = reqwest::Result<bytes::Bytes>> + Send + Unpin + 'static,
-    {
-        tokio::spawn(async move {
-            let mut stream = stream;
-            let mut decoder = ConnectFrameDecoder::default();
-            while let Some(chunk) = stream.next().await {
-                let Ok(chunk) = chunk else { break };
-                decoder.push(&chunk);
-                for frame in decoder.drain() {
-                    match frame {
-                        ConnectFrame::Message(value) => {
-                            let event = value.get("event").unwrap_or(&Value::Null);
-                            if let Some(pid) = event
-                                .get("start")
-                                .and_then(|start| start.get("pid"))
-                                .and_then(Value::as_u64)
-                            {
-                                *self.pid.lock().expect("poisoned") = Some(pid as u32);
-                            }
-                            if let Some(data) = event.get("data") {
-                                let mut buffer = self.buffer.lock().expect("poisoned");
-                                for field in ["pty", "stdout", "stderr"] {
-                                    if let Some(encoded) = data.get(field).and_then(Value::as_str)
-                                        && let Ok(bytes) = BASE64.decode(encoded)
-                                    {
-                                        buffer.extend_from_slice(&bytes);
-                                    }
-                                }
-                            }
-                            if let Some(end) = event.get("end") {
-                                *self.exit_code.lock().expect("poisoned") =
-                                    Some(end.get("exitCode").and_then(Value::as_i64).unwrap_or(0)
-                                        as i32);
-                            }
+/// Decode a `process.Process/Start` stream into a [`RemotePtyProcess`].
+///
+/// The core manager owns the session id, the output window and the pruning; this task owns the
+/// transport, so it records the sandbox pid the session needs for `SendInput` and `SendSignal`
+/// and closes the process when the stream ends.
+fn pump_pty_stream<S>(
+    process: Arc<RemotePtyProcess>,
+    pids: Arc<Mutex<HashMap<u32, u32>>>,
+    stream: S,
+) where
+    S: futures::Stream<Item = reqwest::Result<bytes::Bytes>> + Send + Unpin + 'static,
+{
+    tokio::spawn(async move {
+        let mut stream = stream;
+        let mut decoder = ConnectFrameDecoder::default();
+        let mut exit_code = None;
+        while let Some(chunk) = stream.next().await {
+            let Ok(chunk) = chunk else { break };
+            decoder.push(&chunk);
+            for frame in decoder.drain() {
+                let ConnectFrame::Message(value) = frame else {
+                    continue;
+                };
+                let event = value.get("event").unwrap_or(&Value::Null);
+                if let Some(pid) = event
+                    .get("start")
+                    .and_then(|start| start.get("pid"))
+                    .and_then(Value::as_u64)
+                {
+                    pids.lock()
+                        .expect("poisoned")
+                        .insert(process.id(), pid as u32);
+                }
+                if let Some(data) = event.get("data") {
+                    // A PTY reports everything on `pty`; a plain process splits the streams.
+                    for field in ["pty", "stdout", "stderr"] {
+                        if let Some(encoded) = data.get(field).and_then(Value::as_str)
+                            && let Ok(bytes) = BASE64.decode(encoded)
+                        {
+                            process.push_output(&bytes);
                         }
-                        ConnectFrame::EndStream(_) => {}
                     }
                 }
-                self.notify.notify_waiters();
-            }
-            self.closed.store(true, Ordering::SeqCst);
-            self.notify.notify_waiters();
-        });
-    }
-
-    /// Collect output until the yield window elapses or the process finishes.
-    async fn collect(
-        self: &Arc<Self>,
-        yield_time_ms: u64,
-        max_output_tokens: Option<usize>,
-        registry: &PtyRegistry,
-    ) -> PtyExecUpdate {
-        self.touch();
-        let deadline =
-            Instant::now() + Duration::from_millis(clamp_pty_yield_time_ms(yield_time_ms));
-        let mut output = Vec::new();
-        let mut closed = false;
-        loop {
-            output.extend(self.take_output(false));
-            if self.is_done() {
-                closed = true;
-                output.extend(self.take_output(false));
-                break;
-            }
-            let now = Instant::now();
-            if now >= deadline {
-                break;
-            }
-            let notified = self.notify.notified();
-            if tokio::time::timeout(deadline - now, notified)
-                .await
-                .is_err()
-            {
-                break;
-            }
-        }
-        output.extend(self.take_output(!closed));
-        self.touch();
-        if closed {
-            registry.remove(self.id);
-        }
-
-        let text = String::from_utf8_lossy(&output).into_owned();
-        let (text, original_token_count) = truncate_text_by_tokens(&text, max_output_tokens);
-        PtyExecUpdate {
-            process_id: (!closed).then_some(self.id),
-            output: text.into_bytes(),
-            exit_code: *self.exit_code.lock().expect("poisoned"),
-            original_token_count,
-        }
-    }
-}
-
-/// The live PTY processes of one session.
-#[derive(Default)]
-struct PtyRegistry {
-    processes: Mutex<HashMap<u32, Arc<PtyProcess>>>,
-}
-
-impl PtyRegistry {
-    /// Register a new PTY process, returning it and the pids of any processes pruned to make
-    /// room. The caller must signal those pids: the sandbox-side process outlives this registry.
-    fn insert(&self, tty: bool) -> SandboxResult<(Arc<PtyProcess>, Vec<u32>)> {
-        let mut processes = self.processes.lock().expect("poisoned");
-        processes.retain(|_, process| !process.is_done());
-        let mut evicted = Vec::new();
-        if processes.len() >= PTY_PROCESSES_MAX {
-            let mut by_age: Vec<(u32, Instant)> = processes
-                .iter()
-                .map(|(id, p)| (*id, *p.last_used.lock().expect("poisoned")))
-                .collect();
-            by_age.sort_by_key(|(_, last_used)| *last_used);
-            let prunable = by_age.len().saturating_sub(PTY_PROCESSES_PROTECTED_RECENT);
-            for (id, _) in by_age.into_iter().take(prunable) {
-                if let Some(process) = processes.remove(&id) {
-                    evicted.extend(process.pid());
-                    // Stop the pump task and release anything still polling this handle.
-                    process.closed.store(true, Ordering::SeqCst);
-                    process.notify.notify_waiters();
-                }
-                if processes.len() < PTY_PROCESSES_MAX {
-                    break;
+                if let Some(end) = event.get("end") {
+                    // proto3 JSON omits zero values, so a missing `exitCode` means success.
+                    exit_code =
+                        Some(end.get("exitCode").and_then(Value::as_i64).unwrap_or(0) as i32);
                 }
             }
         }
-        let mut id = None;
-        for _ in 0..1024 {
-            let span = PTY_PROCESS_ID_MAX_EXCLUSIVE - PTY_PROCESS_ID_MIN;
-            let candidate =
-                PTY_PROCESS_ID_MIN + (uuid::Uuid::new_v4().as_u128() % span as u128) as u32;
-            if !processes.contains_key(&candidate) {
-                id = Some(candidate);
-                break;
-            }
-        }
-        let id = id.ok_or_else(|| {
-            SandboxError::new(
-                ErrorCode::ExecTransportError,
-                "could not allocate a free PTY session id",
-            )
-        })?;
-        let process = Arc::new(PtyProcess {
-            id,
-            tty,
-            pid: Mutex::new(None),
-            buffer: Mutex::new(Vec::new()),
-            exit_code: Mutex::new(None),
-            closed: AtomicBool::new(false),
-            notify: Notify::new(),
-            last_used: Mutex::new(Instant::now()),
-        });
-        processes.insert(id, process.clone());
-        Ok((process, evicted))
-    }
-
-    fn get(&self, id: u32) -> SandboxResult<Arc<PtyProcess>> {
-        self.processes
-            .lock()
-            .expect("poisoned")
-            .get(&id)
-            .cloned()
-            .ok_or_else(|| {
-                SandboxError::new(
-                    ErrorCode::PtySessionNotFound,
-                    format!("PTY session `{id}` is not running"),
-                )
-            })
-    }
-
-    fn remove(&self, id: u32) {
-        self.processes.lock().expect("poisoned").remove(&id);
-    }
-
-    /// Forget every process and return the sandbox pids that still need a signal.
-    fn terminate_all(&self) -> Vec<u32> {
-        let mut processes = self.processes.lock().expect("poisoned");
-        let pids = processes
-            .values()
-            .filter(|process| !process.is_done())
-            .filter_map(|process| process.pid())
-            .collect();
-        for process in processes.values() {
-            process.closed.store(true, Ordering::SeqCst);
-            process.notify.notify_waiters();
-        }
-        processes.clear();
-        pids
-    }
+        process.close(exit_code);
+    });
 }
 
 // -------------------------------------------------------------------------------------------
@@ -2015,75 +1961,6 @@ fn apply_process_event(
 // Shared helpers
 // -------------------------------------------------------------------------------------------
 
-/// Map a `reqwest` failure to a transport error.
-pub(crate) fn transport(what: &str, error: reqwest::Error) -> SandboxError {
-    let code = if error.is_timeout() {
-        ErrorCode::ExecTimeout
-    } else {
-        ErrorCode::ExecTransportError
-    };
-    SandboxError::new(code, format!("Failed to {what}: {error}"))
-}
-
-/// Map a non-success HTTP response to a sandbox error.
-pub(crate) fn http_error(
-    code: ErrorCode,
-    what: &str,
-    status: reqwest::StatusCode,
-    body: &str,
-) -> SandboxError {
-    let detail = serde_json::from_str::<Value>(body)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("message")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
-        .unwrap_or_else(|| body.trim().chars().take(400).collect());
-    SandboxError::new(
-        code,
-        format!("Failed to {what}: HTTP {} {detail}", status.as_u16()),
-    )
-}
-
-/// Decode a JSON body, turning a non-success status into an error.
-pub(crate) async fn parse_json<T: serde::de::DeserializeOwned>(
-    response: reqwest::Response,
-    what: &str,
-) -> SandboxResult<T> {
-    let status = response.status();
-    let body = response.text().await.map_err(|e| transport(what, e))?;
-    if !status.is_success() {
-        return Err(http_error(
-            ErrorCode::ExecTransportError,
-            what,
-            status,
-            &body,
-        ));
-    }
-    serde_json::from_str(&body).map_err(|e| {
-        SandboxError::new(
-            ErrorCode::ExecTransportError,
-            format!("Failed to {what}: unexpected response body ({e})"),
-        )
-    })
-}
-
-/// Require a success status, discarding the body.
-pub(crate) async fn expect_success(
-    response: reqwest::Response,
-    what: &str,
-    code: ErrorCode,
-) -> SandboxResult<()> {
-    let status = response.status();
-    if status.is_success() {
-        return Ok(());
-    }
-    let body = response.text().await.unwrap_or_default();
-    Err(http_error(code, what, status, &body))
-}
-
 /// Convert an envd `filesystem.EntryInfo` into a [`FileEntry`].
 fn entry_info_to_file_entry(value: &Value) -> FileEntry {
     let name = value
@@ -2118,29 +1995,6 @@ fn entry_info_to_file_entry(value: &Value) -> FileEntry {
 pub(crate) fn permissions_from_mode(mode: u32, directory: bool) -> Permissions {
     Permissions::new((mode >> 6) & 0o7, (mode >> 3) & 0o7, mode & 0o7).as_directory(directory)
 }
-
-/// The `tar --exclude` patterns for the manifest's ephemeral paths.
-pub(crate) fn workspace_excludes(manifest: &Manifest, root: &str) -> Vec<String> {
-    let trimmed = root.trim_end_matches('/');
-    let mut excludes: Vec<String> = manifest
-        .ephemeral_paths()
-        .into_iter()
-        .filter_map(|path| {
-            path.strip_prefix(trimmed)
-                .map(|relative| relative.trim_start_matches('/').to_string())
-                .filter(|relative| !relative.is_empty())
-                .map(|relative| format!("./{relative}"))
-        })
-        .collect();
-    // A mount stages its credentials in the workspace, so an archive taken while a mount is
-    // attached must never pick them up.
-    excludes.extend(MOUNT_CREDENTIAL_EXCLUDES.iter().map(|p| (*p).to_string()));
-    excludes
-}
-
-/// `tar` patterns matching the credential files a provider mount stages in the workspace.
-pub(crate) const MOUNT_CREDENTIAL_EXCLUDES: &[&str] =
-    &["./.openai-agents-rclone-*", "./.openai-agents-mount-s3-*"];
 
 /// Encode a reference to a provider-native snapshot as a workspace archive.
 pub(crate) fn encode_snapshot_ref(snapshot_id: &str) -> Vec<u8> {

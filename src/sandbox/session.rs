@@ -381,19 +381,8 @@ pub trait SandboxSession: Send + Sync + fmt::Debug {
     async fn persist_workspace(&self) -> SandboxResult<Vec<u8>> {
         let root = self.workspace_root().to_string();
         let mut command = format!("tar -czf - -C {}", shell_quote(&root));
-        // Mounts and other ephemeral entries are runtime-attached state, never durable workspace
-        // content: archiving them would copy whole mounted buckets into the snapshot.
-        for path in self.manifest().ephemeral_paths() {
-            let relative = path
-                .strip_prefix(root.trim_end_matches('/'))
-                .map(|r| r.trim_start_matches('/'))
-                .filter(|r| !r.is_empty());
-            if let Some(relative) = relative {
-                command.push_str(&format!(
-                    " --exclude {}",
-                    shell_quote(&format!("./{relative}"))
-                ));
-            }
+        for exclude in workspace_archive_excludes(self.manifest(), &root) {
+            command.push_str(&format!(" --exclude {}", shell_quote(&exclude)));
         }
         command.push_str(" .");
         let result = self.exec(ExecRequest::shell(command.clone())).await?;
@@ -431,6 +420,36 @@ pub trait SandboxSession: Send + Sync + fmt::Debug {
     fn snapshot(&self) -> Arc<dyn Snapshot> {
         resolve_snapshot(None, self.id())
     }
+}
+
+/// The `tar --exclude` patterns every workspace archive applies.
+///
+/// Two kinds of path must never reach an archive:
+///
+/// - The manifest's ephemeral entries. Mounts and the like are runtime-attached state, never
+///   durable workspace content; archiving them would copy whole mounted buckets into the
+///   snapshot.
+/// - The staging directory a mount writes its credentials to
+///   ([`RCLONE_CONFIG_DIR`](crate::sandbox::mounts::RCLONE_CONFIG_DIR)). It lives inside the
+///   workspace because the session's file API cannot write outside it, so the archive has to
+///   leave it out explicitly.
+///
+/// A backend that overrides [`persist_workspace`](SandboxSession::persist_workspace) — every
+/// hosted one does, because their command output is text — calls this for the same exclusions.
+pub fn workspace_archive_excludes(manifest: &Manifest, root: &str) -> Vec<String> {
+    let trimmed = root.trim_end_matches('/');
+    let mut excludes: Vec<String> = manifest
+        .ephemeral_paths()
+        .into_iter()
+        .filter_map(|path| {
+            path.strip_prefix(trimmed)
+                .map(|relative| relative.trim_start_matches('/').to_string())
+                .filter(|relative| !relative.is_empty())
+                .map(|relative| format!("./{relative}"))
+        })
+        .collect();
+    excludes.push(format!("./{}", crate::sandbox::mounts::RCLONE_CONFIG_DIR));
+    excludes
 }
 
 /// Capture a session's workspace into its snapshot.

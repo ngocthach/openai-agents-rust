@@ -1,35 +1,15 @@
-//! The `rclone` FUSE mount pattern shared by the cloud sandbox providers. Mirrors the parts of
-//! `agents.sandbox.entries.mounts.patterns.RcloneMountPattern` and
-//! `agents.extensions.sandbox._rclone` that a provider needs to attach a cloud bucket.
+//! Provisioning the tools an `rclone` cloud bucket mount needs inside a sandbox. Mirrors
+//! `agents.extensions.sandbox._rclone` and the preflight halves of the E2B and Daytona
+//! `mounts.py`.
 //!
-//! The pattern runs entirely inside the sandbox: it writes the rclone configuration to a file in
-//! the workspace, mounts `remote:path` with `rclone mount --daemon`, and unmounts with
-//! `fusermount`. Because the configuration carries the bucket credentials, an
-//! [`InContainerMountStrategy`] built on it reports
-//! [`MountCredentialAuthority::MountScoped`](crate::sandbox::mounts::MountCredentialAuthority),
-//! so the application has to acknowledge the exact mount path on the manifest before the mount
-//! activates.
-//!
-//! [`InContainerMountStrategy`]: crate::sandbox::mounts::InContainerMountStrategy
-
-use async_trait::async_trait;
+//! The mount itself is [`RcloneMountPattern`](crate::sandbox::mounts::RcloneMountPattern) in the
+//! core, which only checks that `rclone` is present. Installing it is provider-specific, so it
+//! lives here: E2B downloads the release Python pins and verifies its SHA-256, while Daytona
+//! installs the distribution package.
 
 use crate::sandbox::errors::{ErrorCode, SandboxError, SandboxResult};
-use crate::sandbox::mounts::{MountPattern, MountPatternConfig};
-use crate::sandbox::session::{ExecRequest, ExecShell, SandboxSession, shell_quote};
+use crate::sandbox::session::{ExecRequest, ExecShell, SandboxSession};
 use crate::sandbox::types::User;
-use sha2::{Digest, Sha256};
-
-/// `MountPatternConfig` option holding the rclone remote name (`[section]` in the config).
-pub const OPTION_REMOTE_NAME: &str = "remote_name";
-/// `MountPatternConfig` option holding the path inside the remote, for example a bucket name.
-pub const OPTION_REMOTE_PATH: &str = "remote_path";
-/// `MountPatternConfig` option set to `true` when the mount must be read-only.
-pub const OPTION_READ_ONLY: &str = "read_only";
-/// `MountPatternConfig` option holding the uid `rclone` presents files as.
-pub const OPTION_UID: &str = "uid";
-/// `MountPatternConfig` option holding the gid `rclone` presents files as.
-pub const OPTION_GID: &str = "gid";
 
 /// Prefix of the generated rclone configuration file names.
 ///
@@ -40,129 +20,45 @@ pub const CONFIG_FILE_PREFIX: &str = ".openai-agents-rclone-";
 /// Shell test that finds `rclone` on `PATH` or at the location the installers use.
 const RCLONE_CHECK: &str = "command -v rclone >/dev/null 2>&1 || test -x /usr/local/bin/rclone";
 
-/// How `rclone` exposes the remote inside the sandbox.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum RcloneMountMode {
-    /// Mount the remote with `rclone mount`, which needs FUSE.
-    #[default]
-    Fuse,
-}
-
-/// Mounts a cloud bucket inside the sandbox with `rclone mount`.
-///
-/// The secret-bearing configuration comes from
-/// [`MountPatternConfig::config_text`](crate::sandbox::mounts::MountPatternConfig::config_text);
-/// it is written under the workspace root at [`config_path`](Self::config_path) with mode `600`
-/// before the mount runs, and removed when the mount is detached. The non-secret options listed
-/// in this module's constants select the remote and the mount flags.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RcloneMountPattern {
-    /// How the remote is exposed.
-    pub mode: RcloneMountMode,
-    /// Workspace-relative path of the rclone configuration file inside the sandbox.
-    ///
-    /// Like Python's `RcloneMountPattern.config_file_path`, a relative path resolves inside the
-    /// sandbox workspace rather than on the host running the SDK. `None` derives a distinct name
-    /// per mount path, so two mounts cannot overwrite each other's configuration.
-    pub config_path: Option<String>,
-    /// Extra arguments appended to `rclone mount`.
-    pub extra_args: Vec<String>,
-    /// Whether a missing `rclone` may be installed with the sandbox's package manager.
-    pub install_if_missing: bool,
-}
-
-impl Default for RcloneMountPattern {
-    fn default() -> Self {
-        RcloneMountPattern {
-            mode: RcloneMountMode::Fuse,
-            config_path: None,
-            extra_args: Vec::new(),
-            install_if_missing: true,
-        }
-    }
-}
-
-impl RcloneMountPattern {
-    /// A FUSE pattern with the default configuration path.
-    pub fn new() -> Self {
-        RcloneMountPattern::default()
-    }
-
-    /// Write the configuration to an explicit workspace-relative path.
-    pub fn with_config_path(mut self, config_path: impl Into<String>) -> Self {
-        self.config_path = Some(config_path.into());
-        self
-    }
-
-    /// The workspace-relative configuration path used for `mount_path`.
-    fn config_path_for(&self, mount_path: &str) -> String {
-        self.config_path.clone().unwrap_or_else(|| {
-            // A distinct file per mount path, so concurrent mounts never share one config.
-            let digest = Sha256::digest(mount_path.as_bytes());
-            format!(
-                "{CONFIG_FILE_PREFIX}{}.conf",
-                digest
-                    .iter()
-                    .take(8)
-                    .map(|byte| format!("{byte:02x}"))
-                    .collect::<String>()
-            )
-        })
-    }
-
-    /// Append an argument to `rclone mount`.
-    pub fn with_extra_arg(mut self, arg: impl Into<String>) -> Self {
-        self.extra_args.push(arg.into());
-        self
-    }
-
-    /// Whether a missing `rclone` may be installed from the sandbox's package manager.
-    pub fn with_install_if_missing(mut self, install: bool) -> Self {
-        self.install_if_missing = install;
-        self
-    }
-
-    /// The `rclone mount` argument vector for `mount_path`.
-    fn mount_argv(
-        &self,
-        mount_path: &str,
-        config_path: &str,
-        config: &MountPatternConfig,
-    ) -> SandboxResult<Vec<String>> {
-        let remote_name = config.options.get(OPTION_REMOTE_NAME).ok_or_else(|| {
-            SandboxError::new(
-                ErrorCode::MountConfigInvalid,
-                format!("an rclone mount requires the `{OPTION_REMOTE_NAME}` option"),
-            )
-        })?;
-        let remote_path = config
-            .options
-            .get(OPTION_REMOTE_PATH)
-            .map(String::as_str)
-            .unwrap_or_default();
-        let mut argv = vec![
-            "rclone".to_string(),
-            "mount".to_string(),
-            format!("{remote_name}:{remote_path}"),
-            mount_path.to_string(),
-            "--config".to_string(),
-            config_path.to_string(),
-            "--daemon".to_string(),
-            "--allow-other".to_string(),
-        ];
-        if config.options.get(OPTION_READ_ONLY).map(String::as_str) == Some("true") {
-            argv.push("--read-only".to_string());
-        }
-        if let Some(uid) = config.options.get(OPTION_UID) {
-            argv.extend(["--uid".to_string(), uid.clone()]);
-        }
-        if let Some(gid) = config.options.get(OPTION_GID) {
-            argv.extend(["--gid".to_string(), gid.clone()]);
-        }
-        argv.extend(self.extra_args.iter().cloned());
-        Ok(argv)
-    }
-}
+// The pinned release and its published checksums, kept in step with
+// `agents.extensions.sandbox._rclone`'s "RCLONE RELEASE PIN" block.
+/// The `rclone` release this crate installs when the sandbox image has none.
+pub const RCLONE_VERSION: &str = "1.74.4";
+/// Published SHA-256 of each pinned `rclone` release archive, by release architecture.
+const RCLONE_SHA256_BY_ARCH: &[(&str, &str)] = &[
+    (
+        "386",
+        "7feee086d7ff72652c5a91ef4b4a576941ccd33b2929772a2d70471904e516f0",
+    ),
+    (
+        "amd64",
+        "fe435e0c36228e7c2f116a8701f01127bb1f694005fc11d1f27186c8bca4115d",
+    ),
+    (
+        "arm",
+        "8135524b9b85111fa512f10a3fa191736a8d4d6ac3b3169af0763503744e95c9",
+    ),
+    (
+        "arm-v6",
+        "c9e1048feb597938884c0fff314d5d9a002599933cb94ce17fee19599cbfa3f1",
+    ),
+    (
+        "arm-v7",
+        "75844809d25d2534da96220727e7746a300e30ec8c676ca98c47affe5a752e7b",
+    ),
+    (
+        "arm64",
+        "97685285c9ad6a0cf17d5844115d2a67245af6444db672187074bd9c358de419",
+    ),
+];
+/// Exit code the install script uses to report a checksum mismatch.
+const RCLONE_CHECKSUM_MISMATCH_EXIT: i32 = 86;
+/// Packages the pinned-release download needs.
+const INSTALL_RCLONE_PREREQUISITES: &[&str] = &[
+    "DEBIAN_FRONTEND=noninteractive DEBCONF_NOWARNINGS=yes apt-get -o Dpkg::Use-Pty=0 update -qq",
+    "DEBIAN_FRONTEND=noninteractive DEBCONF_NOWARNINGS=yes apt-get -o Dpkg::Use-Pty=0 install -y \
+     -qq ca-certificates coreutils curl unzip",
+];
 
 /// Run a shell snippet as root, as the mount preflight steps need to.
 async fn root_shell(
@@ -229,9 +125,96 @@ pub async fn install_package(
     ))
 }
 
+/// Map a `uname -m` value onto an `rclone` release architecture.
+///
+/// Mirrors `agents.extensions.sandbox._rclone._rclone_arch`.
+fn rclone_arch(machine: &str) -> Option<&'static str> {
+    let normalized = machine.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "x86_64" | "amd64" => Some("amd64"),
+        "x86" => Some("386"),
+        "aarch64" | "arm64" => Some("arm64"),
+        _ => {
+            // `i386` through `i686`.
+            let bytes = normalized.as_bytes();
+            if bytes.len() == 4
+                && bytes[0] == b'i'
+                && matches!(bytes[1], b'3' | b'4' | b'5' | b'6')
+                && &normalized[2..] == "86"
+            {
+                return Some("386");
+            }
+            if normalized.starts_with("armv7") {
+                return Some("arm-v7");
+            }
+            if normalized.starts_with("armv6") {
+                return Some("arm-v6");
+            }
+            if normalized.starts_with("arm") {
+                return Some("arm");
+            }
+            None
+        }
+    }
+}
+
+/// The published SHA-256 of the pinned `rclone` release for `arch`.
+fn rclone_sha256(arch: &str) -> Option<&'static str> {
+    RCLONE_SHA256_BY_ARCH
+        .iter()
+        .find(|(name, _)| *name == arch)
+        .map(|(_, digest)| *digest)
+}
+
+/// The shell script that downloads, verifies and installs the pinned `rclone` release.
+///
+/// Mirrors `agents.extensions.sandbox._rclone._rclone_install_command`: the archive's SHA-256 is
+/// checked before anything is installed, and the binary is moved into place only after it
+/// reports the expected version.
+fn rclone_install_script(arch: &str, sha256: &str) -> String {
+    let archive = format!("rclone-v{RCLONE_VERSION}-linux-{arch}.zip");
+    let url = format!("https://downloads.rclone.org/v{RCLONE_VERSION}/{archive}");
+    [
+        "set -eu".to_string(),
+        "tmp_dir=\"$(mktemp -d)\"".to_string(),
+        "target_tmp=\"\"".to_string(),
+        "cleanup() {".to_string(),
+        "    rm -rf \"$tmp_dir\"".to_string(),
+        "    if [ -n \"$target_tmp\" ]; then rm -f \"$target_tmp\"; fi".to_string(),
+        "}".to_string(),
+        "trap cleanup EXIT".to_string(),
+        "trap 'exit 1' HUP INT TERM".to_string(),
+        format!("archive='{archive}'"),
+        format!("expected_sha256='{sha256}'"),
+        format!("url='{url}'"),
+        "curl --fail --location --silent --show-error --proto '=https' --tlsv1.2 --output \
+         \"$tmp_dir/$archive\" \"$url\""
+            .to_string(),
+        "if ! printf '%s  %s\\n' \"$expected_sha256\" \"$tmp_dir/$archive\" | sha256sum \
+         --check --strict -; then"
+            .to_string(),
+        format!("    exit {RCLONE_CHECKSUM_MISMATCH_EXIT}"),
+        "fi".to_string(),
+        "unzip -q \"$tmp_dir/$archive\" -d \"$tmp_dir/unpacked\"".to_string(),
+        "install -d -m 0755 /usr/local/bin".to_string(),
+        "target_tmp=\"$(mktemp /usr/local/bin/.rclone.XXXXXX)\"".to_string(),
+        "install -m 0755 \"$tmp_dir/unpacked/${archive%.zip}/rclone\" \"$target_tmp\"".to_string(),
+        "version_output=\"$(\"$target_tmp\" version)\"".to_string(),
+        format!(
+            "printf '%s\\n' \"$version_output\" | head -n 1 | grep -Fx 'rclone v{RCLONE_VERSION}'"
+        ),
+        "mv -f \"$target_tmp\" /usr/local/bin/rclone".to_string(),
+        "target_tmp=\"\"".to_string(),
+    ]
+    .join("\n")
+}
+
 /// Make sure `rclone` is available inside the sandbox.
 ///
-/// Mirrors `agents.extensions.sandbox._rclone.ensure_rclone`.
+/// Mirrors `agents.extensions.sandbox._rclone.ensure_rclone`: a missing `rclone` is installed
+/// from the pinned release, whose SHA-256 is verified inside the sandbox before the binary is
+/// moved into `/usr/local/bin`. `apt-get` provides the download prerequisites, so an image
+/// without it must ship `rclone` already.
 pub async fn ensure_rclone(
     session: &dyn SandboxSession,
     install_if_missing: bool,
@@ -248,7 +231,70 @@ pub async fn ensure_rclone(
             "rclone is not installed in the sandbox image",
         ));
     }
-    install_package(session, "rclone", "rclone").await?;
+    if !has_command(session, "apt-get").await? {
+        return Err(SandboxError::new(
+            ErrorCode::MountMissingTool,
+            "rclone is not installed and `apt-get` is unavailable; preinstall rclone in the \
+             sandbox image",
+        ));
+    }
+    let machine = session
+        .exec(
+            ExecRequest::argv(["uname", "-m"])
+                .with_timeout(Some(std::time::Duration::from_secs(30))),
+        )
+        .await?;
+    let arch = machine
+        .ok()
+        .then(|| rclone_arch(&machine.stdout_text()))
+        .flatten()
+        .ok_or_else(|| {
+            SandboxError::new(
+                ErrorCode::MountMissingTool,
+                format!(
+                    "rclone is not installed and the sandbox architecture `{}` has no pinned \
+                     release",
+                    machine.stdout_text().trim()
+                ),
+            )
+        })?;
+    let sha256 = rclone_sha256(arch).ok_or_else(|| {
+        SandboxError::new(
+            ErrorCode::MountMissingTool,
+            format!("no pinned rclone release is recorded for `{arch}`"),
+        )
+    })?;
+
+    for command in INSTALL_RCLONE_PREREQUISITES {
+        let result = root_shell(session, command, 300).await?;
+        if !result.ok() {
+            return Err(SandboxError::new(
+                ErrorCode::MountMissingTool,
+                format!(
+                    "failed to install the rclone download prerequisites (exit code {})",
+                    result.exit_code
+                ),
+            ));
+        }
+    }
+    let install = root_shell(session, &rclone_install_script(arch, sha256), 300).await?;
+    if install.exit_code == RCLONE_CHECKSUM_MISMATCH_EXIT {
+        return Err(SandboxError::new(
+            ErrorCode::MountMissingTool,
+            format!(
+                "the rclone v{RCLONE_VERSION} archive for `{arch}` failed SHA-256 verification"
+            ),
+        ));
+    }
+    if !install.ok() {
+        return Err(SandboxError::new(
+            ErrorCode::MountMissingTool,
+            format!(
+                "failed to install rclone v{RCLONE_VERSION} for `{arch}` (exit code {})",
+                install.exit_code
+            ),
+        ));
+    }
     let present = session
         .exec(ExecRequest::argv(["sh", "-lc", RCLONE_CHECK]).with_shell(ExecShell::None))
         .await?;
@@ -324,174 +370,78 @@ pub async fn ensure_fuse_support(
     Ok(())
 }
 
-#[async_trait]
-impl MountPattern for RcloneMountPattern {
-    fn pattern_type(&self) -> &str {
-        "rclone"
-    }
-
-    fn exposes_credentials(&self) -> bool {
-        true
-    }
-
-    async fn apply(
-        &self,
-        session: &dyn SandboxSession,
-        mount_path: &str,
-        config: &MountPatternConfig,
-    ) -> SandboxResult<()> {
-        // A relative configuration path resolves inside the workspace, so the session's own file
-        // API can write it; a path outside the workspace root would be rejected.
-        let config_path = session.normalize_path(&self.config_path_for(mount_path))?;
-        let argv = self.mount_argv(mount_path, &config_path, config)?;
-        let config_text = config.config_text().ok_or_else(|| {
-            SandboxError::new(
-                ErrorCode::MountConfigInvalid,
-                "an rclone mount requires the remote configuration text",
-            )
-        })?;
-        // The configuration holds the bucket credentials: write it before the mount runs and keep
-        // it out of the process table by streaming it through the file API rather than a command.
-        session
-            .write_file(&config_path, config_text.as_bytes())
-            .await
-            .map_err(|error| {
-                SandboxError::new(
-                    ErrorCode::MountFailed,
-                    format!(
-                        "failed to write the rclone configuration: {}",
-                        error.message
-                    ),
-                )
-            })?;
-        let chmod = session
-            .exec(ExecRequest::argv([
-                "chmod",
-                "600",
-                "--",
-                config_path.as_str(),
-            ]))
-            .await?;
-        if !chmod.ok() {
-            let _ = session.rm(&config_path, false).await;
-            return Err(SandboxError::new(
-                ErrorCode::MountFailed,
-                "failed to restrict the rclone configuration file permissions",
-            ));
-        }
-        let result = session
-            .exec(
-                ExecRequest::argv(argv.clone())
-                    .with_timeout(Some(std::time::Duration::from_secs(120))),
-            )
-            .await?;
-        if !result.ok() {
-            // The credential must not outlive the attempt that staged it.
-            let _ = session.rm(&config_path, false).await;
-            // Never echo the command back: it names the remote the credentials belong to.
-            return Err(SandboxError::new(
-                ErrorCode::MountFailed,
-                format!(
-                    "`rclone mount` failed for `{mount_path}` with exit code {}: {}",
-                    result.exit_code,
-                    result.stderr_text().trim()
-                ),
-            ));
-        }
-        Ok(())
-    }
-
-    async fn unapply(
-        &self,
-        session: &dyn SandboxSession,
-        mount_path: &str,
-        _config: &MountPatternConfig,
-    ) -> SandboxResult<()> {
-        let quoted = shell_quote(mount_path);
-        let script = format!(
-            "fusermount3 -u -- {quoted} 2>/dev/null || fusermount -u -- {quoted} 2>/dev/null || \
-             umount -- {quoted} 2>/dev/null || true"
-        );
-        session
-            .exec(
-                ExecRequest::argv(["sh", "-lc", script.as_str()])
-                    .with_shell(ExecShell::None)
-                    .with_timeout(Some(std::time::Duration::from_secs(60))),
-            )
-            .await?;
-        // The credentials must not outlive the mount.
-        if let Ok(config_path) = session.normalize_path(&self.config_path_for(mount_path)) {
-            let _ = session.rm(&config_path, false).await;
-        }
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn builds_mount_arguments() {
-        let pattern = RcloneMountPattern::new()
-            .with_config_path(".rclone.conf")
-            .with_extra_arg("--vfs-cache-mode=off");
-        let config = MountPatternConfig::new()
-            .with_config_text("[bucket]\ntype = s3\n")
-            .with_option(OPTION_REMOTE_NAME, "bucket")
-            .with_option(OPTION_REMOTE_PATH, "my-bucket/prefix")
-            .with_option(OPTION_READ_ONLY, "true")
-            .with_option(OPTION_UID, "1000")
-            .with_option(OPTION_GID, "1000");
-        let argv = pattern
-            .mount_argv("/workspace/data", "/workspace/.rclone.conf", &config)
-            .unwrap();
-        assert_eq!(
-            argv,
-            vec![
-                "rclone",
-                "mount",
-                "bucket:my-bucket/prefix",
-                "/workspace/data",
-                "--config",
-                "/workspace/.rclone.conf",
-                "--daemon",
-                "--allow-other",
-                "--read-only",
-                "--uid",
-                "1000",
-                "--gid",
-                "1000",
-                "--vfs-cache-mode=off",
-            ]
+    fn maps_machine_names_to_release_architectures() {
+        assert_eq!(rclone_arch("x86_64"), Some("amd64"));
+        assert_eq!(rclone_arch(" AMD64 "), Some("amd64"));
+        assert_eq!(rclone_arch("aarch64"), Some("arm64"));
+        assert_eq!(rclone_arch("i686"), Some("386"));
+        assert_eq!(rclone_arch("armv7l"), Some("arm-v7"));
+        assert_eq!(rclone_arch("armv6l"), Some("arm-v6"));
+        assert_eq!(rclone_arch("armv5"), Some("arm"));
+        assert_eq!(rclone_arch("riscv64"), None);
+    }
+
+    #[test]
+    fn pins_a_checksum_for_every_supported_architecture() {
+        for arch in ["386", "amd64", "arm", "arm-v6", "arm-v7", "arm64"] {
+            let digest = rclone_sha256(arch).unwrap_or_else(|| panic!("no digest for {arch}"));
+            assert_eq!(digest.len(), 64, "{arch}");
+            assert!(digest.chars().all(|c| c.is_ascii_hexdigit()), "{arch}");
+        }
+        assert_eq!(rclone_sha256("riscv64"), None);
+    }
+
+    /// The script is assembled from many pieces, so a quoting slip would only surface inside a
+    /// sandbox. `sh -n` parses it here instead, offline.
+    #[test]
+    fn generates_a_syntactically_valid_install_script() {
+        use std::io::Write as _;
+        let script = rclone_install_script("amd64", "deadbeef");
+        let mut child = std::process::Command::new("sh")
+            .arg("-n")
+            .stdin(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("run sh -n");
+        child
+            .stdin
+            .take()
+            .expect("stdin")
+            .write_all(script.as_bytes())
+            .expect("write the script");
+        let output = child.wait_with_output().expect("wait for sh");
+        assert!(
+            output.status.success(),
+            "sh -n rejected the install script: {}\n{script}",
+            String::from_utf8_lossy(&output.stderr)
         );
     }
 
     #[test]
-    fn derives_a_distinct_configuration_path_per_mount() {
-        let pattern = RcloneMountPattern::new();
-        let first = pattern.config_path_for("/workspace/a");
-        let second = pattern.config_path_for("/workspace/b");
-        assert_ne!(first, second);
-        assert!(first.starts_with(CONFIG_FILE_PREFIX), "{first}");
-        assert!(first.ends_with(".conf"), "{first}");
-        // The derivation is stable, so teardown finds the file activation wrote.
-        assert_eq!(first, pattern.config_path_for("/workspace/a"));
-        assert_eq!(
-            RcloneMountPattern::new()
-                .with_config_path("custom.conf")
-                .config_path_for("/workspace/a"),
-            "custom.conf"
+    fn verifies_the_archive_before_installing_it() {
+        let script = rclone_install_script("amd64", "deadbeef");
+        // The checksum gate must precede unpacking and installing.
+        let check = script.find("sha256sum").expect("a checksum check");
+        let unpack = script.find("unzip").expect("an unpack step");
+        let install = script
+            .find("/usr/local/bin/rclone")
+            .expect("an install step");
+        assert!(check < unpack, "{script}");
+        assert!(unpack < install, "{script}");
+        assert!(script.contains("expected_sha256='deadbeef'"), "{script}");
+        assert!(
+            script.contains(&format!("rclone-v{RCLONE_VERSION}-linux-amd64.zip")),
+            "{script}"
         );
-    }
-
-    #[test]
-    fn requires_a_remote_name() {
-        let pattern = RcloneMountPattern::new();
-        let config = MountPatternConfig::new().with_config_text("[bucket]\n");
-        let error = pattern
-            .mount_argv("/workspace/data", "/workspace/rclone.conf", &config)
-            .unwrap_err();
-        assert_eq!(error.code, ErrorCode::MountConfigInvalid);
+        assert!(script.contains("--proto '=https'"), "{script}");
+        assert!(
+            script.contains(&format!("exit {RCLONE_CHECKSUM_MISMATCH_EXIT}")),
+            "{script}"
+        );
     }
 }

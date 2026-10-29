@@ -3,22 +3,31 @@
 Port of `agents.extensions.sandbox.{e2b,daytona,vercel}` from the Python `openai-agents` SDK to
 the Rust crate `openai-agents-sdk` (feature `sandbox`).
 
-Date: 2026-10-29
+Date: 2026-10-29 (phase 1 + phase 2)
 
 ## Files
 
 | Path | Contents |
 | --- | --- |
 | `src/extensions/sandbox/e2b/mod.rs` | `E2BSandboxClient`, `E2BSandboxClientOptions`, `E2BSandboxSession`, `E2BCloudBucketMountStrategy`, Connect-RPC framing, remote PTY registry, shared HTTP helpers |
-| `src/extensions/sandbox/e2b/rclone.rs` | `RcloneMountPattern` plus the `rclone` / FUSE provisioning helpers, shared with Daytona |
+| `src/extensions/sandbox/e2b/rclone.rs` | Provider-side `rclone` / FUSE provisioning, shared with Daytona: the pinned release download and the package-manager install |
 | `src/extensions/sandbox/daytona.rs` | `DaytonaSandboxClient`, `DaytonaSandboxClientOptions`, `DaytonaSandboxResources`, `DaytonaSandboxSession`, `DaytonaCloudBucketMountStrategy`, single-part multipart encoder |
 | `src/extensions/sandbox/vercel/mod.rs` | `VercelSandboxClient`, `VercelSandboxClientOptions`, `NetworkPolicy`, `VercelSandboxSession`, `VercelCloudBucketMountStrategy` |
 | `src/extensions/sandbox/vercel/tar_gz.rs` | `ustar` writer and gzip framer for `fs/write` |
-| `tests/sandbox_e2b_daytona_vercel_tests.rs` | 13 integration tests against a recording mock HTTP server |
+| `tests/sandbox_e2b_daytona_vercel_tests.rs` | 21 integration tests against a recording mock HTTP/WebSocket server |
+
+Phase 2 also added two additive core modules, with the controller's authorization:
+
+| Path | Contents |
+| --- | --- |
+| `src/sandbox/http.rs` (new) | `transport`, `http_error`, `parse_json`, `expect_success` — the HTTP-to-`SandboxError` mapping every hosted backend needs |
+| `src/sandbox/mounts.rs` (appended) | `RcloneMountPattern`, `RcloneMountMode`, `RCLONE_CONFIG_DIR` and the remote-selection option keys |
+| `src/sandbox/session.rs` (appended) | `workspace_archive_excludes`, now used by the default `persist_workspace` and by all three provider overrides |
 
 `src/extensions/sandbox/{e2b,vercel}.rs` were replaced by directory modules; `pub mod e2b;` and
-`pub mod vercel;` in `src/extensions/sandbox/mod.rs` are unchanged. Nothing under `src/sandbox/**`,
-`Cargo.toml` or `src/lib.rs` was touched.
+`pub mod vercel;` in `src/extensions/sandbox/mod.rs` are unchanged. `Cargo.toml` and `src/lib.rs`
+were not touched. Phase 1 touched nothing under `src/sandbox/**`; phase 2's additions there are
+listed above and are purely additive.
 
 ## Design
 
@@ -212,20 +221,19 @@ names the remote.
    credential- and authority-free, so resume takes those from the client.
 3. **Vercel `provider_id` is `"<sandbox name>:<runtime session id>"`**, because a Vercel sandbox
    needs both and the core state has one `provider_id` field.
-4. **Daytona PTY** uses the session log and input endpoints rather than
-   `process/pty/{id}/connect`, which is a websocket: `tokio-tungstenite` is not enabled by the
-   `sandbox` feature. Output streams and `write_stdin` work; there is no terminal resize and no
-   true TTY allocation. E2B has a real PTY; Vercel has none in Python either, so
-   `supports_pty()` stays `false` there.
+4. **Daytona PTY** is now the real websocket terminal, with resize, plus the session log path
+   for non-TTY processes — the same split Python makes. The only divergence left is the
+   subprotocol fallback described under *Phase 2*. E2B has a real PTY; Vercel has none in Python
+   either, so `supports_pty()` stays `false` there.
 5. **Vercel exec user**: Python rejects any `user` argument. This port maps `root` onto the API's
    `sudo` flag (so the provider's own `mount-s3` strategy can run) and still rejects every other
    user with `ErrorCode::SandboxConfigInvalid`.
-6. **`RcloneMountPattern` is narrowed.** Python's core pattern also supports an NFS mode, named
-   remotes derived per session, and reading the configuration from a file already in the
-   workspace. The Rust pattern supports FUSE with an explicit remote name and inline
-   configuration. It also installs `rclone` from the image's package manager instead of
-   downloading a release pinned by SHA-256, keeping the image's signed repositories as the trust
-   root.
+6. **`RcloneMountPattern` is at parity** on modes, flags, configuration placement and teardown.
+   Two smaller things are still not ported: deriving a remote name from the session id when the
+   caller pins none (the Rust pattern requires the name as an option), and reading the
+   configuration from a file the caller already placed in the workspace. Daytona installs
+   `rclone` from the distribution package rather than the pinned release, matching its own
+   Python `mounts.py`.
 7. **Daytona's default workspace root** (`/home/daytona/workspace`) replaces the SDK default only
    when the caller supplies no manifest at all, as in Python; Vercel's replaces the SDK default
    whenever the manifest still carries it, also as in Python. Resume resolves the root the same
@@ -234,34 +242,141 @@ names the remote.
    sandbox metrics, MCP server configuration (E2B), drives/forks (Vercel), OIDC token refresh
    (Vercel), and Python's retry/instrumentation wrappers.
 
-## Requested core changes
+## Core changes made in phase 2
 
-None are required — everything compiles and passes against the current `src/sandbox/**`. Two
-placements are awkward and would be better in the core, if `src/sandbox/**` is open for edits
-later:
+Everything phase 1 listed as a requested core change has landed, three of them in the core by the
+other agent and three here:
 
-1. **`RcloneMountPattern` lives in `src/extensions/sandbox/e2b/rclone.rs` and `daytona.rs`
-   imports it from there.** Python keeps it in `agents.sandbox.entries.mounts.patterns`, and
-   `src/sandbox/mod.rs` currently documents the FUSE/`mount-s3`/`rclone` patterns as belonging
-   "with those providers". Two providers now share one, so `src/sandbox/mounts.rs` is the natural
-   home. Moving it would also let Blaxel/Cloudflare/Modal reuse it.
-2. **Generic HTTP helpers (`transport`, `http_error`, `parse_json`, `expect_success`) are
-   `pub(crate)` in `src/extensions/sandbox/e2b/mod.rs` and reused by `daytona.rs` and
-   `vercel/mod.rs`.** They map `reqwest` failures and non-2xx responses onto `SandboxError`, and
-   belong next to `src/sandbox/errors.rs`. The task scoped edits to the three provider files, so
-   the alternative was duplicating them three times.
+1. **`RcloneMountPattern` moved to `src/sandbox/mounts.rs`**, where Python keeps it
+   (`agents.sandbox.entries.mounts.patterns`). Blaxel, Cloudflare and Modal can reuse it now.
+   What stayed in `e2b/rclone.rs` is only what Python keeps in `extensions/sandbox/_rclone.py`:
+   installing the tool.
+2. **The HTTP helpers moved to a new `src/sandbox/http.rs`**, next to `errors.rs`, with their own
+   tests for the two provider error-body shapes and for the truncation that stops an HTML error
+   page flooding a log line.
+3. **`workspace_archive_excludes` moved to `src/sandbox/session.rs`** and is now the single
+   source for both the default `persist_workspace` and the three provider overrides. It also adds
+   `RCLONE_CONFIG_DIR`, so no backend — including Docker and unix-local, which can now use the
+   rclone pattern — can archive a staged mount credential.
+4. **`ExecRequest::env`** (added by the other agent) is honoured by all three providers, see
+   below.
+5. **`SandboxSession::as_any`** (added by the other agent) is implemented by all three sessions.
+   The mount strategies use it to refuse a session from another backend, mirroring Python's
+   `_assert_e2b_session` and its Daytona and Vercel equivalents, and the Daytona terminal resize
+   is reachable through it from a `SandboxSession` trait object.
+6. **`provider_scratch_path` / `resolve_internal_path`** (added by the other agent) replaced the
+   private path escape hatches: a workspace archive is staged at an SDK-owned scratch path that
+   the core validates, instead of a hand-built `/tmp` path.
 
-3. **`ExecRequest` has no `env` field.** A mount strategy that needs to hand a credential to a
-   command has to stage it in a file and source it, because putting it in argv would expose it
-   through `/proc` and through Vercel's command log. All three provider APIs accept a per-command
-   environment (`process.ProcessConfig.envs`, the Daytona session wrapper, Vercel `cmd.env`), so
-   `ExecRequest::with_env` would let the strategies pass secrets out of band and would also let
-   `exec` override manifest variables per command.
+## Phase 2: parity work
 
-A fourth, smaller note: `SandboxSession::persist_workspace` has a useful default that an override
-cannot reuse, so each provider re-derives the `--exclude` list from `Manifest::ephemeral_paths()`.
-A `pub fn workspace_exclude_patterns(manifest, root)` in `src/sandbox/session.rs` would remove
-that duplication (the Rust version of it lives in `e2b::workspace_excludes`).
+### Daytona PTY over the toolbox websocket
+
+Python opens the PTY websocket only when the model asks for a writable terminal; a read-only
+interactive process goes through the session log stream. Both paths are now ported, and the
+provider half is the only thing the provider owns — session ids, the yield window, the output
+UTF-8 carry and the `PTY_PROCESSES_MAX` pruning all come from the core `RemotePtyManager`, which
+E2B uses too.
+
+The terminal matches the vendor SDK's `create_pty_session`:
+
+- `GET <toolbox>/process/pty/create-connect?id=&cols=&rows=&cwd=`, upgraded to `ws`/`wss`, with
+  the REST credentials on the handshake.
+- The sandbox environment travels as the `X-Daytona-Pty-Envs~<base64url>` subprotocol token, and
+  `X-Daytona-Pty-Exit-Control` asks the daemon for an `exited` control frame.
+- Output arrives as binary frames and as text frames that are not `{"type":"control"}`; the exit
+  code arrives in the control frame or, failing that, in the JSON close reason (a clean 1000
+  close with no reason means success).
+- Input is sent as binary frames, with a 20-second ping so a silent terminal is not dropped by an
+  intermediate proxy.
+- `resize_terminal` posts `{cols, rows}` to `/process/pty/{id}/resize`; teardown is
+  `DELETE /process/pty/{id}`.
+
+**One deliberate divergence.** `tungstenite` fails a handshake with `NoSubProtocol` when the
+client advertised subprotocols and the server selected none (verified in
+`tungstenite-0.30.0/src/handshake/client.rs`); RFC 6455 permits that server behaviour and
+`aiohttp`, which the vendor SDK uses, tolerates it. The Daytona daemon's source is no longer
+public on GitHub, so this could not be settled by reading it. Rather than gamble, the client
+retries once without any subprotocol and then exports the environment on the typed command line,
+exactly as the non-terminal path does; the exit code still arrives in the close frame, which is
+the documented behaviour for a client that does not send the exit-control token.
+
+The retry asks for a **fresh session id**. By the time `tungstenite` rejects the response the
+server has already answered 101, so `create-connect` has created that PTY session and started its
+shell; the vendor documents that reusing an id is an error, and reusing it would also orphan the
+first shell. So the fallback kills the first session and connects under a new id, and the session
+records the id the connection actually used, so teardown targets the right one. The test's mock
+answers a reused id with 409, which proves the retry does not reuse it.
+
+### `ExecRequest::env`
+
+All three backends now resolve a command's environment with the core's
+`ExecRequest::resolved_env` (manifest first, per-command second) and express it natively:
+
+- **E2B** sets `process.ProcessConfig.envs` on the `Start` request.
+- **Vercel** sets `cmd.env`.
+- **Daytona** has no environment parameter — the toolbox takes one command string — so it lands
+  in the command as `env -- K=V …`, which is how Python already passes the manifest environment
+  there. A PTY has no per-request environment in the core type, so a terminal runs with the
+  session's.
+
+The precedence is the client options' environment, then the manifest's, then the request's, which
+is the order Python resolves per command; `ExecRequest::resolved_env` covers only the last two, so
+each provider starts from its own session environment and extends it.
+
+A command started without a TTY has no stdin on Daytona either now: `pty_write_stdin` with input
+returns `ErrorCode::PtyStdinUnavailable`, matching Python and the E2B port. An empty write is
+still a poll, which is how the model reads the rest of a logged command's output.
+
+### Mount credentials
+
+`VercelCloudBucketMountStrategy` now takes typed credentials and passes them to `mount-s3` as
+`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN` and `AWS_REGION` through
+`ExecRequest::with_envs` — the keys Python's `_runtime_s3_mount_environment` sets. The staged
+credentials file and its shell trap are gone; nothing secret reaches argv, `/proc` or the
+provider's command log, and the strategy's `Debug` redacts the secret.
+
+### `RcloneMountPattern` parity
+
+The core pattern now matches Python's: it only *checks* for `rclone`
+(`ErrorCode::MountMissingTool`), writes its configuration to `.sandbox-rclone-config/<hash>.conf`
+inside the workspace with mode `600`, supports both modes, and tears down with
+`fusermount`/`umount` plus `pkill -f 'rclone (mount|serve nfs) <remote>:'`.
+
+- **FUSE**: `rclone mount remote:path <path> [--read-only] --config <conf> --daemon [extra]`.
+- **NFS**: a `rclone serve nfs --help` probe first (a build without it fails with
+  `MountMissingTool`), then a backgrounded `rclone serve nfs … --addr`, then `mount -t nfs` with
+  Python's default options (`vers=4.1,tcp,port=…,soft,timeo=50,retrans=1`), its three-attempt
+  retry loop and its `timeout 10s` prefix when the image provides `timeout`.
+
+The configuration directory is created before the credential is written, as Python does, so the
+first mount cannot fail on a backend whose upload endpoint does not create parents.
+
+`--allow-other` is added by the E2B and Daytona strategies in FUSE mode only, the way Python's
+`rclone_pattern_for_session` does, rather than being baked into the pattern.
+
+Installing the tool stayed with the providers, as in Python. E2B now downloads the pinned release
+(`rclone v1.74.4`), verifies its published SHA-256 inside the sandbox and only then moves the
+binary into `/usr/local/bin`; Daytona installs the distribution package with `apt-get` or `apk`.
+A unit test pipes the generated install script through `sh -n`, because a quoting slip in a
+shell script assembled from twenty pieces would otherwise only surface inside a sandbox.
+
+### The three assumed HTTP behaviours, re-checked
+
+| Assumption | Status |
+| --- | --- |
+| Vercel `fs/read` answers 404 for a missing path | **Verified** — `@vercel/sandbox` 3.9.1 `readFile` returns `null` on `response.status === 404`. |
+| An E2B envd Connect error body carries a string `code` | **Verified** — `e2b` 2.62.0 `envd/client_shared.py` distinguishes a string `code` (a Connect error) from an integer one (a plain HTTP error page), and `sandbox_async/filesystem.py` `make_dir` branches on `Code.ALREADY_EXISTS`. The port tolerates the named codes, and a plain 409/404 maps the same way the vendor's `PLAIN_HTTP_ERROR_CODES` table does. |
+| Daytona `files/folder` is idempotent | **Inferred, not verified.** The generated client documents only a 201 and the vendor SDK catches nothing, while the Python Agents SDK creates the workspace root twice through it — so the daemon almost certainly uses a `MkdirAll`-style create. The port additionally treats a 409 as success, so either behaviour works. |
+
+### Archive exclusions beyond these three providers
+
+`workspace_archive_excludes` now backs the core default `persist_workspace` (Docker and
+unix-local) and all three overrides here. **Cloudflare, Blaxel and Modal still override
+`persist_workspace` with their own exclude logic**, and this task could not edit them. Now that
+`RcloneMountPattern` is in the core, those backends can use it, so their archives could capture a
+staged mount credential. Routing them through `workspace_archive_excludes` is a one-line change
+each and is left for the controller.
 
 ## Verification
 
@@ -269,15 +384,14 @@ that duplication (the Rust version of it lives in `e2b::workspace_excludes`).
 export CARGO_TARGET_DIR=/Users/ngocthach/.cache/oars-build/cloud1
 rustfmt --edition 2024 <the five source files and the test file>
 cargo clippy --features sandbox --lib --test sandbox_e2b_daytona_vercel_tests -- -D warnings
-cargo test --features sandbox --test sandbox_e2b_daytona_vercel_tests   # 18 passed
+cargo test --features sandbox --test sandbox_e2b_daytona_vercel_tests   # 21 passed
+cargo test --features sandbox                                           # whole suite
 cargo test --features sandbox --lib extensions::sandbox                 # provider unit tests
 ```
 
-`cargo clippy --features sandbox --all-targets -- -D warnings` is clean for the whole workspace,
-and `cargo test --features sandbox --lib extensions::sandbox` and
-`--test sandbox_tests` both pass against the committed core sandbox phase 3 (the
-`AgentsError::Sandbox`, `SandboxStreamedRun` and `PtyManager` cleanup changes do not reach these
-providers, which keep their own remote PTY registries and never touch `PtyManager`).
+`cargo clippy --features sandbox --all-targets -- -D warnings` is clean for the whole workspace
+and `cargo test --features sandbox` passes end to end (282 lib tests plus every integration
+suite), against the committed core.
 
 ### Test coverage
 
@@ -304,10 +418,23 @@ stream that stays open past the first yield window.
   (including stopping the replaced session); `root` → `sudo` and the rejection of other users.
 - **Regressions** — `start` surviving an `already_exists` `MakeDir` on the second call; an E2B
   `rclone` cloud bucket mount activating end to end (configuration written inside the workspace
-  under its derived per-mount name, `--read-only` passed, and the configuration text absent from
-  the command line); `create` → `session_state()` → JSON round trip → `resume` for Vercel (which
-  rewrites the default root), for Daytona created without a manifest, and for a Daytona sandbox a
-  previous run left stopped, which must be started again before the toolbox answers.
+  under its derived per-mount name, `--allow-other` and `--read-only` passed, and the
+  configuration text absent from the command line); `create` → `session_state()` → JSON round
+  trip → `resume` for Vercel (which rewrites the default root), for Daytona created without a
+  manifest, and for a Daytona sandbox a previous run left stopped, which must be started again
+  before the toolbox answers.
+- **Phase 2** — a Daytona terminal driven over a real websocket (the mock completes the upgrade
+  by hand and then speaks frames), covering the handshake credentials, the terminal size, the
+  environment subprotocol, the typed command line, `write_stdin`, and the exit code read out of
+  the close frame; the same flow against a server that selects *no* subprotocol, asserting the
+  retry connects and the environment moves to the typed line; `resize_terminal` reached through
+  `as_any` with its `{cols, rows}` body; and `ExecRequest::with_env` reaching all three
+  providers' wire formats with a per-command variable overriding the manifest.
+
+Unit tests additionally cover the core `RcloneMountPattern`'s FUSE and NFS command construction
+and per-mount configuration paths, the HTTP error-body shapes, the pinned installer's
+architecture table and checksum ordering (plus an `sh -n` parse of the generated script), and the
+Vercel mount credentials staying out of argv while appearing in the command environment.
 
 Unit tests in the source files cover redacted `Debug` output, base-URL and template resolution,
 Connect framing in both directions, proto3 zero-value handling, snapshot-reference round trips,

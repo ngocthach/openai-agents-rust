@@ -22,7 +22,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::sandbox::errors::{ErrorCode, SandboxError, SandboxResult};
-use crate::sandbox::session::{ExecRequest, SandboxSession, shell_quote};
+use crate::sandbox::session::{ExecRequest, ExecShell, SandboxSession, shell_quote};
 use crate::sandbox::workspace_paths::{is_windows_absolute, normalize_segments};
 
 /// Whether a mount hands credentials to code running inside the sandbox.
@@ -667,5 +667,546 @@ mod tests {
         let mount = BindMountStrategy::mount("relative/path");
         let err = mount.validate().unwrap_err();
         assert_eq!(err.code, ErrorCode::MountConfigInvalid);
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The rclone mount pattern
+// ---------------------------------------------------------------------------------------------
+
+/// `MountPatternConfig` option holding the rclone remote name (the `[section]` in the config).
+pub const RCLONE_OPTION_REMOTE_NAME: &str = "remote_name";
+/// `MountPatternConfig` option holding the path inside the remote, for example a bucket name.
+pub const RCLONE_OPTION_REMOTE_PATH: &str = "remote_path";
+/// `MountPatternConfig` option set to `true` when the mount must be read-only.
+pub const RCLONE_OPTION_READ_ONLY: &str = "read_only";
+
+/// Directory, relative to the workspace root, holding generated rclone configurations.
+///
+/// Mirrors Python's `.sandbox-rclone-config`: the configuration must live inside the workspace so
+/// the session's own file API can write it, and every backend's `persist_workspace` excludes this
+/// directory so a credential can never be captured in a workspace archive.
+pub const RCLONE_CONFIG_DIR: &str = ".sandbox-rclone-config";
+
+/// Shell test that finds `rclone` on `PATH` or where the provider installers put it.
+const RCLONE_CHECK: &str = "command -v rclone >/dev/null 2>&1 || test -x /usr/local/bin/rclone";
+
+/// How `rclone` exposes the remote inside the sandbox.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RcloneMountMode {
+    /// Mount the remote with `rclone mount`, which needs FUSE.
+    #[default]
+    Fuse,
+    /// Serve the remote over NFS with `rclone serve nfs` and mount that, for images without FUSE.
+    Nfs,
+}
+
+/// Mounts a cloud bucket inside the sandbox with `rclone`. Mirrors
+/// `agents.sandbox.entries.mounts.patterns.RcloneMountPattern`.
+///
+/// The secret-bearing configuration comes from [`MountPatternConfig::config_text`] and is written
+/// to a `600` file under [`RCLONE_CONFIG_DIR`] before the mount runs, then removed when the mount
+/// is detached. The non-secret options above select the remote and the mount flags; a provider
+/// adds its own flags (`--allow-other`, `--uid`, `--gid`) through [`extra_args`](Self::extra_args).
+///
+/// Installing `rclone` is the provider's job: this pattern only checks that it is present, so a
+/// backend that cannot install it fails with [`ErrorCode::MountMissingTool`] instead of
+/// half-attaching a mount.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RcloneMountPattern {
+    /// How the remote is exposed.
+    pub mode: RcloneMountMode,
+    /// Extra arguments appended to the `rclone` command.
+    pub extra_args: Vec<String>,
+    /// Address `rclone serve nfs` listens on, in `nfs` mode.
+    pub nfs_addr: Option<String>,
+    /// `mount -o` options used in `nfs` mode; `None` uses the defaults Python ships.
+    pub nfs_mount_options: Option<Vec<String>>,
+    /// Workspace-relative configuration path; `None` derives one per mount path.
+    pub config_path: Option<String>,
+}
+
+impl Default for RcloneMountPattern {
+    fn default() -> Self {
+        RcloneMountPattern {
+            mode: RcloneMountMode::Fuse,
+            extra_args: Vec::new(),
+            nfs_addr: None,
+            nfs_mount_options: None,
+            config_path: None,
+        }
+    }
+}
+
+impl RcloneMountPattern {
+    /// A FUSE pattern.
+    pub fn new() -> Self {
+        RcloneMountPattern::default()
+    }
+
+    /// Serve the remote over NFS instead of mounting it with FUSE.
+    pub fn nfs() -> Self {
+        RcloneMountPattern {
+            mode: RcloneMountMode::Nfs,
+            ..Default::default()
+        }
+    }
+
+    /// Append an argument to the `rclone` command.
+    pub fn with_extra_arg(mut self, arg: impl Into<String>) -> Self {
+        self.extra_args.push(arg.into());
+        self
+    }
+
+    /// Append several arguments to the `rclone` command.
+    pub fn with_extra_args<I, S>(mut self, args: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.extra_args.extend(args.into_iter().map(Into::into));
+        self
+    }
+
+    /// Set the address `rclone serve nfs` listens on.
+    pub fn with_nfs_addr(mut self, addr: impl Into<String>) -> Self {
+        self.nfs_addr = Some(addr.into());
+        self
+    }
+
+    /// Replace the `mount -o` options used in `nfs` mode.
+    pub fn with_nfs_mount_options<I, S>(mut self, options: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.nfs_mount_options = Some(options.into_iter().map(Into::into).collect());
+        self
+    }
+
+    /// Write the configuration to an explicit workspace-relative path.
+    pub fn with_config_path(mut self, config_path: impl Into<String>) -> Self {
+        self.config_path = Some(config_path.into());
+        self
+    }
+
+    /// The workspace-relative configuration path used for `mount_path`.
+    ///
+    /// The derived name is stable, so teardown finds the file activation wrote, and distinct per
+    /// mount, so two mounts in one workspace cannot overwrite each other's credentials.
+    pub fn config_path_for(&self, mount_path: &str) -> String {
+        self.config_path.clone().unwrap_or_else(|| {
+            let digest = <sha2::Sha256 as sha2::Digest>::digest(mount_path.as_bytes());
+            let name: String = digest
+                .iter()
+                .take(8)
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            format!("{RCLONE_CONFIG_DIR}/{name}.conf")
+        })
+    }
+
+    /// The remote this mount attaches, as `name:path`.
+    fn remote(&self, config: &MountPatternConfig) -> SandboxResult<(String, String)> {
+        let remote_name = config
+            .options
+            .get(RCLONE_OPTION_REMOTE_NAME)
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| {
+                SandboxError::new(
+                    ErrorCode::MountConfigInvalid,
+                    format!("an rclone mount requires the `{RCLONE_OPTION_REMOTE_NAME}` option"),
+                )
+            })?;
+        let remote_path = config
+            .options
+            .get(RCLONE_OPTION_REMOTE_PATH)
+            .cloned()
+            .unwrap_or_default();
+        Ok((remote_name.clone(), remote_path))
+    }
+
+    fn read_only(config: &MountPatternConfig) -> bool {
+        config
+            .options
+            .get(RCLONE_OPTION_READ_ONLY)
+            .map(String::as_str)
+            == Some("true")
+    }
+
+    /// The `rclone mount` argument vector.
+    fn fuse_argv(
+        &self,
+        mount_path: &str,
+        config_path: &str,
+        config: &MountPatternConfig,
+    ) -> SandboxResult<Vec<String>> {
+        let (remote_name, remote_path) = self.remote(config)?;
+        let mut argv = vec![
+            "rclone".to_string(),
+            "mount".to_string(),
+            format!("{remote_name}:{remote_path}"),
+            mount_path.to_string(),
+        ];
+        if Self::read_only(config) {
+            argv.push("--read-only".to_string());
+        }
+        argv.extend([
+            "--config".to_string(),
+            config_path.to_string(),
+            "--daemon".to_string(),
+        ]);
+        argv.extend(self.extra_args.iter().cloned());
+        Ok(argv)
+    }
+
+    /// The `rclone serve nfs` argument vector.
+    fn nfs_server_argv(
+        &self,
+        config_path: &str,
+        nfs_addr: &str,
+        config: &MountPatternConfig,
+    ) -> SandboxResult<Vec<String>> {
+        let (remote_name, remote_path) = self.remote(config)?;
+        let mut argv = vec![
+            "rclone".to_string(),
+            "serve".to_string(),
+            "nfs".to_string(),
+            format!("{remote_name}:{remote_path}"),
+            "--addr".to_string(),
+            nfs_addr.to_string(),
+            "--config".to_string(),
+            config_path.to_string(),
+        ];
+        if Self::read_only(config) {
+            argv.push("--read-only".to_string());
+        }
+        argv.extend(self.extra_args.iter().cloned());
+        Ok(argv)
+    }
+
+    /// The `mount -t nfs` command that attaches the served remote.
+    ///
+    /// `bounded` wraps each attempt in `timeout 10s`, when the image provides it, so one hung
+    /// mount cannot stall the retry loop.
+    fn nfs_client_command(&self, mount_path: &str, nfs_addr: &str, bounded: bool) -> String {
+        let (host, port) = match nfs_addr.rsplit_once(':') {
+            Some((host, port)) => (host, port),
+            None => (nfs_addr, "2049"),
+        };
+        // A server bound to every interface is reached over the loopback from inside.
+        let host = if matches!(host, "0.0.0.0" | "::" | "") {
+            "127.0.0.1"
+        } else {
+            host
+        };
+        let options = self.nfs_mount_options.clone().unwrap_or_else(|| {
+            vec![
+                "vers=4.1".to_string(),
+                "tcp".to_string(),
+                format!("port={port}"),
+                "soft".to_string(),
+                "timeo=50".to_string(),
+                "retrans=1".to_string(),
+            ]
+        });
+        // The server has just been backgrounded, so the first attempt can race it.
+        format!(
+            "for i in 1 2 3; do {prefix}mount -v -t nfs -o {options} {source} {target} && \
+             exit 0; sleep 1; done; exit 1",
+            prefix = if bounded { "timeout 10s " } else { "" },
+            options = shell_quote(&options.join(",")),
+            source = shell_quote(&format!("{host}:/")),
+            target = shell_quote(mount_path),
+        )
+    }
+}
+
+#[async_trait]
+impl MountPattern for RcloneMountPattern {
+    fn pattern_type(&self) -> &str {
+        "rclone"
+    }
+
+    fn exposes_credentials(&self) -> bool {
+        true
+    }
+
+    async fn apply(
+        &self,
+        session: &dyn SandboxSession,
+        mount_path: &str,
+        config: &MountPatternConfig,
+    ) -> SandboxResult<()> {
+        let present = session
+            .exec(ExecRequest::argv(["sh", "-lc", RCLONE_CHECK]).with_shell(ExecShell::None))
+            .await?;
+        if !present.ok() {
+            return Err(SandboxError::new(
+                ErrorCode::MountMissingTool,
+                "rclone is not installed in the sandbox image",
+            ));
+        }
+        let config_text = config.config_text().ok_or_else(|| {
+            SandboxError::new(
+                ErrorCode::MountConfigInvalid,
+                "an rclone mount requires the remote configuration text",
+            )
+        })?;
+        // A relative configuration path resolves inside the workspace, so the session's own file
+        // API can write it; a path outside the workspace root would be rejected.
+        let config_path = session.normalize_path(&self.config_path_for(mount_path))?;
+        let nfs_addr = self
+            .nfs_addr
+            .clone()
+            .unwrap_or_else(|| "127.0.0.1:2049".to_string());
+        let command = match self.mode {
+            RcloneMountMode::Fuse => {
+                shell_command(&self.fuse_argv(mount_path, &config_path, config)?)
+            }
+            RcloneMountMode::Nfs => {
+                // Not every build of rclone ships the NFS server.
+                let serves_nfs = session
+                    .exec(
+                        ExecRequest::argv([
+                            "sh",
+                            "-lc",
+                            "rclone serve nfs --help >/dev/null 2>&1 || /usr/local/bin/rclone \
+                             serve nfs --help >/dev/null 2>&1",
+                        ])
+                        .with_shell(ExecShell::None),
+                    )
+                    .await?;
+                if !serves_nfs.ok() {
+                    return Err(SandboxError::new(
+                        ErrorCode::MountMissingTool,
+                        "this build of rclone has no `serve nfs` command",
+                    ));
+                }
+                let timeout = session
+                    .exec(
+                        ExecRequest::argv(["sh", "-lc", "command -v timeout >/dev/null 2>&1"])
+                            .with_shell(ExecShell::None),
+                    )
+                    .await?;
+                format!(
+                    // The server runs in the background, then the client mounts what it serves.
+                    "{server} & {client}",
+                    server =
+                        shell_command(&self.nfs_server_argv(&config_path, &nfs_addr, config)?),
+                    client = self.nfs_client_command(mount_path, &nfs_addr, timeout.ok()),
+                )
+            }
+        };
+
+        // Python creates this directory explicitly; a backend whose upload endpoint does not
+        // create parents would otherwise fail on the very first mount.
+        if let Some((parent, _)) = config_path.rsplit_once('/')
+            && !parent.is_empty()
+        {
+            session.mkdir(parent, true).await.map_err(|error| {
+                SandboxError::new(
+                    ErrorCode::MountFailed,
+                    format!(
+                        "failed to create the rclone configuration directory: {}",
+                        error.message
+                    ),
+                )
+            })?;
+        }
+        session
+            .write_file(&config_path, config_text.as_bytes())
+            .await
+            .map_err(|error| {
+                SandboxError::new(
+                    ErrorCode::MountFailed,
+                    format!(
+                        "failed to write the rclone configuration: {}",
+                        error.message
+                    ),
+                )
+            })?;
+        let chmod = session
+            .exec(ExecRequest::argv([
+                "chmod",
+                "600",
+                "--",
+                config_path.as_str(),
+            ]))
+            .await?;
+        if !chmod.ok() {
+            let _ = session.rm(&config_path, false).await;
+            return Err(SandboxError::new(
+                ErrorCode::MountFailed,
+                "failed to restrict the rclone configuration file permissions",
+            ));
+        }
+        let result = session
+            .exec(
+                ExecRequest::argv(["sh", "-lc", command.as_str()])
+                    .with_shell(ExecShell::None)
+                    .with_timeout(Some(std::time::Duration::from_secs(120))),
+            )
+            .await?;
+        if !result.ok() {
+            // The credential must not outlive the attempt that staged it.
+            let _ = session.rm(&config_path, false).await;
+            // Never echo the command back: it names the remote the credentials belong to.
+            return Err(SandboxError::new(
+                ErrorCode::MountFailed,
+                format!(
+                    "`rclone` failed to mount `{mount_path}` with exit code {}: {}",
+                    result.exit_code,
+                    result.stderr_text().trim()
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn unapply(
+        &self,
+        session: &dyn SandboxSession,
+        mount_path: &str,
+        config: &MountPatternConfig,
+    ) -> SandboxResult<()> {
+        let quoted = shell_quote(mount_path);
+        let unmount = match self.mode {
+            RcloneMountMode::Fuse => format!(
+                "fusermount3 -u -- {quoted} 2>/dev/null || fusermount -u -- {quoted} \
+                 2>/dev/null || umount -- {quoted} 2>/dev/null || true"
+            ),
+            RcloneMountMode::Nfs => {
+                format!("umount -- {quoted} >/dev/null 2>&1 || true")
+            }
+        };
+        session
+            .exec(
+                ExecRequest::argv(["sh", "-lc", unmount.as_str()])
+                    .with_shell(ExecShell::None)
+                    .with_timeout(Some(std::time::Duration::from_secs(60))),
+            )
+            .await?;
+        // A daemonized `rclone mount` or a backgrounded `serve nfs` outlives the unmount.
+        if let Ok((remote_name, _)) = self.remote(config) {
+            let pkill = format!(
+                "pkill -f -- {} >/dev/null 2>&1 || true",
+                shell_quote(&format!("rclone (mount|serve nfs) {remote_name}:"))
+            );
+            session
+                .exec(ExecRequest::argv(["sh", "-lc", pkill.as_str()]).with_shell(ExecShell::None))
+                .await?;
+        }
+        // The credentials must not outlive the mount.
+        if let Ok(config_path) = session.normalize_path(&self.config_path_for(mount_path)) {
+            let _ = session.rm(&config_path, false).await;
+        }
+        Ok(())
+    }
+}
+
+/// Join an argument vector into a single POSIX shell command.
+fn shell_command(argv: &[String]) -> String {
+    argv.iter()
+        .map(|arg| shell_quote(arg))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[cfg(test)]
+mod rclone_tests {
+    use super::*;
+
+    fn config() -> MountPatternConfig {
+        MountPatternConfig::new()
+            .with_config_text("[bucket]\ntype = s3\n")
+            .with_option(RCLONE_OPTION_REMOTE_NAME, "bucket")
+            .with_option(RCLONE_OPTION_REMOTE_PATH, "my-bucket/prefix")
+            .with_option(RCLONE_OPTION_READ_ONLY, "true")
+    }
+
+    #[test]
+    fn builds_fuse_mount_arguments() {
+        let pattern = RcloneMountPattern::new().with_extra_args(["--allow-other", "--uid", "1000"]);
+        let argv = pattern
+            .fuse_argv("/workspace/data", "/workspace/rclone.conf", &config())
+            .unwrap();
+        assert_eq!(
+            argv,
+            vec![
+                "rclone",
+                "mount",
+                "bucket:my-bucket/prefix",
+                "/workspace/data",
+                "--read-only",
+                "--config",
+                "/workspace/rclone.conf",
+                "--daemon",
+                "--allow-other",
+                "--uid",
+                "1000",
+            ]
+        );
+    }
+
+    #[test]
+    fn builds_nfs_server_and_client_commands() {
+        let pattern = RcloneMountPattern::nfs();
+        let argv = pattern
+            .nfs_server_argv("/workspace/rclone.conf", "127.0.0.1:2049", &config())
+            .unwrap();
+        assert_eq!(
+            argv,
+            vec![
+                "rclone",
+                "serve",
+                "nfs",
+                "bucket:my-bucket/prefix",
+                "--addr",
+                "127.0.0.1:2049",
+                "--config",
+                "/workspace/rclone.conf",
+                "--read-only",
+            ]
+        );
+        let command = pattern.nfs_client_command("/workspace/data", "0.0.0.0:2049", true);
+        // A server bound to every interface is reached over the loopback from inside.
+        assert!(command.contains(" 127.0.0.1:/ "), "{command}");
+        assert!(command.contains("port=2049"), "{command}");
+        assert!(command.contains("for i in 1 2 3"), "{command}");
+        // One hung attempt must not stall the retry loop.
+        assert!(command.contains("timeout 10s mount"), "{command}");
+        assert!(
+            !pattern
+                .nfs_client_command("/workspace/data", "0.0.0.0:2049", false)
+                .contains("timeout 10s"),
+        );
+    }
+
+    #[test]
+    fn requires_a_remote_name() {
+        let pattern = RcloneMountPattern::new();
+        let bare = MountPatternConfig::new().with_config_text("[bucket]\n");
+        let error = pattern
+            .fuse_argv("/workspace/data", "/workspace/rclone.conf", &bare)
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::MountConfigInvalid);
+    }
+
+    #[test]
+    fn derives_a_distinct_configuration_path_per_mount() {
+        let pattern = RcloneMountPattern::new();
+        let first = pattern.config_path_for("/workspace/a");
+        assert_ne!(first, pattern.config_path_for("/workspace/b"));
+        assert!(first.starts_with(RCLONE_CONFIG_DIR), "{first}");
+        assert!(first.ends_with(".conf"), "{first}");
+        // The derivation is stable, so teardown finds the file activation wrote.
+        assert_eq!(first, pattern.config_path_for("/workspace/a"));
+        assert_eq!(
+            RcloneMountPattern::new()
+                .with_config_path("custom.conf")
+                .config_path_for("/workspace/a"),
+            "custom.conf"
+        );
     }
 }

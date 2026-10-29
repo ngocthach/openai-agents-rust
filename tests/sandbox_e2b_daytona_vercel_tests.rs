@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use openai_agents_sdk::extensions::sandbox::daytona::{
-    DaytonaSandboxClient, DaytonaSandboxClientOptions,
+    DaytonaSandboxClient, DaytonaSandboxClientOptions, DaytonaSandboxSession,
 };
 use openai_agents_sdk::extensions::sandbox::e2b::{
     E2BCloudBucketMountStrategy, E2BSandboxClient, E2BSandboxClientOptions, E2BSandboxType,
@@ -229,12 +229,33 @@ impl MockServer {
     }
 }
 
-/// Read one request, record it, and write the handler's reply.
-async fn serve_one(
-    mut stream: tokio::net::TcpStream,
-    handler: Handler,
-    recorder: Arc<Mutex<Vec<Recorded>>>,
+/// Write a JSON response and close the connection.
+async fn write_json(
+    stream: &mut tokio::net::TcpStream,
+    value: &serde_json::Value,
 ) -> std::io::Result<()> {
+    let body = serde_json::to_vec(value).expect("serializable");
+    let head = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: \
+         close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(head.as_bytes()).await?;
+    stream.write_all(&body).await?;
+    stream.flush().await?;
+    stream.shutdown().await
+}
+
+/// Write a bodyless response and close the connection.
+async fn write_status(stream: &mut tokio::net::TcpStream, status: u16) -> std::io::Result<()> {
+    let head = format!("HTTP/1.1 {status} OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    stream.write_all(head.as_bytes()).await?;
+    stream.flush().await?;
+    stream.shutdown().await
+}
+
+/// Read one request from `stream`, stopping at the end of its body.
+async fn read_request(stream: &mut tokio::net::TcpStream) -> std::io::Result<Recorded> {
     let mut buffer = Vec::new();
     let mut chunk = [0u8; 4096];
     // Read until the end of the headers; the clients never stream a request body.
@@ -244,7 +265,8 @@ async fn serve_one(
         }
         let read = stream.read(&mut chunk).await?;
         if read == 0 {
-            return Ok(());
+            // The peer closed before sending a complete request.
+            return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
         }
         buffer.extend_from_slice(&chunk[..read]);
     };
@@ -278,13 +300,22 @@ async fn serve_one(
     }
     body.truncate(content_length);
 
-    let recorded = Recorded {
+    Ok(Recorded {
         method,
         path,
         query,
         headers,
         body,
-    };
+    })
+}
+
+/// Read one request, record it, and write the handler's reply.
+async fn serve_one(
+    mut stream: tokio::net::TcpStream,
+    handler: Handler,
+    recorder: Arc<Mutex<Vec<Recorded>>>,
+) -> std::io::Result<()> {
+    let recorded = read_request(&mut stream).await?;
     let response = handler(&recorded);
     recorder.lock().expect("poisoned").push(recorded);
 
@@ -906,12 +937,12 @@ async fn daytona_runs_a_create_write_exec_read_delete_flow() {
 async fn daytona_streams_an_interactive_command() {
     let base = Arc::new(Mutex::new(String::new()));
     let handler_base = base.clone();
-    // The command only produces its second line, and only finishes, once stdin has been written.
-    let wrote_stdin = Arc::new(Mutex::new(false));
-    let handler_stdin = wrote_stdin.clone();
+    // The command's second line, and its exit, only appear after the session has polled the log
+    // endpoint a few times, so the first yield window cannot drain the whole command.
+    let polls = Arc::new(Mutex::new(0usize));
+    let handler_polls = polls.clone();
     let server = MockServer::start(move |request| {
         let base_url = handler_base.lock().expect("poisoned").clone();
-        let finished = *handler_stdin.lock().expect("poisoned");
         match (request.method.as_str(), request.path.as_str()) {
             ("POST", "/sandbox") | ("GET", "/sandbox/sbx-daytona") => {
                 MockResponse::json(daytona_sandbox(&base_url))
@@ -923,9 +954,14 @@ async fn daytona_streams_an_interactive_command() {
                 MockResponse::json(serde_json::json!({ "cmdId": "cmd-7" }))
             }
             ("GET", path) if path.ends_with("/logs") => {
+                let seen = {
+                    let mut polls = handler_polls.lock().expect("poisoned");
+                    *polls += 1;
+                    *polls
+                };
                 // The log endpoint always returns the whole log, so the session must only ever
                 // hand the model the part it has not seen yet.
-                MockResponse::bytes(if finished {
+                MockResponse::bytes(if seen >= 6 {
                     "first\nsecond\n"
                 } else {
                     "first\n"
@@ -935,15 +971,12 @@ async fn daytona_streams_an_interactive_command() {
                 if path.starts_with("/toolbox/sbx-daytona/process/session/")
                     && path.contains("/command/") =>
             {
+                let finished = *handler_polls.lock().expect("poisoned") >= 6;
                 MockResponse::json(if finished {
                     serde_json::json!({ "id": "cmd-7", "command": "bash", "exitCode": 0 })
                 } else {
                     serde_json::json!({ "id": "cmd-7", "command": "bash" })
                 })
-            }
-            ("POST", path) if path.ends_with("/input") => {
-                *handler_stdin.lock().expect("poisoned") = true;
-                MockResponse::json(serde_json::json!({}))
             }
             ("DELETE", path) if path.starts_with("/toolbox/sbx-daytona/process/session/") => {
                 MockResponse::json(serde_json::json!({}))
@@ -958,7 +991,7 @@ async fn daytona_streams_an_interactive_command() {
         DaytonaSandboxClientOptions::new()
             .with_api_key("dtn_test")
             .with_api_url(&server.base_url)
-            .with_state_poll_interval(Duration::from_millis(20)),
+            .with_state_poll_interval(Duration::from_millis(100)),
     );
     let session = client.create(None).await.expect("create");
     let first = session
@@ -968,10 +1001,18 @@ async fn daytona_streams_an_interactive_command() {
     assert_eq!(first.output_text(), "first\n");
     let process_id = first.process_id.expect("the command is still running");
 
-    let second = session
+    // A command started without a terminal has no stdin, exactly as in Python.
+    let error = session
         .pty_write_stdin(PtyWriteRequest::new(process_id, "echo second\n"))
         .await
-        .expect("write stdin");
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::PtyStdinUnavailable);
+
+    // An empty write is a poll, which is how the model reads the rest of the output.
+    let second = session
+        .pty_write_stdin(PtyWriteRequest::new(process_id, "").with_yield_time_ms(5_000))
+        .await
+        .expect("poll");
     assert_eq!(second.output_text(), "second\n");
     assert_eq!(second.exit_code, Some(0));
     assert_eq!(second.process_id, None);
@@ -982,12 +1023,6 @@ async fn daytona_streams_an_interactive_command() {
         .find(|r| r.path.ends_with("/exec"))
         .expect("the exec request");
     assert_eq!(start.json()["runAsync"], true);
-    let input = server
-        .requests()
-        .into_iter()
-        .find(|r| r.path.ends_with("/input"))
-        .expect("the input request");
-    assert_eq!(input.json()["data"], "echo second\n");
     server.stop();
 }
 
@@ -1565,7 +1600,8 @@ async fn e2b_activates_an_rclone_cloud_bucket_mount() {
             r.method == "POST"
                 && r.path == "/files"
                 && r.query_param("path").is_some_and(|path| {
-                    path.starts_with("/workspace/.openai-agents-rclone-") && path.ends_with(".conf")
+                    path.starts_with("/workspace/.sandbox-rclone-config/")
+                        && path.ends_with(".conf")
                 })
         })
         .expect("the rclone configuration upload");
@@ -1578,15 +1614,23 @@ async fn e2b_activates_an_rclone_cloud_bucket_mount() {
         .expect("the rclone mount command");
     let payload: serde_json::Value =
         serde_json::from_slice(&mount_command.body[5..]).expect("json");
-    let args: Vec<String> = payload["process"]["args"]
+    // The mount runs as one shell command, so the flags are read out of the command line.
+    let command = payload["process"]["args"]
         .as_array()
-        .expect("args")
-        .iter()
-        .map(|arg| arg.as_str().unwrap_or_default().to_string())
-        .collect();
-    assert!(args.contains(&"bucket:my-bucket".to_string()), "{args:?}");
-    assert!(args.contains(&"/workspace/data".to_string()), "{args:?}");
-    assert!(args.contains(&"--read-only".to_string()), "{args:?}");
+        .and_then(|args| args.last())
+        .and_then(serde_json::Value::as_str)
+        .expect("the mount command")
+        .to_string();
+    assert!(command.contains("bucket:my-bucket"), "{command}");
+    assert!(command.contains("/workspace/data"), "{command}");
+    assert!(command.contains("--read-only"), "{command}");
+    assert!(command.contains("--daemon"), "{command}");
+    // The provider adds the flags its image needs; the core pattern does not.
+    assert!(command.contains("--allow-other"), "{command}");
+    assert!(
+        command.contains("/workspace/.sandbox-rclone-config/"),
+        "{command}"
+    );
     assert!(
         !mount_command.text().contains("type = s3"),
         "the configuration must not reach the command line"
@@ -1738,4 +1782,507 @@ async fn daytona_resumes_a_session_created_without_a_manifest() {
         .expect("resume");
     assert_eq!(resumed.workspace_root(), "/home/daytona/workspace");
     server.stop();
+}
+
+#[tokio::test]
+async fn daytona_drives_a_terminal_over_the_pty_websocket() {
+    use futures::{SinkExt as _, StreamExt as _};
+    use tokio_tungstenite::tungstenite::Message;
+    use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
+    use tokio_tungstenite::tungstenite::protocol::{CloseFrame, Role};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind the mock server");
+    let base_url = format!("http://{}", listener.local_addr().expect("local addr"));
+    let handshake: Arc<Mutex<Option<Recorded>>> = Arc::new(Mutex::new(None));
+    let typed: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    let resized = Arc::new(Mutex::new(None::<serde_json::Value>));
+
+    let server_base = base_url.clone();
+    let server_handshake = handshake.clone();
+    let server_typed = typed.clone();
+    let server_resized = resized.clone();
+    let server = tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            let server_base = server_base.clone();
+            let server_handshake = server_handshake.clone();
+            let server_typed = server_typed.clone();
+            let server_resized = server_resized.clone();
+            // Each connection is served on its own task, so a live websocket never blocks the
+            // next upgrade.
+            tokio::spawn(async move {
+                let Ok(request) = read_request(&mut stream).await else {
+                    return;
+                };
+                match (request.method.as_str(), request.path.as_str()) {
+                    ("POST", "/sandbox") | ("GET", "/sandbox/sbx-daytona") => {
+                        let _ = write_json(&mut stream, &daytona_sandbox(&server_base)).await;
+                    }
+                    ("POST", "/toolbox/sbx-daytona/process/pty/pty-session/resize") => {
+                        *server_resized.lock().expect("poisoned") = Some(request.json());
+                        let _ = write_json(&mut stream, &serde_json::json!({})).await;
+                    }
+                    ("DELETE", path) if path.contains("/process/pty/") => {
+                        let _ = write_json(&mut stream, &serde_json::json!({})).await;
+                    }
+                    ("GET", "/toolbox/sbx-daytona/process/pty/create-connect") => {
+                        *server_handshake.lock().expect("poisoned") = Some(request.clone());
+                        // Complete the upgrade by hand, then speak frames over the raw socket.
+                        let key = request
+                            .header("sec-websocket-key")
+                            .expect("the handshake key")
+                            .to_string();
+                        let response = format!(
+                            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: \
+                         Upgrade\r\nSec-WebSocket-Accept: {}\r\nSec-WebSocket-Protocol: \
+                         X-Daytona-Pty-Exit-Control\r\n\r\n",
+                            derive_accept_key(key.as_bytes())
+                        );
+                        if stream.write_all(response.as_bytes()).await.is_err() {
+                            return;
+                        }
+                        let mut ws = tokio_tungstenite::WebSocketStream::from_raw_socket(
+                            stream,
+                            Role::Server,
+                            None,
+                        )
+                        .await;
+                        let _ = ws
+                            .send(Message::text(
+                                r#"{"type":"control","status":"connected"}"#.to_string(),
+                            ))
+                            .await;
+                        let _ = ws.send(Message::text("$ ".to_string())).await;
+                        // Wait for the command line the session types into the shell.
+                        while let Some(Ok(message)) = ws.next().await {
+                            let data = match message {
+                                Message::Binary(data) => data.to_vec(),
+                                Message::Text(text) => text.as_bytes().to_vec(),
+                                Message::Ping(_) => continue,
+                                Message::Close(_) => break,
+                                _ => continue,
+                            };
+                            let done = {
+                                let mut typed = server_typed.lock().expect("poisoned");
+                                typed.extend_from_slice(&data);
+                                typed.windows(5).any(|w| w == b"exit\n")
+                            };
+                            let _ = ws.send(Message::binary(b"hello terminal\n".to_vec())).await;
+                            if done {
+                                let _ = ws
+                                    .send(Message::Close(Some(CloseFrame {
+                                        code: 1000u16.into(),
+                                        // The daemon encodes the exit code in the close reason.
+                                        reason: r#"{"exitCode":7}"#.into(),
+                                    })))
+                                    .await;
+                                break;
+                            }
+                        }
+                    }
+                    _ => {
+                        let _ = write_status(&mut stream, 404).await;
+                    }
+                }
+            });
+        }
+    });
+
+    let client = DaytonaSandboxClient::with_options(
+        DaytonaSandboxClientOptions::new()
+            .with_api_key("dtn_test")
+            .with_api_url(&base_url)
+            .with_organization_id("org-1")
+            .with_env("TASK", "demo")
+            .with_state_poll_interval(Duration::from_millis(1)),
+    );
+    let session = client.create(None).await.expect("create");
+
+    let first = session
+        .pty_exec_start(
+            PtyExecRequest::new("bash")
+                .with_tty(true)
+                .with_yield_time_ms(250),
+        )
+        .await
+        .expect("pty start");
+    assert!(first.output_text().contains("$ "), "{first:?}");
+    let process_id = first.process_id.expect("the terminal is still open");
+
+    let second = session
+        .pty_write_stdin(PtyWriteRequest::new(process_id, "exit\n").with_yield_time_ms(1_000))
+        .await
+        .expect("write stdin");
+    assert!(
+        second.output_text().contains("hello terminal"),
+        "{second:?}"
+    );
+    // The exit code comes from the websocket close frame, not a REST round trip.
+    assert_eq!(second.exit_code, Some(7));
+    assert_eq!(second.process_id, None);
+
+    // The upgrade carries the REST credentials, the terminal size and the environment, the last
+    // as a subprotocol token rather than a query parameter.
+    let recorded = handshake
+        .lock()
+        .expect("poisoned")
+        .clone()
+        .expect("handshake");
+    assert_eq!(recorded.header("authorization"), Some("Bearer dtn_test"));
+    assert_eq!(recorded.header("x-daytona-organization-id"), Some("org-1"));
+    assert_eq!(recorded.query_param("cols").as_deref(), Some("80"));
+    assert_eq!(recorded.query_param("rows").as_deref(), Some("24"));
+    assert_eq!(
+        recorded.query_param("cwd").as_deref(),
+        Some("/home/daytona/workspace")
+    );
+    assert!(
+        recorded
+            .query_param("id")
+            .is_some_and(|id| id.starts_with("pty-")),
+        "{:?}",
+        recorded.query_param("id")
+    );
+    let protocols = recorded
+        .header("sec-websocket-protocol")
+        .expect("subprotocols")
+        .to_string();
+    assert!(
+        protocols.contains("X-Daytona-Pty-Exit-Control"),
+        "{protocols}"
+    );
+    let token = protocols
+        .split(',')
+        .map(str::trim)
+        .find_map(|p| p.strip_prefix("X-Daytona-Pty-Envs~"))
+        .expect("the environment subprotocol");
+    let decoded = {
+        use base64::Engine as _;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(token)
+            .expect("base64url")
+    };
+    let envs: serde_json::Value = serde_json::from_slice(&decoded).expect("json");
+    assert_eq!(envs["TASK"], "demo");
+
+    // The command reaches the terminal as a typed line, shell-wrapped exactly as `exec` wraps
+    // it, and the model's later input is forwarded verbatim.
+    assert_eq!(
+        String::from_utf8_lossy(&typed.lock().expect("poisoned")),
+        "sh -lc bash\nexit\n"
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn daytona_resizes_a_terminal_and_survives_a_handshake_without_a_subprotocol() {
+    use futures::{SinkExt as _, StreamExt as _};
+    use tokio_tungstenite::tungstenite::Message;
+    use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
+    use tokio_tungstenite::tungstenite::protocol::{CloseFrame, Role};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind the mock server");
+    let base_url = format!("http://{}", listener.local_addr().expect("local addr"));
+    let typed: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    let resized: Arc<Mutex<Vec<(String, serde_json::Value)>>> = Arc::new(Mutex::new(Vec::new()));
+    let ids: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+
+    let server_base = base_url.clone();
+    let server_typed = typed.clone();
+    let server_resized = resized.clone();
+    let server_ids = ids.clone();
+    let server = tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            let server_base = server_base.clone();
+            let server_typed = server_typed.clone();
+            let server_resized = server_resized.clone();
+            let server_ids = server_ids.clone();
+            // Each connection is served on its own task, so the first websocket never blocks the
+            // retry the client opens when the handshake selected no subprotocol.
+            tokio::spawn(async move {
+                let Ok(request) = read_request(&mut stream).await else {
+                    return;
+                };
+                match (request.method.as_str(), request.path.as_str()) {
+                    ("POST", "/sandbox") | ("GET", "/sandbox/sbx-daytona") => {
+                        let _ = write_json(&mut stream, &daytona_sandbox(&server_base)).await;
+                    }
+                    ("POST", path)
+                        if path.starts_with("/toolbox/sbx-daytona/process/pty/")
+                            && path.ends_with("/resize") =>
+                    {
+                        server_resized
+                            .lock()
+                            .expect("poisoned")
+                            .push((path.to_string(), request.json()));
+                        let _ = write_json(&mut stream, &serde_json::json!({})).await;
+                    }
+                    ("DELETE", path) if path.contains("/process/pty/") => {
+                        let _ = write_json(&mut stream, &serde_json::json!({})).await;
+                    }
+                    ("GET", "/toolbox/sbx-daytona/process/pty/create-connect") => {
+                        let id = request.query_param("id").expect("the pty session id");
+                        // The daemon rejects a session id that is already in use, so a retry
+                        // that reused the first id would fail here.
+                        let fresh = {
+                            let mut seen = server_ids.lock().expect("poisoned");
+                            let fresh = !seen.contains(&id);
+                            seen.push(id.clone());
+                            fresh
+                        };
+                        if !fresh {
+                            let _ = write_status(&mut stream, 409).await;
+                            return;
+                        }
+                        let key = request
+                            .header("sec-websocket-key")
+                            .expect("the handshake key")
+                            .to_string();
+                        // RFC 6455 lets a server accept without selecting a subprotocol; this one
+                        // does, which the client must survive.
+                        let response = format!(
+                            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: \
+                         Upgrade\r\nSec-WebSocket-Accept: {}\r\n\r\n",
+                            derive_accept_key(key.as_bytes())
+                        );
+                        if stream.write_all(response.as_bytes()).await.is_err() {
+                            return;
+                        }
+                        let mut ws = tokio_tungstenite::WebSocketStream::from_raw_socket(
+                            stream,
+                            Role::Server,
+                            None,
+                        )
+                        .await;
+                        let _ = ws
+                            .send(Message::text(
+                                r#"{"type":"control","status":"connected"}"#.to_string(),
+                            ))
+                            .await;
+                        while let Some(Ok(message)) = ws.next().await {
+                            let data = match message {
+                                Message::Binary(data) => data.to_vec(),
+                                Message::Text(text) => text.as_bytes().to_vec(),
+                                Message::Ping(_) => continue,
+                                Message::Close(_) => break,
+                                _ => continue,
+                            };
+                            let done = {
+                                let mut typed = server_typed.lock().expect("poisoned");
+                                typed.extend_from_slice(&data);
+                                typed.windows(5).any(|w| w == b"exit\n")
+                            };
+                            if done {
+                                let _ = ws
+                                    .send(Message::Close(Some(CloseFrame {
+                                        code: 1000u16.into(),
+                                        reason: String::new().into(),
+                                    })))
+                                    .await;
+                                break;
+                            }
+                        }
+                    }
+                    _ => {
+                        let _ = write_status(&mut stream, 404).await;
+                    }
+                }
+            });
+        }
+    });
+
+    let client = DaytonaSandboxClient::with_options(
+        DaytonaSandboxClientOptions::new()
+            .with_api_key("dtn_test")
+            .with_api_url(&base_url)
+            .with_env("TASK", "demo")
+            .with_state_poll_interval(Duration::from_millis(1)),
+    );
+    let session = client.create(None).await.expect("create");
+
+    let first = session
+        .pty_exec_start(
+            PtyExecRequest::new("bash")
+                .with_tty(true)
+                .with_yield_time_ms(250),
+        )
+        .await
+        .expect("pty start");
+    let process_id = first.process_id.expect("the terminal is still open");
+
+    // The concrete session exposes resize, which the trait object reaches through `as_any`.
+    let daytona = session
+        .as_any()
+        .and_then(|any| any.downcast_ref::<DaytonaSandboxSession>())
+        .expect("a Daytona session");
+    daytona
+        .resize_terminal(process_id, 120, 30)
+        .await
+        .expect("resize");
+    let recorded = resized.lock().expect("poisoned").clone();
+    let (path, body) = recorded.first().expect("a resize request");
+    assert!(
+        path.starts_with("/toolbox/sbx-daytona/process/pty/pty-"),
+        "{path}"
+    );
+    assert_eq!(body["cols"], 120);
+    assert_eq!(body["rows"], 30);
+
+    let second = session
+        .pty_write_stdin(PtyWriteRequest::new(process_id, "exit\n").with_yield_time_ms(1_000))
+        .await
+        .expect("write stdin");
+    // A clean close with no structured reason means the shell exited successfully.
+    assert_eq!(second.exit_code, Some(0));
+
+    // The handshake could not carry the environment, so it was exported on the typed line.
+    let typed = String::from_utf8_lossy(&typed.lock().expect("poisoned")).into_owned();
+    assert!(
+        typed.starts_with("env -- TASK=demo sh -lc bash\n"),
+        "{typed}"
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn providers_honor_per_command_environment_variables() {
+    // `ExecRequest::with_env` is part of the core contract; each backend expresses it in its own
+    // wire format, and a per-command variable always wins over the manifest value.
+    let e2b_server =
+        MockServer::start(
+            |request| match (request.method.as_str(), request.path.as_str()) {
+                ("POST", "/v2/sandboxes") => MockResponse::json(serde_json::json!({
+                    "templateID": "base",
+                    "sandboxID": "sbx-env",
+                    "clientID": "cl",
+                    "envdVersion": "0.2.0",
+                    "envdAccessToken": "envd-token",
+                })),
+                ("POST", "/process.Process/Start") => e2b_process_stream("", 0),
+                _ => MockResponse::error(404, "unexpected request"),
+            },
+        )
+        .await;
+    let e2b = E2BSandboxClient::with_options(
+        E2BSandboxClientOptions::new()
+            .with_api_key("e2b_test")
+            .with_base_url(&e2b_server.base_url),
+    );
+    let manifest = Manifest::new()
+        .with_env("TASK", "manifest")
+        .with_env("KEEP", "yes");
+    let session = e2b.create(Some(manifest.clone())).await.expect("create");
+    session
+        .exec(
+            ExecRequest::shell("env")
+                .with_env("TASK", "per-command")
+                .with_env("EXTRA", "1"),
+        )
+        .await
+        .expect("exec");
+    let start = e2b_server.find("POST", "/process.Process/Start");
+    let payload: serde_json::Value = serde_json::from_slice(&start.body[5..]).expect("json");
+    assert_eq!(payload["process"]["envs"]["TASK"], "per-command");
+    assert_eq!(payload["process"]["envs"]["EXTRA"], "1");
+    assert_eq!(payload["process"]["envs"]["KEEP"], "yes");
+    e2b_server.stop();
+
+    let base = Arc::new(Mutex::new(String::new()));
+    let handler_base = base.clone();
+    let daytona_server = MockServer::start(move |request| {
+        let base_url = handler_base.lock().expect("poisoned").clone();
+        match (request.method.as_str(), request.path.as_str()) {
+            ("POST", "/sandbox") | ("GET", "/sandbox/sbx-daytona") => {
+                MockResponse::json(daytona_sandbox(&base_url))
+            }
+            ("POST", "/toolbox/sbx-daytona/process/session") => {
+                MockResponse::json(serde_json::json!({}))
+            }
+            ("POST", path) if path.ends_with("/exec") => MockResponse::json(serde_json::json!({
+                "cmdId": "cmd-1", "exitCode": 0, "stdout": "", "stderr": "",
+            })),
+            ("DELETE", _) => MockResponse::json(serde_json::json!({})),
+            _ => MockResponse::error(404, "unexpected request"),
+        }
+    })
+    .await;
+    *base.lock().expect("poisoned") = daytona_server.base_url.clone();
+    let daytona = DaytonaSandboxClient::with_options(
+        DaytonaSandboxClientOptions::new()
+            .with_api_key("dtn_test")
+            .with_api_url(&daytona_server.base_url)
+            .with_state_poll_interval(Duration::from_millis(1)),
+    );
+    let session = daytona
+        .create(Some(manifest.clone().with_root("/home/daytona/workspace")))
+        .await
+        .expect("create");
+    session
+        .exec(ExecRequest::shell("env").with_env("TASK", "per-command"))
+        .await
+        .expect("exec");
+    let exec = daytona_server
+        .requests()
+        .into_iter()
+        .find(|r| r.path.ends_with("/exec"))
+        .expect("the exec request");
+    let command = exec.json()["command"]
+        .as_str()
+        .expect("command")
+        .to_string();
+    // Daytona has no environment parameter, so it lands in the command string.
+    assert!(command.contains("TASK=per-command"), "{command}");
+    assert!(!command.contains("TASK=manifest"), "{command}");
+    assert!(command.contains("KEEP=yes"), "{command}");
+    daytona_server.stop();
+
+    let vercel_server =
+        MockServer::start(
+            |request| match (request.method.as_str(), request.path.as_str()) {
+                ("POST", "/v3/sandboxes") => {
+                    MockResponse::json(vercel_sandbox_and_session("running"))
+                }
+                ("GET", "/v2/sandboxes/sessions/sess-1") => {
+                    let mut body = vercel_sandbox_and_session("running");
+                    MockResponse::json(serde_json::json!({
+                        "session": body["session"].take(),
+                        "routes": [],
+                    }))
+                }
+                ("POST", "/v2/sandboxes/sessions/sess-1/cmd") => {
+                    MockResponse::ndjson(&[serde_json::json!({
+                        "command": {
+                            "id": "cmd-1", "name": "sh", "args": [], "cwd": "/vercel/sandbox",
+                            "sessionId": "sess-1", "exitCode": 0, "startedAt": 1,
+                        },
+                    })])
+                }
+                _ => MockResponse::error(404, "unexpected request"),
+            },
+        )
+        .await;
+    let vercel = VercelSandboxClient::with_options(
+        VercelSandboxClientOptions::new()
+            .with_token("vercel_test")
+            .with_base_url(&vercel_server.base_url)
+            .with_status_poll_interval(Duration::from_millis(1)),
+    );
+    let session = vercel.create(Some(manifest)).await.expect("create");
+    session
+        .exec(ExecRequest::shell("env").with_env("TASK", "per-command"))
+        .await
+        .expect("exec");
+    let cmd = vercel_server.find("POST", "/v2/sandboxes/sessions/sess-1/cmd");
+    assert_eq!(cmd.json()["env"]["TASK"], "per-command");
+    assert_eq!(cmd.json()["env"]["KEEP"], "yes");
+    vercel_server.stop();
 }

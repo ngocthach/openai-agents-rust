@@ -55,6 +55,7 @@ pub mod capabilities;
 pub mod editor;
 pub mod entries;
 pub mod errors;
+pub mod http;
 pub mod manifest;
 pub mod memory;
 pub mod mounts;
@@ -81,7 +82,8 @@ pub use manifest::{DEFAULT_MANIFEST_ROOT, DEFAULT_REMOTE_MOUNT_COMMAND_ALLOWLIST
 pub use memory::{MemoryGenerateConfig, MemoryLayoutConfig, MemoryReadConfig};
 pub use mounts::{
     BindMountStrategy, DockerVolumeMountStrategy, HostPathGrant, InContainerMountStrategy, Mount,
-    MountCredentialAuthority, MountPattern, MountPatternConfig, MountStrategy,
+    MountCredentialAuthority, MountPattern, MountPatternConfig, MountStrategy, RCLONE_CONFIG_DIR,
+    RcloneMountMode, RcloneMountPattern,
 };
 pub use pty::{
     PtyExecRequest, PtyExecUpdate, PtyManager, PtyWriteRequest, RemotePtyManager, RemotePtyProcess,

@@ -52,33 +52,37 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL_SAFE_NO_PAD;
+use futures::StreamExt as _;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::sync::Notify;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue};
 
 use crate::sandbox::errors::{ErrorCode, SandboxError, SandboxResult};
 use crate::sandbox::manifest::Manifest;
 use crate::sandbox::mounts::{
     InContainerMountStrategy, Mount, MountCredentialAuthority, MountPatternConfig, MountStrategy,
+    RCLONE_OPTION_READ_ONLY, RCLONE_OPTION_REMOTE_NAME, RCLONE_OPTION_REMOTE_PATH, RcloneMountMode,
+    RcloneMountPattern,
 };
 use crate::sandbox::pty::{
-    PTY_PROCESS_ID_MAX_EXCLUSIVE, PTY_PROCESS_ID_MIN, PTY_PROCESSES_MAX, PtyExecRequest,
-    PtyExecUpdate, PtyWriteRequest, clamp_pty_yield_time_ms, resolve_pty_write_yield_time_ms,
+    PtyExecRequest, PtyExecUpdate, PtyWriteRequest, RemotePtyManager, RemotePtyProcess,
+    resolve_pty_write_yield_time_ms,
 };
 use crate::sandbox::session::{
     ExecRequest, SandboxClient, SandboxSession, restore_session_snapshot, shell_quote,
+    workspace_archive_excludes,
 };
 use crate::sandbox::snapshot::{Snapshot, SnapshotSpec, resolve_snapshot};
 use crate::sandbox::state::SandboxSessionState;
 use crate::sandbox::types::{ExecResult, FileEntry, Permissions};
-use crate::sandbox::util::truncate_text_by_tokens;
+use crate::sandbox::workspace_paths::provider_scratch_path;
 
-use super::e2b::rclone::{
-    self, RcloneMountMode, RcloneMountPattern, ensure_fuse_support, ensure_rclone,
-};
-use super::e2b::{
-    adopt_recorded_root, expect_success, http_error, parse_json, transport, workspace_excludes,
-};
+use super::e2b::adopt_recorded_root;
+use super::e2b::rclone::{ensure_fuse_support, ensure_rclone};
+use crate::sandbox::http::{expect_success, http_error, parse_json, transport};
 
 /// The backend identifier reported by this client and its sessions.
 pub const BACKEND_ID: &str = "daytona";
@@ -94,6 +98,24 @@ pub const DAYTONA_TARGET_ENV: &str = "DAYTONA_TARGET";
 pub const DEFAULT_DAYTONA_API_URL: &str = "https://app.daytona.io/api";
 /// The workspace root Daytona sessions default to, matching Python.
 pub const DEFAULT_DAYTONA_WORKSPACE_ROOT: &str = "/home/daytona/workspace";
+/// Value of the `X-Daytona-Source` header this client sends.
+pub const DAYTONA_SOURCE: &str = "openai-agents-sdk-rust";
+
+/// Subprotocol that asks the daemon to report the PTY exit code in a control frame.
+const PTY_EXIT_CONTROL_SUBPROTOCOL: &str = "X-Daytona-Pty-Exit-Control";
+/// Prefix of the subprotocol token carrying the PTY environment.
+///
+/// The environment travels as a subprotocol rather than a query parameter or header so secrets
+/// and large values stay out of URLs and access logs, exactly as the vendor SDK does it.
+const PTY_ENVS_SUBPROTOCOL_PREFIX: &str = "X-Daytona-Pty-Envs~";
+/// Terminal columns a new PTY session starts with, matching the vendor default.
+const PTY_TERMINAL_COLS: u16 = 80;
+/// Terminal rows a new PTY session starts with, matching the vendor default.
+const PTY_TERMINAL_ROWS: u16 = 24;
+/// How long a PTY websocket is given to acknowledge the connection.
+const PTY_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// How often the client pings an idle PTY websocket, matching the vendor SDK.
+const PTY_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(20);
 
 /// Resource limits for a Daytona sandbox. Mirrors Python's `DaytonaSandboxResources`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -482,7 +504,7 @@ impl DaytonaSandboxClient {
     ) -> reqwest::RequestBuilder {
         let mut builder = builder
             .bearer_auth(api_key)
-            .header("X-Daytona-Source", "openai-agents-sdk-rust");
+            .header("X-Daytona-Source", DAYTONA_SOURCE);
         if let Some(organization_id) = self.options.resolved_organization_id() {
             builder = builder.header("X-Daytona-Organization-ID", organization_id);
         }
@@ -672,7 +694,9 @@ pub struct DaytonaSandboxSession {
     started: AtomicBool,
     stopped: AtomicBool,
     released: tokio::sync::Mutex<bool>,
-    ptys: PtyRegistry,
+    ptys: RemotePtyManager,
+    /// The provider half of each live PTY session.
+    pty_handles: Mutex<HashMap<u32, Arc<DaytonaPtyHandle>>>,
     snapshot: Option<SnapshotSpec>,
     snapshot_id: String,
     resuming: bool,
@@ -715,7 +739,8 @@ impl DaytonaSandboxSession {
             started: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
             released: tokio::sync::Mutex::new(false),
-            ptys: PtyRegistry::default(),
+            ptys: RemotePtyManager::new(),
+            pty_handles: Mutex::new(HashMap::new()),
             snapshot,
             resuming: false,
         }
@@ -742,7 +767,7 @@ impl DaytonaSandboxSession {
     fn authorize(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         let mut builder = builder
             .bearer_auth(&self.api_key)
-            .header("X-Daytona-Source", "openai-agents-sdk-rust");
+            .header("X-Daytona-Source", DAYTONA_SOURCE);
         if let Some(organization_id) = self.options.resolved_organization_id() {
             builder = builder.header("X-Daytona-Organization-ID", organization_id);
         }
@@ -829,6 +854,16 @@ impl DaytonaSandboxSession {
         }
     }
 
+    /// The environment one command runs with: the session's, then the request's own.
+    ///
+    /// The session environment is the client options' plus the manifest's, which is what Python
+    /// passes per command; `ExecRequest::env` then overrides individual names.
+    fn request_envs(&self, request: &ExecRequest) -> BTreeMap<String, String> {
+        let mut envs = self.command_envs();
+        envs.extend(request.env.iter().map(|(k, v)| (k.clone(), v.clone())));
+        envs
+    }
+
     /// The environment every command runs with.
     fn command_envs(&self) -> BTreeMap<String, String> {
         let mut envs = self.options.env_vars.clone();
@@ -838,28 +873,27 @@ impl DaytonaSandboxSession {
         envs
     }
 
-    /// Wrap `argv` as a shell command that enters `cwd` and exports the manifest environment.
+    /// Wrap `argv` as a shell command that enters `cwd` and exports `envs`.
     ///
     /// Mirrors Python's `DaytonaSandboxSession._exec_internal`: the toolbox API takes one command
-    /// string, with no separate working directory or environment.
-    fn session_command(&self, argv: &[String], cwd: &str) -> String {
+    /// string, with no separate working directory or environment, so both are expressed in the
+    /// command itself.
+    fn session_command(
+        &self,
+        argv: &[String],
+        cwd: &str,
+        envs: &BTreeMap<String, String>,
+    ) -> String {
         let joined = argv
             .iter()
             .map(|arg| shell_quote(arg))
             .collect::<Vec<_>>()
             .join(" ");
-        let envs = self.command_envs();
-        let env_prefix = if envs.is_empty() {
-            String::new()
-        } else {
-            let assignments = envs
-                .iter()
-                .map(|(key, value)| shell_quote(&format!("{key}={value}")))
-                .collect::<Vec<_>>()
-                .join(" ");
-            format!("env -- {assignments} ")
-        };
-        format!("cd {} && {env_prefix}{joined}", shell_quote(cwd))
+        format!(
+            "cd {} && {}{joined}",
+            shell_quote(cwd),
+            env_command_prefix(envs)
+        )
     }
 
     /// Resolve the working directory of a request, defaulting to the workspace root.
@@ -902,11 +936,12 @@ impl DaytonaSandboxSession {
         &self,
         argv: Vec<String>,
         cwd: String,
+        envs: &BTreeMap<String, String>,
         timeout: Option<Duration>,
     ) -> SandboxResult<ExecResult> {
         let what = "run a command in the Daytona sandbox";
         let toolbox_session = format!("sandbox-{}", uuid::Uuid::new_v4().simple());
-        let command = self.session_command(&argv, &cwd);
+        let command = self.session_command(&argv, &cwd, envs);
         let budget = timeout.unwrap_or(self.options.timeouts.exec_unbounded);
         let run = async {
             self.create_toolbox_session(&toolbox_session).await?;
@@ -931,60 +966,6 @@ impl DaytonaSandboxSession {
         };
         self.delete_toolbox_session(&toolbox_session).await;
         result
-    }
-
-    /// Fetch the combined log of one session command.
-    async fn command_logs(
-        &self,
-        toolbox_session: &str,
-        command_id: &str,
-    ) -> SandboxResult<Vec<u8>> {
-        let what = "read Daytona command logs";
-        let response = self
-            .authorize(self.http.get(self.toolbox(&format!(
-                "/process/session/{toolbox_session}/command/{command_id}/logs"
-            ))))
-            .send()
-            .await
-            .map_err(|e| transport(what, e))?;
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(http_error(
-                ErrorCode::ExecTransportError,
-                what,
-                status,
-                &body,
-            ));
-        }
-        Ok(response
-            .bytes()
-            .await
-            .map_err(|e| transport(what, e))?
-            .to_vec())
-    }
-
-    /// Fetch the exit code of one session command, once it has one.
-    async fn command_exit_code(
-        &self,
-        toolbox_session: &str,
-        command_id: &str,
-    ) -> SandboxResult<Option<i32>> {
-        let what = "read a Daytona command status";
-        let response = self
-            .authorize(self.http.get(self.toolbox(&format!(
-                "/process/session/{toolbox_session}/command/{command_id}"
-            ))))
-            .send()
-            .await
-            .map_err(|e| transport(what, e))?;
-        #[derive(Deserialize)]
-        struct Command {
-            #[serde(rename = "exitCode", default)]
-            exit_code: Option<i32>,
-        }
-        let command: Command = parse_json(response, what).await?;
-        Ok(command.exit_code)
     }
 
     /// Download a file by its absolute sandbox path.
@@ -1192,6 +1173,10 @@ impl SandboxSession for DaytonaSandboxSession {
         BACKEND_ID
     }
 
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
+    }
+
     async fn start(&self) -> SandboxResult<()> {
         let root = self.manifest.root().to_string();
         // The toolbox uses the workspace root as the working directory of every command, so it
@@ -1200,6 +1185,7 @@ impl SandboxSession for DaytonaSandboxSession {
             .exec_in_session(
                 vec!["mkdir".into(), "-p".into(), "--".into(), root.clone()],
                 "/".to_string(),
+                &self.command_envs(),
                 Some(self.options.timeouts.fast_op),
             )
             .await?;
@@ -1266,7 +1252,8 @@ impl SandboxSession for DaytonaSandboxSession {
     async fn exec(&self, request: ExecRequest) -> SandboxResult<ExecResult> {
         let cwd = self.resolve_cwd(&request.cwd)?;
         // Daytona has no user parameter, so the `sudo -u` wrapper stays in the command.
-        self.exec_in_session(request.resolved_argv(), cwd, request.timeout)
+        let envs = self.request_envs(&request);
+        self.exec_in_session(request.resolved_argv(), cwd, &envs, request.timeout)
             .await
     }
 
@@ -1342,66 +1329,79 @@ impl SandboxSession for DaytonaSandboxSession {
     async fn pty_exec_start(&self, request: PtyExecRequest) -> SandboxResult<PtyExecUpdate> {
         let cwd = self.resolve_cwd(&request.cwd)?;
         let argv = request.resolved_argv();
-        let command = self.session_command(&argv, &cwd);
-        let toolbox_session = format!("pty-{}", uuid::Uuid::new_v4().simple());
-        self.create_toolbox_session(&toolbox_session).await?;
-        let what = "start an interactive process in the Daytona sandbox";
-        let response = self
-            .authorize(
-                self.http
-                    .post(self.toolbox(&format!("/process/session/{toolbox_session}/exec"))),
-            )
-            .json(&json!({ "command": command, "runAsync": true }))
-            .send()
-            .await
-            .map_err(|e| transport(what, e))?;
-        #[derive(Deserialize)]
-        struct Started {
-            #[serde(rename = "cmdId")]
-            cmd_id: String,
+        // Python only opens the PTY websocket when the model asked for a writable terminal; a
+        // read-only interactive process goes through the session log stream instead.
+        if request.tty {
+            self.start_terminal(&argv, &cwd, &request).await
+        } else {
+            self.start_logged_command(&argv, &cwd, &request).await
         }
-        let started: Started = match parse_json(response, what).await {
-            Ok(started) => started,
-            Err(error) => {
-                self.delete_toolbox_session(&toolbox_session).await;
-                return Err(error);
-            }
-        };
-        let process = self
-            .ptys
-            .insert(toolbox_session.clone(), started.cmd_id.clone())?;
-        Ok(self
-            .poll_pty(&process, request.yield_time_ms, request.max_output_tokens)
-            .await)
     }
 
     async fn pty_write_stdin(&self, request: PtyWriteRequest) -> SandboxResult<PtyExecUpdate> {
         let process = self.ptys.get(request.session_id)?;
         if !request.chars.is_empty() {
-            let what = "write to an interactive process in the Daytona sandbox";
-            let response = self
-                .authorize(self.http.post(self.toolbox(&format!(
-                    "/process/session/{}/command/{}/input",
-                    process.toolbox_session, process.command_id
-                ))))
-                .json(&json!({ "data": request.chars }))
-                .send()
-                .await
-                .map_err(|e| transport(what, e))?;
-            expect_success(response, what, ErrorCode::ExecTransportError).await?;
+            let handle = self.pty_handle(request.session_id).ok_or_else(|| {
+                SandboxError::new(
+                    ErrorCode::PtySessionNotFound,
+                    format!("PTY session `{}` is not running", request.session_id),
+                )
+            })?;
+            match handle.as_ref() {
+                DaytonaPtyHandle::Terminal { input, .. } => {
+                    input.send(request.chars.as_bytes().to_vec()).map_err(|_| {
+                        SandboxError::new(
+                            ErrorCode::PtySessionNotFound,
+                            format!(
+                                "PTY session `{}` is no longer connected",
+                                request.session_id
+                            ),
+                        )
+                    })?;
+                    // The daemon echoes through the PTY; give it a moment, as Python does.
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                DaytonaPtyHandle::Logged {
+                    toolbox_session,
+                    command_id,
+                } => {
+                    // Python raises for a process started without a terminal; only the websocket
+                    // path has a real stdin.
+                    if !process.tty() {
+                        return Err(SandboxError::new(
+                            ErrorCode::PtyStdinUnavailable,
+                            format!(
+                                "PTY session `{}` was not started with a TTY, so it has no stdin",
+                                request.session_id
+                            ),
+                        ));
+                    }
+                    let what = "write to an interactive process in the Daytona sandbox";
+                    let response = self
+                        .authorize(self.http.post(self.toolbox(&format!(
+                            "/process/session/{toolbox_session}/command/{command_id}/input"
+                        ))))
+                        .json(&json!({ "data": request.chars }))
+                        .send()
+                        .await
+                        .map_err(|e| transport(what, e))?;
+                    expect_success(response, what, ErrorCode::ExecTransportError).await?;
+                }
+            }
         }
         let yield_time_ms =
             resolve_pty_write_yield_time_ms(request.yield_time_ms, request.chars.is_empty());
-        Ok(self
-            .poll_pty(&process, yield_time_ms, request.max_output_tokens)
-            .await)
+        let update = process
+            .collect(yield_time_ms, request.max_output_tokens)
+            .await;
+        self.forget_finished_pty(&update, process.id()).await;
+        Ok(update)
     }
 
     async fn pty_terminate_all(&self) -> SandboxResult<()> {
-        // Deleting the toolbox session terminates the commands running in it, which is the only
-        // teardown the toolbox API exposes.
-        for process in self.ptys.terminate_all() {
-            self.delete_toolbox_session(&process.toolbox_session).await;
+        for process in self.ptys.take_all() {
+            process.close(None);
+            self.release_pty(process.id()).await;
         }
         Ok(())
     }
@@ -1423,13 +1423,16 @@ impl SandboxSession for DaytonaSandboxSession {
 
     async fn persist_workspace(&self) -> SandboxResult<Vec<u8>> {
         let root = self.manifest.root().to_string();
-        let archive_path = format!("/tmp/openai-agents-{}.tar.gz", self.session_id);
+        let archive_path = self.resolve_internal_path(&provider_scratch_path(&format!(
+            "{}.tar.gz",
+            self.session_id
+        )))?;
         let mut command = format!(
             "tar -czf {archive} -C {root}",
             archive = shell_quote(&archive_path),
             root = shell_quote(&root),
         );
-        for exclude in workspace_excludes(&self.manifest, &root) {
+        for exclude in workspace_archive_excludes(&self.manifest, &root) {
             command.push_str(&format!(" --exclude {}", shell_quote(&exclude)));
         }
         command.push_str(" .");
@@ -1438,6 +1441,7 @@ impl SandboxSession for DaytonaSandboxSession {
             .exec_in_session(
                 vec!["sh".into(), "-lc".into(), command],
                 root.clone(),
+                &self.command_envs(),
                 Some(self.options.timeouts.workspace_tar),
             )
             .await?;
@@ -1465,7 +1469,10 @@ impl SandboxSession for DaytonaSandboxSession {
 
     async fn hydrate_workspace(&self, archive: &[u8]) -> SandboxResult<()> {
         let root = self.manifest.root().to_string();
-        let archive_path = format!("/tmp/openai-agents-{}.tar.gz", self.session_id);
+        let archive_path = self.resolve_internal_path(&provider_scratch_path(&format!(
+            "{}.tar.gz",
+            self.session_id
+        )))?;
         self.upload_at(&archive_path, archive).await?;
         let script = format!(
             "mkdir -p {root} && tar -xzf {archive} -C {root}",
@@ -1476,6 +1483,7 @@ impl SandboxSession for DaytonaSandboxSession {
             .exec_in_session(
                 vec!["sh".into(), "-lc".into(), script],
                 "/".to_string(),
+                &self.command_envs(),
                 Some(self.options.timeouts.workspace_tar),
             )
             .await;
@@ -1495,69 +1503,453 @@ impl SandboxSession for DaytonaSandboxSession {
 }
 
 impl DaytonaSandboxSession {
-    /// Collect interactive output until the yield window elapses or the command finishes.
+    /// The provider handle behind one PTY session.
+    fn pty_handle(&self, session_id: u32) -> Option<Arc<DaytonaPtyHandle>> {
+        self.pty_handles
+            .lock()
+            .expect("poisoned")
+            .get(&session_id)
+            .cloned()
+    }
+
+    /// Drop the bookkeeping of a session whose command has exited.
+    async fn forget_finished_pty(&self, update: &PtyExecUpdate, session_id: u32) {
+        if update.process_id.is_none() {
+            self.ptys.remove(session_id);
+            self.release_pty(session_id).await;
+        }
+    }
+
+    /// Release the provider-side resources behind one PTY session.
+    async fn release_pty(&self, session_id: u32) {
+        let handle = self
+            .pty_handles
+            .lock()
+            .expect("poisoned")
+            .remove(&session_id);
+        match handle.as_deref() {
+            Some(DaytonaPtyHandle::Terminal { pty_session, .. }) => {
+                self.kill_pty_session(pty_session).await
+            }
+            // Deleting the toolbox session terminates the commands running in it, which is the
+            // only command teardown the toolbox API exposes.
+            Some(DaytonaPtyHandle::Logged {
+                toolbox_session, ..
+            }) => self.delete_toolbox_session(toolbox_session).await,
+            None => {}
+        }
+    }
+
+    /// Release the sessions the registry pruned to make room.
+    async fn release_pruned(&self, pruned: &[Arc<RemotePtyProcess>]) {
+        for process in pruned {
+            process.close(None);
+            self.release_pty(process.id()).await;
+        }
+    }
+
+    /// Start an interactive command as an asynchronous toolbox session command.
     ///
-    /// The toolbox log endpoint always returns the whole log, so the process entry remembers how
-    /// much of it the model has already seen.
-    async fn poll_pty(
+    /// The command's output is read back from the session log endpoint, which is how a
+    /// non-writable interactive process works in Python too.
+    async fn start_logged_command(
         &self,
-        process: &Arc<PtyProcess>,
-        yield_time_ms: u64,
-        max_output_tokens: Option<usize>,
-    ) -> PtyExecUpdate {
-        let deadline =
-            Instant::now() + Duration::from_millis(clamp_pty_yield_time_ms(yield_time_ms));
-        let mut output = Vec::new();
-        let mut finished = false;
-        loop {
-            if let Ok(log) = self
-                .command_logs(&process.toolbox_session, &process.command_id)
-                .await
-            {
-                output.extend(process.advance(&log));
+        argv: &[String],
+        cwd: &str,
+        request: &PtyExecRequest,
+    ) -> SandboxResult<PtyExecUpdate> {
+        let command = self.session_command(argv, cwd, &self.command_envs());
+        let toolbox_session = format!("pty-{}", uuid::Uuid::new_v4().simple());
+        self.create_toolbox_session(&toolbox_session).await?;
+        let what = "start an interactive process in the Daytona sandbox";
+        let response = self
+            .authorize(
+                self.http
+                    .post(self.toolbox(&format!("/process/session/{toolbox_session}/exec"))),
+            )
+            .json(&json!({ "command": command, "runAsync": true }))
+            .send()
+            .await
+            .map_err(|e| transport(what, e))?;
+        #[derive(Deserialize)]
+        struct Started {
+            #[serde(rename = "cmdId")]
+            cmd_id: String,
+        }
+        let started: Started = match parse_json(response, what).await {
+            Ok(started) => started,
+            Err(error) => {
+                self.delete_toolbox_session(&toolbox_session).await;
+                return Err(error);
             }
-            if let Ok(Some(exit_code)) = self
-                .command_exit_code(&process.toolbox_session, &process.command_id)
-                .await
-            {
-                *process.exit_code.lock().expect("poisoned") = Some(exit_code);
-                finished = true;
-                // One last read, so output written just before the exit is not dropped.
-                if let Ok(log) = self
-                    .command_logs(&process.toolbox_session, &process.command_id)
-                    .await
-                {
-                    output.extend(process.advance(&log));
+        };
+        let (process, pruned) = self.ptys.register(false)?;
+        self.release_pruned(&pruned).await;
+        self.pty_handles.lock().expect("poisoned").insert(
+            process.id(),
+            Arc::new(DaytonaPtyHandle::Logged {
+                toolbox_session: toolbox_session.clone(),
+                command_id: started.cmd_id.clone(),
+            }),
+        );
+        self.spawn_log_poller(process.clone(), toolbox_session, started.cmd_id);
+        let update = process
+            .collect(request.yield_time_ms, request.max_output_tokens)
+            .await;
+        self.forget_finished_pty(&update, process.id()).await;
+        Ok(update)
+    }
+
+    /// Poll a session command's log into `process` until the command exits.
+    ///
+    /// The log endpoint always returns the whole log, so the task remembers how much of it it
+    /// has already delivered.
+    fn spawn_log_poller(
+        &self,
+        process: Arc<RemotePtyProcess>,
+        toolbox_session: String,
+        command_id: String,
+    ) {
+        let http = self.http.clone();
+        let api_key = self.api_key.clone();
+        let organization_id = self.options.resolved_organization_id();
+        let toolbox_base = self.toolbox_base.read().expect("poisoned").clone();
+        let interval = self.options.state_poll_interval;
+        tokio::spawn(async move {
+            let authorize = |builder: reqwest::RequestBuilder| {
+                let mut builder = builder
+                    .bearer_auth(&api_key)
+                    .header("X-Daytona-Source", DAYTONA_SOURCE);
+                if let Some(organization_id) = &organization_id {
+                    builder = builder.header("X-Daytona-Organization-ID", organization_id);
                 }
+                builder
+            };
+            let logs_url = format!(
+                "{toolbox_base}/process/session/{toolbox_session}/command/{command_id}/logs"
+            );
+            let status_url =
+                format!("{toolbox_base}/process/session/{toolbox_session}/command/{command_id}");
+            let mut delivered = 0usize;
+            while !process.is_done() {
+                if let Ok(response) = authorize(http.get(&logs_url)).send().await
+                    && response.status().is_success()
+                    && let Ok(body) = response.bytes().await
+                    && body.len() > delivered
+                {
+                    process.push_output(&body[delivered..]);
+                    delivered = body.len();
+                }
+                let exit_code = match authorize(http.get(&status_url)).send().await {
+                    Ok(response) if response.status().is_success() => response
+                        .json::<Value>()
+                        .await
+                        .ok()
+                        .and_then(|value| value.get("exitCode").and_then(Value::as_i64))
+                        .map(|code| code as i32),
+                    _ => None,
+                };
+                if let Some(exit_code) = exit_code {
+                    // One last read, so output written just before the exit is not dropped.
+                    if let Ok(response) = authorize(http.get(&logs_url)).send().await
+                        && response.status().is_success()
+                        && let Ok(body) = response.bytes().await
+                        && body.len() > delivered
+                    {
+                        process.push_output(&body[delivered..]);
+                    }
+                    process.close(Some(exit_code));
+                    return;
+                }
+                tokio::time::sleep(interval).await;
+            }
+        });
+    }
+
+    /// Start a writable terminal over the toolbox PTY websocket.
+    ///
+    /// Mirrors the vendor SDK's `create_pty_session`: one `create-connect` upgrade carries the
+    /// session id and terminal size as query parameters and the environment as a WebSocket
+    /// subprotocol token, so neither secrets nor large values land in a URL or an access log.
+    async fn start_terminal(
+        &self,
+        argv: &[String],
+        cwd: &str,
+        request: &PtyExecRequest,
+    ) -> SandboxResult<PtyExecUpdate> {
+        let requested_session = format!("pty-{}", uuid::Uuid::new_v4().simple());
+        let (process, pruned) = self.ptys.register(true)?;
+        self.release_pruned(&pruned).await;
+        let connected = match self
+            .connect_terminal(&process, &requested_session, cwd)
+            .await
+        {
+            Ok(connected) => connected,
+            Err(error) => {
+                self.ptys.remove(process.id());
+                self.kill_pty_session(&requested_session).await;
+                return Err(error);
+            }
+        };
+        // A fallback connection runs under a different id than the one first requested.
+        let pty_session = connected.pty_session.clone();
+        self.pty_handles.lock().expect("poisoned").insert(
+            process.id(),
+            Arc::new(DaytonaPtyHandle::Terminal {
+                pty_session: pty_session.clone(),
+                input: connected.input.clone(),
+            }),
+        );
+        // The terminal runs a shell; the command reaches it as a typed line, as in Python.
+        let joined = argv
+            .iter()
+            .map(|arg| shell_quote(arg))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let line = if connected.envs_delivered {
+            format!("{joined}\n")
+        } else {
+            // The handshake could not carry the environment, so it is exported on the typed
+            // line the same way the non-terminal path exports it.
+            format!("{}{joined}\n", env_command_prefix(&self.command_envs()))
+        };
+        if connected.input.send(line.into_bytes()).is_err() {
+            self.ptys.remove(process.id());
+            self.release_pty(process.id()).await;
+            return Err(SandboxError::new(
+                ErrorCode::ExecTransportError,
+                format!("the Daytona PTY session `{pty_session}` closed before it could be used"),
+            ));
+        }
+        let update = process
+            .collect(request.yield_time_ms, request.max_output_tokens)
+            .await;
+        self.forget_finished_pty(&update, process.id()).await;
+        Ok(update)
+    }
+
+    /// Open the PTY websocket and pump it into `process`.
+    ///
+    /// The vendor SDK sends the sandbox environment as a WebSocket subprotocol token, but
+    /// RFC 6455 lets a server accept an upgrade without selecting a subprotocol, and
+    /// `tungstenite` then fails the connection where `aiohttp` (which the vendor SDK uses) does
+    /// not. When that happens the connection is retried without subprotocols and the caller
+    /// passes the environment on the typed command line instead.
+    async fn connect_terminal(
+        &self,
+        process: &Arc<RemotePtyProcess>,
+        pty_session: &str,
+        cwd: &str,
+    ) -> SandboxResult<ConnectedTerminal> {
+        let envs = self.command_envs();
+        let mut protocols = vec![PTY_EXIT_CONTROL_SUBPROTOCOL.to_string()];
+        if !envs.is_empty() {
+            let encoded =
+                BASE64_URL_SAFE_NO_PAD.encode(serde_json::to_vec(&envs).expect("serializable"));
+            protocols.push(format!("{PTY_ENVS_SUBPROTOCOL_PREFIX}{encoded}"));
+        }
+        let mut pty_session = pty_session.to_string();
+        let mut envs_delivered = !envs.is_empty();
+        let stream = match self
+            .open_pty_socket(&pty_session, cwd, Some(&protocols))
+            .await
+        {
+            Ok(stream) => stream,
+            Err(TerminalConnectError::NoSubProtocol) => {
+                // The upgrade already returned 101, so the daemon has created this PTY session
+                // and started its shell. Reusing the id would be rejected and would orphan that
+                // shell, so it is killed and the retry gets a fresh one.
+                self.kill_pty_session(&pty_session).await;
+                pty_session = format!("pty-{}", uuid::Uuid::new_v4().simple());
+                envs_delivered = false;
+                self.open_pty_socket(&pty_session, cwd, None)
+                    .await
+                    .map_err(TerminalConnectError::into_sandbox_error)?
+            }
+            Err(error) => return Err(error.into_sandbox_error()),
+        };
+        let (sink, source) = stream.split();
+
+        let handshake = Arc::new(TerminalHandshake::default());
+        let (input_tx, input_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        spawn_terminal_reader(process.clone(), handshake.clone(), source);
+        spawn_terminal_writer(sink, input_rx);
+
+        // The daemon acknowledges with a `connected` control frame, or reports `exited` when the
+        // shell is already gone.
+        let deadline = Instant::now() + PTY_CONNECT_TIMEOUT;
+        while !handshake.settled.load(Ordering::SeqCst) {
+            if process.is_done() {
                 break;
             }
-            let now = Instant::now();
-            if now >= deadline {
-                break;
+            if Instant::now() >= deadline {
+                return Err(SandboxError::new(
+                    ErrorCode::ExecTransportError,
+                    format!("the Daytona PTY session `{pty_session}` did not connect in time"),
+                ));
             }
-            let notified = process.notify.notified();
-            let wait = (deadline - now).min(self.options.state_poll_interval);
-            let _ = tokio::time::timeout(wait, notified).await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        process.touch();
-        if finished {
-            self.ptys.remove(process.id);
-            self.delete_toolbox_session(&process.toolbox_session).await;
+        // The daemon reports a refused session as a control frame rather than a close.
+        if let Some(message) = handshake.error.lock().expect("poisoned").clone() {
+            return Err(SandboxError::new(
+                ErrorCode::ExecTransportError,
+                format!("the PTY session `{pty_session}` failed to start: {message}"),
+            ));
         }
-        let text = String::from_utf8_lossy(&output).into_owned();
-        let (text, original_token_count) = truncate_text_by_tokens(&text, max_output_tokens);
-        PtyExecUpdate {
-            process_id: (!finished).then_some(process.id),
-            output: text.into_bytes(),
-            exit_code: *process.exit_code.lock().expect("poisoned"),
-            original_token_count,
+        Ok(ConnectedTerminal {
+            pty_session,
+            input: input_tx,
+            envs_delivered,
+        })
+    }
+
+    /// Open one PTY websocket, with or without the vendor's subprotocol tokens.
+    async fn open_pty_socket(
+        &self,
+        pty_session: &str,
+        cwd: &str,
+        protocols: Option<&[String]>,
+    ) -> Result<
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        TerminalConnectError,
+    > {
+        let mut url = reqwest::Url::parse(&self.toolbox("/process/pty/create-connect"))
+            .map_err(|e| TerminalConnectError::Other(e.to_string()))?;
+        {
+            let mut query = url.query_pairs_mut();
+            query.append_pair("id", pty_session);
+            query.append_pair("cols", &PTY_TERMINAL_COLS.to_string());
+            query.append_pair("rows", &PTY_TERMINAL_ROWS.to_string());
+            if !cwd.is_empty() {
+                query.append_pair("cwd", cwd);
+            }
         }
+        // The toolbox base is an HTTP URL; the websocket lives on the same host and path.
+        let ws_url = url.as_str().replacen("http", "ws", 1);
+        let mut request = ws_url
+            .as_str()
+            .into_client_request()
+            .map_err(|e| TerminalConnectError::Other(e.to_string()))?;
+        self.apply_ws_headers(request.headers_mut(), protocols)
+            .map_err(|error| TerminalConnectError::Other(error.message))?;
+
+        crate::util::ensure_crypto_provider();
+        match tokio_tungstenite::connect_async(request).await {
+            Ok((stream, _response)) => Ok(stream),
+            Err(error) if is_no_subprotocol_error(&error) => {
+                Err(TerminalConnectError::NoSubProtocol)
+            }
+            Err(error) => Err(TerminalConnectError::Other(error.to_string())),
+        }
+    }
+
+    /// Attach the REST credentials, and optionally the subprotocols, to a websocket handshake.
+    fn apply_ws_headers(
+        &self,
+        headers: &mut tokio_tungstenite::tungstenite::http::HeaderMap,
+        protocols: Option<&[String]>,
+    ) -> SandboxResult<()> {
+        let bearer = HeaderValue::from_str(&format!("Bearer {}", self.api_key)).map_err(|_| {
+            SandboxError::new(
+                ErrorCode::SandboxConfigInvalid,
+                "the Daytona API key contains characters that cannot be sent in a header",
+            )
+        })?;
+        headers.insert(HeaderName::from_static("authorization"), bearer);
+        headers.insert(
+            HeaderName::from_static("x-daytona-source"),
+            HeaderValue::from_static(DAYTONA_SOURCE),
+        );
+        if let Some(organization_id) = self.options.resolved_organization_id()
+            && let Ok(value) = HeaderValue::from_str(&organization_id)
+        {
+            headers.insert(HeaderName::from_static("x-daytona-organization-id"), value);
+        }
+        if let Some(protocols) = protocols {
+            let protocol = HeaderValue::from_str(&protocols.join(", ")).map_err(|_| {
+                SandboxError::new(
+                    ErrorCode::SandboxConfigInvalid,
+                    "a sandbox environment variable cannot be encoded for the PTY handshake",
+                )
+            })?;
+            headers.insert(HeaderName::from_static("sec-websocket-protocol"), protocol);
+        }
+        Ok(())
+    }
+
+    /// Resize the terminal behind one PTY session.
+    ///
+    /// Terminal sessions only; a logged command has no terminal to resize.
+    pub async fn resize_terminal(
+        &self,
+        session_id: u32,
+        cols: u16,
+        rows: u16,
+    ) -> SandboxResult<()> {
+        let handle = self.pty_handle(session_id).ok_or_else(|| {
+            SandboxError::new(
+                ErrorCode::PtySessionNotFound,
+                format!("PTY session `{session_id}` is not running"),
+            )
+        })?;
+        let DaytonaPtyHandle::Terminal { pty_session, .. } = handle.as_ref() else {
+            return Err(SandboxError::new(
+                ErrorCode::PtyStdinUnavailable,
+                format!("PTY session `{session_id}` is not a writable terminal"),
+            ));
+        };
+        let what = "resize the Daytona PTY session";
+        let response = self
+            .authorize(
+                self.http
+                    .post(self.toolbox(&format!("/process/pty/{pty_session}/resize"))),
+            )
+            .json(&json!({ "cols": cols, "rows": rows }))
+            .send()
+            .await
+            .map_err(|e| transport(what, e))?;
+        expect_success(response, what, ErrorCode::ExecTransportError).await
+    }
+
+    /// Kill a PTY session, best effort.
+    async fn kill_pty_session(&self, pty_session: &str) {
+        let request = self
+            .authorize(
+                self.http
+                    .delete(self.toolbox(&format!("/process/pty/{pty_session}"))),
+            )
+            .send();
+        let _ = tokio::time::timeout(self.options.timeouts.cleanup, request).await;
     }
 }
 
 // -------------------------------------------------------------------------------------------
 // Cloud bucket mounts
 // -------------------------------------------------------------------------------------------
+
+/// Refuse a mount on any backend other than Daytona.
+///
+/// Mirrors Python's `_assert_daytona_session`: the strategy's preflight assumes this
+/// provider's image and its privilege model, so running it elsewhere would be guesswork.
+fn assert_daytona_session(session: &dyn SandboxSession) -> SandboxResult<()> {
+    let matches = session
+        .as_any()
+        .is_some_and(|any| any.is::<DaytonaSandboxSession>());
+    if !matches {
+        return Err(SandboxError::new(
+            ErrorCode::MountConfigInvalid,
+            format!(
+                "a Daytona cloud bucket mount requires a Daytona sandbox session, not the \
+                 `{}` backend",
+                session.backend_id()
+            ),
+        ));
+    }
+    Ok(())
+}
 
 /// Mounts rclone-backed cloud storage inside a Daytona sandbox. Mirrors
 /// `agents.extensions.sandbox.daytona.mounts.DaytonaCloudBucketMountStrategy`.
@@ -1572,6 +1964,8 @@ pub struct DaytonaCloudBucketMountStrategy {
     pub pattern: RcloneMountPattern,
     /// The secret-bearing rclone configuration and the remote selection options.
     pub config: MountPatternConfig,
+    /// Whether a missing `rclone` (or `fuse3`) may be installed into the sandbox.
+    pub install_tools: bool,
 }
 
 impl DaytonaCloudBucketMountStrategy {
@@ -1583,16 +1977,23 @@ impl DaytonaCloudBucketMountStrategy {
     ) -> Self {
         DaytonaCloudBucketMountStrategy {
             pattern: RcloneMountPattern::new(),
+            install_tools: true,
             config: MountPatternConfig::new()
                 .with_config_text(config_text)
-                .with_option(rclone::OPTION_REMOTE_NAME, remote_name)
-                .with_option(rclone::OPTION_REMOTE_PATH, remote_path),
+                .with_option(RCLONE_OPTION_REMOTE_NAME, remote_name)
+                .with_option(RCLONE_OPTION_REMOTE_PATH, remote_path),
         }
     }
 
     /// Replace the rclone pattern.
     pub fn with_pattern(mut self, pattern: RcloneMountPattern) -> Self {
         self.pattern = pattern;
+        self
+    }
+
+    /// Whether a missing `rclone` (or `fuse3`) may be installed into the sandbox.
+    pub fn with_install_tools(mut self, install_tools: bool) -> Self {
+        self.install_tools = install_tools;
         self
     }
 
@@ -1604,17 +2005,32 @@ impl DaytonaCloudBucketMountStrategy {
     fn delegate(&self, mount: &Mount) -> InContainerMountStrategy {
         let mut config = self.config.clone();
         config.options.insert(
-            rclone::OPTION_READ_ONLY.to_string(),
+            RCLONE_OPTION_READ_ONLY.to_string(),
             mount.read_only.to_string(),
         );
-        InContainerMountStrategy::new(Arc::new(self.pattern.clone()), config)
+        InContainerMountStrategy::new(Arc::new(self.fuse_pattern()), config)
+    }
+
+    /// The pattern with the flags this provider's images need.
+    ///
+    /// Mirrors Python's `rclone_pattern_for_session`: a FUSE mount is made readable by the
+    /// sandbox's command user, which is not the root user the mount command runs as.
+    fn fuse_pattern(&self) -> RcloneMountPattern {
+        if self.pattern.mode != RcloneMountMode::Fuse {
+            return self.pattern.clone();
+        }
+        let mut pattern = self.pattern.clone();
+        if !pattern.extra_args.iter().any(|arg| arg == "--allow-other") {
+            pattern.extra_args.push("--allow-other".to_string());
+        }
+        pattern
     }
 
     async fn preflight(&self, session: &dyn SandboxSession) -> SandboxResult<()> {
         if self.pattern.mode == RcloneMountMode::Fuse {
-            ensure_fuse_support(session, self.pattern.install_if_missing).await?;
+            ensure_fuse_support(session, self.install_tools).await?;
         }
-        ensure_rclone(session, self.pattern.install_if_missing).await
+        ensure_rclone(session, self.install_tools).await
     }
 }
 
@@ -1642,6 +2058,7 @@ impl MountStrategy for DaytonaCloudBucketMountStrategy {
         session: &dyn SandboxSession,
         mount_path: &str,
     ) -> SandboxResult<()> {
+        assert_daytona_session(session)?;
         session.authorize_mount_activation(mount, mount_path)?;
         self.preflight(session).await?;
         self.delegate(mount)
@@ -1655,6 +2072,7 @@ impl MountStrategy for DaytonaCloudBucketMountStrategy {
         session: &dyn SandboxSession,
         mount_path: &str,
     ) -> SandboxResult<()> {
+        assert_daytona_session(session)?;
         self.delegate(mount)
             .deactivate(mount, session, mount_path)
             .await
@@ -1666,6 +2084,7 @@ impl MountStrategy for DaytonaCloudBucketMountStrategy {
         session: &dyn SandboxSession,
         mount_path: &str,
     ) -> SandboxResult<()> {
+        assert_daytona_session(session)?;
         session.authorize_mount_activation(mount, mount_path)?;
         self.preflight(session).await?;
         self.delegate(mount)
@@ -1678,114 +2097,245 @@ impl MountStrategy for DaytonaCloudBucketMountStrategy {
 // Interactive process bookkeeping
 // -------------------------------------------------------------------------------------------
 
-/// One asynchronous toolbox command the model drives interactively.
-struct PtyProcess {
-    id: u32,
-    toolbox_session: String,
-    command_id: String,
-    delivered: Mutex<usize>,
-    exit_code: Mutex<Option<i32>>,
-    notify: Notify,
-    last_used: Mutex<Instant>,
-}
-
-impl PtyProcess {
-    fn touch(&self) {
-        *self.last_used.lock().expect("poisoned") = Instant::now();
-    }
-
-    /// The part of `log` the model has not seen yet.
-    fn advance(&self, log: &[u8]) -> Vec<u8> {
-        let mut delivered = self.delivered.lock().expect("poisoned");
-        if log.len() <= *delivered {
-            return Vec::new();
-        }
-        let fresh = log[*delivered..].to_vec();
-        *delivered = log.len();
-        fresh
-    }
-}
-
-/// The live interactive commands of one session.
-#[derive(Default)]
-struct PtyRegistry {
-    processes: Mutex<HashMap<u32, Arc<PtyProcess>>>,
-}
-
-impl PtyRegistry {
-    fn insert(
-        &self,
+/// What the session needs to drive one interactive process.
+///
+/// The core [`RemotePtyManager`] owns the session id, the output window and the pruning; this is
+/// the provider-side half it knows nothing about.
+#[derive(Debug)]
+enum DaytonaPtyHandle {
+    /// A writable terminal on the toolbox PTY websocket.
+    Terminal {
+        /// The PTY session id the toolbox knows it by.
+        pty_session: String,
+        /// Sends bytes to the websocket writer task.
+        input: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+    },
+    /// An asynchronous session command, read back from the log endpoint.
+    Logged {
+        /// The toolbox session holding the command.
         toolbox_session: String,
+        /// The command inside that session.
         command_id: String,
-    ) -> SandboxResult<Arc<PtyProcess>> {
-        let mut processes = self.processes.lock().expect("poisoned");
-        if processes.len() >= PTY_PROCESSES_MAX {
-            return Err(SandboxError::new(
-                ErrorCode::ExecTransportError,
-                format!("at most {PTY_PROCESSES_MAX} interactive processes may run per session"),
-            ));
-        }
-        let mut id = None;
-        for _ in 0..1024 {
-            let span = PTY_PROCESS_ID_MAX_EXCLUSIVE - PTY_PROCESS_ID_MIN;
-            let candidate =
-                PTY_PROCESS_ID_MIN + (uuid::Uuid::new_v4().as_u128() % span as u128) as u32;
-            if !processes.contains_key(&candidate) {
-                id = Some(candidate);
-                break;
+    },
+}
+
+/// The handshake state of a terminal, observed while the connection is being established.
+#[derive(Debug, Default)]
+struct TerminalHandshake {
+    /// Whether the daemon has answered, either by connecting or by refusing.
+    settled: AtomicBool,
+    /// The failure the daemon reported in a control frame, if any.
+    error: Mutex<Option<String>>,
+}
+
+/// A terminal whose websocket is open.
+struct ConnectedTerminal {
+    /// The PTY session id the connection actually used.
+    pty_session: String,
+    /// Sends bytes to the websocket writer task.
+    input: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+    /// Whether the handshake carried the sandbox environment.
+    envs_delivered: bool,
+}
+
+/// Why a PTY websocket could not be opened.
+enum TerminalConnectError {
+    /// The server accepted the upgrade without selecting a subprotocol.
+    NoSubProtocol,
+    /// Anything else.
+    Other(String),
+}
+
+impl TerminalConnectError {
+    fn into_sandbox_error(self) -> SandboxError {
+        let detail = match self {
+            TerminalConnectError::NoSubProtocol => {
+                "the server selected no websocket subprotocol".to_string()
+            }
+            TerminalConnectError::Other(detail) => detail,
+        };
+        SandboxError::new(
+            ErrorCode::ExecTransportError,
+            format!("Failed to open the Daytona PTY websocket: {detail}"),
+        )
+    }
+}
+
+/// Read the PTY websocket into `process` until it closes.
+fn spawn_terminal_reader<S>(
+    process: Arc<RemotePtyProcess>,
+    handshake: Arc<TerminalHandshake>,
+    source: S,
+) where
+    S: futures::Stream<
+            Item = Result<
+                tokio_tungstenite::tungstenite::Message,
+                tokio_tungstenite::tungstenite::Error,
+            >,
+        > + Send
+        + Unpin
+        + 'static,
+{
+    use tokio_tungstenite::tungstenite::Message;
+    tokio::spawn(async move {
+        let mut source = source;
+        let mut exit_code = None;
+        // The daemon encodes the exit code in the close frame, so the close reason matters.
+        let mut close_code = None;
+        let mut close_reason = None;
+        while let Some(message) = source.next().await {
+            match message {
+                Ok(Message::Text(text)) => {
+                    match parse_terminal_control(text.as_str()) {
+                        Some(control) => {
+                            handshake.settled.store(true, Ordering::SeqCst);
+                            if let Some(message) = control.error {
+                                *handshake.error.lock().expect("poisoned") = Some(message);
+                            }
+                            if let Some(code) = control.exit_code {
+                                exit_code = Some(code);
+                            }
+                        }
+                        // Anything that is not a control frame is terminal output.
+                        None => process.push_output(text.as_bytes()),
+                    }
+                }
+                Ok(Message::Binary(data)) => process.push_output(&data),
+                Ok(Message::Close(frame)) => {
+                    if let Some(frame) = frame {
+                        close_code = Some(u16::from(frame.code));
+                        let reason = frame.reason.to_string();
+                        if !reason.is_empty() {
+                            close_reason = Some(reason);
+                        }
+                    }
+                    break;
+                }
+                Ok(_) => {}
+                Err(_) => break,
             }
         }
-        let id = id.ok_or_else(|| {
-            SandboxError::new(
-                ErrorCode::ExecTransportError,
-                "could not allocate a free PTY session id",
-            )
-        })?;
-        let process = Arc::new(PtyProcess {
-            id,
-            toolbox_session,
-            command_id,
-            delivered: Mutex::new(0),
-            exit_code: Mutex::new(None),
-            notify: Notify::new(),
-            last_used: Mutex::new(Instant::now()),
-        });
-        processes.insert(id, process.clone());
-        Ok(process)
-    }
-
-    fn get(&self, id: u32) -> SandboxResult<Arc<PtyProcess>> {
-        self.processes
-            .lock()
-            .expect("poisoned")
-            .get(&id)
-            .cloned()
-            .ok_or_else(|| {
-                SandboxError::new(
-                    ErrorCode::PtySessionNotFound,
-                    format!("PTY session `{id}` is not running"),
-                )
-            })
-    }
-
-    fn remove(&self, id: u32) {
-        self.processes.lock().expect("poisoned").remove(&id);
-    }
-
-    fn terminate_all(&self) -> Vec<Arc<PtyProcess>> {
-        let mut processes = self.processes.lock().expect("poisoned");
-        let live = processes.values().cloned().collect();
-        for process in processes.values() {
-            process.notify.notify_waiters();
+        if exit_code.is_none() {
+            exit_code = close_frame_exit_code(close_code, close_reason.as_deref());
         }
-        processes.clear();
-        live
+        // A connection that drops without ever answering must not leave the connect wait hanging.
+        handshake.settled.store(true, Ordering::SeqCst);
+        process.close(exit_code);
+    });
+}
+
+/// One `{"type":"control"}` frame from the PTY daemon.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct TerminalControl {
+    /// The exit code, when the frame reports the shell exiting.
+    exit_code: Option<i32>,
+    /// The failure message, when the frame reports an error.
+    error: Option<String>,
+}
+
+/// Parse a PTY control frame; anything else is terminal output.
+fn parse_terminal_control(text: &str) -> Option<TerminalControl> {
+    let value = serde_json::from_str::<Value>(text).ok()?;
+    if value.get("type").and_then(Value::as_str) != Some("control") {
+        return None;
     }
+    let mut control = TerminalControl::default();
+    match value.get("status").and_then(Value::as_str) {
+        Some("exited") => {
+            control.exit_code = value
+                .get("exitCode")
+                .and_then(Value::as_i64)
+                .map(|code| code as i32);
+        }
+        Some("error") => {
+            control.error = Some(
+                value
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown connection error")
+                    .to_string(),
+            );
+        }
+        _ => {}
+    }
+    Some(control)
+}
+
+/// The exit code a websocket close frame carries.
+///
+/// The daemon encodes `{"exitCode": n}` in the close reason so the client needs no extra round
+/// trip; a clean close with no structured reason means the shell exited successfully.
+fn close_frame_exit_code(close_code: Option<u16>, close_reason: Option<&str>) -> Option<i32> {
+    if let Some(reason) = close_reason
+        && let Ok(value) = serde_json::from_str::<Value>(reason)
+        && let Some(code) = value.get("exitCode").and_then(Value::as_i64)
+    {
+        return Some(code as i32);
+    }
+    (close_code == Some(1000)).then_some(0)
+}
+
+/// Forward queued input to the PTY websocket, keeping it alive with periodic pings.
+fn spawn_terminal_writer<S>(sink: S, mut input: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>)
+where
+    S: futures::Sink<tokio_tungstenite::tungstenite::Message> + Send + Unpin + 'static,
+{
+    use futures::SinkExt as _;
+    use tokio_tungstenite::tungstenite::Message;
+    tokio::spawn(async move {
+        let mut sink = sink;
+        let mut keepalive = tokio::time::interval(PTY_KEEPALIVE_INTERVAL);
+        keepalive.tick().await;
+        loop {
+            tokio::select! {
+                chunk = input.recv() => match chunk {
+                    Some(chunk) => {
+                        if sink.send(Message::binary(chunk)).await.is_err() {
+                            break;
+                        }
+                    }
+                    None => break,
+                },
+                // A terminal can stay silent for a long time, and proxies drop idle
+                // connections; a ping keeps it open without typing into the shell.
+                _ = keepalive.tick() => {
+                    if sink.send(Message::Ping(Default::default())).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+        let _ = sink.close().await;
+    });
 }
 
 // -------------------------------------------------------------------------------------------
 // Shared helpers
 // -------------------------------------------------------------------------------------------
+
+/// Whether a websocket failure is `tungstenite`'s "the server selected no subprotocol" check.
+fn is_no_subprotocol_error(error: &tokio_tungstenite::tungstenite::Error) -> bool {
+    use tokio_tungstenite::tungstenite::error::{ProtocolError, SubProtocolError};
+    matches!(
+        error,
+        tokio_tungstenite::tungstenite::Error::Protocol(
+            ProtocolError::SecWebSocketSubProtocolError(SubProtocolError::NoSubProtocol)
+        )
+    )
+}
+
+/// The `env -- K=V ...` prefix that exports `envs` for one command.
+fn env_command_prefix(envs: &BTreeMap<String, String>) -> String {
+    if envs.is_empty() {
+        return String::new();
+    }
+    let assignments = envs
+        .iter()
+        .map(|(key, value)| shell_quote(&format!("{key}={value}")))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("env -- {assignments} ")
+}
 
 /// Build a one-field `multipart/form-data` body and its `Content-Type` header.
 ///
@@ -1901,10 +2451,23 @@ mod tests {
         let command = session.session_command(
             &["echo".to_string(), "hi there".to_string()],
             "/home/daytona/workspace",
+            &session.command_envs(),
         );
         assert_eq!(
             command,
             "cd /home/daytona/workspace && env -- 'FOO=bar baz' echo 'hi there'"
+        );
+        // A per-command variable wins over the manifest value of the same name.
+        let overridden = session.session_command(
+            &["echo".to_string()],
+            "/home/daytona/workspace",
+            &ExecRequest::argv(["echo"])
+                .with_env("FOO", "override")
+                .resolved_env(session.manifest().environment()),
+        );
+        assert_eq!(
+            overridden,
+            "cd /home/daytona/workspace && env -- FOO=override echo"
         );
     }
 

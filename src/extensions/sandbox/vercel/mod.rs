@@ -56,18 +56,18 @@ use serde_json::{Value, json};
 
 use crate::sandbox::errors::{ErrorCode, SandboxError, SandboxResult};
 use crate::sandbox::manifest::{DEFAULT_MANIFEST_ROOT, Manifest};
-use crate::sandbox::mounts::{Mount, MountCredentialAuthority, MountPatternConfig, MountStrategy};
+use crate::sandbox::mounts::{Mount, MountCredentialAuthority, MountStrategy};
 use crate::sandbox::session::{
     ExecRequest, SandboxClient, SandboxSession, restore_session_snapshot, shell_quote,
+    workspace_archive_excludes,
 };
 use crate::sandbox::snapshot::{Snapshot, SnapshotSpec, resolve_snapshot};
 use crate::sandbox::state::SandboxSessionState;
 use crate::sandbox::types::{ExecResult, User};
+use crate::sandbox::workspace_paths::provider_scratch_path;
 
-use super::e2b::{
-    adopt_recorded_root, decode_snapshot_ref, encode_snapshot_ref, expect_success, http_error,
-    parse_json, transport, workspace_excludes,
-};
+use super::e2b::{adopt_recorded_root, decode_snapshot_ref, encode_snapshot_ref};
+use crate::sandbox::http::{expect_success, http_error, parse_json, transport};
 
 pub mod tar_gz;
 
@@ -756,6 +756,16 @@ impl VercelSandboxSession {
         )
     }
 
+    /// The environment one command runs with: the session's, then the request's own.
+    ///
+    /// The session environment is the client options' plus the manifest's, which is what Python
+    /// passes per command; `ExecRequest::env` then overrides individual names.
+    fn request_envs(&self, request: &ExecRequest) -> BTreeMap<String, String> {
+        let mut envs = self.command_envs();
+        envs.extend(request.env.iter().map(|(k, v)| (k.clone(), v.clone())));
+        envs
+    }
+
     /// The environment every command runs with.
     fn command_envs(&self) -> BTreeMap<String, String> {
         let mut envs = self.options.env.clone();
@@ -847,6 +857,7 @@ impl VercelSandboxSession {
         &self,
         argv: Vec<String>,
         cwd: String,
+        envs: &BTreeMap<String, String>,
         timeout: Option<Duration>,
         sudo: bool,
     ) -> SandboxResult<ExecResult> {
@@ -863,7 +874,6 @@ impl VercelSandboxSession {
             "logs": true,
         });
         let map = body.as_object_mut().expect("object");
-        let envs = self.command_envs();
         if !envs.is_empty() {
             map.insert("env".into(), json!(envs));
         }
@@ -1061,12 +1071,17 @@ impl SandboxSession for VercelSandboxSession {
         BACKEND_ID
     }
 
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
+    }
+
     async fn start(&self) -> SandboxResult<()> {
         let root = self.manifest.root().to_string();
         let prepared = self
             .run_command(
                 vec!["mkdir".into(), "-p".into(), "--".into(), root.clone()],
                 "/".to_string(),
+                &self.command_envs(),
                 None,
                 false,
             )
@@ -1121,12 +1136,14 @@ impl SandboxSession for VercelSandboxSession {
         let cwd = self.resolve_cwd(&request.cwd)?;
         let sudo = Self::resolve_sudo(request.user.as_ref())?;
         // The API takes the privilege escalation out of band, so no `sudo` wrapper is built here.
+        let envs = self.request_envs(&request);
         let argv = ExecRequest {
             user: None,
             ..request.clone()
         }
         .resolved_argv();
-        self.run_command(argv, cwd, request.timeout, sudo).await
+        self.run_command(argv, cwd, &envs, request.timeout, sudo)
+            .await
     }
 
     async fn read_file(&self, path: &str) -> SandboxResult<Vec<u8>> {
@@ -1169,13 +1186,16 @@ impl SandboxSession for VercelSandboxSession {
             return Ok(encode_snapshot_ref(&snapshot_id));
         }
         let root = self.manifest.root().to_string();
-        let archive_path = format!("/tmp/openai-agents-{}.tar.gz", self.session_key);
+        let archive_path = self.resolve_internal_path(&provider_scratch_path(&format!(
+            "{}.tar.gz",
+            self.session_key
+        )))?;
         let mut command = format!(
             "tar -czf {archive} -C {root}",
             archive = shell_quote(&archive_path),
             root = shell_quote(&root),
         );
-        for exclude in workspace_excludes(&self.manifest, &root) {
+        for exclude in workspace_archive_excludes(&self.manifest, &root) {
             command.push_str(&format!(" --exclude {}", shell_quote(&exclude)));
         }
         command.push_str(" .");
@@ -1184,6 +1204,7 @@ impl SandboxSession for VercelSandboxSession {
             .run_command(
                 vec!["sh".into(), "-lc".into(), command],
                 root.clone(),
+                &self.command_envs(),
                 None,
                 false,
             )
@@ -1202,6 +1223,7 @@ impl SandboxSession for VercelSandboxSession {
             .run_command(
                 vec!["rm".into(), "-f".into(), "--".into(), archive_path.clone()],
                 "/".to_string(),
+                &self.command_envs(),
                 None,
                 false,
             )
@@ -1297,6 +1319,27 @@ fn parse_command_stream(body: &str) -> SandboxResult<ExecResult> {
 // Cloud bucket mounts
 // -------------------------------------------------------------------------------------------
 
+/// Refuse a mount on any backend other than Vercel.
+///
+/// Mirrors Python's `_assert_vercel_session`: the strategy depends on the runtime image shipping
+/// `mount-s3` and on how this backend delivers a command's environment.
+fn assert_vercel_session(session: &dyn SandboxSession) -> SandboxResult<()> {
+    let is_vercel = session
+        .as_any()
+        .is_some_and(|any| any.is::<VercelSandboxSession>());
+    if !is_vercel {
+        return Err(SandboxError::new(
+            ErrorCode::MountConfigInvalid,
+            format!(
+                "a Vercel cloud bucket mount requires a Vercel sandbox session, not the `{}` \
+                 backend",
+                session.backend_id()
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// Mounts an S3 bucket inside a Vercel sandbox with `mount-s3`. Mirrors
 /// `agents.extensions.sandbox.vercel.mounts.VercelCloudBucketMountStrategy`.
 ///
@@ -1305,7 +1348,7 @@ fn parse_command_stream(body: &str) -> SandboxResult<ExecResult> {
 /// credentials they reach the sandbox as process environment variables, so the mount reports
 /// [`MountCredentialAuthority::MountScoped`] and the manifest has to acknowledge the exact mount
 /// path before it activates.
-#[derive(Debug, Clone)]
+#[derive(Clone, Default)]
 pub struct VercelCloudBucketMountStrategy {
     /// The bucket to mount.
     pub bucket: String,
@@ -1315,8 +1358,36 @@ pub struct VercelCloudBucketMountStrategy {
     pub region: Option<String>,
     /// Optional S3-compatible endpoint.
     pub endpoint_url: Option<String>,
-    /// The credentials handed to `mount-s3`, as environment assignments.
-    pub credentials: MountPatternConfig,
+    /// Access key id, when the bucket needs credentials.
+    pub access_key_id: Option<String>,
+    /// Secret access key, when the bucket needs credentials.
+    pub secret_access_key: Option<String>,
+    /// Session token, for temporary credentials.
+    pub session_token: Option<String>,
+}
+
+// The secret must never reach a log line through the `MountStrategy: Debug` bound.
+impl std::fmt::Debug for VercelCloudBucketMountStrategy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VercelCloudBucketMountStrategy")
+            .field("bucket", &self.bucket)
+            .field("prefix", &self.prefix)
+            .field("region", &self.region)
+            .field("endpoint_url", &self.endpoint_url)
+            .field(
+                "access_key_id",
+                &self.access_key_id.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "secret_access_key",
+                &self.secret_access_key.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "session_token",
+                &self.session_token.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
 }
 
 impl VercelCloudBucketMountStrategy {
@@ -1324,10 +1395,7 @@ impl VercelCloudBucketMountStrategy {
     pub fn new(bucket: impl Into<String>) -> Self {
         VercelCloudBucketMountStrategy {
             bucket: bucket.into(),
-            prefix: None,
-            region: None,
-            endpoint_url: None,
-            credentials: MountPatternConfig::new(),
+            ..Default::default()
         }
     }
 
@@ -1349,10 +1417,51 @@ impl VercelCloudBucketMountStrategy {
         self
     }
 
-    /// Authenticate with static credentials, passed as `KEY=value` lines.
-    pub fn with_credentials(mut self, credentials: impl Into<String>) -> Self {
-        self.credentials = MountPatternConfig::new().with_config_text(credentials);
+    /// Authenticate with static credentials.
+    pub fn with_credentials(
+        mut self,
+        access_key_id: impl Into<String>,
+        secret_access_key: impl Into<String>,
+    ) -> Self {
+        self.access_key_id = Some(access_key_id.into());
+        self.secret_access_key = Some(secret_access_key.into());
         self
+    }
+
+    /// Add a session token, for temporary credentials.
+    pub fn with_session_token(mut self, session_token: impl Into<String>) -> Self {
+        self.session_token = Some(session_token.into());
+        self
+    }
+
+    /// Whether this mount hands credentials to the sandbox.
+    fn authenticated(&self) -> bool {
+        self.access_key_id.is_some() && self.secret_access_key.is_some()
+    }
+
+    /// The environment `mount-s3` reads its credentials from.
+    ///
+    /// Mirrors Python's `_runtime_s3_mount_environment`. The values travel as the command's
+    /// environment, never in its argument vector, so they stay out of the sandbox's process
+    /// table and out of the provider's command log.
+    fn credential_env(&self) -> BTreeMap<String, String> {
+        let mut env = BTreeMap::new();
+        if let (Some(access_key_id), Some(secret_access_key)) =
+            (&self.access_key_id, &self.secret_access_key)
+        {
+            env.insert("AWS_ACCESS_KEY_ID".to_string(), access_key_id.clone());
+            env.insert(
+                "AWS_SECRET_ACCESS_KEY".to_string(),
+                secret_access_key.clone(),
+            );
+        }
+        if let Some(session_token) = &self.session_token {
+            env.insert("AWS_SESSION_TOKEN".to_string(), session_token.clone());
+        }
+        if let Some(region) = &self.region {
+            env.insert("AWS_REGION".to_string(), region.clone());
+        }
+        env
     }
 
     /// A [`Mount`] using this strategy.
@@ -1371,7 +1480,7 @@ impl VercelCloudBucketMountStrategy {
         if read_only {
             argv.push("--read-only".to_string());
         }
-        if self.credentials.has_config_text() {
+        if self.authenticated() {
             argv.push("--allow-delete".to_string());
         } else {
             argv.push("--no-sign-request".to_string());
@@ -1411,7 +1520,7 @@ impl MountStrategy for VercelCloudBucketMountStrategy {
     }
 
     fn credential_authority(&self) -> MountCredentialAuthority {
-        if self.credentials.has_config_text() {
+        if self.authenticated() {
             MountCredentialAuthority::MountScoped
         } else {
             MountCredentialAuthority::None
@@ -1428,64 +1537,21 @@ impl MountStrategy for VercelCloudBucketMountStrategy {
         session: &dyn SandboxSession,
         mount_path: &str,
     ) -> SandboxResult<()> {
+        // `mount-s3` ships in Vercel's runtime images, and the credentials are handed to the
+        // command as environment variables; on another backend that environment would land
+        // somewhere this strategy has not reasoned about, so it refuses to run there.
+        assert_vercel_session(session)?;
         session.authorize_mount_activation(mount, mount_path)?;
         session.mkdir(mount_path, true).await?;
         let argv = self.mount_argv(mount_path, mount.read_only);
-        let quoted_argv = argv
-            .iter()
-            .map(|arg| shell_quote(arg))
-            .collect::<Vec<_>>()
-            .join(" ");
-        // `ExecRequest` carries no environment, and anything in the command line is readable
-        // from the sandbox's process table and is recorded by the provider's command log, so the
-        // credentials are written to a `600` file, sourced, and removed before `mount-s3` runs.
-        let mut staged_credentials = None;
-        let command = match self.credentials.config_text() {
-            None => quoted_argv,
-            Some(credentials) => {
-                let credentials_path = format!(
-                    "{}/.openai-agents-mount-s3-{}.env",
-                    session.workspace_root().trim_end_matches('/'),
-                    uuid::Uuid::new_v4().simple()
-                );
-                session
-                    .write_file(&credentials_path, credentials.as_bytes())
-                    .await
-                    .map_err(|error| {
-                        SandboxError::new(
-                            ErrorCode::MountFailed,
-                            format!("failed to stage the bucket credentials: {}", error.message),
-                        )
-                    })?;
-                staged_credentials = Some(credentials_path.clone());
-                let quoted_path = shell_quote(&credentials_path);
-                // The trap fires on every exit path, so a failure between staging the file and
-                // starting `mount-s3` cannot leave the credential behind in the workspace.
-                [
-                    format!("trap 'rm -f -- {quoted_path}' EXIT INT TERM HUP"),
-                    format!("chmod 600 -- {quoted_path}"),
-                    "set -a".to_string(),
-                    format!(". {quoted_path}"),
-                    "set +a".to_string(),
-                    format!("rm -f -- {quoted_path}"),
-                    quoted_argv,
-                ]
-                .join("; ")
-            }
-        };
         let result = session
             .exec(
-                ExecRequest::argv(["sh", "-lc", command.as_str()])
-                    .with_shell(crate::sandbox::session::ExecShell::None)
+                ExecRequest::argv(argv)
+                    .with_envs(self.credential_env())
                     .with_timeout(Some(Duration::from_secs(120))),
             )
             .await?;
         if !result.ok() {
-            // The shell trap normally removes the credential; make sure of it when the command
-            // never ran at all.
-            if let Some(path) = &staged_credentials {
-                let _ = session.rm(path, false).await;
-            }
             // Never echo the command back: it names the bucket the credentials belong to.
             return Err(SandboxError::new(
                 ErrorCode::MountFailed,
@@ -1505,6 +1571,7 @@ impl MountStrategy for VercelCloudBucketMountStrategy {
         session: &dyn SandboxSession,
         mount_path: &str,
     ) -> SandboxResult<()> {
+        assert_vercel_session(session)?;
         let quoted = shell_quote(mount_path);
         let script = format!(
             "fusermount3 -u -- {quoted} 2>/dev/null || fusermount -u -- {quoted} 2>/dev/null || \
@@ -1614,6 +1681,44 @@ mod tests {
                 "--prefix",
                 "data/",
             ]
+        );
+    }
+
+    #[test]
+    fn keeps_bucket_credentials_out_of_the_command_line() {
+        let strategy = VercelCloudBucketMountStrategy::new("my-bucket")
+            .with_region("us-east-1")
+            .with_credentials("AKIAEXAMPLE", "s3cr3t")
+            .with_session_token("token");
+        let argv = strategy.mount_argv("/vercel/sandbox/data", false);
+        let command = argv.join(" ");
+        assert!(!command.contains("s3cr3t"), "{command}");
+        assert!(!command.contains("AKIAEXAMPLE"), "{command}");
+        // An authenticated mount signs its requests; an anonymous one must not try.
+        assert!(command.contains("--allow-delete"), "{command}");
+        assert!(!command.contains("--no-sign-request"), "{command}");
+
+        let env = strategy.credential_env();
+        assert_eq!(env["AWS_ACCESS_KEY_ID"], "AKIAEXAMPLE");
+        assert_eq!(env["AWS_SECRET_ACCESS_KEY"], "s3cr3t");
+        assert_eq!(env["AWS_SESSION_TOKEN"], "token");
+        assert_eq!(env["AWS_REGION"], "us-east-1");
+
+        let debug = format!("{strategy:?}");
+        assert!(!debug.contains("s3cr3t"), "{debug}");
+        assert!(debug.contains("<redacted>"));
+
+        // An anonymous mount carries no credentials at all.
+        let anonymous = VercelCloudBucketMountStrategy::new("public-bucket");
+        assert!(anonymous.credential_env().is_empty());
+        assert_eq!(
+            anonymous.credential_authority(),
+            MountCredentialAuthority::None
+        );
+        assert!(
+            anonymous
+                .mount_argv("/vercel/sandbox/data", true)
+                .contains(&"--no-sign-request".to_string())
         );
     }
 
