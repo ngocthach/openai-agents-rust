@@ -347,6 +347,7 @@ fn dapr_error(status: reqwest::StatusCode, body: String) -> AgentsError {
         },
         body: serde_json::from_str(&body).ok().map(Box::new),
         request_id: None,
+        headers: None,
     }
 }
 
@@ -574,6 +575,7 @@ mod tests {
             message: "ERR_STATE_SAVE: possible etag mismatch".into(),
             body: None,
             request_id: None,
+            headers: None,
         };
         assert!(is_concurrency_conflict(&conflict));
         let http_conflict = AgentsError::ApiError {
@@ -581,6 +583,7 @@ mod tests {
             message: "conflict".into(),
             body: None,
             request_id: None,
+            headers: None,
         };
         assert!(is_concurrency_conflict(&http_conflict));
         let other = AgentsError::ApiError {
@@ -588,6 +591,7 @@ mod tests {
             message: "boom".into(),
             body: None,
             request_id: None,
+            headers: None,
         };
         assert!(!is_concurrency_conflict(&other));
         assert!(!is_concurrency_conflict(&AgentsError::other("boom")));

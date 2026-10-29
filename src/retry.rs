@@ -67,6 +67,7 @@ impl ModelRetryNormalizedError {
                 status,
                 body,
                 request_id,
+                headers,
                 ..
             } => {
                 n.status_code = (*status != 0).then_some(*status);
@@ -76,10 +77,7 @@ impl ModelRetryNormalizedError {
                     .and_then(|b| b.pointer("/error/code"))
                     .and_then(Value::as_str)
                     .map(str::to_string);
-                n.retry_after = body
-                    .as_ref()
-                    .and_then(|b| b.get("retry_after"))
-                    .and_then(Value::as_f64);
+                n.retry_after = headers.as_ref().and_then(parse_retry_after);
             }
             AgentsError::Http(h) => {
                 n.is_timeout = h.is_timeout();
@@ -91,6 +89,28 @@ impl ModelRetryNormalizedError {
         }
         n
     }
+}
+
+/// Parse `retry-after-ms` / `retry-after` (seconds or an HTTP date) into seconds. Delays outside
+/// 0..=60 seconds are ignored, matching the OpenAI SDK.
+fn parse_retry_after(headers: &std::collections::BTreeMap<String, String>) -> Option<f64> {
+    let delay = if let Some(ms) = headers
+        .get("retry-after-ms")
+        .and_then(|v| v.trim().parse::<f64>().ok())
+    {
+        Some(ms / 1000.0)
+    } else {
+        headers.get("retry-after").and_then(|v| {
+            let v = v.trim();
+            v.parse::<f64>().ok().or_else(|| {
+                chrono::DateTime::parse_from_rfc2822(v).ok().map(|t| {
+                    (t.with_timezone(&chrono::Utc) - chrono::Utc::now()).num_milliseconds() as f64
+                        / 1000.0
+                })
+            })
+        })
+    };
+    delay.filter(|d| (0.0..=60.0).contains(d))
 }
 
 /// Provider-specific retry guidance returned by [`crate::models::Model::get_retry_advice`].
@@ -485,8 +505,16 @@ pub fn get_openai_retry_advice(request: &ModelRetryAdviceRequest<'_>) -> Option<
     let normalized = ModelRetryNormalizedError::from_error(error);
     let reason = Some(error.to_string());
     let stateful = request.previous_response_id.is_some() || request.conversation_id.is_some();
-    if let AgentsError::ApiError { body: Some(b), .. } = error
-        && let Some(h) = b.get("x_should_retry").and_then(Value::as_bool)
+    if let AgentsError::ApiError {
+        headers: Some(h), ..
+    } = error
+        && let Some(h) =
+            h.get("x-should-retry")
+                .and_then(|v| match v.trim().to_ascii_lowercase().as_str() {
+                    "true" => Some(true),
+                    "false" => Some(false),
+                    _ => None,
+                })
     {
         return Some(ModelRetryAdvice {
             suggested: Some(h),
@@ -614,7 +642,48 @@ mod tests {
             message: "x".into(),
             body: None,
             request_id: None,
+            headers: None,
         }
+    }
+
+    #[test]
+    fn reads_retry_headers() {
+        let mut h = std::collections::BTreeMap::new();
+        h.insert("retry-after".to_string(), "2".to_string());
+        h.insert("x-should-retry".to_string(), "true".to_string());
+        let err = AgentsError::ApiError {
+            status: 400,
+            message: "x".into(),
+            body: None,
+            request_id: None,
+            headers: Some(h),
+        };
+        assert_eq!(
+            ModelRetryNormalizedError::from_error(&err).retry_after,
+            Some(2.0)
+        );
+        let advice = get_openai_retry_advice(&ModelRetryAdviceRequest {
+            error: &err,
+            attempt: 1,
+            stream: false,
+            previous_response_id: None,
+            conversation_id: None,
+        })
+        .unwrap();
+        assert_eq!(advice.suggested, Some(true));
+        assert_eq!(advice.replay_safety, Some(ReplaySafety::Safe));
+        let d = evaluate_retry(
+            &err,
+            1,
+            1,
+            &retry_policies::retry_after(),
+            false,
+            false,
+            Some(&advice),
+            None,
+            None,
+        );
+        assert_eq!(d.delay, Some(2.0));
     }
 
     #[test]

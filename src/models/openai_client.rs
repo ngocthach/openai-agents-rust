@@ -42,6 +42,23 @@ impl Default for OpenAIClient {
     }
 }
 
+/// Response headers relevant to retry decisions, keyed by lowercase name.
+pub(crate) fn retry_headers(
+    headers: &reqwest::header::HeaderMap,
+) -> Option<std::collections::BTreeMap<String, String>> {
+    let map: std::collections::BTreeMap<String, String> =
+        ["retry-after", "retry-after-ms", "x-should-retry"]
+            .iter()
+            .filter_map(|k| {
+                headers
+                    .get(*k)
+                    .and_then(|v| v.to_str().ok())
+                    .map(|v| (k.to_string(), v.to_string()))
+            })
+            .collect();
+    (!map.is_empty()).then_some(map)
+}
+
 impl OpenAIClient {
     /// A client with an explicit API key and the default base URL.
     pub fn new(api_key: impl Into<String>) -> Self {
@@ -176,6 +193,7 @@ impl OpenAIClient {
         if status.is_success() {
             return Ok((resp, request_id));
         }
+        let headers = retry_headers(resp.headers());
         let text = resp.text().await.unwrap_or_default();
         let body: Option<Value> = serde_json::from_str(&text).ok();
         let message = body
@@ -195,6 +213,7 @@ impl OpenAIClient {
             message,
             body: body.map(Box::new),
             request_id,
+            headers,
         })
     }
 
@@ -377,6 +396,7 @@ fn parse_event(event: &str) -> SseEvent {
                     message: msg,
                     body: Some(Box::new(v)),
                     request_id: None,
+                    headers: None,
                 });
             }
             SseEvent::Data(v)

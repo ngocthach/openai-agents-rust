@@ -58,5 +58,6 @@ pub(crate) async fn check_response(response: reqwest::Response) -> Result<reqwes
         message,
         body: body.map(Box::new),
         request_id,
+        headers: None,
     })
 }

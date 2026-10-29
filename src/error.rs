@@ -116,6 +116,9 @@ pub enum AgentsError {
         message: String,
         body: Option<Box<serde_json::Value>>,
         request_id: Option<String>,
+        /// Selected response headers (lowercase names), e.g. `retry-after`, `retry-after-ms`
+        /// and `x-should-retry`.
+        headers: Option<std::collections::BTreeMap<String, String>>,
     },
 
     /// Transport-level HTTP failure.

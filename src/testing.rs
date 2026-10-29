@@ -141,6 +141,7 @@ impl FakeModel {
                     message: format!("scripted API error {status}"),
                     body: None,
                     request_id: None,
+                    headers: None,
                 });
             }
             ModelStep::Respond(f) => f(request)?,
