@@ -10,3 +10,5 @@ pub mod visualization;
 pub mod codex;
 #[cfg(feature = "websocket")]
 pub mod hosted_multi_agent;
+#[cfg(feature = "sandbox")]
+pub mod sandbox;
