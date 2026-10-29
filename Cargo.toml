@@ -77,3 +77,7 @@ required-features = ["sqlite"]
 [[example]]
 name = "responses_websocket"
 required-features = ["websocket"]
+
+[[example]]
+name = "voice_static"
+required-features = ["voice"]

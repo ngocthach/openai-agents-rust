@@ -153,13 +153,15 @@ fn items_to_input(items: &[RunItem]) -> Vec<InputItem> {
         .collect()
 }
 
+type ToolsAndHandoffs<C> = (Vec<Tool<C>>, Vec<Handoff<C>>);
+
 /// Resolve collisions between bare function tool names and handoff names. The winner is the
 /// last handoff with the name, else the last tool.
 fn resolve_tool_name_collisions<C>(
     tools: Vec<Tool<C>>,
     handoffs: Vec<Handoff<C>>,
     policy: crate::run_config::ToolNameCollisionPolicy,
-) -> Result<(Vec<Tool<C>>, Vec<Handoff<C>>)> {
+) -> Result<ToolsAndHandoffs<C>> {
     // (is_handoff, index) owners per bare name.
     let mut owners: HashMap<String, Vec<(bool, usize)>> = HashMap::new();
     for (i, t) in tools.iter().enumerate() {

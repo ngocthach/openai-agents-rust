@@ -104,13 +104,17 @@ pub struct OutputGuardrailBlockedMessageArgs {
     pub agent_name: String,
 }
 
+/// Formats the blocked-output placeholder.
+pub type BlockedMessageFormatter =
+    Arc<dyn Fn(&OutputGuardrailBlockedMessageArgs) -> Option<String> + Send + Sync>;
+
 /// The placeholder kept in history for a terminal tool output blocked by an output guardrail.
 #[derive(Clone)]
 pub enum OutputGuardrailBlockedMessage {
     /// A fixed non-empty message.
     Text(String),
     /// A formatter; returning `None` or an empty string uses the default.
-    Formatter(Arc<dyn Fn(&OutputGuardrailBlockedMessageArgs) -> Option<String> + Send + Sync>),
+    Formatter(BlockedMessageFormatter),
 }
 
 impl fmt::Debug for OutputGuardrailBlockedMessage {
