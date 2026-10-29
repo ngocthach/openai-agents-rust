@@ -26,6 +26,8 @@ voice = ["dep:base64", "dep:tokio-tungstenite", "reqwest/multipart"]
 sandbox = []
 encrypt = ["dep:chacha20poly1305", "dep:hkdf", "dep:sha2", "dep:base64"]
 redis = ["dep:redis"]
+mongodb = ["dep:mongodb"]
+sqlx = ["dep:sqlx"]
 
 [dependencies]
 async-trait = "0.1"
@@ -43,7 +45,7 @@ tokio-stream = "0.1"
 tokio-util = "0.7"
 uuid = { version = "1", features = ["v4"] }
 rand = "0.9"
-rusqlite = { version = "0.41", features = ["bundled"], optional = true }
+rusqlite = { version = "0.39", features = ["bundled"], optional = true }
 rmcp = { version = "3", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest"], optional = true }
 # Optional dependencies for websocket-based features (realtime, voice, Responses WebSocket).
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"], optional = true }
@@ -54,6 +56,10 @@ hkdf = { version = "0.13", optional = true }
 sha2 = { version = "0.11", optional = true }
 # Optional dependency for RedisSession (feature `redis`).
 redis = { version = "1", default-features = false, features = ["tokio-comp", "aio"], optional = true }
+# Optional dependency for MongoDBSession (feature `mongodb`).
+mongodb = { version = "3", optional = true }
+# Optional dependency for SqlxSession on PostgreSQL / MySQL (feature `sqlx`).
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "mysql", "any", "json", "chrono"], optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
