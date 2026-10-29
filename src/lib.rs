@@ -15,6 +15,7 @@ pub mod prompts;
 pub mod run_context;
 pub mod run_state;
 pub mod strict_schema;
+pub mod tracing;
 pub mod tool;
 pub mod tool_context;
 pub mod tool_guardrails;
