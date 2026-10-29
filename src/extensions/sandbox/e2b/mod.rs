@@ -1,0 +1,2308 @@
+//! The E2B sandbox backend (<https://e2b.dev>). Port of `agents.extensions.sandbox.e2b`.
+//!
+//! # Design
+//!
+//! Python wraps the `e2b` / `e2b-code-interpreter` SDKs. This port talks to the two E2B HTTP
+//! surfaces directly with `reqwest`, so it needs no extra dependency:
+//!
+//! - The **platform API** (`https://api.<domain>`, authenticated with `X-API-Key`) creates,
+//!   inspects, pauses, resumes, snapshots and kills sandboxes.
+//! - **envd**, the agent running inside each sandbox, is reached through the shared sandbox host
+//!   (`https://sandbox.<domain>`). Every request carries `E2b-Sandbox-Id`, `E2b-Sandbox-Port`
+//!   and the per-sandbox `X-Access-Token` returned by create, connect and resume.
+//!
+//! envd exposes `GET`/`POST /files` for file transfer and a Connect RPC surface for everything
+//! else. Unary calls (`filesystem.Filesystem/*`, `process.Process/SendInput`, `SendSignal`) are
+//! plain JSON `POST`s; `process.Process/Start` is a server-streaming call, so its body and
+//! response use Connect's enveloped framing (one flag byte, a big-endian length, then JSON).
+//! [`exec`](E2BSandboxSession::exec) buffers that stream, while
+//! [`pty_exec_start`](E2BSandboxSession::pty_exec_start) keeps it open and hands the model the
+//! output collected inside each yield window, which is how E2B supports a real PTY.
+//!
+//! ```no_run
+//! use std::sync::Arc;
+//!
+//! use openai_agents_sdk::extensions::sandbox::e2b::{E2BSandboxClient, E2BSandboxClientOptions};
+//! use openai_agents_sdk::sandbox::{Manifest, SandboxClient};
+//!
+//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+//! // Reads `E2B_API_KEY` from the environment, as the Python SDK does.
+//! let client = E2BSandboxClient::with_options(E2BSandboxClientOptions::new());
+//! let session = client.create(Some(Manifest::new())).await?;
+//! session.start().await?;
+//! let result = session
+//!     .exec(openai_agents_sdk::sandbox::ExecRequest::shell("echo hi"))
+//!     .await?;
+//! println!("{}", result.stdout_text());
+//! session.shutdown().await?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! # Divergences from Python
+//!
+//! - `sandbox_type` selects the default template name only; both E2B SDK classes speak the same
+//!   HTTP API, so there is no separate code-interpreter transport.
+//! - [`SandboxSessionState`] stays credential-free: the sandbox access token is never persisted,
+//!   and [`resume`](E2BSandboxClient::resume) fetches a fresh one from
+//!   `POST /v2/sandboxes/{id}/connect`. Provider options come from the client on resume, not from
+//!   the persisted state.
+//! - MCP server configuration, sandbox metrics and exposed-port endpoint resolution are not
+//!   ported.
+
+pub mod rclone;
+
+use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
+
+use async_trait::async_trait;
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
+use futures::StreamExt as _;
+use serde::Deserialize;
+use serde_json::{Value, json};
+use tokio::sync::Notify;
+
+use crate::sandbox::errors::{ErrorCode, SandboxError, SandboxResult};
+use crate::sandbox::manifest::Manifest;
+use crate::sandbox::mounts::{
+    InContainerMountStrategy, Mount, MountCredentialAuthority, MountPatternConfig, MountStrategy,
+};
+use crate::sandbox::pty::{
+    PTY_PROCESS_ID_MAX_EXCLUSIVE, PTY_PROCESS_ID_MIN, PTY_PROCESSES_MAX,
+    PTY_PROCESSES_PROTECTED_RECENT, PtyExecRequest, PtyExecUpdate, PtyWriteRequest,
+    clamp_pty_yield_time_ms, resolve_pty_write_yield_time_ms,
+};
+use crate::sandbox::session::{
+    ExecRequest, SandboxClient, SandboxSession, restore_session_snapshot, shell_quote,
+};
+use crate::sandbox::snapshot::{Snapshot, SnapshotSpec, resolve_snapshot};
+use crate::sandbox::state::SandboxSessionState;
+use crate::sandbox::types::{ExecResult, FileEntry, Permissions};
+use crate::sandbox::util::truncate_text_by_tokens;
+
+use self::rclone::{RcloneMountMode, RcloneMountPattern, ensure_fuse_support, ensure_rclone};
+
+/// The backend identifier reported by this client and its sessions.
+pub const BACKEND_ID: &str = "e2b";
+/// Environment variable holding the E2B API key, as in the Python SDK.
+pub const E2B_API_KEY_ENV: &str = "E2B_API_KEY";
+/// Environment variable overriding the E2B domain, as in the Python SDK.
+pub const E2B_DOMAIN_ENV: &str = "E2B_DOMAIN";
+/// The default E2B domain.
+pub const DEFAULT_E2B_DOMAIN: &str = "e2b.app";
+/// The port envd listens on inside the sandbox.
+pub const DEFAULT_ENVD_PORT: u16 = 49983;
+/// Default template of the plain `e2b` sandbox type.
+pub const DEFAULT_E2B_TEMPLATE: &str = "base";
+/// Default template of the `e2b_code_interpreter` sandbox type.
+pub const DEFAULT_CODE_INTERPRETER_TEMPLATE: &str = "code-interpreter-v1";
+
+/// Marks a workspace archive that only references a native E2B sandbox snapshot.
+const SNAPSHOT_REF_MAGIC: &[u8] = b"E2B_SANDBOX_SNAPSHOT_V1\n";
+
+/// Which E2B sandbox interface a client creates.
+///
+/// Both interfaces speak the same HTTP API; the variant selects the default template.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum E2BSandboxType {
+    /// The plain `e2b` sandbox.
+    #[default]
+    E2B,
+    /// The `e2b-code-interpreter` sandbox.
+    CodeInterpreter,
+}
+
+impl E2BSandboxType {
+    /// The wire name of the sandbox type.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            E2BSandboxType::E2B => "e2b",
+            E2BSandboxType::CodeInterpreter => "e2b_code_interpreter",
+        }
+    }
+
+    /// The template used when the options name none.
+    pub fn default_template(self) -> &'static str {
+        match self {
+            E2BSandboxType::E2B => DEFAULT_E2B_TEMPLATE,
+            E2BSandboxType::CodeInterpreter => DEFAULT_CODE_INTERPRETER_TEMPLATE,
+        }
+    }
+}
+
+/// What E2B does when a sandbox reaches its time-to-live.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum E2BTimeoutAction {
+    /// Pause the sandbox, keeping its filesystem and memory.
+    #[default]
+    Pause,
+    /// Kill the sandbox.
+    Kill,
+}
+
+/// How a session persists its workspace into a [`Snapshot`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WorkspacePersistence {
+    /// Archive the workspace with `tar`, so the bytes are portable across backends.
+    #[default]
+    Tar,
+    /// Take a native E2B sandbox snapshot and store only a reference to it.
+    Snapshot,
+}
+
+/// Timeouts applied to E2B operations. Mirrors Python's `E2BSandboxTimeouts`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct E2BSandboxTimeouts {
+    /// Sent to envd when a command has no timeout of its own; E2B would otherwise default to 60s.
+    pub exec_unbounded: Duration,
+    /// Budget for liveness checks.
+    pub keepalive: Duration,
+    /// Budget for best-effort cleanup, such as removing a temporary archive.
+    pub cleanup: Duration,
+    /// Budget for small filesystem operations.
+    pub fast_op: Duration,
+    /// Budget for file uploads.
+    pub file_upload: Duration,
+    /// Budget for workspace archive operations.
+    pub snapshot_tar: Duration,
+}
+
+impl Default for E2BSandboxTimeouts {
+    fn default() -> Self {
+        E2BSandboxTimeouts {
+            exec_unbounded: Duration::from_secs(24 * 60 * 60),
+            keepalive: Duration::from_secs(5),
+            cleanup: Duration::from_secs(30),
+            fast_op: Duration::from_secs(10),
+            file_upload: Duration::from_secs(30),
+            snapshot_tar: Duration::from_secs(60),
+        }
+    }
+}
+
+/// Settings used when creating an E2B-backed session.
+#[derive(Clone, PartialEq, Eq)]
+pub struct E2BSandboxClientOptions {
+    /// API key for the platform API. Falls back to `E2B_API_KEY`.
+    pub api_key: Option<String>,
+    /// E2B domain. Falls back to `E2B_DOMAIN`, then [`DEFAULT_E2B_DOMAIN`].
+    pub domain: Option<String>,
+    /// Override of the platform API base URL, for tests and self-hosted clusters.
+    pub api_base_url: Option<String>,
+    /// Override of the shared sandbox host base URL, for tests and self-hosted clusters.
+    pub sandbox_base_url: Option<String>,
+    /// The port envd listens on inside the sandbox.
+    pub envd_port: u16,
+    /// Which E2B sandbox interface to create.
+    pub sandbox_type: E2BSandboxType,
+    /// Template the sandbox is created from.
+    pub template: Option<String>,
+    /// Sandbox time-to-live in seconds.
+    pub timeout_secs: Option<u32>,
+    /// Metadata attached to the sandbox.
+    pub metadata: BTreeMap<String, String>,
+    /// Environment variables set when the sandbox is created.
+    pub envs: BTreeMap<String, String>,
+    /// Whether the sandbox may reach the internet.
+    pub allow_internet_access: Option<bool>,
+    /// Ports the sandbox exposes; a non-empty list enables public traffic.
+    pub exposed_ports: Vec<u16>,
+    /// Operation timeouts.
+    pub timeouts: E2BSandboxTimeouts,
+    /// Pause instead of killing the sandbox when the session shuts down.
+    pub pause_on_exit: bool,
+    /// What E2B does when the sandbox's time-to-live elapses.
+    pub on_timeout: E2BTimeoutAction,
+    /// Whether incoming traffic resumes a paused sandbox.
+    pub auto_resume: bool,
+    /// How the session persists its workspace.
+    pub workspace_persistence: WorkspacePersistence,
+}
+
+impl Default for E2BSandboxClientOptions {
+    fn default() -> Self {
+        E2BSandboxClientOptions {
+            api_key: None,
+            domain: None,
+            api_base_url: None,
+            sandbox_base_url: None,
+            envd_port: DEFAULT_ENVD_PORT,
+            sandbox_type: E2BSandboxType::default(),
+            template: None,
+            timeout_secs: None,
+            metadata: BTreeMap::new(),
+            envs: BTreeMap::new(),
+            allow_internet_access: None,
+            exposed_ports: Vec::new(),
+            timeouts: E2BSandboxTimeouts::default(),
+            pause_on_exit: false,
+            on_timeout: E2BTimeoutAction::default(),
+            auto_resume: true,
+            workspace_persistence: WorkspacePersistence::default(),
+        }
+    }
+}
+
+// The API key must never reach a log line through the `SandboxClient: Debug` bound.
+impl std::fmt::Debug for E2BSandboxClientOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("E2BSandboxClientOptions")
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .field("domain", &self.domain)
+            .field("api_base_url", &self.api_base_url)
+            .field("sandbox_base_url", &self.sandbox_base_url)
+            .field("envd_port", &self.envd_port)
+            .field("sandbox_type", &self.sandbox_type)
+            .field("template", &self.template)
+            .field("timeout_secs", &self.timeout_secs)
+            .field("metadata", &self.metadata)
+            .field("envs", &self.envs.keys().collect::<Vec<_>>())
+            .field("allow_internet_access", &self.allow_internet_access)
+            .field("exposed_ports", &self.exposed_ports)
+            .field("timeouts", &self.timeouts)
+            .field("pause_on_exit", &self.pause_on_exit)
+            .field("on_timeout", &self.on_timeout)
+            .field("auto_resume", &self.auto_resume)
+            .field("workspace_persistence", &self.workspace_persistence)
+            .finish()
+    }
+}
+
+impl E2BSandboxClientOptions {
+    /// Options that read the API key and domain from the environment.
+    pub fn new() -> Self {
+        E2BSandboxClientOptions::default()
+    }
+
+    /// Use an explicit API key instead of `E2B_API_KEY`.
+    pub fn with_api_key(mut self, api_key: impl Into<String>) -> Self {
+        self.api_key = Some(api_key.into());
+        self
+    }
+
+    /// Use an explicit domain instead of `E2B_DOMAIN`.
+    pub fn with_domain(mut self, domain: impl Into<String>) -> Self {
+        self.domain = Some(domain.into());
+        self
+    }
+
+    /// Point both the platform API and the sandbox host at one base URL.
+    ///
+    /// Tests use this to drive the client against a local HTTP server.
+    pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
+        let base_url = base_url.into();
+        self.api_base_url = Some(base_url.clone());
+        self.sandbox_base_url = Some(base_url);
+        self
+    }
+
+    /// Override only the platform API base URL.
+    pub fn with_api_base_url(mut self, base_url: impl Into<String>) -> Self {
+        self.api_base_url = Some(base_url.into());
+        self
+    }
+
+    /// Override only the shared sandbox host base URL.
+    pub fn with_sandbox_base_url(mut self, base_url: impl Into<String>) -> Self {
+        self.sandbox_base_url = Some(base_url.into());
+        self
+    }
+
+    /// Select the sandbox interface, and therefore the default template.
+    pub fn with_sandbox_type(mut self, sandbox_type: E2BSandboxType) -> Self {
+        self.sandbox_type = sandbox_type;
+        self
+    }
+
+    /// Create the sandbox from an explicit template.
+    pub fn with_template(mut self, template: impl Into<String>) -> Self {
+        self.template = Some(template.into());
+        self
+    }
+
+    /// Set the sandbox time-to-live in seconds.
+    pub fn with_timeout_secs(mut self, timeout_secs: u32) -> Self {
+        self.timeout_secs = Some(timeout_secs);
+        self
+    }
+
+    /// Attach a metadata key.
+    pub fn with_metadata(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.metadata.insert(key.into(), value.into());
+        self
+    }
+
+    /// Set an environment variable at sandbox creation.
+    pub fn with_env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.envs.insert(key.into(), value.into());
+        self
+    }
+
+    /// Allow or deny internet access from inside the sandbox.
+    pub fn with_allow_internet_access(mut self, allow: bool) -> Self {
+        self.allow_internet_access = Some(allow);
+        self
+    }
+
+    /// Expose a port, which also enables public traffic to the sandbox.
+    pub fn with_exposed_port(mut self, port: u16) -> Self {
+        self.exposed_ports.push(port);
+        self
+    }
+
+    /// Replace the operation timeouts.
+    pub fn with_timeouts(mut self, timeouts: E2BSandboxTimeouts) -> Self {
+        self.timeouts = timeouts;
+        self
+    }
+
+    /// Pause instead of killing the sandbox on shutdown.
+    pub fn with_pause_on_exit(mut self, pause_on_exit: bool) -> Self {
+        self.pause_on_exit = pause_on_exit;
+        self
+    }
+
+    /// Set what E2B does when the sandbox's time-to-live elapses.
+    pub fn with_on_timeout(mut self, on_timeout: E2BTimeoutAction) -> Self {
+        self.on_timeout = on_timeout;
+        self
+    }
+
+    /// Whether traffic resumes a paused sandbox.
+    pub fn with_auto_resume(mut self, auto_resume: bool) -> Self {
+        self.auto_resume = auto_resume;
+        self
+    }
+
+    /// Select how the session persists its workspace.
+    pub fn with_workspace_persistence(mut self, persistence: WorkspacePersistence) -> Self {
+        self.workspace_persistence = persistence;
+        self
+    }
+
+    /// The resolved platform API base URL.
+    fn api_base(&self) -> String {
+        match &self.api_base_url {
+            Some(url) => url.trim_end_matches('/').to_string(),
+            None => format!("https://api.{}", self.resolved_domain()),
+        }
+    }
+
+    /// The resolved shared sandbox host base URL.
+    fn sandbox_base(&self) -> String {
+        match &self.sandbox_base_url {
+            Some(url) => url.trim_end_matches('/').to_string(),
+            None => format!("https://sandbox.{}", self.resolved_domain()),
+        }
+    }
+
+    fn resolved_domain(&self) -> String {
+        self.domain
+            .clone()
+            .or_else(|| std::env::var(E2B_DOMAIN_ENV).ok().filter(|v| !v.is_empty()))
+            .unwrap_or_else(|| DEFAULT_E2B_DOMAIN.to_string())
+    }
+
+    /// The API key, from the options or the environment.
+    fn resolved_api_key(&self) -> SandboxResult<String> {
+        // An explicitly empty key is a misconfiguration, not a request to read the environment.
+        if let Some(api_key) = &self.api_key {
+            return if api_key.is_empty() {
+                Err(missing_api_key())
+            } else {
+                Ok(api_key.clone())
+            };
+        }
+        std::env::var(E2B_API_KEY_ENV)
+            .ok()
+            .filter(|key| !key.is_empty())
+            .ok_or_else(missing_api_key)
+    }
+
+    /// The template the sandbox is created from.
+    fn resolved_template(&self) -> String {
+        self.template
+            .clone()
+            .unwrap_or_else(|| self.sandbox_type.default_template().to_string())
+    }
+}
+
+/// Adopt the workspace root recorded in `state` when the manifest never chose one.
+///
+/// A provider may rewrite the SDK-wide default root at create time, so the digest recorded in the
+/// state covers the rewritten root. Verifying a manifest that still carries the default against
+/// that digest would always fail. Any other root is left alone, so a manifest that *did* choose a
+/// root must still match what the session was created from.
+pub(crate) fn adopt_recorded_root(manifest: Manifest, state: &SandboxSessionState) -> Manifest {
+    if manifest.root() == crate::sandbox::manifest::DEFAULT_MANIFEST_ROOT {
+        manifest.with_root(state.workspace_root.clone())
+    } else {
+        manifest
+    }
+}
+
+/// The error raised when no usable E2B API key is configured.
+fn missing_api_key() -> SandboxError {
+    SandboxError::new(
+        ErrorCode::SandboxConfigInvalid,
+        format!(
+            "the E2B sandbox backend needs an API key: set `{E2B_API_KEY_ENV}` or \
+             `E2BSandboxClientOptions::with_api_key`"
+        ),
+    )
+}
+
+/// Creates [`E2BSandboxSession`]s against the E2B HTTP API.
+#[derive(Debug, Clone)]
+pub struct E2BSandboxClient {
+    options: E2BSandboxClientOptions,
+    http: reqwest::Client,
+    snapshot: Option<SnapshotSpec>,
+}
+
+impl Default for E2BSandboxClient {
+    fn default() -> Self {
+        E2BSandboxClient::with_options(E2BSandboxClientOptions::default())
+    }
+}
+
+impl E2BSandboxClient {
+    /// A client reading its credentials from the environment.
+    pub fn new() -> Self {
+        E2BSandboxClient::default()
+    }
+
+    /// A client using explicit options.
+    pub fn with_options(options: E2BSandboxClientOptions) -> Self {
+        E2BSandboxClient {
+            options,
+            http: reqwest::Client::new(),
+            snapshot: None,
+        }
+    }
+
+    /// Reuse an existing HTTP client.
+    pub fn with_http_client(mut self, http: reqwest::Client) -> Self {
+        self.http = http;
+        self
+    }
+
+    /// Store workspace snapshots so a paused run can resume the same workspace.
+    pub fn with_snapshot(mut self, snapshot: SnapshotSpec) -> Self {
+        self.snapshot = Some(snapshot);
+        self
+    }
+
+    /// The options this client was built with.
+    pub fn options(&self) -> &E2BSandboxClientOptions {
+        &self.options
+    }
+
+    /// Create a sandbox from `template` and return its id and access token.
+    async fn create_sandbox(
+        &self,
+        api_key: &str,
+        template: &str,
+        envs: &BTreeMap<String, String>,
+    ) -> SandboxResult<CreatedSandbox> {
+        let mut body = json!({
+            "templateID": template,
+            "autoPause": self.options.on_timeout == E2BTimeoutAction::Pause,
+        });
+        let map = body.as_object_mut().expect("object");
+        if let Some(timeout) = self.options.timeout_secs {
+            map.insert("timeout".into(), json!(timeout));
+        }
+        if !self.options.metadata.is_empty() {
+            map.insert("metadata".into(), json!(self.options.metadata));
+        }
+        if !envs.is_empty() {
+            map.insert("envVars".into(), json!(envs));
+        }
+        if let Some(allow) = self.options.allow_internet_access {
+            map.insert("allow_internet_access".into(), json!(allow));
+        }
+        if !self.options.exposed_ports.is_empty() {
+            map.insert("network".into(), json!({ "allowPublicTraffic": true }));
+        }
+        if self.options.on_timeout == E2BTimeoutAction::Pause {
+            map.insert(
+                "autoResume".into(),
+                json!({ "enabled": self.options.auto_resume }),
+            );
+        }
+        let response = self
+            .http
+            .post(format!("{}/v2/sandboxes", self.options.api_base()))
+            .header("X-API-Key", api_key)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| transport("create an E2B sandbox", e))?;
+        let created: CreatedSandbox = parse_json(response, "create an E2B sandbox").await?;
+        Ok(created)
+    }
+}
+
+/// A sandbox as the platform API reports it on create, connect and resume.
+#[derive(Debug, Clone, Deserialize)]
+struct CreatedSandbox {
+    #[serde(rename = "sandboxID")]
+    sandbox_id: String,
+    #[serde(rename = "envdAccessToken", default)]
+    envd_access_token: Option<String>,
+}
+
+#[async_trait]
+impl SandboxClient for E2BSandboxClient {
+    fn backend_id(&self) -> &str {
+        BACKEND_ID
+    }
+
+    async fn create(&self, manifest: Option<Manifest>) -> SandboxResult<Arc<dyn SandboxSession>> {
+        let manifest = manifest.unwrap_or_default();
+        let api_key = self.options.resolved_api_key()?;
+        // Manifest environment variables win over the client's, as in Python.
+        let mut envs = self.options.envs.clone();
+        for (key, value) in manifest.environment() {
+            envs.insert(key.clone(), value.clone());
+        }
+        let created = self
+            .create_sandbox(&api_key, &self.options.resolved_template(), &envs)
+            .await?;
+        Ok(Arc::new(E2BSandboxSession::new(
+            self.options.clone(),
+            api_key,
+            self.http.clone(),
+            created,
+            manifest,
+            self.snapshot.clone(),
+        )))
+    }
+
+    async fn resume(
+        &self,
+        state: &SandboxSessionState,
+        manifest: Manifest,
+    ) -> SandboxResult<Arc<dyn SandboxSession>> {
+        if state.backend != BACKEND_ID {
+            return Err(SandboxError::new(
+                ErrorCode::SessionStateMismatch,
+                format!(
+                    "sandbox session state was created by the `{}` backend",
+                    state.backend
+                ),
+            ));
+        }
+        let manifest = adopt_recorded_root(manifest, state);
+        state.verify_manifest(&manifest)?;
+        let sandbox_id = state.provider_id.clone().ok_or_else(|| {
+            SandboxError::new(
+                ErrorCode::SessionStateInvalid,
+                "E2B sandbox session state is missing its sandbox id",
+            )
+        })?;
+        let api_key = self.options.resolved_api_key()?;
+        let mut envs = self.options.envs.clone();
+        for (key, value) in manifest.environment() {
+            envs.insert(key.clone(), value.clone());
+        }
+
+        // Reattaching returns a fresh access token; the persisted state never carries one.
+        let connected = self
+            .http
+            .post(format!(
+                "{}/v2/sandboxes/{sandbox_id}/connect",
+                self.options.api_base()
+            ))
+            .header("X-API-Key", &api_key)
+            .json(&json!({}))
+            .send()
+            .await
+            .ok()
+            .filter(|response| response.status().is_success());
+        let created = match connected {
+            Some(response) => Some(parse_json::<CreatedSandbox>(response, "connect").await?),
+            None => None,
+        };
+        let (created, resuming) = match created {
+            Some(created) => (created, true),
+            // The original sandbox is gone: create a replacement and hydrate it from the snapshot.
+            None => (
+                self.create_sandbox(&api_key, &self.options.resolved_template(), &envs)
+                    .await?,
+                true,
+            ),
+        };
+        let session = E2BSandboxSession::new(
+            self.options.clone(),
+            api_key,
+            self.http.clone(),
+            created,
+            manifest,
+            Some(state.snapshot.clone()),
+        )
+        .with_session_id(state.session_id.clone())
+        .with_snapshot_id(state.snapshot_id.clone());
+        Ok(Arc::new(if resuming {
+            session.resuming()
+        } else {
+            session
+        }))
+    }
+
+    async fn delete(&self, session: Arc<dyn SandboxSession>) -> SandboxResult<()> {
+        session.shutdown().await
+    }
+}
+
+/// The mutable provider identity of a session: E2B replaces both when a snapshot is restored.
+#[derive(Debug, Clone)]
+struct RemoteHandle {
+    sandbox_id: String,
+    access_token: Option<String>,
+}
+
+/// A sandbox session whose workspace lives in an E2B sandbox.
+pub struct E2BSandboxSession {
+    session_id: String,
+    manifest: Manifest,
+    options: E2BSandboxClientOptions,
+    api_key: String,
+    api_base: String,
+    sandbox_base: String,
+    http: reqwest::Client,
+    remote: RwLock<RemoteHandle>,
+    started: AtomicBool,
+    paused: AtomicBool,
+    released: tokio::sync::Mutex<bool>,
+    ptys: PtyRegistry,
+    snapshot: Option<SnapshotSpec>,
+    snapshot_id: String,
+    resuming: bool,
+}
+
+// Neither the API key nor the sandbox access token may appear in a log line.
+impl std::fmt::Debug for E2BSandboxSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("E2BSandboxSession")
+            .field("session_id", &self.session_id)
+            .field("sandbox_id", &self.sandbox_id())
+            .field("workspace_root", &self.manifest.root())
+            .field("resuming", &self.resuming)
+            .finish_non_exhaustive()
+    }
+}
+
+impl E2BSandboxSession {
+    fn new(
+        options: E2BSandboxClientOptions,
+        api_key: String,
+        http: reqwest::Client,
+        created: CreatedSandbox,
+        manifest: Manifest,
+        snapshot: Option<SnapshotSpec>,
+    ) -> Self {
+        let session_id = uuid::Uuid::new_v4().to_string();
+        E2BSandboxSession {
+            api_base: options.api_base(),
+            sandbox_base: options.sandbox_base(),
+            options,
+            api_key,
+            http,
+            remote: RwLock::new(RemoteHandle {
+                sandbox_id: created.sandbox_id,
+                access_token: created.envd_access_token,
+            }),
+            manifest,
+            snapshot_id: session_id.clone(),
+            session_id,
+            started: AtomicBool::new(false),
+            paused: AtomicBool::new(false),
+            released: tokio::sync::Mutex::new(false),
+            ptys: PtyRegistry::default(),
+            snapshot,
+            resuming: false,
+        }
+    }
+
+    /// Reuse a persisted session identity.
+    fn with_session_id(mut self, session_id: String) -> Self {
+        self.session_id = session_id;
+        self
+    }
+
+    /// Reuse a persisted snapshot identity.
+    fn with_snapshot_id(mut self, snapshot_id: String) -> Self {
+        self.snapshot_id = snapshot_id;
+        self
+    }
+
+    /// Restore the snapshot on start instead of materializing the full manifest.
+    fn resuming(mut self) -> Self {
+        self.resuming = true;
+        self
+    }
+
+    /// The E2B sandbox currently backing this session.
+    pub fn sandbox_id(&self) -> String {
+        self.remote.read().expect("poisoned").sandbox_id.clone()
+    }
+
+    /// Attach the platform authentication to a request.
+    fn platform(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        builder.header("X-API-Key", &self.api_key)
+    }
+
+    /// Attach the envd routing headers and the sandbox access token to a request.
+    fn envd(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        let handle = self.remote.read().expect("poisoned");
+        let mut builder = builder
+            .header("E2b-Sandbox-Id", &handle.sandbox_id)
+            .header("E2b-Sandbox-Port", self.options.envd_port.to_string());
+        if let Some(token) = &handle.access_token {
+            builder = builder.header("X-Access-Token", token);
+        }
+        builder
+    }
+
+    /// Call a unary Connect RPC on envd.
+    async fn connect_unary(&self, method: &str, body: Value, what: &str) -> SandboxResult<Value> {
+        self.connect_unary_tolerating(method, body, what, &[]).await
+    }
+
+    /// Call a unary Connect RPC, accepting the listed Connect error codes as success.
+    ///
+    /// envd answers `MakeDir` on an existing directory with `already_exists` and `Remove` on a
+    /// missing path with `not_found`. The vendor SDK swallows both, and the sandbox session
+    /// contract expects `mkdir -p` and `rm -f` semantics, so they are not failures here either.
+    async fn connect_unary_tolerating(
+        &self,
+        method: &str,
+        body: Value,
+        what: &str,
+        tolerated: &[&str],
+    ) -> SandboxResult<Value> {
+        let response = self
+            .envd(self.http.post(format!("{}/{method}", self.sandbox_base)))
+            .header("Connect-Protocol-Version", "1")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| transport(what, e))?;
+        let status = response.status();
+        let text = response.text().await.map_err(|e| transport(what, e))?;
+        if status.is_success() {
+            return serde_json::from_str(&text).or(Ok(Value::Null));
+        }
+        let code = serde_json::from_str::<Value>(&text).ok().and_then(|value| {
+            value
+                .get("code")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        });
+        if let Some(code) = &code
+            && tolerated.contains(&code.as_str())
+        {
+            return Ok(Value::Null);
+        }
+        Err(http_error(
+            ErrorCode::ExecTransportError,
+            what,
+            status,
+            &text,
+        ))
+    }
+
+    /// The environment every command runs with.
+    fn command_envs(&self) -> BTreeMap<String, String> {
+        let mut envs = self.options.envs.clone();
+        for (key, value) in self.manifest.environment() {
+            envs.insert(key.clone(), value.clone());
+        }
+        envs
+    }
+
+    /// The timeout envd is told to apply, honouring the "no timeout" sentinel.
+    fn envd_timeout(&self, timeout: Option<Duration>) -> Duration {
+        match timeout {
+            None => self.options.timeouts.exec_unbounded,
+            Some(timeout) if timeout.is_zero() => Duration::from_secs(1),
+            Some(timeout) => timeout,
+        }
+    }
+
+    /// Build a `process.StartRequest` for `argv`.
+    fn start_request(
+        &self,
+        argv: &[String],
+        cwd: Option<String>,
+        pty: Option<(u16, u16)>,
+        stdin: bool,
+    ) -> Value {
+        let (cmd, args) = argv
+            .split_first()
+            .map(|(cmd, args)| (cmd.clone(), args.to_vec()))
+            .unwrap_or_else(|| ("true".to_string(), Vec::new()));
+        let mut process = json!({ "cmd": cmd, "args": args, "envs": self.command_envs() });
+        if let Some(cwd) = cwd {
+            process
+                .as_object_mut()
+                .expect("object")
+                .insert("cwd".into(), json!(cwd));
+        }
+        let mut request = json!({ "process": process, "stdin": stdin });
+        if let Some((rows, cols)) = pty {
+            request.as_object_mut().expect("object").insert(
+                "pty".into(),
+                json!({ "size": { "rows": rows, "cols": cols } }),
+            );
+        }
+        request
+    }
+
+    /// Resolve the working directory of a request, defaulting to the workspace root.
+    fn resolve_cwd(&self, cwd: &Option<String>) -> SandboxResult<String> {
+        match cwd {
+            None => Ok(self.manifest.root().to_string()),
+            Some(cwd) => self.normalize_path(cwd),
+        }
+    }
+
+    /// Open `process.Process/Start` and return the framed response stream.
+    async fn open_process_stream(
+        &self,
+        request: Value,
+        user: Option<&str>,
+        timeout: Duration,
+        what: &str,
+    ) -> SandboxResult<reqwest::Response> {
+        let mut builder = self
+            .envd(
+                self.http
+                    .post(format!("{}/process.Process/Start", self.sandbox_base)),
+            )
+            .header("Connect-Protocol-Version", "1")
+            .header("Content-Type", "application/connect+json")
+            .header("Connect-Timeout-Ms", timeout.as_millis().to_string())
+            .body(encode_connect_frame(&request));
+        if let Some(user) = user {
+            // envd takes the system user through basic auth, with an empty password.
+            builder = builder.basic_auth(user, None::<&str>);
+        }
+        let response = builder.send().await.map_err(|e| transport(what, e))?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(http_error(
+                ErrorCode::ExecTransportError,
+                what,
+                status,
+                &body,
+            ));
+        }
+        Ok(response)
+    }
+
+    /// Run a command without the workspace-root default, used while the root is still missing.
+    async fn exec_at(
+        &self,
+        argv: Vec<String>,
+        cwd: Option<String>,
+        timeout: Option<Duration>,
+        user: Option<String>,
+    ) -> SandboxResult<ExecResult> {
+        let what = "run a command in the E2B sandbox";
+        let envd_timeout = self.envd_timeout(timeout);
+        let request = self.start_request(&argv, cwd, None, false);
+        let response = self
+            .open_process_stream(request, user.as_deref(), envd_timeout, what)
+            .await?;
+        let collect = async {
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            let mut exit_code = None;
+            let mut stream = response.bytes_stream();
+            let mut decoder = ConnectFrameDecoder::default();
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.map_err(|e| transport(what, e))?;
+                decoder.push(&chunk);
+                for frame in decoder.drain() {
+                    match frame {
+                        ConnectFrame::Message(value) => {
+                            apply_process_event(&value, &mut stdout, &mut stderr, &mut exit_code);
+                        }
+                        ConnectFrame::EndStream(value) => {
+                            if let Some(error) = connect_stream_error(&value) {
+                                return Err(SandboxError::new(
+                                    ErrorCode::ExecTransportError,
+                                    format!("E2B rejected the command: {error}"),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+            // envd always reports an end event; without one the stream was cut short and the
+            // exit code is unknown, so reporting success would be a lie.
+            let exit_code = exit_code.ok_or_else(|| {
+                SandboxError::new(
+                    ErrorCode::ExecTransportError,
+                    format!(
+                        "the E2B command stream for `{}` ended before the process finished",
+                        argv.join(" ")
+                    ),
+                )
+            })?;
+            Ok(ExecResult {
+                stdout,
+                stderr,
+                exit_code,
+            })
+        };
+        match timeout {
+            None => collect.await,
+            Some(limit) => match tokio::time::timeout(limit, collect).await {
+                Ok(result) => result,
+                Err(_) => Err(SandboxError::new(
+                    ErrorCode::ExecTimeout,
+                    format!("Command `{}` timed out after {limit:?}", argv.join(" ")),
+                )),
+            },
+        }
+    }
+
+    /// Create a directory with the filesystem API, which works before the root exists.
+    async fn make_dir(&self, path: &str) -> SandboxResult<()> {
+        self.connect_unary_tolerating(
+            "filesystem.Filesystem/MakeDir",
+            json!({ "path": path }),
+            "create a directory in the E2B sandbox",
+            &["already_exists"],
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// Kill the listed sandbox-side PTY processes, best effort.
+    async fn signal_pty_processes(&self, pids: &[u32]) {
+        for pid in pids {
+            let _ = self
+                .connect_unary(
+                    "process.Process/SendSignal",
+                    json!({ "process": { "pid": pid }, "signal": "SIGNAL_SIGKILL" }),
+                    "terminate a PTY process in the E2B sandbox",
+                )
+                .await;
+        }
+    }
+
+    /// Pause the sandbox, keeping its filesystem and memory.
+    async fn pause(&self) -> SandboxResult<()> {
+        let response = self
+            .platform(self.http.post(format!(
+                "{}/sandboxes/{}/pause",
+                self.api_base,
+                self.sandbox_id()
+            )))
+            .send()
+            .await
+            .map_err(|e| transport("pause the E2B sandbox", e))?;
+        expect_success(
+            response,
+            "pause the E2B sandbox",
+            ErrorCode::WorkspaceStopError,
+        )
+        .await
+    }
+
+    /// Kill the sandbox and release its resources.
+    async fn kill(&self) -> SandboxResult<()> {
+        let response = self
+            .platform(self.http.delete(format!(
+                "{}/sandboxes/{}",
+                self.api_base,
+                self.sandbox_id()
+            )))
+            .send()
+            .await
+            .map_err(|e| transport("kill the E2B sandbox", e))?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(());
+        }
+        expect_success(
+            response,
+            "kill the E2B sandbox",
+            ErrorCode::WorkspaceStopError,
+        )
+        .await
+    }
+
+    /// Release the sandbox exactly once, pausing it when the options ask for that.
+    async fn terminate(&self) -> SandboxResult<()> {
+        let mut terminated = self.released.lock().await;
+        if *terminated {
+            return Ok(());
+        }
+        self.pty_terminate_all().await.ok();
+        let result = if self.options.pause_on_exit {
+            // A `stop` already paused it; pausing a paused sandbox is a conflict, and falling
+            // back to a kill would destroy a sandbox the caller asked to keep.
+            if self.paused.load(Ordering::SeqCst) {
+                Ok(())
+            } else {
+                match self.pause().await {
+                    Ok(()) => Ok(()),
+                    // A pause that cannot be taken must not leak the sandbox.
+                    Err(error) => {
+                        log::warn!("failed to pause the E2B sandbox, killing it instead: {error}");
+                        self.kill().await
+                    }
+                }
+            }
+        } else {
+            self.kill().await
+        };
+        self.started.store(false, Ordering::SeqCst);
+        *terminated = true;
+        result
+    }
+
+    /// Replace the backing sandbox with one created from a native snapshot template.
+    async fn restore_native_snapshot(&self, snapshot_id: &str) -> SandboxResult<()> {
+        // Reuse the client's create path so the snapshot sandbox keeps the configured timeout,
+        // metadata, network and lifecycle options instead of a hand-written subset.
+        let client = E2BSandboxClient {
+            options: self.options.clone(),
+            http: self.http.clone(),
+            snapshot: None,
+        };
+        let created = client
+            .create_sandbox(&self.api_key, snapshot_id, &self.command_envs())
+            .await?;
+        // Killing the sandbox the snapshot replaces keeps the account from leaking sandboxes.
+        let previous = {
+            let mut handle = self.remote.write().expect("poisoned");
+            let previous = handle.sandbox_id.clone();
+            handle.sandbox_id = created.sandbox_id;
+            handle.access_token = created.envd_access_token;
+            previous
+        };
+        let _ = self
+            .platform(
+                self.http
+                    .delete(format!("{}/sandboxes/{previous}", self.api_base)),
+            )
+            .send()
+            .await;
+        Ok(())
+    }
+
+    /// Take a native E2B snapshot of the whole sandbox.
+    async fn create_native_snapshot(&self) -> SandboxResult<String> {
+        let response = self
+            .platform(self.http.post(format!(
+                "{}/sandboxes/{}/snapshots",
+                self.api_base,
+                self.sandbox_id()
+            )))
+            .json(&json!({ "memory": false }))
+            .send()
+            .await
+            .map_err(|e| transport("snapshot the E2B sandbox", e))?;
+        #[derive(Deserialize)]
+        struct SnapshotInfo {
+            #[serde(rename = "snapshotID")]
+            snapshot_id: String,
+        }
+        let info: SnapshotInfo = parse_json(response, "snapshot the E2B sandbox").await?;
+        Ok(info.snapshot_id)
+    }
+
+    /// Download a file by its absolute sandbox path.
+    ///
+    /// Workspace reads go through [`read_file`](SandboxSession::read_file), which validates the
+    /// path first; this is for the paths the session itself owns, such as a temporary archive
+    /// under `/tmp`.
+    async fn download_at(&self, path: &str) -> SandboxResult<Vec<u8>> {
+        let what = "read a file from the E2B sandbox";
+        let response = self
+            .envd(self.http.get(format!("{}/files", self.sandbox_base)))
+            .query(&[("path", path)])
+            .send()
+            .await
+            .map_err(|e| transport(what, e))?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Err(SandboxError::new(
+                ErrorCode::WorkspaceReadNotFound,
+                format!("`{path}` does not exist in the sandbox"),
+            ));
+        }
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(http_error(
+                ErrorCode::WorkspaceWriteTypeError,
+                what,
+                status,
+                &body,
+            ));
+        }
+        Ok(response
+            .bytes()
+            .await
+            .map_err(|e| transport(what, e))?
+            .to_vec())
+    }
+
+    /// Upload a file by its absolute sandbox path.
+    async fn upload_at(&self, path: &str, contents: &[u8]) -> SandboxResult<()> {
+        let what = "write a file to the E2B sandbox";
+        let response = self
+            .envd(self.http.post(format!("{}/files", self.sandbox_base)))
+            .query(&[("path", path)])
+            .header("Content-Type", "application/octet-stream")
+            .timeout(self.options.timeouts.file_upload)
+            .body(contents.to_vec())
+            .send()
+            .await
+            .map_err(|e| transport(what, e))?;
+        expect_success(response, what, ErrorCode::WorkspaceWriteTypeError).await
+    }
+
+    /// Remove a path by its absolute sandbox path.
+    async fn remove_at(&self, path: &str) -> SandboxResult<()> {
+        self.connect_unary_tolerating(
+            "filesystem.Filesystem/Remove",
+            json!({ "path": path }),
+            "remove a path in the E2B sandbox",
+            &["not_found"],
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// Archive the workspace, excluding the manifest's ephemeral paths.
+    async fn persist_workspace_tar(&self) -> SandboxResult<Vec<u8>> {
+        let root = self.manifest.root().to_string();
+        let mut command = format!("tar -czf - -C {}", shell_quote(&root));
+        for exclude in workspace_excludes(&self.manifest, &root) {
+            command.push_str(&format!(" --exclude {}", shell_quote(&exclude)));
+        }
+        // envd reports command output as text, so the archive travels base64-encoded.
+        command.push_str(" . | base64 -w0");
+        let result = self
+            .exec_at(
+                vec!["sh".into(), "-lc".into(), command],
+                Some(root.clone()),
+                Some(self.options.timeouts.snapshot_tar),
+                None,
+            )
+            .await?;
+        if !result.ok() {
+            return Err(SandboxError::new(
+                ErrorCode::SnapshotPersistError,
+                format!(
+                    "Failed to archive workspace `{root}`: {}",
+                    result.stderr_text().trim()
+                ),
+            ));
+        }
+        BASE64.decode(result.stdout_text().trim()).map_err(|e| {
+            SandboxError::new(
+                ErrorCode::SnapshotPersistError,
+                format!("E2B returned a workspace archive that is not valid base64: {e}"),
+            )
+        })
+    }
+}
+
+#[async_trait]
+impl SandboxSession for E2BSandboxSession {
+    fn id(&self) -> &str {
+        &self.session_id
+    }
+
+    fn manifest(&self) -> &Manifest {
+        &self.manifest
+    }
+
+    fn backend_id(&self) -> &str {
+        BACKEND_ID
+    }
+
+    async fn start(&self) -> SandboxResult<()> {
+        let root = self.manifest.root().to_string();
+        // The filesystem API can create roots the command user cannot, so it goes first; the
+        // command below then proves the root is usable as a working directory.
+        self.make_dir(&root).await.map_err(|error| {
+            SandboxError::new(
+                ErrorCode::WorkspaceStartError,
+                format!(
+                    "Failed to create the E2B workspace root `{root}`: {}",
+                    error.message
+                ),
+            )
+        })?;
+        let prepared = self
+            .exec_at(
+                vec!["mkdir".into(), "-p".into(), "--".into(), root.clone()],
+                Some("/".to_string()),
+                Some(self.options.timeouts.fast_op),
+                None,
+            )
+            .await?;
+        if !prepared.ok() {
+            return Err(SandboxError::new(
+                ErrorCode::WorkspaceStartError,
+                format!(
+                    "Failed to prepare the E2B workspace root `{root}`: {}",
+                    prepared.stderr_text().trim()
+                ),
+            ));
+        }
+        self.started.store(true, Ordering::SeqCst);
+        let result = if self.resuming {
+            match restore_session_snapshot(self).await {
+                Ok(false) => self
+                    .manifest
+                    .clone()
+                    .apply_ephemeral(self)
+                    .await
+                    .map(|_| ()),
+                Ok(true) => Ok(()),
+                Err(error) => Err(error),
+            }
+        } else {
+            self.manifest.clone().apply(self).await.map(|_| ())
+        };
+        result.inspect_err(|_| {
+            self.started.store(false, Ordering::SeqCst);
+        })?;
+        Ok(())
+    }
+
+    async fn stop(&self) -> SandboxResult<()> {
+        // `stop` keeps what `shutdown` releases, so it pauses the sandbox: a paused E2B sandbox
+        // keeps its filesystem and can be resumed by id.
+        if *self.released.lock().await {
+            return Ok(());
+        }
+        self.pty_terminate_all().await.ok();
+        let result = self.pause().await;
+        self.started.store(false, Ordering::SeqCst);
+        if result.is_ok() {
+            self.paused.store(true, Ordering::SeqCst);
+        }
+        result
+    }
+
+    async fn shutdown(&self) -> SandboxResult<()> {
+        self.terminate().await
+    }
+
+    async fn running(&self) -> SandboxResult<bool> {
+        let response = tokio::time::timeout(
+            self.options.timeouts.keepalive,
+            self.platform(self.http.get(format!(
+                "{}/sandboxes/{}",
+                self.api_base,
+                self.sandbox_id()
+            )))
+            .send(),
+        )
+        .await;
+        let Ok(Ok(response)) = response else {
+            return Ok(false);
+        };
+        if !response.status().is_success() {
+            return Ok(false);
+        }
+        #[derive(Deserialize)]
+        struct Detail {
+            #[serde(default)]
+            state: Option<String>,
+        }
+        let detail: Detail = response.json().await.unwrap_or(Detail { state: None });
+        Ok(detail.state.as_deref() == Some("running"))
+    }
+
+    async fn exec(&self, request: ExecRequest) -> SandboxResult<ExecResult> {
+        let cwd = self.resolve_cwd(&request.cwd)?;
+        let user = request.user.as_ref().map(|user| user.name.clone());
+        // envd takes the user out of band, so the `sudo` wrapper must not be built here.
+        let argv = ExecRequest {
+            user: None,
+            ..request.clone()
+        }
+        .resolved_argv();
+        self.exec_at(argv, Some(cwd), request.timeout, user).await
+    }
+
+    async fn read_file(&self, path: &str) -> SandboxResult<Vec<u8>> {
+        let resolved = self.normalize_path(path)?;
+        self.download_at(&resolved).await
+    }
+
+    async fn write_file(&self, path: &str, contents: &[u8]) -> SandboxResult<()> {
+        let resolved = self.normalize_path(path)?;
+        self.upload_at(&resolved, contents).await
+    }
+
+    fn supports_pty(&self) -> bool {
+        true
+    }
+
+    async fn ls(&self, path: &str) -> SandboxResult<Vec<FileEntry>> {
+        let resolved = self.normalize_path(path)?;
+        let value = self
+            .connect_unary(
+                "filesystem.Filesystem/ListDir",
+                json!({ "path": resolved, "depth": 1 }),
+                "list a directory in the E2B sandbox",
+            )
+            .await?;
+        Ok(value
+            .get("entries")
+            .and_then(Value::as_array)
+            .map(|entries| entries.iter().map(entry_info_to_file_entry).collect())
+            .unwrap_or_default())
+    }
+
+    async fn mkdir(&self, path: &str, _parents: bool) -> SandboxResult<()> {
+        // envd's MakeDir always creates the missing parents.
+        let resolved = self.normalize_path(path)?;
+        self.make_dir(&resolved).await
+    }
+
+    async fn rm(&self, path: &str, recursive: bool) -> SandboxResult<()> {
+        let resolved = self.normalize_path(path)?;
+        if recursive {
+            return self.remove_at(&resolved).await;
+        }
+        // envd's `Remove` always deletes recursively, so a non-recursive request runs `rm -f`
+        // instead: a model removing "a file" must not be able to wipe a directory tree.
+        let command = vec![
+            "rm".to_string(),
+            "-f".to_string(),
+            "--".to_string(),
+            resolved,
+        ];
+        let result = self
+            .exec_at(
+                command.clone(),
+                Some("/".to_string()),
+                Some(self.options.timeouts.fast_op),
+                None,
+            )
+            .await?;
+        if !result.ok() {
+            return Err(SandboxError::exec_nonzero(&command, &result));
+        }
+        Ok(())
+    }
+
+    async fn mv(&self, source: &str, destination: &str) -> SandboxResult<()> {
+        let source = self.normalize_path(source)?;
+        let destination = self.normalize_path(destination)?;
+        self.connect_unary(
+            "filesystem.Filesystem/Move",
+            json!({ "source": source, "destination": destination }),
+            "move a path in the E2B sandbox",
+        )
+        .await
+        .map(|_| ())
+    }
+
+    async fn pty_exec_start(&self, request: PtyExecRequest) -> SandboxResult<PtyExecUpdate> {
+        let cwd = self.resolve_cwd(&request.cwd)?;
+        let user = request.user.as_ref().map(|user| user.name.clone());
+        let argv = PtyExecRequest {
+            user: None,
+            ..request.clone()
+        }
+        .resolved_argv();
+        let start = self.start_request(&argv, Some(cwd), Some((24, 80)), request.tty);
+        let response = self
+            .open_process_stream(
+                start,
+                user.as_deref(),
+                self.options.timeouts.exec_unbounded,
+                "start a PTY process in the E2B sandbox",
+            )
+            .await?;
+        let (process, evicted) = self.ptys.insert(request.tty)?;
+        // A pruned process keeps running inside the sandbox until it is signalled.
+        self.signal_pty_processes(&evicted).await;
+        process.clone().pump(response.bytes_stream());
+        Ok(process
+            .collect(request.yield_time_ms, request.max_output_tokens, &self.ptys)
+            .await)
+    }
+
+    async fn pty_write_stdin(&self, request: PtyWriteRequest) -> SandboxResult<PtyExecUpdate> {
+        let process = self.ptys.get(request.session_id)?;
+        if !request.chars.is_empty() {
+            if !process.tty {
+                return Err(SandboxError::new(
+                    ErrorCode::PtyStdinUnavailable,
+                    format!(
+                        "PTY session `{}` was not started with a TTY, so it has no stdin",
+                        request.session_id
+                    ),
+                ));
+            }
+            let pid = process.pid().ok_or_else(|| {
+                SandboxError::new(
+                    ErrorCode::PtySessionNotFound,
+                    format!(
+                        "PTY session `{}` has not reported its process id yet",
+                        request.session_id
+                    ),
+                )
+            })?;
+            self.connect_unary(
+                "process.Process/SendInput",
+                json!({
+                    "process": { "pid": pid },
+                    "input": { "pty": BASE64.encode(request.chars.as_bytes()) },
+                }),
+                "write to a PTY process in the E2B sandbox",
+            )
+            .await?;
+        }
+        let yield_time_ms =
+            resolve_pty_write_yield_time_ms(request.yield_time_ms, request.chars.is_empty());
+        Ok(process
+            .collect(yield_time_ms, request.max_output_tokens, &self.ptys)
+            .await)
+    }
+
+    async fn pty_terminate_all(&self) -> SandboxResult<()> {
+        let pids = self.ptys.terminate_all();
+        self.signal_pty_processes(&pids).await;
+        Ok(())
+    }
+
+    fn session_state(&self) -> SandboxSessionState {
+        SandboxSessionState::new(
+            BACKEND_ID,
+            &self.session_id,
+            self.manifest.root(),
+            &self.manifest,
+        )
+        .with_provider_id(Some(self.sandbox_id()))
+        .with_snapshot(self.snapshot.clone().unwrap_or_default())
+    }
+
+    fn snapshot(&self) -> Arc<dyn Snapshot> {
+        resolve_snapshot(self.snapshot.as_ref(), &self.snapshot_id)
+    }
+
+    async fn persist_workspace(&self) -> SandboxResult<Vec<u8>> {
+        if self.options.workspace_persistence == WorkspacePersistence::Snapshot {
+            let snapshot_id = self.create_native_snapshot().await?;
+            return Ok(encode_snapshot_ref(&snapshot_id));
+        }
+        self.persist_workspace_tar().await
+    }
+
+    async fn hydrate_workspace(&self, archive: &[u8]) -> SandboxResult<()> {
+        if let Some(snapshot_id) = decode_snapshot_ref(archive) {
+            return self.restore_native_snapshot(&snapshot_id).await;
+        }
+        let root = self.manifest.root().to_string();
+        let archive_path = format!("/tmp/openai-agents-{}.tar.gz", self.session_id);
+        self.upload_at(&archive_path, archive).await?;
+        let script = format!(
+            "mkdir -p {root} && tar -xzf {archive} -C {root}",
+            root = shell_quote(&root),
+            archive = shell_quote(&archive_path),
+        );
+        let result = self
+            .exec_at(
+                vec!["sh".into(), "-lc".into(), script],
+                Some("/".to_string()),
+                Some(self.options.timeouts.snapshot_tar),
+                None,
+            )
+            .await;
+        // The archive is scratch space; removing it must not mask the extraction outcome.
+        let _ = tokio::time::timeout(self.options.timeouts.cleanup, self.remove_at(&archive_path))
+            .await;
+        let result = result?;
+        if !result.ok() {
+            return Err(SandboxError::new(
+                ErrorCode::SnapshotRestoreError,
+                format!(
+                    "Failed to restore the E2B workspace: {}",
+                    result.stderr_text().trim()
+                ),
+            ));
+        }
+        Ok(())
+    }
+}
+
+// -------------------------------------------------------------------------------------------
+// Cloud bucket mounts
+// -------------------------------------------------------------------------------------------
+
+/// Mounts rclone-backed cloud storage inside an E2B sandbox. Mirrors
+/// `agents.extensions.sandbox.e2b.mounts.E2BCloudBucketMountStrategy`.
+///
+/// Activation checks that the sandbox supports FUSE, makes `/dev/fuse` usable by the command
+/// user, installs `rclone` when it is missing, and then delegates to
+/// [`InContainerMountStrategy`]. The rclone configuration carries the bucket credentials, so the
+/// mount reports [`MountCredentialAuthority::MountScoped`] and the manifest has to acknowledge
+/// the exact mount path before it activates.
+#[derive(Debug, Clone)]
+pub struct E2BCloudBucketMountStrategy {
+    /// The rclone pattern that attaches the bucket.
+    pub pattern: RcloneMountPattern,
+    /// The secret-bearing rclone configuration and the remote selection options.
+    pub config: MountPatternConfig,
+}
+
+impl E2BCloudBucketMountStrategy {
+    /// A strategy mounting `remote_name:remote_path` from `config_text`.
+    pub fn new(
+        remote_name: impl Into<String>,
+        remote_path: impl Into<String>,
+        config_text: impl Into<String>,
+    ) -> Self {
+        E2BCloudBucketMountStrategy {
+            pattern: RcloneMountPattern::new(),
+            config: MountPatternConfig::new()
+                .with_config_text(config_text)
+                .with_option(rclone::OPTION_REMOTE_NAME, remote_name)
+                .with_option(rclone::OPTION_REMOTE_PATH, remote_path),
+        }
+    }
+
+    /// Replace the rclone pattern.
+    pub fn with_pattern(mut self, pattern: RcloneMountPattern) -> Self {
+        self.pattern = pattern;
+        self
+    }
+
+    /// A [`Mount`] using this strategy.
+    pub fn mount(self) -> Mount {
+        Mount::new(Arc::new(self))
+    }
+
+    /// The delegate used for one activation, with the mount's read-only flag applied.
+    fn delegate(&self, mount: &Mount) -> InContainerMountStrategy {
+        let mut config = self.config.clone();
+        config.options.insert(
+            rclone::OPTION_READ_ONLY.to_string(),
+            mount.read_only.to_string(),
+        );
+        InContainerMountStrategy::new(Arc::new(self.pattern.clone()), config)
+    }
+
+    /// Run the preflight the provider's image needs before an rclone mount.
+    async fn preflight(&self, session: &dyn SandboxSession) -> SandboxResult<()> {
+        if self.pattern.mode == RcloneMountMode::Fuse {
+            ensure_fuse_support(session, self.pattern.install_if_missing).await?;
+        }
+        ensure_rclone(session, self.pattern.install_if_missing).await
+    }
+}
+
+#[async_trait]
+impl MountStrategy for E2BCloudBucketMountStrategy {
+    fn strategy_type(&self) -> &str {
+        "e2b_cloud_bucket"
+    }
+
+    fn credential_authority(&self) -> MountCredentialAuthority {
+        if self.config.has_config_text() {
+            MountCredentialAuthority::MountScoped
+        } else {
+            MountCredentialAuthority::None
+        }
+    }
+
+    fn supports_native_snapshot_detach(&self) -> bool {
+        false
+    }
+
+    async fn activate(
+        &self,
+        mount: &Mount,
+        session: &dyn SandboxSession,
+        mount_path: &str,
+    ) -> SandboxResult<()> {
+        session.authorize_mount_activation(mount, mount_path)?;
+        self.preflight(session).await?;
+        self.delegate(mount)
+            .activate(mount, session, mount_path)
+            .await
+    }
+
+    async fn deactivate(
+        &self,
+        mount: &Mount,
+        session: &dyn SandboxSession,
+        mount_path: &str,
+    ) -> SandboxResult<()> {
+        self.delegate(mount)
+            .deactivate(mount, session, mount_path)
+            .await
+    }
+
+    async fn restore_after_snapshot(
+        &self,
+        mount: &Mount,
+        session: &dyn SandboxSession,
+        mount_path: &str,
+    ) -> SandboxResult<()> {
+        session.authorize_mount_activation(mount, mount_path)?;
+        self.preflight(session).await?;
+        self.delegate(mount)
+            .activate(mount, session, mount_path)
+            .await
+    }
+}
+
+// -------------------------------------------------------------------------------------------
+// Remote PTY bookkeeping
+// -------------------------------------------------------------------------------------------
+
+/// One PTY process running inside the sandbox, with the output collected so far.
+struct PtyProcess {
+    id: u32,
+    tty: bool,
+    pid: Mutex<Option<u32>>,
+    buffer: Mutex<Vec<u8>>,
+    exit_code: Mutex<Option<i32>>,
+    closed: AtomicBool,
+    notify: Notify,
+    last_used: Mutex<Instant>,
+}
+
+impl PtyProcess {
+    fn pid(&self) -> Option<u32> {
+        *self.pid.lock().expect("poisoned")
+    }
+
+    fn is_done(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
+    }
+
+    fn touch(&self) {
+        *self.last_used.lock().expect("poisoned") = Instant::now();
+    }
+
+    fn take_output(&self, keep_partial_utf8: bool) -> Vec<u8> {
+        let mut buffer = self.buffer.lock().expect("poisoned");
+        if keep_partial_utf8 {
+            let keep = crate::sandbox::pty::incomplete_utf8_suffix_length(&buffer);
+            let split = buffer.len() - keep;
+            let tail = buffer.split_off(split);
+            let output = std::mem::replace(&mut *buffer, tail);
+            return output;
+        }
+        std::mem::take(&mut *buffer)
+    }
+
+    /// Decode the Connect response stream into the process buffer on a background task.
+    fn pump<S>(self: Arc<Self>, stream: S)
+    where
+        S: futures::Stream<Item = reqwest::Result<bytes::Bytes>> + Send + Unpin + 'static,
+    {
+        tokio::spawn(async move {
+            let mut stream = stream;
+            let mut decoder = ConnectFrameDecoder::default();
+            while let Some(chunk) = stream.next().await {
+                let Ok(chunk) = chunk else { break };
+                decoder.push(&chunk);
+                for frame in decoder.drain() {
+                    match frame {
+                        ConnectFrame::Message(value) => {
+                            let event = value.get("event").unwrap_or(&Value::Null);
+                            if let Some(pid) = event
+                                .get("start")
+                                .and_then(|start| start.get("pid"))
+                                .and_then(Value::as_u64)
+                            {
+                                *self.pid.lock().expect("poisoned") = Some(pid as u32);
+                            }
+                            if let Some(data) = event.get("data") {
+                                let mut buffer = self.buffer.lock().expect("poisoned");
+                                for field in ["pty", "stdout", "stderr"] {
+                                    if let Some(encoded) = data.get(field).and_then(Value::as_str)
+                                        && let Ok(bytes) = BASE64.decode(encoded)
+                                    {
+                                        buffer.extend_from_slice(&bytes);
+                                    }
+                                }
+                            }
+                            if let Some(end) = event.get("end") {
+                                *self.exit_code.lock().expect("poisoned") =
+                                    Some(end.get("exitCode").and_then(Value::as_i64).unwrap_or(0)
+                                        as i32);
+                            }
+                        }
+                        ConnectFrame::EndStream(_) => {}
+                    }
+                }
+                self.notify.notify_waiters();
+            }
+            self.closed.store(true, Ordering::SeqCst);
+            self.notify.notify_waiters();
+        });
+    }
+
+    /// Collect output until the yield window elapses or the process finishes.
+    async fn collect(
+        self: &Arc<Self>,
+        yield_time_ms: u64,
+        max_output_tokens: Option<usize>,
+        registry: &PtyRegistry,
+    ) -> PtyExecUpdate {
+        self.touch();
+        let deadline =
+            Instant::now() + Duration::from_millis(clamp_pty_yield_time_ms(yield_time_ms));
+        let mut output = Vec::new();
+        let mut closed = false;
+        loop {
+            output.extend(self.take_output(false));
+            if self.is_done() {
+                closed = true;
+                output.extend(self.take_output(false));
+                break;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            let notified = self.notify.notified();
+            if tokio::time::timeout(deadline - now, notified)
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+        output.extend(self.take_output(!closed));
+        self.touch();
+        if closed {
+            registry.remove(self.id);
+        }
+
+        let text = String::from_utf8_lossy(&output).into_owned();
+        let (text, original_token_count) = truncate_text_by_tokens(&text, max_output_tokens);
+        PtyExecUpdate {
+            process_id: (!closed).then_some(self.id),
+            output: text.into_bytes(),
+            exit_code: *self.exit_code.lock().expect("poisoned"),
+            original_token_count,
+        }
+    }
+}
+
+/// The live PTY processes of one session.
+#[derive(Default)]
+struct PtyRegistry {
+    processes: Mutex<HashMap<u32, Arc<PtyProcess>>>,
+}
+
+impl PtyRegistry {
+    /// Register a new PTY process, returning it and the pids of any processes pruned to make
+    /// room. The caller must signal those pids: the sandbox-side process outlives this registry.
+    fn insert(&self, tty: bool) -> SandboxResult<(Arc<PtyProcess>, Vec<u32>)> {
+        let mut processes = self.processes.lock().expect("poisoned");
+        processes.retain(|_, process| !process.is_done());
+        let mut evicted = Vec::new();
+        if processes.len() >= PTY_PROCESSES_MAX {
+            let mut by_age: Vec<(u32, Instant)> = processes
+                .iter()
+                .map(|(id, p)| (*id, *p.last_used.lock().expect("poisoned")))
+                .collect();
+            by_age.sort_by_key(|(_, last_used)| *last_used);
+            let prunable = by_age.len().saturating_sub(PTY_PROCESSES_PROTECTED_RECENT);
+            for (id, _) in by_age.into_iter().take(prunable) {
+                if let Some(process) = processes.remove(&id) {
+                    evicted.extend(process.pid());
+                    // Stop the pump task and release anything still polling this handle.
+                    process.closed.store(true, Ordering::SeqCst);
+                    process.notify.notify_waiters();
+                }
+                if processes.len() < PTY_PROCESSES_MAX {
+                    break;
+                }
+            }
+        }
+        let mut id = None;
+        for _ in 0..1024 {
+            let span = PTY_PROCESS_ID_MAX_EXCLUSIVE - PTY_PROCESS_ID_MIN;
+            let candidate =
+                PTY_PROCESS_ID_MIN + (uuid::Uuid::new_v4().as_u128() % span as u128) as u32;
+            if !processes.contains_key(&candidate) {
+                id = Some(candidate);
+                break;
+            }
+        }
+        let id = id.ok_or_else(|| {
+            SandboxError::new(
+                ErrorCode::ExecTransportError,
+                "could not allocate a free PTY session id",
+            )
+        })?;
+        let process = Arc::new(PtyProcess {
+            id,
+            tty,
+            pid: Mutex::new(None),
+            buffer: Mutex::new(Vec::new()),
+            exit_code: Mutex::new(None),
+            closed: AtomicBool::new(false),
+            notify: Notify::new(),
+            last_used: Mutex::new(Instant::now()),
+        });
+        processes.insert(id, process.clone());
+        Ok((process, evicted))
+    }
+
+    fn get(&self, id: u32) -> SandboxResult<Arc<PtyProcess>> {
+        self.processes
+            .lock()
+            .expect("poisoned")
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| {
+                SandboxError::new(
+                    ErrorCode::PtySessionNotFound,
+                    format!("PTY session `{id}` is not running"),
+                )
+            })
+    }
+
+    fn remove(&self, id: u32) {
+        self.processes.lock().expect("poisoned").remove(&id);
+    }
+
+    /// Forget every process and return the sandbox pids that still need a signal.
+    fn terminate_all(&self) -> Vec<u32> {
+        let mut processes = self.processes.lock().expect("poisoned");
+        let pids = processes
+            .values()
+            .filter(|process| !process.is_done())
+            .filter_map(|process| process.pid())
+            .collect();
+        for process in processes.values() {
+            process.closed.store(true, Ordering::SeqCst);
+            process.notify.notify_waiters();
+        }
+        processes.clear();
+        pids
+    }
+}
+
+// -------------------------------------------------------------------------------------------
+// Connect protocol framing
+// -------------------------------------------------------------------------------------------
+
+/// One frame of a Connect streaming body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ConnectFrame {
+    /// A protocol message.
+    Message(Value),
+    /// The trailing frame, which carries any RPC-level error.
+    EndStream(Value),
+}
+
+/// Encode `message` as a single Connect envelope: flags, length, JSON payload.
+fn encode_connect_frame(message: &Value) -> Vec<u8> {
+    let payload = serde_json::to_vec(message).expect("serializable");
+    let mut frame = Vec::with_capacity(payload.len() + 5);
+    frame.push(0);
+    frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    frame.extend_from_slice(&payload);
+    frame
+}
+
+/// Reassembles Connect envelopes from a chunked HTTP body.
+#[derive(Debug, Default)]
+struct ConnectFrameDecoder {
+    buffer: Vec<u8>,
+}
+
+impl ConnectFrameDecoder {
+    fn push(&mut self, chunk: &[u8]) {
+        self.buffer.extend_from_slice(chunk);
+    }
+
+    /// Take every complete frame currently buffered.
+    fn drain(&mut self) -> Vec<ConnectFrame> {
+        let mut frames = Vec::new();
+        let mut offset = 0usize;
+        while self.buffer.len() >= offset + 5 {
+            let flags = self.buffer[offset];
+            let length = u32::from_be_bytes([
+                self.buffer[offset + 1],
+                self.buffer[offset + 2],
+                self.buffer[offset + 3],
+                self.buffer[offset + 4],
+            ]) as usize;
+            if self.buffer.len() < offset + 5 + length {
+                break;
+            }
+            let payload = &self.buffer[offset + 5..offset + 5 + length];
+            let value = serde_json::from_slice::<Value>(payload).unwrap_or(Value::Null);
+            frames.push(if flags & 0x02 != 0 {
+                ConnectFrame::EndStream(value)
+            } else {
+                ConnectFrame::Message(value)
+            });
+            offset += 5 + length;
+        }
+        self.buffer.drain(..offset);
+        frames
+    }
+}
+
+/// The error message carried by an `EndStreamResponse`, when the RPC failed.
+fn connect_stream_error(value: &Value) -> Option<String> {
+    let error = value.get("error")?;
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown error");
+    let code = error
+        .get("code")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    Some(format!("{code}: {message}"))
+}
+
+/// Fold a `process.StartResponse` message into the collected command output.
+fn apply_process_event(
+    value: &Value,
+    stdout: &mut Vec<u8>,
+    stderr: &mut Vec<u8>,
+    exit_code: &mut Option<i32>,
+) {
+    let Some(event) = value.get("event") else {
+        return;
+    };
+    if let Some(data) = event.get("data") {
+        for (field, sink) in [("stdout", &mut *stdout), ("stderr", &mut *stderr)] {
+            if let Some(encoded) = data.get(field).and_then(Value::as_str)
+                && let Ok(bytes) = BASE64.decode(encoded)
+            {
+                sink.extend_from_slice(&bytes);
+            }
+        }
+        // A process started with a PTY reports everything on the `pty` field.
+        if let Some(encoded) = data.get("pty").and_then(Value::as_str)
+            && let Ok(bytes) = BASE64.decode(encoded)
+        {
+            stdout.extend_from_slice(&bytes);
+        }
+    }
+    if let Some(end) = event.get("end") {
+        // proto3 JSON omits zero values, so a missing `exitCode` means success.
+        *exit_code = Some(end.get("exitCode").and_then(Value::as_i64).unwrap_or(0) as i32);
+    }
+}
+
+// -------------------------------------------------------------------------------------------
+// Shared helpers
+// -------------------------------------------------------------------------------------------
+
+/// Map a `reqwest` failure to a transport error.
+pub(crate) fn transport(what: &str, error: reqwest::Error) -> SandboxError {
+    let code = if error.is_timeout() {
+        ErrorCode::ExecTimeout
+    } else {
+        ErrorCode::ExecTransportError
+    };
+    SandboxError::new(code, format!("Failed to {what}: {error}"))
+}
+
+/// Map a non-success HTTP response to a sandbox error.
+pub(crate) fn http_error(
+    code: ErrorCode,
+    what: &str,
+    status: reqwest::StatusCode,
+    body: &str,
+) -> SandboxError {
+    let detail = serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("message")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| body.trim().chars().take(400).collect());
+    SandboxError::new(
+        code,
+        format!("Failed to {what}: HTTP {} {detail}", status.as_u16()),
+    )
+}
+
+/// Decode a JSON body, turning a non-success status into an error.
+pub(crate) async fn parse_json<T: serde::de::DeserializeOwned>(
+    response: reqwest::Response,
+    what: &str,
+) -> SandboxResult<T> {
+    let status = response.status();
+    let body = response.text().await.map_err(|e| transport(what, e))?;
+    if !status.is_success() {
+        return Err(http_error(
+            ErrorCode::ExecTransportError,
+            what,
+            status,
+            &body,
+        ));
+    }
+    serde_json::from_str(&body).map_err(|e| {
+        SandboxError::new(
+            ErrorCode::ExecTransportError,
+            format!("Failed to {what}: unexpected response body ({e})"),
+        )
+    })
+}
+
+/// Require a success status, discarding the body.
+pub(crate) async fn expect_success(
+    response: reqwest::Response,
+    what: &str,
+    code: ErrorCode,
+) -> SandboxResult<()> {
+    let status = response.status();
+    if status.is_success() {
+        return Ok(());
+    }
+    let body = response.text().await.unwrap_or_default();
+    Err(http_error(code, what, status, &body))
+}
+
+/// Convert an envd `filesystem.EntryInfo` into a [`FileEntry`].
+fn entry_info_to_file_entry(value: &Value) -> FileEntry {
+    let name = value
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let path = value
+        .get("path")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let is_dir = value.get("type").and_then(Value::as_str) == Some("FILE_TYPE_DIRECTORY");
+    let size = value.get("size").and_then(|size| {
+        size.as_u64()
+            .or_else(|| size.as_str().and_then(|s| s.parse().ok()))
+    });
+    let permissions = value
+        .get("mode")
+        .and_then(Value::as_u64)
+        .map(|mode| permissions_from_mode(mode as u32, is_dir));
+    FileEntry {
+        name,
+        path,
+        size,
+        permissions,
+        is_dir,
+    }
+}
+
+/// Build [`Permissions`] from a numeric file mode.
+pub(crate) fn permissions_from_mode(mode: u32, directory: bool) -> Permissions {
+    Permissions::new((mode >> 6) & 0o7, (mode >> 3) & 0o7, mode & 0o7).as_directory(directory)
+}
+
+/// The `tar --exclude` patterns for the manifest's ephemeral paths.
+pub(crate) fn workspace_excludes(manifest: &Manifest, root: &str) -> Vec<String> {
+    let trimmed = root.trim_end_matches('/');
+    let mut excludes: Vec<String> = manifest
+        .ephemeral_paths()
+        .into_iter()
+        .filter_map(|path| {
+            path.strip_prefix(trimmed)
+                .map(|relative| relative.trim_start_matches('/').to_string())
+                .filter(|relative| !relative.is_empty())
+                .map(|relative| format!("./{relative}"))
+        })
+        .collect();
+    // A mount stages its credentials in the workspace, so an archive taken while a mount is
+    // attached must never pick them up.
+    excludes.extend(MOUNT_CREDENTIAL_EXCLUDES.iter().map(|p| (*p).to_string()));
+    excludes
+}
+
+/// `tar` patterns matching the credential files a provider mount stages in the workspace.
+pub(crate) const MOUNT_CREDENTIAL_EXCLUDES: &[&str] =
+    &["./.openai-agents-rclone-*", "./.openai-agents-mount-s3-*"];
+
+/// Encode a reference to a provider-native snapshot as a workspace archive.
+pub(crate) fn encode_snapshot_ref(snapshot_id: &str) -> Vec<u8> {
+    let mut encoded = SNAPSHOT_REF_MAGIC.to_vec();
+    encoded.extend_from_slice(
+        serde_json::to_string(&json!({ "snapshot_id": snapshot_id }))
+            .expect("serializable")
+            .as_bytes(),
+    );
+    encoded
+}
+
+/// Read back a snapshot reference written by [`encode_snapshot_ref`].
+pub(crate) fn decode_snapshot_ref(raw: &[u8]) -> Option<String> {
+    let body = raw.strip_prefix(SNAPSHOT_REF_MAGIC)?;
+    serde_json::from_slice::<Value>(body)
+        .ok()?
+        .get("snapshot_id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn redacts_the_api_key() {
+        let options = E2BSandboxClientOptions::new().with_api_key("e2b_secret");
+        let debug = format!("{options:?}");
+        assert!(!debug.contains("e2b_secret"), "{debug}");
+        assert!(debug.contains("<redacted>"));
+    }
+
+    #[test]
+    fn resolves_base_urls_from_the_domain() {
+        let options = E2BSandboxClientOptions::new().with_domain("example.dev");
+        assert_eq!(options.api_base(), "https://api.example.dev");
+        assert_eq!(options.sandbox_base(), "https://sandbox.example.dev");
+        let overridden = E2BSandboxClientOptions::new().with_base_url("http://127.0.0.1:9/");
+        assert_eq!(overridden.api_base(), "http://127.0.0.1:9");
+        assert_eq!(overridden.sandbox_base(), "http://127.0.0.1:9");
+    }
+
+    #[test]
+    fn selects_the_default_template_per_sandbox_type() {
+        assert_eq!(
+            E2BSandboxClientOptions::new().resolved_template(),
+            DEFAULT_E2B_TEMPLATE
+        );
+        assert_eq!(
+            E2BSandboxClientOptions::new()
+                .with_sandbox_type(E2BSandboxType::CodeInterpreter)
+                .resolved_template(),
+            DEFAULT_CODE_INTERPRETER_TEMPLATE
+        );
+        assert_eq!(
+            E2BSandboxClientOptions::new()
+                .with_template("custom")
+                .resolved_template(),
+            "custom"
+        );
+    }
+
+    #[test]
+    fn round_trips_connect_frames() {
+        let frame = encode_connect_frame(&json!({ "a": 1 }));
+        assert_eq!(frame[0], 0);
+        let mut decoder = ConnectFrameDecoder::default();
+        // Split the frame to prove the decoder reassembles partial chunks.
+        decoder.push(&frame[..3]);
+        assert!(decoder.drain().is_empty());
+        decoder.push(&frame[3..]);
+        assert_eq!(
+            decoder.drain(),
+            vec![ConnectFrame::Message(json!({ "a": 1 }))]
+        );
+    }
+
+    #[test]
+    fn decodes_end_stream_frames() {
+        let payload = br#"{"error":{"code":"internal","message":"boom"}}"#;
+        let mut frame = vec![2u8];
+        frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        frame.extend_from_slice(payload);
+        let mut decoder = ConnectFrameDecoder::default();
+        decoder.push(&frame);
+        let frames = decoder.drain();
+        let ConnectFrame::EndStream(value) = &frames[0] else {
+            panic!("expected an end-stream frame: {frames:?}");
+        };
+        assert_eq!(
+            connect_stream_error(value).as_deref(),
+            Some("internal: boom")
+        );
+    }
+
+    #[test]
+    fn folds_process_events_into_output() {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut exit_code = None;
+        apply_process_event(
+            &json!({ "event": { "start": { "pid": 7 } } }),
+            &mut stdout,
+            &mut stderr,
+            &mut exit_code,
+        );
+        apply_process_event(
+            &json!({ "event": { "data": { "stdout": BASE64.encode("hi\n") } } }),
+            &mut stdout,
+            &mut stderr,
+            &mut exit_code,
+        );
+        apply_process_event(
+            &json!({ "event": { "data": { "stderr": BASE64.encode("warn\n") } } }),
+            &mut stdout,
+            &mut stderr,
+            &mut exit_code,
+        );
+        apply_process_event(
+            &json!({ "event": { "end": { "exited": true, "exitCode": 3 } } }),
+            &mut stdout,
+            &mut stderr,
+            &mut exit_code,
+        );
+        assert_eq!(stdout, b"hi\n");
+        assert_eq!(stderr, b"warn\n");
+        assert_eq!(exit_code, Some(3));
+        // proto3 JSON omits zero values, so a success end event carries no `exitCode`.
+        apply_process_event(
+            &json!({ "event": { "end": { "exited": true } } }),
+            &mut stdout,
+            &mut stderr,
+            &mut exit_code,
+        );
+        assert_eq!(exit_code, Some(0));
+    }
+
+    #[test]
+    fn round_trips_snapshot_references() {
+        let encoded = encode_snapshot_ref("team/snap:v1");
+        assert_eq!(
+            decode_snapshot_ref(&encoded).as_deref(),
+            Some("team/snap:v1")
+        );
+        assert_eq!(decode_snapshot_ref(b"not a snapshot"), None);
+    }
+
+    #[test]
+    fn maps_entry_info_to_file_entries() {
+        let entry = entry_info_to_file_entry(&json!({
+            "name": "task.md",
+            "path": "/workspace/task.md",
+            "type": "FILE_TYPE_FILE",
+            "size": "12",
+            "mode": 420,
+        }));
+        assert_eq!(entry.name, "task.md");
+        assert_eq!(entry.size, Some(12));
+        assert!(!entry.is_dir);
+        assert_eq!(entry.permissions.unwrap().octal_string(), "0644");
+    }
+}

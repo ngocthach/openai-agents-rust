@@ -1,0 +1,1741 @@
+//! The E2B, Daytona and Vercel sandbox backends, driven against a local mock HTTP server.
+//!
+//! Every test points the provider's base-URL override at a `tokio::net::TcpListener` that records
+//! each request and replies from a per-test handler, so the assertions cover the exact request
+//! paths, authentication headers, bodies and response parsing without a network or a real key.
+#![cfg(feature = "sandbox")]
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use openai_agents_sdk::extensions::sandbox::daytona::{
+    DaytonaSandboxClient, DaytonaSandboxClientOptions,
+};
+use openai_agents_sdk::extensions::sandbox::e2b::{
+    E2BCloudBucketMountStrategy, E2BSandboxClient, E2BSandboxClientOptions, E2BSandboxType,
+    WorkspacePersistence,
+};
+use openai_agents_sdk::extensions::sandbox::vercel::{
+    VercelSandboxClient, VercelSandboxClientOptions,
+    WorkspacePersistence as VercelWorkspacePersistence,
+};
+use openai_agents_sdk::sandbox::entries::Entry;
+use openai_agents_sdk::sandbox::pty::{PtyExecRequest, PtyWriteRequest};
+use openai_agents_sdk::sandbox::{
+    ErrorCode, ExecRequest, Manifest, SandboxClient, SandboxSessionState,
+};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+// ---------------------------------------------------------------------------------------------
+// A tiny recording HTTP server
+// ---------------------------------------------------------------------------------------------
+
+/// One request the mock server received.
+#[derive(Debug, Clone)]
+struct Recorded {
+    method: String,
+    path: String,
+    query: String,
+    headers: HashMap<String, String>,
+    body: Vec<u8>,
+}
+
+impl Recorded {
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .get(&name.to_ascii_lowercase())
+            .map(String::as_str)
+    }
+
+    fn query_param(&self, name: &str) -> Option<String> {
+        self.query.split('&').find_map(|pair| {
+            let (key, value) = pair.split_once('=')?;
+            (key == name).then(|| percent_decode(value))
+        })
+    }
+
+    fn json(&self) -> serde_json::Value {
+        serde_json::from_slice(&self.body).unwrap_or(serde_json::Value::Null)
+    }
+
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.body).into_owned()
+    }
+}
+
+/// Decode the small subset of percent-encoding the clients emit in query strings.
+fn percent_decode(value: &str) -> String {
+    let bytes = value.replace('+', " ").into_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            let hex = std::str::from_utf8(&bytes[index + 1..index + 3]).unwrap_or("");
+            if let Ok(byte) = u8::from_str_radix(hex, 16) {
+                out.push(byte);
+                index += 3;
+                continue;
+            }
+        }
+        out.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// The reply the handler produces for one request.
+#[derive(Debug, Clone)]
+struct MockResponse {
+    status: u16,
+    content_type: &'static str,
+    body: Vec<u8>,
+    /// Extra body parts written after a delay, with no `Content-Length`, for streaming replies.
+    stream: Vec<(Vec<u8>, u64)>,
+}
+
+impl MockResponse {
+    fn json(value: serde_json::Value) -> Self {
+        MockResponse {
+            status: 200,
+            content_type: "application/json",
+            body: serde_json::to_vec(&value).expect("serializable"),
+            stream: Vec::new(),
+        }
+    }
+
+    fn empty(status: u16) -> Self {
+        MockResponse {
+            status,
+            content_type: "application/json",
+            body: Vec::new(),
+            stream: Vec::new(),
+        }
+    }
+
+    fn bytes(body: impl Into<Vec<u8>>) -> Self {
+        MockResponse {
+            status: 200,
+            content_type: "application/octet-stream",
+            body: body.into(),
+            stream: Vec::new(),
+        }
+    }
+
+    fn ndjson(lines: &[serde_json::Value]) -> Self {
+        let mut body = Vec::new();
+        for line in lines {
+            body.extend_from_slice(
+                serde_json::to_string(line)
+                    .expect("serializable")
+                    .as_bytes(),
+            );
+            body.push(b'\n');
+        }
+        MockResponse {
+            status: 200,
+            content_type: "application/x-ndjson",
+            body,
+            stream: Vec::new(),
+        }
+    }
+
+    fn error(status: u16, message: &str) -> Self {
+        MockResponse {
+            status,
+            content_type: "application/json",
+            body: serde_json::to_vec(&serde_json::json!({ "code": status, "message": message }))
+                .expect("serializable"),
+            stream: Vec::new(),
+        }
+    }
+
+    /// A reply whose body arrives in parts, each after the given delay in milliseconds.
+    fn streamed(content_type: &'static str, parts: Vec<(Vec<u8>, u64)>) -> Self {
+        MockResponse {
+            status: 200,
+            content_type,
+            body: Vec::new(),
+            stream: parts,
+        }
+    }
+}
+
+type Handler = Arc<dyn Fn(&Recorded) -> MockResponse + Send + Sync>;
+
+/// A local HTTP server that records every request and answers from a closure.
+struct MockServer {
+    base_url: String,
+    requests: Arc<Mutex<Vec<Recorded>>>,
+    shutdown: tokio::sync::oneshot::Sender<()>,
+}
+
+impl MockServer {
+    async fn start<F>(handler: F) -> Self
+    where
+        F: Fn(&Recorded) -> MockResponse + Send + Sync + 'static,
+    {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind the mock server");
+        let base_url = format!("http://{}", listener.local_addr().expect("local addr"));
+        let requests: Arc<Mutex<Vec<Recorded>>> = Arc::new(Mutex::new(Vec::new()));
+        let handler: Handler = Arc::new(handler);
+        let (shutdown, mut stop) = tokio::sync::oneshot::channel();
+        let recorder = requests.clone();
+        tokio::spawn(async move {
+            loop {
+                let accepted = tokio::select! {
+                    accepted = listener.accept() => accepted,
+                    _ = &mut stop => break,
+                };
+                let Ok((stream, _)) = accepted else { break };
+                let handler = handler.clone();
+                let recorder = recorder.clone();
+                tokio::spawn(async move {
+                    let _ = serve_one(stream, handler, recorder).await;
+                });
+            }
+        });
+        MockServer {
+            base_url,
+            requests,
+            shutdown,
+        }
+    }
+
+    fn requests(&self) -> Vec<Recorded> {
+        self.requests.lock().expect("poisoned").clone()
+    }
+
+    /// The first request matching `method` and `path`.
+    fn find(&self, method: &str, path: &str) -> Recorded {
+        self.requests()
+            .into_iter()
+            .find(|request| request.method == method && request.path == path)
+            .unwrap_or_else(|| {
+                panic!(
+                    "no `{method} {path}` request; saw {:?}",
+                    self.requests()
+                        .iter()
+                        .map(|r| format!("{} {}", r.method, r.path))
+                        .collect::<Vec<_>>()
+                )
+            })
+    }
+
+    fn stop(self) {
+        let _ = self.shutdown.send(());
+    }
+}
+
+/// Read one request, record it, and write the handler's reply.
+async fn serve_one(
+    mut stream: tokio::net::TcpStream,
+    handler: Handler,
+    recorder: Arc<Mutex<Vec<Recorded>>>,
+) -> std::io::Result<()> {
+    let mut buffer = Vec::new();
+    let mut chunk = [0u8; 4096];
+    // Read until the end of the headers; the clients never stream a request body.
+    let header_end = loop {
+        if let Some(index) = find_subslice(&buffer, b"\r\n\r\n") {
+            break index;
+        }
+        let read = stream.read(&mut chunk).await?;
+        if read == 0 {
+            return Ok(());
+        }
+        buffer.extend_from_slice(&chunk[..read]);
+    };
+    let head = String::from_utf8_lossy(&buffer[..header_end]).into_owned();
+    let mut lines = head.split("\r\n");
+    let request_line = lines.next().unwrap_or_default();
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next().unwrap_or_default().to_string();
+    let target = parts.next().unwrap_or_default().to_string();
+    let (path, query) = match target.split_once('?') {
+        Some((path, query)) => (path.to_string(), query.to_string()),
+        None => (target.clone(), String::new()),
+    };
+    let mut headers = HashMap::new();
+    for line in lines {
+        if let Some((name, value)) = line.split_once(':') {
+            headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
+        }
+    }
+    let content_length: usize = headers
+        .get("content-length")
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0);
+    let mut body = buffer[header_end + 4..].to_vec();
+    while body.len() < content_length {
+        let read = stream.read(&mut chunk).await?;
+        if read == 0 {
+            break;
+        }
+        body.extend_from_slice(&chunk[..read]);
+    }
+    body.truncate(content_length);
+
+    let recorded = Recorded {
+        method,
+        path,
+        query,
+        headers,
+        body,
+    };
+    let response = handler(&recorded);
+    recorder.lock().expect("poisoned").push(recorded);
+
+    if response.stream.is_empty() {
+        let head = format!(
+            "HTTP/1.1 {} OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            response.status,
+            response.content_type,
+            response.body.len()
+        );
+        stream.write_all(head.as_bytes()).await?;
+        stream.write_all(&response.body).await?;
+    } else {
+        // Without `Content-Length`, the body ends when the connection closes, which is how the
+        // provider streaming endpoints behave.
+        let head = format!(
+            "HTTP/1.1 {} OK\r\nContent-Type: {}\r\nConnection: close\r\n\r\n",
+            response.status, response.content_type
+        );
+        stream.write_all(head.as_bytes()).await?;
+        for (part, delay_ms) in response.stream {
+            if delay_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            }
+            stream.write_all(&part).await?;
+            stream.flush().await?;
+        }
+    }
+    stream.flush().await?;
+    stream.shutdown().await
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+// ---------------------------------------------------------------------------------------------
+// E2B
+// ---------------------------------------------------------------------------------------------
+
+/// Encode one Connect envelope: a flag byte, a big-endian length, then the JSON payload.
+fn connect_frame(flags: u8, value: serde_json::Value) -> Vec<u8> {
+    let payload = serde_json::to_vec(&value).expect("serializable");
+    let mut frame = vec![flags];
+    frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    frame.extend_from_slice(&payload);
+    frame
+}
+
+/// A complete `process.Process/Start` response: stdout, then the end event, then the trailer.
+fn e2b_process_stream(stdout: &str, exit_code: i64) -> MockResponse {
+    use base64::Engine as _;
+    let mut body = connect_frame(
+        0,
+        serde_json::json!({ "event": { "start": { "pid": 4242 } } }),
+    );
+    body.extend_from_slice(&connect_frame(
+        0,
+        serde_json::json!({
+            "event": {
+                "data": {
+                    "stdout": base64::engine::general_purpose::STANDARD.encode(stdout),
+                },
+            },
+        }),
+    ));
+    body.extend_from_slice(&connect_frame(
+        0,
+        serde_json::json!({ "event": { "end": { "exited": true, "exitCode": exit_code } } }),
+    ));
+    body.extend_from_slice(&connect_frame(2, serde_json::json!({})));
+    MockResponse {
+        status: 200,
+        content_type: "application/connect+json",
+        body,
+        stream: Vec::new(),
+    }
+}
+
+fn e2b_client(base_url: &str) -> E2BSandboxClient {
+    E2BSandboxClient::with_options(
+        E2BSandboxClientOptions::new()
+            .with_api_key("e2b_test")
+            .with_base_url(base_url)
+            .with_sandbox_type(E2BSandboxType::CodeInterpreter)
+            .with_timeout_secs(120)
+            .with_metadata("owner", "tests"),
+    )
+}
+
+#[tokio::test]
+async fn e2b_runs_a_create_write_exec_read_delete_flow() {
+    let server =
+        MockServer::start(
+            |request| match (request.method.as_str(), request.path.as_str()) {
+                ("POST", "/v2/sandboxes") => MockResponse {
+                    status: 201,
+                    content_type: "application/json",
+                    body: serde_json::to_vec(&serde_json::json!({
+                        "templateID": "code-interpreter-v1",
+                        "sandboxID": "sbx-1",
+                        "clientID": "cl-1",
+                        "envdVersion": "0.2.0",
+                        "envdAccessToken": "envd-token",
+                    }))
+                    .expect("serializable"),
+                    stream: Vec::new(),
+                },
+                ("POST", "/filesystem.Filesystem/MakeDir") => {
+                    MockResponse::json(serde_json::json!({}))
+                }
+                ("POST", "/filesystem.Filesystem/Remove") => {
+                    MockResponse::json(serde_json::json!({}))
+                }
+                ("POST", "/process.Process/Start") => e2b_process_stream("hello from e2b\n", 0),
+                ("POST", "/files") => MockResponse::json(serde_json::json!([
+                    { "path": "/workspace/notes.txt", "name": "notes.txt", "type": "file" }
+                ])),
+                ("GET", "/files") => MockResponse::bytes("stored bytes"),
+                ("DELETE", "/sandboxes/sbx-1") => MockResponse::empty(204),
+                _ => MockResponse::error(404, "unexpected request"),
+            },
+        )
+        .await;
+
+    let client = e2b_client(&server.base_url);
+    let manifest = Manifest::new()
+        .with_entry("task.md", Entry::text_file("read me"))
+        .with_env("TASK", "demo");
+    let session = client.create(Some(manifest)).await.expect("create");
+    assert_eq!(session.backend_id(), "e2b");
+    assert_eq!(session.workspace_root(), "/workspace");
+
+    session.start().await.expect("start");
+    session
+        .write_file("notes.txt", b"stored bytes")
+        .await
+        .expect("write");
+    let result = session
+        .exec(ExecRequest::shell("echo hello").with_timeout(Some(Duration::from_secs(5))))
+        .await
+        .expect("exec");
+    assert_eq!(result.stdout_text(), "hello from e2b\n");
+    assert_eq!(result.exit_code, 0);
+    assert_eq!(
+        session.read_file("notes.txt").await.expect("read"),
+        b"stored bytes"
+    );
+    session.rm("notes.txt", false).await.expect("rm");
+    session.shutdown().await.expect("shutdown");
+
+    // The platform call carries the API key and the create body built from the options.
+    let create = server.find("POST", "/v2/sandboxes");
+    assert_eq!(create.header("x-api-key"), Some("e2b_test"));
+    let body = create.json();
+    assert_eq!(body["templateID"], "code-interpreter-v1");
+    assert_eq!(body["timeout"], 120);
+    assert_eq!(body["metadata"]["owner"], "tests");
+    // Manifest environment variables reach the sandbox at creation.
+    assert_eq!(body["envVars"]["TASK"], "demo");
+    assert_eq!(body["autoPause"], true);
+    assert_eq!(body["autoResume"]["enabled"], true);
+
+    // envd calls carry the routing headers and the per-sandbox access token, not the API key.
+    let upload = server
+        .requests()
+        .into_iter()
+        .find(|r| {
+            r.method == "POST"
+                && r.path == "/files"
+                && r.query_param("path").as_deref() == Some("/workspace/notes.txt")
+        })
+        .expect("the notes.txt upload");
+    assert_eq!(upload.header("e2b-sandbox-id"), Some("sbx-1"));
+    assert_eq!(upload.header("e2b-sandbox-port"), Some("49983"));
+    assert_eq!(upload.header("x-access-token"), Some("envd-token"));
+    assert_eq!(
+        upload.header("content-type"),
+        Some("application/octet-stream")
+    );
+    assert_eq!(upload.body, b"stored bytes");
+
+    let download = server.find("GET", "/files");
+    assert_eq!(
+        download.query_param("path").as_deref(),
+        Some("/workspace/notes.txt")
+    );
+
+    // `Process/Start` is a Connect server-streaming call, so its body is enveloped. `start`
+    // itself runs a command too, so select the one carrying the test's shell line.
+    let start = server
+        .requests()
+        .into_iter()
+        .find(|r| r.path == "/process.Process/Start" && r.text().contains("echo hello"))
+        .expect("the exec request");
+    assert_eq!(
+        start.header("content-type"),
+        Some("application/connect+json")
+    );
+    assert_eq!(start.header("connect-protocol-version"), Some("1"));
+    assert_eq!(start.body[0], 0, "the request frame must be uncompressed");
+    let framed_length = u32::from_be_bytes(start.body[1..5].try_into().unwrap()) as usize;
+    assert_eq!(framed_length, start.body.len() - 5);
+    let payload: serde_json::Value = serde_json::from_slice(&start.body[5..]).expect("json");
+    assert_eq!(payload["process"]["cmd"], "sh");
+    assert_eq!(payload["process"]["args"][0], "-lc");
+    assert_eq!(payload["process"]["cwd"], "/workspace");
+    assert_eq!(payload["process"]["envs"]["TASK"], "demo");
+    assert_eq!(payload["stdin"], false);
+
+    // The manifest entry was materialized through the file API during `start`.
+    assert!(
+        server.requests().iter().any(|r| r.method == "POST"
+            && r.path == "/files"
+            && r.query_param("path").as_deref() == Some("/workspace/task.md")),
+        "the manifest entry should have been uploaded"
+    );
+    server.stop();
+}
+
+#[tokio::test]
+async fn e2b_reports_command_failures_and_missing_files() {
+    let server =
+        MockServer::start(
+            |request| match (request.method.as_str(), request.path.as_str()) {
+                ("POST", "/v2/sandboxes") => MockResponse::json(serde_json::json!({
+                    "templateID": "base",
+                    "sandboxID": "sbx-2",
+                    "clientID": "cl",
+                    "envdVersion": "0.2.0",
+                    "envdAccessToken": "envd-token",
+                })),
+                ("POST", "/process.Process/Start") => e2b_process_stream("", 7),
+                ("GET", "/files") => MockResponse::error(404, "path does not exist"),
+                _ => MockResponse::error(404, "unexpected request"),
+            },
+        )
+        .await;
+
+    let client = E2BSandboxClient::with_options(
+        E2BSandboxClientOptions::new()
+            .with_api_key("e2b_test")
+            .with_base_url(&server.base_url),
+    );
+    let session = client.create(None).await.expect("create");
+    let result = session
+        .exec(ExecRequest::shell("false"))
+        .await
+        .expect("exec");
+    assert_eq!(result.exit_code, 7);
+
+    let error = session.read_file("missing.txt").await.unwrap_err();
+    assert_eq!(error.code, ErrorCode::WorkspaceReadNotFound);
+    server.stop();
+}
+
+#[tokio::test]
+async fn e2b_rejects_a_missing_api_key() {
+    // No API key in the options: the backend must fail before any request is made.
+    let client = E2BSandboxClient::with_options(
+        E2BSandboxClientOptions::new()
+            .with_base_url("http://127.0.0.1:1")
+            .with_api_key(""),
+    );
+    let error = client.create(None).await.unwrap_err();
+    assert_eq!(error.code, ErrorCode::SandboxConfigInvalid);
+}
+
+#[tokio::test]
+async fn e2b_streams_pty_output_and_writes_stdin() {
+    use base64::Engine as _;
+    let server =
+        MockServer::start(
+            |request| match (request.method.as_str(), request.path.as_str()) {
+                ("POST", "/v2/sandboxes") => MockResponse::json(serde_json::json!({
+                    "templateID": "base",
+                    "sandboxID": "sbx-3",
+                    "clientID": "cl",
+                    "envdVersion": "0.2.0",
+                    "envdAccessToken": "envd-token",
+                })),
+                ("POST", "/process.Process/Start") => {
+                    let mut opening = connect_frame(
+                        0,
+                        serde_json::json!({ "event": { "start": { "pid": 1234 } } }),
+                    );
+                    opening.extend_from_slice(&connect_frame(
+                        0,
+                        serde_json::json!({
+                            "event": {
+                                "data": {
+                                    "pty": base64::engine::general_purpose::STANDARD.encode("$ "),
+                                },
+                            },
+                        }),
+                    ));
+                    // Hold the stream open past the first yield window, then finish it.
+                    MockResponse::streamed(
+                        "application/connect+json",
+                        vec![
+                            (opening, 0),
+                            (
+                                connect_frame(
+                                    0,
+                                    serde_json::json!({
+                                        "event": {
+                                            "data": {
+                                                "pty": base64::engine::general_purpose::STANDARD
+                                                    .encode("done\n"),
+                                            },
+                                        },
+                                    }),
+                                ),
+                                400,
+                            ),
+                            (
+                                connect_frame(
+                                    0,
+                                    serde_json::json!({
+                                        "event": { "end": { "exited": true, "exitCode": 0 } },
+                                    }),
+                                ),
+                                0,
+                            ),
+                            (connect_frame(2, serde_json::json!({})), 0),
+                        ],
+                    )
+                }
+                ("POST", "/process.Process/SendInput") => MockResponse::json(serde_json::json!({})),
+                ("POST", "/process.Process/SendSignal") => {
+                    MockResponse::json(serde_json::json!({}))
+                }
+                _ => MockResponse::error(404, "unexpected request"),
+            },
+        )
+        .await;
+
+    let client = E2BSandboxClient::with_options(
+        E2BSandboxClientOptions::new()
+            .with_api_key("e2b_test")
+            .with_base_url(&server.base_url),
+    );
+    let session = client.create(None).await.expect("create");
+    assert!(session.supports_pty());
+
+    let first = session
+        .pty_exec_start(
+            PtyExecRequest::new("bash")
+                .with_tty(true)
+                .with_yield_time_ms(250),
+        )
+        .await
+        .expect("pty start");
+    assert_eq!(first.output_text(), "$ ");
+    let process_id = first.process_id.expect("the process is still running");
+
+    let second = session
+        .pty_write_stdin(PtyWriteRequest::new(process_id, "exit\n").with_yield_time_ms(1_000))
+        .await
+        .expect("write stdin");
+    assert!(second.output_text().contains("done"), "{second:?}");
+    assert_eq!(second.exit_code, Some(0));
+    assert_eq!(second.process_id, None, "a finished process is forgotten");
+
+    // A PTY start asks envd for a terminal and an attached stdin.
+    let start = server.find("POST", "/process.Process/Start");
+    let payload: serde_json::Value = serde_json::from_slice(&start.body[5..]).expect("json");
+    assert_eq!(payload["stdin"], true);
+    assert_eq!(payload["pty"]["size"]["rows"], 24);
+    assert_eq!(payload["pty"]["size"]["cols"], 80);
+
+    // Input is addressed by the pid envd reported and base64-encoded.
+    let input = server.find("POST", "/process.Process/SendInput");
+    let body = input.json();
+    assert_eq!(body["process"]["pid"], 1234);
+    assert_eq!(
+        body["input"]["pty"],
+        base64::engine::general_purpose::STANDARD.encode("exit\n")
+    );
+    server.stop();
+}
+
+#[tokio::test]
+async fn e2b_resume_reconnects_to_the_recorded_sandbox() {
+    let server =
+        MockServer::start(
+            |request| match (request.method.as_str(), request.path.as_str()) {
+                ("POST", "/v2/sandboxes/sbx-saved/connect") => {
+                    MockResponse::json(serde_json::json!({
+                        "templateID": "base",
+                        "sandboxID": "sbx-saved",
+                        "clientID": "cl",
+                        "envdVersion": "0.2.0",
+                        "envdAccessToken": "fresh-token",
+                    }))
+                }
+                _ => MockResponse::error(404, "unexpected request"),
+            },
+        )
+        .await;
+
+    let client = E2BSandboxClient::with_options(
+        E2BSandboxClientOptions::new()
+            .with_api_key("e2b_test")
+            .with_base_url(&server.base_url),
+    );
+    let manifest = Manifest::new().with_entry("task.md", Entry::text_file("read me"));
+    let state = SandboxSessionState::new("e2b", "session-1", "/workspace", &manifest)
+        .with_provider_id(Some("sbx-saved".to_string()));
+    let resumed = client
+        .resume(&state, manifest.clone())
+        .await
+        .expect("resume");
+    assert_eq!(resumed.id(), "session-1");
+    assert_eq!(
+        resumed.session_state().provider_id.as_deref(),
+        Some("sbx-saved")
+    );
+
+    // The persisted state carries no token, so resume has to fetch a fresh one.
+    let connect = server.find("POST", "/v2/sandboxes/sbx-saved/connect");
+    assert_eq!(connect.header("x-api-key"), Some("e2b_test"));
+    assert!(
+        serde_json::to_string(&state.clone())
+            .unwrap()
+            .find("token")
+            .is_none(),
+        "the persisted state must stay credential-free"
+    );
+
+    // A manifest that does not match the recorded topology is rejected.
+    let error = client.resume(&state, Manifest::new()).await.unwrap_err();
+    assert_eq!(error.code, ErrorCode::SessionStateMismatch);
+    server.stop();
+}
+
+#[tokio::test]
+async fn e2b_persists_a_native_snapshot_reference() {
+    let server =
+        MockServer::start(
+            |request| match (request.method.as_str(), request.path.as_str()) {
+                ("POST", "/v2/sandboxes") => MockResponse::json(serde_json::json!({
+                    "templateID": "base",
+                    "sandboxID": "sbx-4",
+                    "clientID": "cl",
+                    "envdVersion": "0.2.0",
+                    "envdAccessToken": "envd-token",
+                })),
+                ("POST", "/sandboxes/sbx-4/snapshots") => MockResponse::json(serde_json::json!({
+                    "snapshotID": "team/snap:default",
+                    "names": ["team/snap:default"],
+                })),
+                _ => MockResponse::error(404, "unexpected request"),
+            },
+        )
+        .await;
+
+    let client = E2BSandboxClient::with_options(
+        E2BSandboxClientOptions::new()
+            .with_api_key("e2b_test")
+            .with_base_url(&server.base_url)
+            .with_workspace_persistence(WorkspacePersistence::Snapshot),
+    );
+    let session = client.create(None).await.expect("create");
+    let archive = session.persist_workspace().await.expect("persist");
+    let encoded = String::from_utf8_lossy(&archive);
+    assert!(
+        encoded.starts_with("E2B_SANDBOX_SNAPSHOT_V1\n"),
+        "{encoded}"
+    );
+    assert!(encoded.contains("team/snap:default"));
+
+    let snapshot = server.find("POST", "/sandboxes/sbx-4/snapshots");
+    assert_eq!(snapshot.json()["memory"], false);
+    server.stop();
+}
+
+// ---------------------------------------------------------------------------------------------
+// Daytona
+// ---------------------------------------------------------------------------------------------
+
+/// The platform response for a started sandbox whose toolbox points back at the mock server.
+fn daytona_sandbox(base_url: &str) -> serde_json::Value {
+    serde_json::json!({
+        "id": "sbx-daytona",
+        "state": "started",
+        "toolboxProxyUrl": format!("{base_url}/toolbox"),
+    })
+}
+
+#[tokio::test]
+async fn daytona_runs_a_create_write_exec_read_delete_flow() {
+    let base = Arc::new(Mutex::new(String::new()));
+    let handler_base = base.clone();
+    let server = MockServer::start(move |request| {
+        let base_url = handler_base.lock().expect("poisoned").clone();
+        match (request.method.as_str(), request.path.as_str()) {
+            ("POST", "/sandbox") | ("GET", "/sandbox/sbx-daytona") => {
+                MockResponse::json(daytona_sandbox(&base_url))
+            }
+            ("DELETE", "/sandbox/sbx-daytona") => MockResponse::json(serde_json::json!({})),
+            ("POST", "/toolbox/sbx-daytona/process/session") => {
+                MockResponse::json(serde_json::json!({}))
+            }
+            ("POST", path) if path.ends_with("/exec") => MockResponse::json(serde_json::json!({
+                "cmdId": "cmd-1",
+                "exitCode": 0,
+                "stdout": "hello from daytona\n",
+                "stderr": "",
+            })),
+            ("DELETE", path) if path.starts_with("/toolbox/sbx-daytona/process/session/") => {
+                MockResponse::json(serde_json::json!({}))
+            }
+            ("POST", "/toolbox/sbx-daytona/files/upload-v2") => {
+                MockResponse::json(serde_json::json!({}))
+            }
+            ("GET", "/toolbox/sbx-daytona/files/download") => MockResponse::bytes("stored bytes"),
+            ("POST", "/toolbox/sbx-daytona/files/folder") => {
+                MockResponse::json(serde_json::json!({}))
+            }
+            ("DELETE", "/toolbox/sbx-daytona/files") => MockResponse::json(serde_json::json!({})),
+            _ => MockResponse::error(404, "unexpected request"),
+        }
+    })
+    .await;
+    *base.lock().expect("poisoned") = server.base_url.clone();
+
+    let client = DaytonaSandboxClient::with_options(
+        DaytonaSandboxClientOptions::new()
+            .with_api_key("dtn_test")
+            .with_api_url(&server.base_url)
+            .with_organization_id("org-1")
+            .with_sandbox_snapshot_name("agents-base")
+            .with_state_poll_interval(Duration::from_millis(1)),
+    );
+    let session = client.create(None).await.expect("create");
+    assert_eq!(session.backend_id(), "daytona");
+    // A caller who supplies no manifest gets the Daytona image's workspace root.
+    assert_eq!(session.workspace_root(), "/home/daytona/workspace");
+
+    session.start().await.expect("start");
+    session
+        .write_file("notes.txt", b"stored bytes")
+        .await
+        .expect("write");
+    let result = session
+        .exec(ExecRequest::shell("echo hello").with_timeout(Some(Duration::from_secs(5))))
+        .await
+        .expect("exec");
+    assert_eq!(result.stdout_text(), "hello from daytona\n");
+    assert_eq!(
+        session.read_file("notes.txt").await.expect("read"),
+        b"stored bytes"
+    );
+    session.rm("notes.txt", true).await.expect("rm");
+    session.shutdown().await.expect("shutdown");
+
+    // The platform call authenticates with a bearer token and the organization scope.
+    let create = server.find("POST", "/sandbox");
+    assert_eq!(create.header("authorization"), Some("Bearer dtn_test"));
+    assert_eq!(create.header("x-daytona-organization-id"), Some("org-1"));
+    assert_eq!(create.json()["snapshot"], "agents-base");
+    assert_eq!(create.json()["autoStopInterval"], 0);
+
+    // Toolbox calls go to the proxy URL the platform returned, prefixed with the sandbox id, and
+    // carry the same credentials.
+    let session_create = server.find("POST", "/toolbox/sbx-daytona/process/session");
+    assert_eq!(
+        session_create.header("authorization"),
+        Some("Bearer dtn_test")
+    );
+    assert!(
+        session_create.json()["sessionId"]
+            .as_str()
+            .expect("session id")
+            .starts_with("sandbox-")
+    );
+
+    // Each command is wrapped so the toolbox runs it in the workspace with the manifest env.
+    let exec = server
+        .requests()
+        .into_iter()
+        .find(|r| r.path.ends_with("/exec") && r.text().contains("echo hello"))
+        .expect("the exec request");
+    let command = exec.json()["command"]
+        .as_str()
+        .expect("command")
+        .to_string();
+    assert!(
+        command.starts_with("cd /home/daytona/workspace && "),
+        "{command}"
+    );
+    assert!(command.ends_with("sh -lc 'echo hello'"), "{command}");
+    assert_eq!(exec.json()["runAsync"], false);
+
+    // Uploads use a single-part multipart body addressed by the absolute path.
+    let upload = server.find("POST", "/toolbox/sbx-daytona/files/upload-v2");
+    assert_eq!(
+        upload.query_param("path").as_deref(),
+        Some("/home/daytona/workspace/notes.txt")
+    );
+    let content_type = upload.header("content-type").expect("content type");
+    assert!(content_type.starts_with("multipart/form-data; boundary="));
+    let text = upload.text();
+    assert!(
+        text.contains("name=\"file\"; filename=\"notes.txt\""),
+        "{text}"
+    );
+    assert!(text.contains("stored bytes"), "{text}");
+
+    let remove = server.find("DELETE", "/toolbox/sbx-daytona/files");
+    assert_eq!(remove.query_param("recursive").as_deref(), Some("true"));
+    server.stop();
+}
+
+#[tokio::test]
+async fn daytona_streams_an_interactive_command() {
+    let base = Arc::new(Mutex::new(String::new()));
+    let handler_base = base.clone();
+    // The command only produces its second line, and only finishes, once stdin has been written.
+    let wrote_stdin = Arc::new(Mutex::new(false));
+    let handler_stdin = wrote_stdin.clone();
+    let server = MockServer::start(move |request| {
+        let base_url = handler_base.lock().expect("poisoned").clone();
+        let finished = *handler_stdin.lock().expect("poisoned");
+        match (request.method.as_str(), request.path.as_str()) {
+            ("POST", "/sandbox") | ("GET", "/sandbox/sbx-daytona") => {
+                MockResponse::json(daytona_sandbox(&base_url))
+            }
+            ("POST", "/toolbox/sbx-daytona/process/session") => {
+                MockResponse::json(serde_json::json!({}))
+            }
+            ("POST", path) if path.ends_with("/exec") => {
+                MockResponse::json(serde_json::json!({ "cmdId": "cmd-7" }))
+            }
+            ("GET", path) if path.ends_with("/logs") => {
+                // The log endpoint always returns the whole log, so the session must only ever
+                // hand the model the part it has not seen yet.
+                MockResponse::bytes(if finished {
+                    "first\nsecond\n"
+                } else {
+                    "first\n"
+                })
+            }
+            ("GET", path)
+                if path.starts_with("/toolbox/sbx-daytona/process/session/")
+                    && path.contains("/command/") =>
+            {
+                MockResponse::json(if finished {
+                    serde_json::json!({ "id": "cmd-7", "command": "bash", "exitCode": 0 })
+                } else {
+                    serde_json::json!({ "id": "cmd-7", "command": "bash" })
+                })
+            }
+            ("POST", path) if path.ends_with("/input") => {
+                *handler_stdin.lock().expect("poisoned") = true;
+                MockResponse::json(serde_json::json!({}))
+            }
+            ("DELETE", path) if path.starts_with("/toolbox/sbx-daytona/process/session/") => {
+                MockResponse::json(serde_json::json!({}))
+            }
+            _ => MockResponse::error(404, "unexpected request"),
+        }
+    })
+    .await;
+    *base.lock().expect("poisoned") = server.base_url.clone();
+
+    let client = DaytonaSandboxClient::with_options(
+        DaytonaSandboxClientOptions::new()
+            .with_api_key("dtn_test")
+            .with_api_url(&server.base_url)
+            .with_state_poll_interval(Duration::from_millis(20)),
+    );
+    let session = client.create(None).await.expect("create");
+    let first = session
+        .pty_exec_start(PtyExecRequest::new("bash").with_yield_time_ms(250))
+        .await
+        .expect("start");
+    assert_eq!(first.output_text(), "first\n");
+    let process_id = first.process_id.expect("the command is still running");
+
+    let second = session
+        .pty_write_stdin(PtyWriteRequest::new(process_id, "echo second\n"))
+        .await
+        .expect("write stdin");
+    assert_eq!(second.output_text(), "second\n");
+    assert_eq!(second.exit_code, Some(0));
+    assert_eq!(second.process_id, None);
+
+    let start = server
+        .requests()
+        .into_iter()
+        .find(|r| r.path.ends_with("/exec"))
+        .expect("the exec request");
+    assert_eq!(start.json()["runAsync"], true);
+    let input = server
+        .requests()
+        .into_iter()
+        .find(|r| r.path.ends_with("/input"))
+        .expect("the input request");
+    assert_eq!(input.json()["data"], "echo second\n");
+    server.stop();
+}
+
+#[tokio::test]
+async fn daytona_round_trips_a_workspace_archive() {
+    let base = Arc::new(Mutex::new(String::new()));
+    let handler_base = base.clone();
+    let server = MockServer::start(move |request| {
+        let base_url = handler_base.lock().expect("poisoned").clone();
+        match (request.method.as_str(), request.path.as_str()) {
+            ("POST", "/sandbox") | ("GET", "/sandbox/sbx-daytona") => {
+                MockResponse::json(daytona_sandbox(&base_url))
+            }
+            ("POST", "/toolbox/sbx-daytona/process/session") => {
+                MockResponse::json(serde_json::json!({}))
+            }
+            ("POST", path) if path.ends_with("/exec") => MockResponse::json(serde_json::json!({
+                "cmdId": "cmd-1",
+                "exitCode": 0,
+                "stdout": "",
+                "stderr": "",
+            })),
+            ("DELETE", path) if path.starts_with("/toolbox/sbx-daytona/process/session/") => {
+                MockResponse::json(serde_json::json!({}))
+            }
+            ("GET", "/toolbox/sbx-daytona/files/download") => MockResponse::bytes(vec![0x1f, 0x8b]),
+            ("POST", "/toolbox/sbx-daytona/files/upload-v2") => {
+                MockResponse::json(serde_json::json!({}))
+            }
+            ("DELETE", "/toolbox/sbx-daytona/files") => MockResponse::json(serde_json::json!({})),
+            _ => MockResponse::error(404, "unexpected request"),
+        }
+    })
+    .await;
+    *base.lock().expect("poisoned") = server.base_url.clone();
+
+    let client = DaytonaSandboxClient::with_options(
+        DaytonaSandboxClientOptions::new()
+            .with_api_key("dtn_test")
+            .with_api_url(&server.base_url)
+            .with_state_poll_interval(Duration::from_millis(1)),
+    );
+    let session = client.create(None).await.expect("create");
+    let archive = session.persist_workspace().await.expect("persist");
+    assert_eq!(archive, vec![0x1f, 0x8b], "the gzip bytes must survive");
+
+    // The archive is produced on disk and downloaded, because command output is text.
+    let tar = server
+        .requests()
+        .into_iter()
+        .find(|r| r.path.ends_with("/exec") && r.text().contains("tar -czf"))
+        .expect("the tar command");
+    let command = tar.json()["command"].as_str().expect("command").to_string();
+    assert!(command.contains("-C /home/daytona/workspace"), "{command}");
+    assert!(command.contains("/tmp/openai-agents-"), "{command}");
+
+    session
+        .hydrate_workspace(&[0x1f, 0x8b])
+        .await
+        .expect("hydrate");
+    let upload = server.find("POST", "/toolbox/sbx-daytona/files/upload-v2");
+    assert!(
+        upload
+            .query_param("path")
+            .expect("path")
+            .starts_with("/tmp/openai-agents-")
+    );
+    server.stop();
+}
+
+// ---------------------------------------------------------------------------------------------
+// Vercel
+// ---------------------------------------------------------------------------------------------
+
+fn vercel_sandbox_and_session(status: &str) -> serde_json::Value {
+    serde_json::json!({
+        "sandbox": {
+            "name": "agents-test",
+            "persistent": false,
+            "createdAt": 1,
+            "updatedAt": 1,
+            "currentSessionId": "sess-1",
+        },
+        "session": {
+            "id": "sess-1",
+            "memory": 2048,
+            "vcpus": 2,
+            "region": "iad1",
+            "timeout": 270000,
+            "status": status,
+            "requestedAt": 1,
+            "createdAt": 1,
+            "updatedAt": 1,
+            "cwd": "/vercel/sandbox",
+        },
+        "routes": [],
+    })
+}
+
+#[tokio::test]
+async fn vercel_runs_a_create_write_exec_read_stop_flow() {
+    let server =
+        MockServer::start(
+            |request| match (request.method.as_str(), request.path.as_str()) {
+                ("POST", "/v3/sandboxes") => {
+                    MockResponse::json(vercel_sandbox_and_session("running"))
+                }
+                ("GET", "/v2/sandboxes/sessions/sess-1") => {
+                    let mut body = vercel_sandbox_and_session("running");
+                    MockResponse::json(serde_json::json!({
+                        "session": body["session"].take(),
+                        "routes": [],
+                    }))
+                }
+                ("POST", "/v2/sandboxes/sessions/sess-1/cmd") => MockResponse::ndjson(&[
+                    serde_json::json!({
+                        "command": {
+                            "id": "cmd-1",
+                            "name": "sh",
+                            "args": ["-lc", "echo hello"],
+                            "cwd": "/vercel/sandbox",
+                            "sessionId": "sess-1",
+                            "exitCode": serde_json::Value::Null,
+                            "startedAt": 1,
+                        },
+                    }),
+                    serde_json::json!({ "stream": "stdout", "data": "hello from vercel\n" }),
+                    serde_json::json!({
+                        "command": {
+                            "id": "cmd-1",
+                            "name": "sh",
+                            "args": [],
+                            "cwd": "/vercel/sandbox",
+                            "sessionId": "sess-1",
+                            "exitCode": 0,
+                            "startedAt": 1,
+                        },
+                    }),
+                ]),
+                ("POST", "/v2/sandboxes/sessions/sess-1/fs/write") => {
+                    MockResponse::json(serde_json::json!({}))
+                }
+                ("POST", "/v2/sandboxes/sessions/sess-1/fs/mkdir") => {
+                    MockResponse::json(serde_json::json!({}))
+                }
+                ("POST", "/v2/sandboxes/sessions/sess-1/fs/read") => {
+                    MockResponse::bytes("stored bytes")
+                }
+                ("POST", "/v2/sandboxes/sessions/sess-1/stop") => {
+                    let mut body = vercel_sandbox_and_session("stopped");
+                    MockResponse::json(serde_json::json!({ "session": body["session"].take() }))
+                }
+                _ => MockResponse::error(404, "unexpected request"),
+            },
+        )
+        .await;
+
+    let client = VercelSandboxClient::with_options(
+        VercelSandboxClientOptions::new()
+            .with_token("vercel_test")
+            .with_base_url(&server.base_url)
+            .with_project_id("prj_1")
+            .with_team_id("team_1")
+            .with_status_poll_interval(Duration::from_millis(1)),
+    );
+    let session = client.create(None).await.expect("create");
+    assert_eq!(session.backend_id(), "vercel");
+    // The Vercel runtime image rewrites the SDK-wide default workspace root.
+    assert_eq!(session.workspace_root(), "/vercel/sandbox");
+    assert!(!session.supports_pty(), "Vercel sandboxes have no PTY");
+
+    session.start().await.expect("start");
+    session
+        .write_file("notes.txt", b"stored bytes")
+        .await
+        .expect("write");
+    let result = session
+        .exec(ExecRequest::shell("echo hello"))
+        .await
+        .expect("exec");
+    assert_eq!(result.stdout_text(), "hello from vercel\n");
+    assert_eq!(result.exit_code, 0);
+    assert_eq!(
+        session.read_file("notes.txt").await.expect("read"),
+        b"stored bytes"
+    );
+    assert!(session.running().await.expect("running"));
+    session.shutdown().await.expect("shutdown");
+
+    // Every call is a bearer-authenticated request scoped to the team.
+    let create = server.find("POST", "/v3/sandboxes");
+    assert_eq!(create.header("authorization"), Some("Bearer vercel_test"));
+    assert_eq!(create.query_param("teamId").as_deref(), Some("team_1"));
+    let body = create.json();
+    assert_eq!(body["projectId"], "prj_1");
+    assert_eq!(body["persistent"], false);
+    assert_eq!(body["timeout"], 270_000);
+    assert!(
+        body["name"].as_str().expect("name").starts_with("agents-"),
+        "{body}"
+    );
+
+    let cmd = server
+        .requests()
+        .into_iter()
+        .find(|r| r.path.ends_with("/cmd") && r.text().contains("echo hello"))
+        .expect("the command request");
+    let cmd_body = cmd.json();
+    assert_eq!(cmd_body["command"], "sh");
+    assert_eq!(cmd_body["args"][0], "-lc");
+    assert_eq!(cmd_body["cwd"], "/vercel/sandbox");
+    assert_eq!(cmd_body["wait"], true);
+    assert_eq!(cmd_body["logs"], true);
+
+    // `fs/write` only accepts a gzipped tar extracted relative to `x-cwd`.
+    let write = server.find("POST", "/v2/sandboxes/sessions/sess-1/fs/write");
+    assert_eq!(write.header("content-type"), Some("application/gzip"));
+    assert_eq!(write.header("x-cwd"), Some("/"));
+    assert_eq!(&write.body[..3], &[0x1f, 0x8b, 0x08]);
+
+    let read = server.find("POST", "/v2/sandboxes/sessions/sess-1/fs/read");
+    assert_eq!(read.json()["path"], "/vercel/sandbox/notes.txt");
+    server.stop();
+}
+
+#[tokio::test]
+async fn vercel_waits_for_a_pending_session_and_fails_on_terminal_states() {
+    let polls = Arc::new(Mutex::new(0usize));
+    let handler_polls = polls.clone();
+    let server =
+        MockServer::start(
+            move |request| match (request.method.as_str(), request.path.as_str()) {
+                ("POST", "/v3/sandboxes") => {
+                    MockResponse::json(vercel_sandbox_and_session("pending"))
+                }
+                ("GET", "/v2/sandboxes/sessions/sess-1") => {
+                    let seen = {
+                        let mut polls = handler_polls.lock().expect("poisoned");
+                        *polls += 1;
+                        *polls
+                    };
+                    let status = if seen >= 2 { "running" } else { "pending" };
+                    let mut body = vercel_sandbox_and_session(status);
+                    MockResponse::json(serde_json::json!({
+                        "session": body["session"].take(),
+                        "routes": [],
+                    }))
+                }
+                _ => MockResponse::error(404, "unexpected request"),
+            },
+        )
+        .await;
+
+    let client = VercelSandboxClient::with_options(
+        VercelSandboxClientOptions::new()
+            .with_token("vercel_test")
+            .with_base_url(&server.base_url)
+            .with_status_poll_interval(Duration::from_millis(1)),
+    );
+    client.create(None).await.expect("create");
+    assert!(
+        *polls.lock().expect("poisoned") >= 2,
+        "the client should poll until the session is running"
+    );
+    server.stop();
+
+    let failing =
+        MockServer::start(
+            |request| match (request.method.as_str(), request.path.as_str()) {
+                ("POST", "/v3/sandboxes") => {
+                    MockResponse::json(vercel_sandbox_and_session("pending"))
+                }
+                ("GET", "/v2/sandboxes/sessions/sess-1") => {
+                    let mut body = vercel_sandbox_and_session("failed");
+                    MockResponse::json(serde_json::json!({
+                        "session": body["session"].take(),
+                        "routes": [],
+                    }))
+                }
+                _ => MockResponse::error(404, "unexpected request"),
+            },
+        )
+        .await;
+    let client = VercelSandboxClient::with_options(
+        VercelSandboxClientOptions::new()
+            .with_token("vercel_test")
+            .with_base_url(&failing.base_url)
+            .with_status_poll_interval(Duration::from_millis(1)),
+    );
+    let error = client.create(None).await.unwrap_err();
+    assert_eq!(error.code, ErrorCode::WorkspaceStartError);
+    assert!(error.message.contains("failed"), "{error}");
+    failing.stop();
+}
+
+#[tokio::test]
+async fn vercel_persists_and_restores_a_native_snapshot() {
+    let server =
+        MockServer::start(
+            |request| match (request.method.as_str(), request.path.as_str()) {
+                ("POST", "/v3/sandboxes") => {
+                    let created = if request.json()["source"].is_null() {
+                        vercel_sandbox_and_session("running")
+                    } else {
+                        // A snapshot restore replaces the sandbox with a new session.
+                        serde_json::json!({
+                            "sandbox": {
+                                "name": "agents-restored",
+                                "persistent": false,
+                                "createdAt": 2,
+                                "updatedAt": 2,
+                                "currentSessionId": "sess-2",
+                            },
+                            "session": {
+                                "id": "sess-2",
+                                "memory": 2048,
+                                "vcpus": 2,
+                                "region": "iad1",
+                                "timeout": 270000,
+                                "status": "running",
+                                "requestedAt": 2,
+                                "createdAt": 2,
+                                "updatedAt": 2,
+                                "cwd": "/vercel/sandbox",
+                            },
+                            "routes": [],
+                        })
+                    };
+                    MockResponse::json(created)
+                }
+                ("GET", path) if path.starts_with("/v2/sandboxes/sessions/") => {
+                    let mut body = vercel_sandbox_and_session("running");
+                    MockResponse::json(serde_json::json!({
+                        "session": body["session"].take(),
+                        "routes": [],
+                    }))
+                }
+                ("POST", "/v2/sandboxes/sessions/sess-1/snapshot") => {
+                    MockResponse::json(serde_json::json!({
+                        "snapshot": {
+                            "id": "snap-1",
+                            "sourceSessionId": "sess-1",
+                            "region": "iad1",
+                            "status": "created",
+                            "sizeBytes": 10,
+                            "createdAt": 1,
+                            "updatedAt": 1,
+                        },
+                        "session": vercel_sandbox_and_session("running")["session"],
+                    }))
+                }
+                ("POST", path) if path.ends_with("/stop") => {
+                    MockResponse::json(serde_json::json!({
+                        "session": vercel_sandbox_and_session("stopped")["session"],
+                    }))
+                }
+                _ => MockResponse::error(404, "unexpected request"),
+            },
+        )
+        .await;
+
+    let client = VercelSandboxClient::with_options(
+        VercelSandboxClientOptions::new()
+            .with_token("vercel_test")
+            .with_base_url(&server.base_url)
+            .with_workspace_persistence(VercelWorkspacePersistence::Snapshot)
+            .with_snapshot_expiration_ms(60_000)
+            .with_status_poll_interval(Duration::from_millis(1)),
+    );
+    let session = client.create(None).await.expect("create");
+    let archive = session.persist_workspace().await.expect("persist");
+    assert!(
+        String::from_utf8_lossy(&archive).contains("snap-1"),
+        "{:?}",
+        String::from_utf8_lossy(&archive)
+    );
+    assert_eq!(
+        server
+            .find("POST", "/v2/sandboxes/sessions/sess-1/snapshot")
+            .json()["expiration"],
+        60_000
+    );
+
+    session.hydrate_workspace(&archive).await.expect("hydrate");
+    // The session now points at the replacement sandbox and its new runtime session.
+    assert_eq!(
+        session.session_state().provider_id.as_deref(),
+        Some("agents-restored:sess-2")
+    );
+    let restore = server
+        .requests()
+        .into_iter()
+        .find(|r| r.path == "/v3/sandboxes" && !r.json()["source"].is_null())
+        .expect("the restore request");
+    assert_eq!(restore.json()["source"]["type"], "snapshot");
+    assert_eq!(restore.json()["source"]["snapshotId"], "snap-1");
+    // The session the snapshot replaced is stopped so the project does not leak sandboxes.
+    assert!(
+        server
+            .requests()
+            .iter()
+            .any(|r| r.path == "/v2/sandboxes/sessions/sess-1/stop"),
+        "the replaced session should be stopped"
+    );
+    server.stop();
+}
+
+#[tokio::test]
+async fn vercel_rejects_an_unsupported_exec_user() {
+    let server =
+        MockServer::start(
+            |request| match (request.method.as_str(), request.path.as_str()) {
+                ("POST", "/v3/sandboxes") => {
+                    MockResponse::json(vercel_sandbox_and_session("running"))
+                }
+                ("GET", "/v2/sandboxes/sessions/sess-1") => {
+                    let mut body = vercel_sandbox_and_session("running");
+                    MockResponse::json(serde_json::json!({
+                        "session": body["session"].take(),
+                        "routes": [],
+                    }))
+                }
+                ("POST", "/v2/sandboxes/sessions/sess-1/cmd") => MockResponse::ndjson(&[
+                    serde_json::json!({ "stream": "stdout", "data": "root\n" }),
+                    serde_json::json!({
+                        "command": {
+                            "id": "cmd-1",
+                            "name": "id",
+                            "args": [],
+                            "cwd": "/vercel/sandbox",
+                            "sessionId": "sess-1",
+                            "exitCode": 0,
+                            "startedAt": 1,
+                        },
+                    }),
+                ]),
+                _ => MockResponse::error(404, "unexpected request"),
+            },
+        )
+        .await;
+
+    let client = VercelSandboxClient::with_options(
+        VercelSandboxClientOptions::new()
+            .with_token("vercel_test")
+            .with_base_url(&server.base_url)
+            .with_status_poll_interval(Duration::from_millis(1)),
+    );
+    let session = client.create(None).await.expect("create");
+
+    // `root` becomes the API's `sudo` flag instead of a `sudo` command wrapper.
+    let result = session
+        .exec(ExecRequest::shell("id").with_user(Some("root".into())))
+        .await
+        .expect("exec as root");
+    assert_eq!(result.stdout_text(), "root\n");
+    let cmd = server.find("POST", "/v2/sandboxes/sessions/sess-1/cmd");
+    assert_eq!(cmd.json()["sudo"], true);
+    assert_eq!(cmd.json()["command"], "sh");
+
+    let error = session
+        .exec(ExecRequest::shell("id").with_user(Some("agent".into())))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::SandboxConfigInvalid);
+    server.stop();
+}
+
+// ---------------------------------------------------------------------------------------------
+// Regressions
+// ---------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn e2b_start_tolerates_an_existing_workspace_root() {
+    // `start` creates the root, then `Manifest::apply` creates it again. envd answers the second
+    // call with Connect's `already_exists`, which must not fail the session.
+    let seen = Arc::new(Mutex::new(0usize));
+    let handler_seen = seen.clone();
+    let server =
+        MockServer::start(
+            move |request| match (request.method.as_str(), request.path.as_str()) {
+                ("POST", "/v2/sandboxes") => MockResponse::json(serde_json::json!({
+                    "templateID": "base",
+                    "sandboxID": "sbx-dup",
+                    "clientID": "cl",
+                    "envdVersion": "0.2.0",
+                    "envdAccessToken": "envd-token",
+                })),
+                ("POST", "/filesystem.Filesystem/MakeDir") => {
+                    let count = {
+                        let mut seen = handler_seen.lock().expect("poisoned");
+                        *seen += 1;
+                        *seen
+                    };
+                    if count == 1 {
+                        MockResponse::json(serde_json::json!({}))
+                    } else {
+                        MockResponse {
+                            status: 409,
+                            content_type: "application/json",
+                            body: serde_json::to_vec(&serde_json::json!({
+                                "code": "already_exists",
+                                "message": "path /workspace already exists",
+                            }))
+                            .expect("serializable"),
+                            stream: Vec::new(),
+                        }
+                    }
+                }
+                ("POST", "/process.Process/Start") => e2b_process_stream("", 0),
+                _ => MockResponse::error(404, "unexpected request"),
+            },
+        )
+        .await;
+
+    let client = E2BSandboxClient::with_options(
+        E2BSandboxClientOptions::new()
+            .with_api_key("e2b_test")
+            .with_base_url(&server.base_url),
+    );
+    let session = client.create(None).await.expect("create");
+    session.start().await.expect("start");
+    assert!(
+        *seen.lock().expect("poisoned") >= 2,
+        "the manifest applier should have created the root again"
+    );
+    server.stop();
+}
+
+#[tokio::test]
+async fn e2b_activates_an_rclone_cloud_bucket_mount() {
+    let server =
+        MockServer::start(
+            |request| match (request.method.as_str(), request.path.as_str()) {
+                ("POST", "/v2/sandboxes") => MockResponse::json(serde_json::json!({
+                    "templateID": "base",
+                    "sandboxID": "sbx-mount",
+                    "clientID": "cl",
+                    "envdVersion": "0.2.0",
+                    "envdAccessToken": "envd-token",
+                })),
+                ("POST", "/filesystem.Filesystem/MakeDir") => {
+                    MockResponse::json(serde_json::json!({}))
+                }
+                // Every preflight probe and the mount itself succeed.
+                ("POST", "/process.Process/Start") => e2b_process_stream("", 0),
+                ("POST", "/files") => MockResponse::json(serde_json::json!([])),
+                _ => MockResponse::error(404, "unexpected request"),
+            },
+        )
+        .await;
+
+    let client = E2BSandboxClient::with_options(
+        E2BSandboxClientOptions::new()
+            .with_api_key("e2b_test")
+            .with_base_url(&server.base_url),
+    );
+    let mount = E2BCloudBucketMountStrategy::new("bucket", "my-bucket", "[bucket]\ntype = s3\n")
+        .mount()
+        .with_read_only(true);
+    let manifest = Manifest::new()
+        .with_entry("data", Entry::mount(mount))
+        // The mount writes a credential into the sandbox, so the manifest has to acknowledge its
+        // exact path before it can activate.
+        .with_in_container_mount_credential_exposure_acknowledged(["/workspace/data"]);
+    let session = client.create(Some(manifest)).await.expect("create");
+    session.start().await.expect("start");
+
+    // The rclone configuration is written inside the workspace, where the session's own file API
+    // can reach it, and never passed on a command line.
+    let config = server
+        .requests()
+        .into_iter()
+        .find(|r| {
+            // The file name is derived from the mount path, so two mounts cannot share one.
+            r.method == "POST"
+                && r.path == "/files"
+                && r.query_param("path").is_some_and(|path| {
+                    path.starts_with("/workspace/.openai-agents-rclone-") && path.ends_with(".conf")
+                })
+        })
+        .expect("the rclone configuration upload");
+    assert_eq!(config.text(), "[bucket]\ntype = s3\n");
+
+    let mount_command = server
+        .requests()
+        .into_iter()
+        .find(|r| r.path == "/process.Process/Start" && r.text().contains("bucket:my-bucket"))
+        .expect("the rclone mount command");
+    let payload: serde_json::Value =
+        serde_json::from_slice(&mount_command.body[5..]).expect("json");
+    let args: Vec<String> = payload["process"]["args"]
+        .as_array()
+        .expect("args")
+        .iter()
+        .map(|arg| arg.as_str().unwrap_or_default().to_string())
+        .collect();
+    assert!(args.contains(&"bucket:my-bucket".to_string()), "{args:?}");
+    assert!(args.contains(&"/workspace/data".to_string()), "{args:?}");
+    assert!(args.contains(&"--read-only".to_string()), "{args:?}");
+    assert!(
+        !mount_command.text().contains("type = s3"),
+        "the configuration must not reach the command line"
+    );
+    server.stop();
+}
+
+#[tokio::test]
+async fn vercel_resumes_from_its_own_persisted_state() {
+    // `create` rewrites the default workspace root, so a state built from a live session has to
+    // round trip through JSON and back into `resume` without tripping the manifest digest check.
+    let server =
+        MockServer::start(
+            |request| match (request.method.as_str(), request.path.as_str()) {
+                ("POST", "/v3/sandboxes") => {
+                    MockResponse::json(vercel_sandbox_and_session("running"))
+                }
+                ("GET", "/v2/sandboxes/sessions/sess-1") => {
+                    let mut body = vercel_sandbox_and_session("running");
+                    MockResponse::json(serde_json::json!({
+                        "session": body["session"].take(),
+                        "routes": [],
+                    }))
+                }
+                _ => MockResponse::error(404, "unexpected request"),
+            },
+        )
+        .await;
+
+    let client = VercelSandboxClient::with_options(
+        VercelSandboxClientOptions::new()
+            .with_token("vercel_test")
+            .with_base_url(&server.base_url)
+            .with_status_poll_interval(Duration::from_millis(1)),
+    );
+    let manifest = Manifest::new().with_entry("task.md", Entry::text_file("read me"));
+    let session = client.create(Some(manifest.clone())).await.expect("create");
+    let state = session.session_state();
+    assert_eq!(state.workspace_root, "/vercel/sandbox");
+
+    let payload = state.to_json_string().expect("serialize");
+    assert!(
+        !payload.contains("vercel_test"),
+        "state must stay credential-free"
+    );
+    let restored = SandboxSessionState::from_json_str(&payload).expect("deserialize");
+
+    let resumed = client.resume(&restored, manifest).await.expect("resume");
+    assert_eq!(resumed.workspace_root(), "/vercel/sandbox");
+    assert_eq!(
+        resumed.session_state().provider_id.as_deref(),
+        Some("agents-test:sess-1")
+    );
+    server.stop();
+}
+
+#[tokio::test]
+async fn daytona_resumes_from_its_own_persisted_state_and_restarts_the_sandbox() {
+    let base = Arc::new(Mutex::new(String::new()));
+    let handler_base = base.clone();
+    let started = Arc::new(Mutex::new(false));
+    let handler_started = started.clone();
+    let server = MockServer::start(move |request| {
+        let base_url = handler_base.lock().expect("poisoned").clone();
+        match (request.method.as_str(), request.path.as_str()) {
+            ("POST", "/sandbox") => MockResponse::json(daytona_sandbox(&base_url)),
+            ("GET", "/sandbox/sbx-daytona") => {
+                // The previous run stopped the sandbox; it only reports `started` again after an
+                // explicit start call.
+                let state = if *handler_started.lock().expect("poisoned") {
+                    "started"
+                } else {
+                    "stopped"
+                };
+                let mut body = daytona_sandbox(&base_url);
+                body["state"] = serde_json::json!(state);
+                MockResponse::json(body)
+            }
+            ("POST", "/sandbox/sbx-daytona/start") => {
+                *handler_started.lock().expect("poisoned") = true;
+                MockResponse::json(serde_json::json!({}))
+            }
+            _ => MockResponse::error(404, "unexpected request"),
+        }
+    })
+    .await;
+    *base.lock().expect("poisoned") = server.base_url.clone();
+
+    let client = DaytonaSandboxClient::with_options(
+        DaytonaSandboxClientOptions::new()
+            .with_api_key("dtn_test")
+            .with_api_url(&server.base_url)
+            .with_state_poll_interval(Duration::from_millis(1)),
+    );
+    let manifest = Manifest::new()
+        .with_root("/home/daytona/workspace")
+        .with_entry("task.md", Entry::text_file("read me"));
+    let state =
+        SandboxSessionState::new("daytona", "session-1", "/home/daytona/workspace", &manifest)
+            .with_provider_id(Some("sbx-daytona".to_string()));
+    let payload = state.to_json_string().expect("serialize");
+    let restored = SandboxSessionState::from_json_str(&payload).expect("deserialize");
+
+    let resumed = client.resume(&restored, manifest).await.expect("resume");
+    assert_eq!(resumed.id(), "session-1");
+    assert!(
+        server
+            .requests()
+            .iter()
+            .any(|r| r.path == "/sandbox/sbx-daytona/start"),
+        "a stopped sandbox must be started before the toolbox is used"
+    );
+    server.stop();
+}
+
+#[tokio::test]
+async fn daytona_resumes_a_session_created_without_a_manifest() {
+    // `create(None)` picks the Daytona workspace root, so the recorded digest covers that root.
+    // Resuming with a freshly built manifest must still verify.
+    let base = Arc::new(Mutex::new(String::new()));
+    let handler_base = base.clone();
+    let server = MockServer::start(move |request| {
+        let base_url = handler_base.lock().expect("poisoned").clone();
+        match (request.method.as_str(), request.path.as_str()) {
+            ("POST", "/sandbox") | ("GET", "/sandbox/sbx-daytona") => {
+                MockResponse::json(daytona_sandbox(&base_url))
+            }
+            _ => MockResponse::error(404, "unexpected request"),
+        }
+    })
+    .await;
+    *base.lock().expect("poisoned") = server.base_url.clone();
+
+    let client = DaytonaSandboxClient::with_options(
+        DaytonaSandboxClientOptions::new()
+            .with_api_key("dtn_test")
+            .with_api_url(&server.base_url)
+            .with_state_poll_interval(Duration::from_millis(1)),
+    );
+    let session = client.create(None).await.expect("create");
+    let state = session.session_state();
+    assert_eq!(state.workspace_root, "/home/daytona/workspace");
+
+    let payload = state.to_json_string().expect("serialize");
+    let restored = SandboxSessionState::from_json_str(&payload).expect("deserialize");
+    let resumed = client
+        .resume(&restored, Manifest::new())
+        .await
+        .expect("resume");
+    assert_eq!(resumed.workspace_root(), "/home/daytona/workspace");
+    server.stop();
+}
