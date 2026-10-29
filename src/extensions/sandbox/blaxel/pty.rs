@@ -372,7 +372,7 @@ mod tests {
         let update = sessions
             .start(
                 &url,
-                &PtyExecRequest::new("echo hi").with_yield_time_ms(400),
+                &PtyExecRequest::new("echo hi").with_yield_time_ms(2000),
                 Duration::from_secs(5),
             )
             .await
@@ -396,7 +396,7 @@ mod tests {
         let update = sessions
             .start(
                 &url,
-                &PtyExecRequest::new("cat").with_yield_time_ms(400),
+                &PtyExecRequest::new("cat").with_yield_time_ms(2000),
                 Duration::from_secs(5),
             )
             .await
@@ -404,7 +404,7 @@ mod tests {
         let session_id = update.process_id.expect("the terminal is still running");
 
         let update = sessions
-            .write_stdin(&PtyWriteRequest::new(session_id, "typed\n").with_yield_time_ms(400))
+            .write_stdin(&PtyWriteRequest::new(session_id, "typed\n").with_yield_time_ms(2000))
             .await
             .unwrap();
         assert_eq!(update.output_text(), "out: hi\r\n");

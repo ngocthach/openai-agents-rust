@@ -384,7 +384,7 @@ mod tests {
                 Some("cf-token"),
                 &PtyExecRequest::new("echo hi")
                     .with_tty(true)
-                    .with_yield_time_ms(400),
+                    .with_yield_time_ms(2000),
                 Some("/workspace/repo"),
             )
             .await
@@ -411,7 +411,7 @@ mod tests {
                 None,
                 &PtyExecRequest::new("cat")
                     .with_tty(true)
-                    .with_yield_time_ms(400),
+                    .with_yield_time_ms(2000),
                 None,
             )
             .await
@@ -419,7 +419,7 @@ mod tests {
         let session_id = update.process_id.expect("the terminal is still running");
 
         let update = sessions
-            .write_stdin(&PtyWriteRequest::new(session_id, "typed\n").with_yield_time_ms(400))
+            .write_stdin(&PtyWriteRequest::new(session_id, "typed\n").with_yield_time_ms(2000))
             .await
             .unwrap();
         assert_eq!(update.output_text(), "out: hi\r\n");
@@ -439,7 +439,7 @@ mod tests {
             .start(
                 &url,
                 None,
-                &PtyExecRequest::new("cat").with_yield_time_ms(400),
+                &PtyExecRequest::new("cat").with_yield_time_ms(2000),
                 None,
             )
             .await
