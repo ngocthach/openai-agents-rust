@@ -353,10 +353,13 @@ impl<C> From<bool> for NeedsApproval<C> {
 /// Function converting a tool failure into a model-visible message.
 pub type ToolErrorFn<C> = Arc<dyn Fn(&RunContext<C>, &AgentsError) -> String + Send + Sync>;
 
-/// The default message sent to the model when a tool fails.
-pub fn default_tool_error_function<C>(_ctx: &RunContext<C>, error: &AgentsError) -> String {
-    format!("An error occurred while running the tool. Please try again. Error: {error}")
+/// The default message sent to the model when a tool fails. It does not expose the error.
+pub fn default_tool_error_function<C>(_ctx: &RunContext<C>, _error: &AgentsError) -> String {
+    "An error occurred while running the tool. Please try again.".to_string()
 }
+
+/// Default model-visible message when a tool call is rejected by a reviewer.
+pub const DEFAULT_APPROVAL_REJECTION_MESSAGE: &str = "Tool execution was not approved.";
 
 type InvokeFn<C> =
     Arc<dyn Fn(ToolContext<C>, String) -> BoxFuture<'static, Result<ToolOutput>> + Send + Sync>;

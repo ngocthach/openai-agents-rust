@@ -32,17 +32,106 @@ pub struct ApprovalRecord {
     pub sticky_rejection_message: Option<String>,
 }
 
-/// Serializable approval state keyed by `"{agent}\u{1}{tool}"`.
-pub type ApprovalsState = BTreeMap<String, ApprovalRecord>;
+/// Serializable approval decisions keyed by tool identity (`agent` + `tool`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ApprovalsState(pub BTreeMap<String, ApprovalRecord>);
 
 fn approval_key(agent: &str, tool_name: &str) -> String {
     format!("{agent}\u{1}{tool_name}")
+}
+
+impl ApprovalsState {
+    /// Approve a call; `always` approves future calls to the same tool by the same agent.
+    pub fn approve(&mut self, item: &ToolApprovalItem, always: bool) {
+        let rec = self.0.entry(approval_key(&item.agent, &item.tool_name)).or_default();
+        if always {
+            rec.approved_always = true;
+            rec.rejected_always = false;
+        }
+        rec.approved_call_ids.insert(item.call_id().to_string());
+        rec.rejected_call_ids.remove(item.call_id());
+    }
+
+    /// Reject a call; `always` rejects future calls to the same tool by the same agent.
+    pub fn reject(&mut self, item: &ToolApprovalItem, always: bool, message: Option<String>) {
+        let rec = self.0.entry(approval_key(&item.agent, &item.tool_name)).or_default();
+        if always {
+            rec.rejected_always = true;
+            rec.approved_always = false;
+            if message.is_some() {
+                rec.sticky_rejection_message = message.clone();
+            }
+        }
+        rec.rejected_call_ids.insert(item.call_id().to_string());
+        rec.approved_call_ids.remove(item.call_id());
+        if let Some(m) = message {
+            rec.rejection_messages.insert(item.call_id().to_string(), m);
+        }
+    }
+
+    /// `Some(true)` approved, `Some(false)` rejected, `None` undecided.
+    pub fn status(&self, agent: &str, tool_name: &str, call_id: &str) -> Option<bool> {
+        let rec = self.0.get(&approval_key(agent, tool_name))?;
+        if rec.rejected_call_ids.contains(call_id) {
+            return Some(false);
+        }
+        if rec.approved_call_ids.contains(call_id) {
+            return Some(true);
+        }
+        if rec.rejected_always {
+            return Some(false);
+        }
+        if rec.approved_always {
+            return Some(true);
+        }
+        None
+    }
+
+    /// Custom rejection message for a call.
+    pub fn rejection_message(&self, agent: &str, tool_name: &str, call_id: &str) -> Option<String> {
+        let rec = self.0.get(&approval_key(agent, tool_name))?;
+        rec.rejection_messages
+            .get(call_id)
+            .cloned()
+            .or_else(|| rec.sticky_rejection_message.clone())
+    }
+
+    /// Merge decisions from another state.
+    pub fn merge(&mut self, other: &ApprovalsState) {
+        for (k, v) in &other.0 {
+            let rec = self.0.entry(k.clone()).or_default();
+            rec.approved_always |= v.approved_always;
+            rec.rejected_always |= v.rejected_always;
+            rec.approved_call_ids.extend(v.approved_call_ids.iter().cloned());
+            rec.rejected_call_ids.extend(v.rejected_call_ids.iter().cloned());
+            for id in &v.approved_call_ids {
+                if !v.rejected_call_ids.contains(id) {
+                    rec.rejected_call_ids.remove(id);
+                }
+            }
+            for id in &v.rejected_call_ids {
+                if !v.approved_call_ids.contains(id) {
+                    rec.approved_call_ids.remove(id);
+                }
+            }
+            rec.rejection_messages
+                .extend(v.rejection_messages.iter().map(|(a, b)| (a.clone(), b.clone())));
+            if v.sticky_rejection_message.is_some() {
+                rec.sticky_rejection_message = v.sticky_rejection_message.clone();
+            }
+        }
+    }
 }
 
 #[derive(Default)]
 struct Inner {
     usage: Usage,
     approvals: ApprovalsState,
+    /// Serialized nested `Agent::as_tool` run states awaiting approval, keyed by tool call id.
+    nested_states: BTreeMap<String, Value>,
+    /// Interruptions raised by nested agent tool runs, keyed by tool call id.
+    nested_interruptions: BTreeMap<String, Vec<ToolApprovalItem>>,
 }
 
 /// Wrapper around the app context with shared usage and approval state.
@@ -137,16 +226,7 @@ impl<C> RunContext<C> {
     /// Approve a pending tool call. With `always_approve`, future calls to the same tool by the
     /// same agent are approved automatically.
     pub fn approve_tool(&self, item: &ToolApprovalItem, always_approve: bool) {
-        let mut inner = self.inner.lock().expect("run context poisoned");
-        let rec = inner
-            .approvals
-            .entry(approval_key(&item.agent, &item.tool_name))
-            .or_default();
-        if always_approve {
-            rec.approved_always = true;
-        }
-        rec.approved_call_ids.insert(item.call_id().to_string());
-        rec.rejected_call_ids.remove(item.call_id());
+        self.lock().approvals.approve(item, always_approve);
     }
 
     /// Reject a pending tool call, optionally with a custom model-visible message.
@@ -156,74 +236,63 @@ impl<C> RunContext<C> {
         always_reject: bool,
         rejection_message: Option<String>,
     ) {
-        let mut inner = self.inner.lock().expect("run context poisoned");
-        let rec = inner
-            .approvals
-            .entry(approval_key(&item.agent, &item.tool_name))
-            .or_default();
-        if always_reject {
-            rec.rejected_always = true;
-            if rejection_message.is_some() {
-                rec.sticky_rejection_message = rejection_message.clone();
-            }
-        }
-        rec.rejected_call_ids.insert(item.call_id().to_string());
-        rec.approved_call_ids.remove(item.call_id());
-        if let Some(msg) = rejection_message {
-            rec.rejection_messages.insert(item.call_id().to_string(), msg);
-        }
+        self.lock().approvals.reject(item, always_reject, rejection_message);
     }
 
     /// Approval status for a tool call: `Some(true)` approved, `Some(false)` rejected, `None`
     /// undecided.
     pub fn is_tool_approved(&self, agent: &str, tool_name: &str, call_id: &str) -> Option<bool> {
-        let inner = self.inner.lock().expect("run context poisoned");
-        let rec = inner.approvals.get(&approval_key(agent, tool_name))?;
-        if rec.rejected_call_ids.contains(call_id) {
-            return Some(false);
-        }
-        if rec.approved_call_ids.contains(call_id) {
-            return Some(true);
-        }
-        if rec.rejected_always {
-            return Some(false);
-        }
-        if rec.approved_always {
-            return Some(true);
-        }
-        None
+        self.lock().approvals.status(agent, tool_name, call_id)
     }
 
     /// Custom rejection message for a rejected call, if one was provided.
     pub fn rejection_message(&self, agent: &str, tool_name: &str, call_id: &str) -> Option<String> {
-        let inner = self.inner.lock().expect("run context poisoned");
-        let rec = inner.approvals.get(&approval_key(agent, tool_name))?;
-        rec.rejection_messages
-            .get(call_id)
-            .cloned()
-            .or_else(|| rec.sticky_rejection_message.clone())
+        self.lock().approvals.rejection_message(agent, tool_name, call_id)
     }
 
     /// Export approval state (for `RunState`).
     pub fn export_approvals(&self) -> ApprovalsState {
-        self.inner.lock().expect("run context poisoned").approvals.clone()
+        self.lock().approvals.clone()
     }
 
     /// Import approval state (for `RunState`), merging with existing decisions.
     pub fn import_approvals(&self, approvals: &ApprovalsState) {
-        let mut inner = self.inner.lock().expect("run context poisoned");
-        for (k, v) in approvals {
-            let rec = inner.approvals.entry(k.clone()).or_default();
-            rec.approved_always |= v.approved_always;
-            rec.rejected_always |= v.rejected_always;
-            rec.approved_call_ids.extend(v.approved_call_ids.iter().cloned());
-            rec.rejected_call_ids.extend(v.rejected_call_ids.iter().cloned());
-            rec.rejection_messages
-                .extend(v.rejection_messages.iter().map(|(a, b)| (a.clone(), b.clone())));
-            if v.sticky_rejection_message.is_some() {
-                rec.sticky_rejection_message = v.sticky_rejection_message.clone();
-            }
-        }
+        self.lock().approvals.merge(approvals);
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
+        self.inner.lock().expect("run context poisoned")
+    }
+
+    pub(crate) fn nested_states(&self) -> BTreeMap<String, Value> {
+        self.lock().nested_states.clone()
+    }
+
+    pub(crate) fn import_nested_states(&self, states: &BTreeMap<String, Value>) {
+        self.lock()
+            .nested_states
+            .extend(states.iter().map(|(k, v)| (k.clone(), v.clone())));
+    }
+
+    pub(crate) fn take_nested_state(&self, call_id: &str) -> Option<Value> {
+        self.lock().nested_states.remove(call_id)
+    }
+
+    pub(crate) fn set_nested_interruption(
+        &self,
+        call_id: &str,
+        state: Value,
+        interruptions: Vec<ToolApprovalItem>,
+    ) {
+        let mut inner = self.lock();
+        inner.nested_states.insert(call_id.to_string(), state);
+        inner
+            .nested_interruptions
+            .insert(call_id.to_string(), interruptions);
+    }
+
+    pub(crate) fn take_nested_interruptions(&self, call_id: &str) -> Option<Vec<ToolApprovalItem>> {
+        self.lock().nested_interruptions.remove(call_id)
     }
 }
 

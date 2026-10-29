@@ -1,0 +1,144 @@
+//! Session memory: conversation history persisted across runs. Mirrors `agents.memory`.
+
+mod openai_conversations_session;
+#[cfg(feature = "sqlite")]
+mod sqlite_session;
+
+use std::fmt;
+use std::sync::Mutex;
+
+use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
+
+use crate::error::Result;
+use crate::items::InputItem;
+
+pub use openai_conversations_session::OpenAIConversationsSession;
+#[cfg(feature = "sqlite")]
+pub use sqlite_session::SqliteSession;
+
+/// Settings controlling how history is retrieved.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionSettings {
+    /// Maximum number of most recent items to retrieve (`None` = all).
+    pub limit: Option<usize>,
+}
+
+impl SessionSettings {
+    /// Settings retrieving at most `limit` items.
+    pub fn with_limit(limit: usize) -> Self {
+        SessionSettings { limit: Some(limit) }
+    }
+
+    /// Overlay `Some` values from `other`.
+    pub fn resolve(&self, other: Option<&SessionSettings>) -> SessionSettings {
+        match other {
+            Some(o) if o.limit.is_some() => o.clone(),
+            _ => self.clone(),
+        }
+    }
+}
+
+/// Stores conversation history for a session.
+///
+/// The runner retrieves history before each run and stores new items after it.
+#[async_trait]
+pub trait Session: Send + Sync + fmt::Debug {
+    /// The session id.
+    fn session_id(&self) -> &str;
+
+    /// Default settings for this session.
+    fn session_settings(&self) -> Option<SessionSettings> {
+        None
+    }
+
+    /// Retrieve history, the most recent `limit` items when set (chronological order).
+    async fn get_items(&self, limit: Option<usize>) -> Result<Vec<InputItem>>;
+
+    /// Append items.
+    async fn add_items(&self, items: Vec<InputItem>) -> Result<()>;
+
+    /// Remove and return the most recent item.
+    async fn pop_item(&self) -> Result<Option<InputItem>>;
+
+    /// Remove all items.
+    async fn clear_session(&self) -> Result<()>;
+}
+
+/// A session stored in process memory.
+#[derive(Debug, Default)]
+pub struct InMemorySession {
+    session_id: String,
+    settings: Option<SessionSettings>,
+    items: Mutex<Vec<InputItem>>,
+}
+
+impl InMemorySession {
+    /// A new empty in-memory session.
+    pub fn new(session_id: impl Into<String>) -> Self {
+        InMemorySession {
+            session_id: session_id.into(),
+            settings: None,
+            items: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Set default session settings.
+    pub fn with_settings(mut self, settings: SessionSettings) -> Self {
+        self.settings = Some(settings);
+        self
+    }
+}
+
+#[async_trait]
+impl Session for InMemorySession {
+    fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    fn session_settings(&self) -> Option<SessionSettings> {
+        self.settings.clone()
+    }
+
+    async fn get_items(&self, limit: Option<usize>) -> Result<Vec<InputItem>> {
+        let items = self.items.lock().expect("session poisoned");
+        Ok(match limit {
+            None => items.clone(),
+            Some(0) => Vec::new(),
+            Some(n) => items[items.len().saturating_sub(n)..].to_vec(),
+        })
+    }
+
+    async fn add_items(&self, items: Vec<InputItem>) -> Result<()> {
+        self.items.lock().expect("session poisoned").extend(items);
+        Ok(())
+    }
+
+    async fn pop_item(&self) -> Result<Option<InputItem>> {
+        Ok(self.items.lock().expect("session poisoned").pop())
+    }
+
+    async fn clear_session(&self) -> Result<()> {
+        self.items.lock().expect("session poisoned").clear();
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn in_memory_session_operations() {
+        let s = InMemorySession::new("s1");
+        s.add_items(vec![InputItem::user("a"), InputItem::assistant("b"), InputItem::user("c")])
+            .await
+            .unwrap();
+        assert_eq!(s.get_items(None).await.unwrap().len(), 3);
+        let last2 = s.get_items(Some(2)).await.unwrap();
+        assert_eq!(last2[0].text_content().as_deref(), Some("b"));
+        assert_eq!(s.pop_item().await.unwrap().unwrap().text_content().as_deref(), Some("c"));
+        s.clear_session().await.unwrap();
+        assert!(s.get_items(None).await.unwrap().is_empty());
+    }
+}

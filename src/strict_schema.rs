@@ -37,6 +37,27 @@ const ROOT_REF_NON_CONSTRAINING_SIBLINGS: &[&str] = &[
     "$id",
 ];
 
+/// String formats accepted by OpenAI structured outputs.
+const SUPPORTED_STRING_FORMATS: &[&str] = &[
+    "date-time", "time", "date", "duration", "email", "hostname", "ipv4", "ipv6", "uuid",
+];
+
+/// Remove `format` values that OpenAI strict mode rejects. schemars emits formats such as
+/// `uint32`, `int64` and `double` for Rust numeric types; Pydantic never does.
+fn strip_unsupported_format(obj: &mut Map<String, Value>) {
+    let Some(Value::String(fmt)) = obj.get("format") else {
+        return;
+    };
+    let is_string = match obj.get("type") {
+        Some(Value::String(t)) => t == "string",
+        Some(Value::Array(ts)) => ts.iter().any(|t| t == "string"),
+        _ => false,
+    };
+    if !(is_string && SUPPORTED_STRING_FORMATS.contains(&fmt.as_str())) {
+        obj.remove("format");
+    }
+}
+
 /// Convert `schema` to the strict JSON schema format expected by the OpenAI API.
 ///
 /// Objects get `additionalProperties: false` and every property becomes required, `oneOf` turns
@@ -127,6 +148,10 @@ fn ensure_strict(
     };
     let explicitly_closed = obj.get("additionalProperties") == Some(&Value::Bool(false));
     spend(budget)?;
+    strip_unsupported_format(&mut obj);
+    if is_root {
+        obj.remove("$schema");
+    }
     let next = depth + 1;
 
     if obj.contains_key("$ref") {
@@ -369,6 +394,25 @@ mod tests {
         assert_eq!(loc["additionalProperties"], false);
         assert!(strict["properties"]["u"].get("oneOf").is_none());
         assert!(strict["properties"]["u"]["anyOf"].is_array());
+    }
+
+    #[test]
+    fn strips_numeric_formats_but_keeps_string_formats() {
+        let schema = serde_json::json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+                "n": {"type": "integer", "format": "uint32", "minimum": 0},
+                "d": {"type": "string", "format": "date-time"},
+                "x": {"type": "string", "format": "binary"}
+            }
+        });
+        let strict = ensure_strict_json_schema(&schema).unwrap();
+        assert!(strict.get("$schema").is_none());
+        assert!(strict["properties"]["n"].get("format").is_none());
+        assert_eq!(strict["properties"]["n"]["minimum"], 0);
+        assert_eq!(strict["properties"]["d"]["format"], "date-time");
+        assert!(strict["properties"]["x"].get("format").is_none());
     }
 
     #[test]
