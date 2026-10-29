@@ -18,6 +18,9 @@ use crate::tool_context::ToolContext;
 use crate::tool_guardrails::{ToolInputGuardrail, ToolOutputGuardrail};
 use crate::util::BoxFuture;
 
+mod local;
+pub use local::*;
+
 /// A structured part of a tool output (text, image or file).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -393,9 +396,13 @@ pub struct FunctionTool<C> {
     pub failure_error_function: Option<ToolErrorFn<C>>,
     /// Timeout message formatter.
     pub timeout_error_function: Option<ToolErrorFn<C>>,
+    /// Programmatic callers allowed to invoke this tool (Responses API only).
+    pub allowed_callers: Option<Vec<String>>,
     invoke: InvokeFn<C>,
     pub(crate) is_agent_tool: bool,
     pub(crate) mcp_server_name: Option<String>,
+    pub(crate) namespace: Option<String>,
+    pub(crate) namespace_description: Option<String>,
 }
 
 impl<C> Clone for FunctionTool<C> {
@@ -414,9 +421,12 @@ impl<C> Clone for FunctionTool<C> {
             defer_loading: self.defer_loading,
             failure_error_function: self.failure_error_function.clone(),
             timeout_error_function: self.timeout_error_function.clone(),
+            allowed_callers: self.allowed_callers.clone(),
             invoke: self.invoke.clone(),
             is_agent_tool: self.is_agent_tool,
             mcp_server_name: self.mcp_server_name.clone(),
+            namespace: self.namespace.clone(),
+            namespace_description: self.namespace_description.clone(),
         }
     }
 }
@@ -554,6 +564,9 @@ impl<C: Send + Sync + 'static> FunctionTool<C> {
             invoke,
             is_agent_tool: false,
             mcp_server_name: None,
+            allowed_callers: None,
+            namespace: None,
+            namespace_description: None,
         }
     }
 
@@ -655,6 +668,12 @@ impl<C: Send + Sync + 'static> FunctionTool<C> {
         self.defer_loading = defer;
         self
     }
+
+    /// Restrict which programmatic callers may invoke the tool (Responses API only).
+    pub fn with_allowed_callers(mut self, callers: Vec<String>) -> Self {
+        self.allowed_callers = Some(callers);
+        self
+    }
 }
 
 impl<C> FunctionTool<C> {
@@ -665,17 +684,20 @@ impl<C> FunctionTool<C> {
 
     /// Convert to a Responses API `function` tool param.
     pub fn to_responses_param(&self) -> Value {
-        let mut v = json!({
-            "type": "function",
-            "name": self.name,
-            "description": self.description,
-            "parameters": self.params_json_schema,
-            "strict": self.strict_json_schema,
-        });
-        if self.defer_loading {
-            v["defer_loading"] = Value::Bool(true);
+        self.to_spec().to_responses_param()
+    }
+
+    /// The namespace attached with [`tool_namespace`], if any.
+    pub fn namespace(&self) -> Option<&str> {
+        self.namespace.as_deref()
+    }
+
+    /// `namespace.name` for namespaced tools, otherwise the name.
+    pub fn qualified_name(&self) -> String {
+        match &self.namespace {
+            Some(ns) => format!("{ns}.{}", self.name),
+            None => self.name.clone(),
         }
-        v
     }
 
     /// Convert to a Chat Completions `function` tool param.
@@ -704,8 +726,47 @@ impl<C> FunctionTool<C> {
             parameters: self.params_json_schema.clone(),
             strict: self.strict_json_schema,
             defer_loading: self.defer_loading,
+            namespace: self.namespace.clone(),
+            namespace_description: self.namespace_description.clone(),
+            allowed_callers: self.allowed_callers.clone(),
         }
     }
+}
+
+/// Group function tools under a namespace for Responses API tool search. The model sees one
+/// `namespace` tool and calls its members as `namespace.name`.
+pub fn tool_namespace<C>(
+    name: &str,
+    description: &str,
+    tools: Vec<FunctionTool<C>>,
+) -> Result<Vec<FunctionTool<C>>> {
+    let name = name.trim();
+    let description = description.trim();
+    if name.is_empty() {
+        return Err(AgentsError::user(
+            "tool_namespace() requires a non-empty namespace name.",
+        ));
+    }
+    if description.is_empty() {
+        return Err(AgentsError::user(
+            "tool_namespace() requires a non-empty description.",
+        ));
+    }
+    tools
+        .into_iter()
+        .map(|mut t| {
+            if t.name == name {
+                return Err(AgentsError::user(format!(
+                    "Responses tool-search reserves the synthetic namespace `{name}.{name}` for \
+                     deferred top-level function tools. Rename the namespace or tool name to \
+                     avoid ambiguous dispatch."
+                )));
+            }
+            t.namespace = Some(name.to_string());
+            t.namespace_description = Some(description.to_string());
+            Ok(t)
+        })
+        .collect()
 }
 
 /// Hosted web search tool.
@@ -983,7 +1044,21 @@ pub enum Tool<C> {
     ImageGeneration(ImageGenerationTool),
     /// Hosted MCP server.
     HostedMCP(HostedMCPTool<C>),
-    /// Any other Responses tool param, passed through verbatim (e.g. hosted shell).
+    /// A computer controlled by the model.
+    Computer(Arc<ComputerTool<C>>),
+    /// The shell tool (local executor or hosted container).
+    Shell(Arc<ShellTool<C>>),
+    /// The legacy local shell tool.
+    LocalShell(Arc<LocalShellTool<C>>),
+    /// File edits through V4A diffs.
+    ApplyPatch(Arc<ApplyPatchTool<C>>),
+    /// A custom (raw string input) tool.
+    Custom(Arc<CustomTool<C>>),
+    /// Hosted tool search.
+    ToolSearch(ToolSearchTool),
+    /// Hosted programmatic tool calling.
+    ProgrammaticToolCalling(ProgrammaticToolCallingTool),
+    /// Any other Responses tool param, passed through verbatim.
     Raw(Value),
 }
 
@@ -996,6 +1071,13 @@ impl<C> Clone for Tool<C> {
             Tool::CodeInterpreter(t) => Tool::CodeInterpreter(t.clone()),
             Tool::ImageGeneration(t) => Tool::ImageGeneration(t.clone()),
             Tool::HostedMCP(t) => Tool::HostedMCP(t.clone()),
+            Tool::Computer(t) => Tool::Computer(t.clone()),
+            Tool::Shell(t) => Tool::Shell(t.clone()),
+            Tool::LocalShell(t) => Tool::LocalShell(t.clone()),
+            Tool::ApplyPatch(t) => Tool::ApplyPatch(t.clone()),
+            Tool::Custom(t) => Tool::Custom(t.clone()),
+            Tool::ToolSearch(t) => Tool::ToolSearch(t.clone()),
+            Tool::ProgrammaticToolCalling(t) => Tool::ProgrammaticToolCalling(*t),
             Tool::Raw(v) => Tool::Raw(v.clone()),
         }
     }
@@ -1010,6 +1092,15 @@ impl<C> fmt::Debug for Tool<C> {
             Tool::CodeInterpreter(t) => f.debug_tuple("CodeInterpreter").field(t).finish(),
             Tool::ImageGeneration(t) => f.debug_tuple("ImageGeneration").field(t).finish(),
             Tool::HostedMCP(t) => f.debug_tuple("HostedMCP").field(t).finish(),
+            Tool::Computer(t) => f.debug_tuple("Computer").field(t).finish(),
+            Tool::Shell(t) => f.debug_tuple("Shell").field(t).finish(),
+            Tool::LocalShell(t) => f.debug_tuple("LocalShell").field(t).finish(),
+            Tool::ApplyPatch(t) => f.debug_tuple("ApplyPatch").field(t).finish(),
+            Tool::Custom(t) => f.debug_tuple("Custom").field(t).finish(),
+            Tool::ToolSearch(t) => f.debug_tuple("ToolSearch").field(t).finish(),
+            Tool::ProgrammaticToolCalling(t) => {
+                f.debug_tuple("ProgrammaticToolCalling").field(t).finish()
+            }
             Tool::Raw(t) => f.debug_tuple("Raw").field(t).finish(),
         }
     }
@@ -1025,6 +1116,13 @@ impl<C> Tool<C> {
             Tool::CodeInterpreter(_) => "code_interpreter".into(),
             Tool::ImageGeneration(_) => "image_generation".into(),
             Tool::HostedMCP(t) => t.server_label().unwrap_or("mcp").to_string(),
+            Tool::Computer(t) => t.name().to_string(),
+            Tool::Shell(t) => t.name.clone(),
+            Tool::LocalShell(t) => t.name().to_string(),
+            Tool::ApplyPatch(t) => t.name.clone(),
+            Tool::Custom(t) => t.name.clone(),
+            Tool::ToolSearch(_) => "tool_search".into(),
+            Tool::ProgrammaticToolCalling(_) => "programmatic_tool_calling".into(),
             Tool::Raw(v) => v
                 .get("type")
                 .and_then(Value::as_str)
@@ -1042,6 +1140,9 @@ impl<C> Tool<C> {
     }
 
     /// Convert to a Responses API tool param, plus any `include` values it needs.
+    ///
+    /// For a computer tool this resolves the computer synchronously only when it is already
+    /// created; the runner uses [`ComputerTool::to_responses_param`] instead.
     pub fn to_responses_param(&self) -> (Value, Vec<String>) {
         match self {
             Tool::Function(t) => (t.to_responses_param(), Vec::new()),
@@ -1067,6 +1168,13 @@ impl<C> Tool<C> {
             ),
             Tool::ImageGeneration(t) => (t.to_responses_param(), Vec::new()),
             Tool::HostedMCP(t) => (t.to_responses_param(), Vec::new()),
+            Tool::Computer(_) => (json!({"type": "computer"}), Vec::new()),
+            Tool::Shell(t) => (t.to_responses_param(), Vec::new()),
+            Tool::LocalShell(t) => (t.to_responses_param(), Vec::new()),
+            Tool::ApplyPatch(t) => (t.to_responses_param(), Vec::new()),
+            Tool::Custom(t) => (t.to_responses_param(), Vec::new()),
+            Tool::ToolSearch(t) => (t.to_responses_param(), Vec::new()),
+            Tool::ProgrammaticToolCalling(t) => (t.to_responses_param(), Vec::new()),
             Tool::Raw(v) => (v.clone(), Vec::new()),
         }
     }
@@ -1111,6 +1219,41 @@ impl<C> From<ImageGenerationTool> for Tool<C> {
 impl<C> From<HostedMCPTool<C>> for Tool<C> {
     fn from(value: HostedMCPTool<C>) -> Self {
         Tool::HostedMCP(value)
+    }
+}
+
+macro_rules! tool_from_arc {
+    ($($ty:ident => $variant:ident),* $(,)?) => {$(
+        impl<C> From<$ty<C>> for Tool<C> {
+            fn from(value: $ty<C>) -> Self {
+                Tool::$variant(Arc::new(value))
+            }
+        }
+        impl<C> From<Arc<$ty<C>>> for Tool<C> {
+            fn from(value: Arc<$ty<C>>) -> Self {
+                Tool::$variant(value)
+            }
+        }
+    )*};
+}
+
+tool_from_arc!(
+    ComputerTool => Computer,
+    ShellTool => Shell,
+    LocalShellTool => LocalShell,
+    ApplyPatchTool => ApplyPatch,
+    CustomTool => Custom,
+);
+
+impl<C> From<ToolSearchTool> for Tool<C> {
+    fn from(value: ToolSearchTool) -> Self {
+        Tool::ToolSearch(value)
+    }
+}
+
+impl<C> From<ProgrammaticToolCallingTool> for Tool<C> {
+    fn from(value: ProgrammaticToolCallingTool) -> Self {
+        Tool::ProgrammaticToolCalling(value)
     }
 }
 

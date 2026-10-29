@@ -7,6 +7,8 @@ pub mod openai_chatcompletions;
 pub mod openai_client;
 pub mod openai_provider;
 pub mod openai_responses;
+#[cfg(feature = "websocket")]
+pub mod openai_responses_ws;
 
 use std::sync::RwLock;
 
@@ -19,6 +21,8 @@ pub use openai_chatcompletions::OpenAIChatCompletionsModel;
 pub use openai_client::OpenAIClient;
 pub use openai_provider::OpenAIProvider;
 pub use openai_responses::OpenAIResponsesModel;
+#[cfg(feature = "websocket")]
+pub use openai_responses_ws::OpenAIResponsesWSModel;
 
 /// Placeholder id used for items synthesized from Chat Completions responses.
 pub const FAKE_RESPONSES_ID: &str = "__fake_id__";

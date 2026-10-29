@@ -291,7 +291,7 @@ impl<C: Send + Sync + 'static> Handoff<C> {
             description: self.tool_description.clone(),
             parameters: self.input_json_schema.clone(),
             strict: self.strict_json_schema,
-            defer_loading: false,
+            ..Default::default()
         }
     }
 }

@@ -53,10 +53,29 @@ fn format_tool_error<C>(
     call_id: &str,
     default_message: String,
 ) -> String {
+    format_tool_error_for(
+        config,
+        kind,
+        "function",
+        tool_name,
+        call_id,
+        default_message,
+    )
+}
+
+/// Apply the run's tool error formatter for a tool of the given runtime type.
+pub(crate) fn format_tool_error_for<C>(
+    config: &RunConfig<C>,
+    kind: ToolErrorKind,
+    tool_type: &str,
+    tool_name: &str,
+    call_id: &str,
+    default_message: String,
+) -> String {
     if let Some(f) = &config.tool_error_formatter {
         let args = ToolErrorFormatterArgs {
             kind,
-            tool_type: "function".into(),
+            tool_type: tool_type.into(),
             tool_name: tool_name.to_string(),
             call_id: call_id.to_string(),
             default_message: default_message.clone(),
@@ -145,7 +164,8 @@ pub(crate) async fn execute_function_tool<C: Send + Sync + 'static>(
         output_guardrail_results: o,
     };
 
-    // Approvals.
+    // Approvals are keyed by the qualified name so namespaced tools never collide.
+    let approval_name = tool.qualified_name();
     let needs_approval = tool
         .needs_approval
         .evaluate(env.ctx, &call.arguments, &call.call_id)
@@ -163,13 +183,13 @@ pub(crate) async fn execute_function_tool<C: Send + Sync + 'static>(
         }
         match env
             .ctx
-            .is_tool_approved(&env.agent.name, &tool.name, &call.call_id)
+            .is_tool_approved(&env.agent.name, &approval_name, &call.call_id)
         {
             None => {
                 let item = ToolApprovalItem {
                     agent: env.agent.name.clone(),
                     raw_item: call.clone(),
-                    tool_name: tool.name.clone(),
+                    tool_name: approval_name.clone(),
                 };
                 return Ok(finish(
                     ToolOutcome::Interruptions(vec![item]),
@@ -180,7 +200,7 @@ pub(crate) async fn execute_function_tool<C: Send + Sync + 'static>(
             Some(false) => {
                 let message = env
                     .ctx
-                    .rejection_message(&env.agent.name, &tool.name, &call.call_id)
+                    .rejection_message(&env.agent.name, &approval_name, &call.call_id)
                     .unwrap_or_else(|| {
                         format_tool_error(
                             env.config,

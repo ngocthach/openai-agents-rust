@@ -50,7 +50,28 @@ impl OpenAIChatCompletionsModel {
         let mut tools: Vec<Value> = Vec::new();
         for t in &req.tools {
             match t {
-                ToolSpec::Function(f) => tools.push(f.to_chat_param()),
+                ToolSpec::Function(f) => {
+                    let mut features = Vec::new();
+                    if f.namespace.is_some() {
+                        features.push("tool_namespace()");
+                    }
+                    if f.defer_loading {
+                        features.push("defer_loading");
+                    }
+                    if f.allowed_callers.is_some() {
+                        features.push("allowed_callers");
+                    }
+                    if !features.is_empty() {
+                        return Err(AgentsError::user(format!(
+                            "The following function-tool features are only supported with \
+                             OpenAI Responses models: {}. Tool `{}` cannot be used with \
+                             OpenAIChatCompletionsModel.",
+                            features.join(", "),
+                            f.name
+                        )));
+                    }
+                    tools.push(f.to_chat_param())
+                }
                 ToolSpec::Hosted { param, .. } => {
                     return Err(AgentsError::user(format!(
                         "Hosted tools are not supported with the ChatCompletions API. Got tool type: {}",

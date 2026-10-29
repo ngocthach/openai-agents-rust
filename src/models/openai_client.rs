@@ -135,7 +135,7 @@ impl OpenAIClient {
         )
     }
 
-    fn headers(&self, extra: Option<&HashMap<String, String>>) -> Result<HeaderMap> {
+    pub(crate) fn headers(&self, extra: Option<&HashMap<String, String>>) -> Result<HeaderMap> {
         let mut h = HeaderMap::new();
         if let Some(key) = self.api_key() {
             h.insert(

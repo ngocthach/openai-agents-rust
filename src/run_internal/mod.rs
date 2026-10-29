@@ -1,6 +1,7 @@
 //! The agent loop. Port of `agents.run_internal`.
 
 mod history;
+mod local_tools;
 mod model_call;
 mod tools;
 
@@ -65,6 +66,7 @@ struct ProcessedResponse<C> {
     functions: Vec<(FunctionCall, Arc<FunctionTool<C>>)>,
     handoffs: Vec<(FunctionCall, Handoff<C>)>,
     mcp_approvals: Vec<(Value, Option<HostedMCPTool<C>>)>,
+    local_calls: Vec<local_tools::LocalCall<C>>,
     tools_used: Vec<String>,
     last_message: Option<MessageOutput>,
     has_tool_activity: bool,
@@ -149,6 +151,70 @@ fn items_to_input(items: &[RunItem]) -> Vec<InputItem> {
         .filter(|i| !matches!(i.kind, RunItemKind::ToolApproval { .. }))
         .map(RunItem::to_input_item)
         .collect()
+}
+
+/// The function tool key for a call: `namespace.name` for namespaced calls. Deferred top-level
+/// tools come back with `namespace == name` and resolve to the bare name.
+fn function_lookup_name(fc: &FunctionCall) -> String {
+    match fc.extra.get("namespace").and_then(Value::as_str) {
+        Some(ns) if !ns.is_empty() && ns != fc.name => format!("{ns}.{}", fc.name),
+        _ => fc.name.clone(),
+    }
+}
+
+/// Match a non-function output item to a local runtime tool of the agent.
+fn match_local_call<C>(
+    tools: &[Tool<C>],
+    v: &Value,
+    ty: &str,
+) -> Result<Option<local_tools::LocalCall<C>>> {
+    use local_tools::LocalCall;
+    let missing = |what: &str| {
+        Err(AgentsError::model_behavior(format!(
+            "Model produced a {ty} item but the agent has no {what}."
+        )))
+    };
+    match ty {
+        "computer_call" => match tools.iter().find_map(|t| match t {
+            Tool::Computer(c) => Some(c.clone()),
+            _ => None,
+        }) {
+            Some(c) => Ok(Some(LocalCall::Computer(v.clone(), c))),
+            None => missing("ComputerTool"),
+        },
+        // Hosted shells are executed by OpenAI: only local shell tools run here.
+        "shell_call" => Ok(tools.iter().find_map(|t| match t {
+            Tool::Shell(s) if s.is_local() => Some(LocalCall::Shell(v.clone(), s.clone())),
+            _ => None,
+        })),
+        "local_shell_call" => match tools.iter().find_map(|t| match t {
+            Tool::LocalShell(s) => Some(s.clone()),
+            _ => None,
+        }) {
+            Some(s) => Ok(Some(LocalCall::LocalShell(v.clone(), s))),
+            None => missing("LocalShellTool"),
+        },
+        "apply_patch_call" => match tools.iter().find_map(|t| match t {
+            Tool::ApplyPatch(a) => Some(a.clone()),
+            _ => None,
+        }) {
+            Some(a) => Ok(Some(LocalCall::ApplyPatch(v.clone(), a))),
+            None => missing("ApplyPatchTool"),
+        },
+        "custom_tool_call" => {
+            let name = v.get("name").and_then(Value::as_str).unwrap_or_default();
+            match tools.iter().find_map(|t| match t {
+                Tool::Custom(c) if c.name == name => Some(c.clone()),
+                _ => None,
+            }) {
+                Some(c) => Ok(Some(LocalCall::Custom(v.clone(), c))),
+                None => Err(AgentsError::model_behavior(format!(
+                    "Custom tool {name} not found"
+                ))),
+            }
+        }
+        _ => Ok(None),
+    }
 }
 
 fn call_id_of(item: &RunItem) -> Option<String> {
@@ -963,16 +1029,20 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
             instructions = r.instructions;
         }
 
-        let tool_specs: Vec<ToolSpec> = tools
-            .iter()
-            .map(|t| match t {
+        let mut tool_specs: Vec<ToolSpec> = Vec::with_capacity(tools.len());
+        for t in &tools {
+            tool_specs.push(match t {
                 Tool::Function(f) => ToolSpec::Function(f.to_spec()),
+                Tool::Computer(c) => ToolSpec::Hosted {
+                    param: c.to_responses_param().await?,
+                    includes: Vec::new(),
+                },
                 other => {
                     let (param, includes) = other.to_responses_param();
                     ToolSpec::Hosted { param, includes }
                 }
-            })
-            .collect();
+            });
+        }
         let tracing_mode = if self.config.tracing_disabled {
             ModelTracing::Disabled
         } else if self.config.trace_include_sensitive_data {
@@ -1092,13 +1162,14 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
             functions: Vec::new(),
             handoffs: Vec::new(),
             mcp_approvals: Vec::new(),
+            local_calls: Vec::new(),
             tools_used: Vec::new(),
             last_message: None,
             has_tool_activity: false,
         };
-        let function_map: HashMap<&str, &Arc<FunctionTool<C>>> = tools
+        let function_map: HashMap<String, &Arc<FunctionTool<C>>> = tools
             .iter()
-            .filter_map(|t| t.as_function().map(|f| (f.name.as_str(), f)))
+            .filter_map(|t| t.as_function().map(|f| (f.qualified_name(), f)))
             .collect();
         let handoff_map: HashMap<&str, &Handoff<C>> =
             handoffs.iter().map(|h| (h.tool_name.as_str(), h)).collect();
@@ -1151,7 +1222,7 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
                         if !skip.contains(&fc.call_id) {
                             processed.handoffs.push((fc.clone(), (*h).clone()));
                         }
-                    } else if let Some(t) = function_map.get(fc.name.as_str()) {
+                    } else if let Some(t) = function_map.get(&function_lookup_name(fc)) {
                         if append {
                             let item = RunItem::new(
                                 name.clone(),
@@ -1207,6 +1278,36 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
                 }
                 OutputItem::Other(v) => {
                     let ty = v.get("type").and_then(Value::as_str).unwrap_or_default();
+                    if let Some(local) = match_local_call(tools, v, ty)? {
+                        processed.has_tool_activity = true;
+                        if append {
+                            let item = RunItem::new(
+                                name.clone(),
+                                RunItemKind::ToolCall {
+                                    raw_item: v.clone(),
+                                },
+                            );
+                            self.push_item(item, Some(RunItemStreamEventName::ToolCalled));
+                        }
+                        processed.tools_used.push(local.tool_name());
+                        if !skip.contains(&local_tools::call_id_of(v)) {
+                            processed.local_calls.push(local);
+                        }
+                        continue;
+                    }
+                    if ty.ends_with("_call_output") {
+                        if append {
+                            let item = RunItem::new(
+                                name.clone(),
+                                RunItemKind::ToolCallOutput {
+                                    raw_item: v.clone(),
+                                    output: v.get("output").cloned().unwrap_or(Value::Null),
+                                },
+                            );
+                            self.push_item(item, Some(RunItemStreamEventName::ToolOutput));
+                        }
+                        continue;
+                    }
                     match ty {
                         "mcp_list_tools" => {
                             if append {
@@ -1436,6 +1537,39 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
             }
         }
 
+        // Local runtime tools (computer, shell, apply patch, custom).
+        let ran_local = !processed.local_calls.is_empty();
+        for call in processed.local_calls {
+            let outcome = {
+                let env = ToolEnv {
+                    ctx: &self.ctx,
+                    agent,
+                    hooks: self.hooks.as_ref(),
+                    config: &self.config,
+                };
+                Box::pin(local_tools::execute_local_call(&env, call)).await?
+            };
+            match outcome {
+                local_tools::LocalOutcome::Output { raw_item, output } => {
+                    let ri = RunItem::new(
+                        agent.name.clone(),
+                        RunItemKind::ToolCallOutput { raw_item, output },
+                    );
+                    self.push_item(ri, Some(RunItemStreamEventName::ToolOutput));
+                }
+                local_tools::LocalOutcome::Interruption(item) => {
+                    self.generated_items.push(RunItem::new(
+                        item.agent.clone(),
+                        RunItemKind::ToolApproval {
+                            raw_item: item.raw_item.clone(),
+                            tool_name: item.tool_name.clone(),
+                        },
+                    ));
+                    interruptions.push(item);
+                }
+            }
+        }
+
         if !interruptions.is_empty() {
             return Ok(NextStep::Interruption(interruptions));
         }
@@ -1469,7 +1603,7 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
                 return Ok(NextStep::FinalOutput(out));
             }
         }
-        if ran_functions || answered_mcp {
+        if ran_functions || answered_mcp || ran_local {
             return Ok(NextStep::RunAgain);
         }
 

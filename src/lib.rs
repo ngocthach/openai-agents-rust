@@ -25,6 +25,9 @@
 
 pub mod agent;
 pub mod agent_output;
+pub mod apply_diff;
+pub mod computer;
+pub mod editor;
 pub mod error;
 pub mod extensions;
 pub mod guardrail;

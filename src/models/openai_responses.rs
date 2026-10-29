@@ -55,20 +55,12 @@ impl OpenAIResponsesModel {
             Value::Array(clean_input_for_openai(&req.input)),
         );
 
-        let mut tools: Vec<Value> = Vec::new();
-        let mut includes: BTreeSet<String> = BTreeSet::new();
-        for t in &req.tools {
-            match t {
-                ToolSpec::Function(f) => tools.push(f.to_responses_param()),
-                ToolSpec::Hosted {
-                    param,
-                    includes: inc,
-                } => {
-                    tools.push(param.clone());
-                    includes.extend(inc.iter().cloned());
-                }
-            }
-        }
+        let request_model = body
+            .get("model")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let (mut tools, mut includes) =
+            convert_tools(&req.tools, request_model.as_deref(), s.tool_choice.as_ref())?;
         for h in &req.handoffs {
             tools.push(h.to_responses_param());
         }
@@ -89,7 +81,12 @@ impl OpenAIResponsesModel {
             );
         }
         if let Some(tc) = &s.tool_choice {
-            let converted = convert_tool_choice(tc);
+            let mut converted = convert_tool_choice(tc);
+            if converted.get("type").and_then(Value::as_str) == Some("computer_use_preview")
+                && !use_preview_computer_tool(request_model.as_deref(), Some(tc))
+            {
+                converted = json!({"type": "computer"});
+            }
             let omit = req.prompt.is_some() && !has_tools && converted.is_object();
             if !omit {
                 body.insert("tool_choice".into(), converted);
@@ -189,6 +186,122 @@ impl OpenAIResponsesModel {
     }
 }
 
+fn use_preview_computer_tool(model: Option<&str>, tool_choice: Option<&ToolChoice>) -> bool {
+    match model {
+        Some(m) => m.starts_with("computer-use-preview"),
+        // Prompt-managed calls omit the model: default to the preview payload unless the
+        // caller explicitly selected the GA tool.
+        None => !matches!(
+            tool_choice,
+            Some(ToolChoice::Named(n)) if n == "computer" || n == "computer_use"
+        ),
+    }
+}
+
+/// Convert tool specs to Responses tool params: namespaced function tools are grouped into
+/// `namespace` tools, the computer tool gets its GA or preview shape, and deferred tools are
+/// validated against the presence of a `tool_search` tool.
+fn convert_tools(
+    specs: &[ToolSpec],
+    model: Option<&str>,
+    tool_choice: Option<&ToolChoice>,
+) -> Result<(Vec<Value>, BTreeSet<String>)> {
+    let mut tools: Vec<Value> = Vec::new();
+    let mut includes = BTreeSet::new();
+    let mut namespaces: Vec<(String, String, usize)> = Vec::new();
+    let mut namespace_members: std::collections::HashMap<String, Vec<Value>> =
+        std::collections::HashMap::new();
+    let mut tool_search_count = 0;
+    let mut needs_tool_search = false;
+    for t in specs {
+        match t {
+            ToolSpec::Function(f) => {
+                if f.defer_loading {
+                    needs_tool_search = true;
+                }
+                match &f.namespace {
+                    Some(ns) => {
+                        let desc = f.namespace_description.clone().unwrap_or_default();
+                        match namespaces.iter().find(|(n, _, _)| n == ns) {
+                            Some((_, d, _)) if *d != desc => {
+                                return Err(AgentsError::user(format!(
+                                    "All tools in namespace '{ns}' must share the same description."
+                                )));
+                            }
+                            Some(_) => {}
+                            None => {
+                                namespaces.push((ns.clone(), desc, tools.len()));
+                                tools.push(Value::Null);
+                            }
+                        }
+                        namespace_members
+                            .entry(ns.clone())
+                            .or_default()
+                            .push(f.to_responses_param());
+                    }
+                    None => tools.push(f.to_responses_param()),
+                }
+            }
+            ToolSpec::Hosted {
+                param,
+                includes: inc,
+            } => {
+                let ty = param
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if ty == "tool_search" {
+                    tool_search_count += 1;
+                }
+                if param.get("defer_loading").and_then(Value::as_bool) == Some(true) {
+                    needs_tool_search = true;
+                }
+                if ty == "computer" {
+                    if use_preview_computer_tool(model, tool_choice) {
+                        let (Some(env), Some(w), Some(h)) = (
+                            param.get("environment"),
+                            param.get("display_width"),
+                            param.get("display_height"),
+                        ) else {
+                            return Err(AgentsError::user(
+                                "Preview computer tool payloads require `environment` and \
+                                 `dimensions` on the Computer implementation.",
+                            ));
+                        };
+                        tools.push(json!({"type": "computer_use_preview", "environment": env,
+                            "display_width": w, "display_height": h}));
+                    } else {
+                        tools.push(json!({"type": "computer"}));
+                    }
+                } else {
+                    tools.push(param.clone());
+                }
+                includes.extend(inc.iter().cloned());
+            }
+        }
+    }
+    if tool_search_count > 1 {
+        return Err(AgentsError::user(
+            "Only one ToolSearchTool() is allowed when using OpenAI Responses models.",
+        ));
+    }
+    if needs_tool_search && tool_search_count == 0 {
+        return Err(AgentsError::user(
+            "Deferred-loading Responses tools require ToolSearchTool() when using OpenAI \
+             Responses models.",
+        ));
+    }
+    for (name, description, index) in namespaces {
+        tools[index] = json!({
+            "type": "namespace",
+            "name": name,
+            "description": description,
+            "tools": namespace_members.remove(&name).unwrap_or_default(),
+        });
+    }
+    Ok((tools, includes))
+}
+
 /// Convert a `ToolChoice` to the Responses API format.
 pub(crate) fn convert_tool_choice(tc: &ToolChoice) -> Value {
     match tc {
@@ -203,7 +316,10 @@ pub(crate) fn convert_tool_choice(tc: &ToolChoice) -> Value {
             | "image_generation"
             | "code_interpreter"
             | "mcp"
+            | "tool_search"
+            | "programmatic_tool_calling"
             | "computer_use_preview" => json!({"type": n}),
+            "computer" | "computer_use" => json!({"type": "computer_use_preview"}),
             other => json!({"type": "function", "name": other}),
         },
     }
@@ -286,7 +402,7 @@ pub(crate) fn parse_response(
     })
 }
 
-fn finish_response_span(span: &Span, resp: &ModelResponse, include_data: bool) {
+pub(crate) fn finish_response_span(span: &Span, resp: &ModelResponse, include_data: bool) {
     span.update_data(|d| {
         if let SpanData::Response { response_id, usage } = d {
             *response_id = resp.response_id.clone();
@@ -298,7 +414,7 @@ fn finish_response_span(span: &Span, resp: &ModelResponse, include_data: bool) {
 }
 
 /// Ensures a span is finished when a stream is dropped early.
-struct SpanGuard(Span);
+pub(crate) struct SpanGuard(pub(crate) Span);
 
 impl Drop for SpanGuard {
     fn drop(&mut self) {
@@ -421,6 +537,89 @@ mod tests {
     use crate::models::interface::FunctionToolSpec;
     use std::sync::Arc;
 
+    fn spec(name: &str, ns: Option<&str>, defer: bool) -> ToolSpec {
+        ToolSpec::Function(FunctionToolSpec {
+            name: name.into(),
+            description: "d".into(),
+            parameters: json!({"type": "object", "properties": {}}),
+            strict: true,
+            defer_loading: defer,
+            namespace: ns.map(str::to_string),
+            namespace_description: ns.map(|_| "ns desc".to_string()),
+            allowed_callers: None,
+        })
+    }
+
+    #[test]
+    fn groups_namespaces_and_validates_tool_search() {
+        let model = OpenAIResponsesModel::new("gpt-5.6-luna", OpenAIClient::new("sk-test"));
+        let search = ToolSpec::Hosted {
+            param: json!({"type": "tool_search"}),
+            includes: vec![],
+        };
+        let req = ModelRequest {
+            tools: vec![
+                spec("a", Some("crm"), false),
+                spec("plain", None, false),
+                spec("b", Some("crm"), true),
+                search.clone(),
+            ],
+            ..Default::default()
+        };
+        let body = model.build_request_body(&req, false).unwrap();
+        let tools = body["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 3);
+        assert_eq!(tools[0]["type"], "namespace");
+        assert_eq!(tools[0]["name"], "crm");
+        assert_eq!(tools[0]["description"], "ns desc");
+        assert_eq!(tools[0]["tools"][1]["name"], "b");
+        assert_eq!(tools[0]["tools"][1]["defer_loading"], true);
+        assert_eq!(tools[1]["name"], "plain");
+
+        let missing = ModelRequest {
+            tools: vec![spec("x", None, true)],
+            ..Default::default()
+        };
+        assert!(model.build_request_body(&missing, false).is_err());
+        let twice = ModelRequest {
+            tools: vec![search.clone(), search],
+            ..Default::default()
+        };
+        assert!(model.build_request_body(&twice, false).is_err());
+    }
+
+    #[test]
+    fn computer_tool_shape_follows_model() {
+        let computer = ToolSpec::Hosted {
+            param: json!({"type": "computer", "environment": "browser",
+                "display_width": 800, "display_height": 600}),
+            includes: vec![],
+        };
+        let req = ModelRequest {
+            tools: vec![computer],
+            model_settings: ModelSettings {
+                tool_choice: Some(ToolChoice::from("computer_use")),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let ga = OpenAIResponsesModel::new("gpt-5.6-luna", OpenAIClient::new("sk-test"))
+            .build_request_body(&req, false)
+            .unwrap();
+        assert_eq!(ga["tools"][0], json!({"type": "computer"}));
+        assert_eq!(ga["tool_choice"], json!({"type": "computer"}));
+        let preview =
+            OpenAIResponsesModel::new("computer-use-preview", OpenAIClient::new("sk-test"))
+                .build_request_body(&req, false)
+                .unwrap();
+        assert_eq!(preview["tools"][0]["type"], "computer_use_preview");
+        assert_eq!(preview["tools"][0]["display_height"], 600);
+        assert_eq!(
+            preview["tool_choice"],
+            json!({"type": "computer_use_preview"})
+        );
+    }
+
     #[test]
     fn builds_request_body() {
         let model = OpenAIResponsesModel::new("gpt-5.6-luna", OpenAIClient::new("sk-test"));
@@ -438,7 +637,7 @@ mod tests {
                 description: "d".into(),
                 parameters: json!({"type": "object", "properties": {}}),
                 strict: true,
-                defer_loading: false,
+                ..Default::default()
             })],
             output_schema: Some(Arc::new(AgentOutputSchema::new::<Vec<String>>().unwrap())),
             ..Default::default()

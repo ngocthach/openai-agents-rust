@@ -10,11 +10,19 @@ use super::openai_responses::OpenAIResponsesModel;
 use super::{OpenAIApi, default_openai_api, default_openai_client};
 use crate::error::Result;
 
+#[cfg(feature = "websocket")]
+type WebsocketModelCache =
+    Arc<std::sync::Mutex<std::collections::HashMap<(String, bool), Arc<dyn Model>>>>;
+
 /// Resolves model names to OpenAI Responses (default) or Chat Completions models.
 #[derive(Debug, Clone, Default)]
 pub struct OpenAIProvider {
     client: Option<OpenAIClient>,
     use_responses: Option<bool>,
+    #[cfg(feature = "websocket")]
+    use_responses_websocket: bool,
+    #[cfg(feature = "websocket")]
+    websocket_models: WebsocketModelCache,
 }
 
 impl OpenAIProvider {
@@ -32,6 +40,15 @@ impl OpenAIProvider {
     /// Choose Responses (`true`) or Chat Completions (`false`).
     pub fn with_use_responses(mut self, use_responses: bool) -> Self {
         self.use_responses = Some(use_responses);
+        self
+    }
+
+    /// Use the Responses API over a persistent WebSocket. Models are cached per name so their
+    /// connection is reused across runs; call [`Model::close`] on them (or drop the provider)
+    /// when done.
+    #[cfg(feature = "websocket")]
+    pub fn with_responses_websocket(mut self, enabled: bool) -> Self {
+        self.use_responses_websocket = enabled;
         self
     }
 
@@ -55,6 +72,20 @@ impl ModelProvider for OpenAIProvider {
             .map(str::to_string)
             .unwrap_or_else(get_default_model);
         let client = self.client();
+        #[cfg(feature = "websocket")]
+        if self.use_responses_websocket && self.use_responses() {
+            let mut cache = self.websocket_models.lock().expect("poisoned");
+            let model = cache
+                .entry((name.clone(), explicit))
+                .or_insert_with(|| {
+                    Arc::new(
+                        super::openai_responses_ws::OpenAIResponsesWSModel::new(name, client)
+                            .with_explicit(explicit),
+                    )
+                })
+                .clone();
+            return Ok(model);
+        }
         if self.use_responses() {
             Ok(Arc::new(
                 OpenAIResponsesModel::new(name, client).with_explicit(explicit),

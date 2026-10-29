@@ -35,13 +35,19 @@ impl ModelTracing {
 }
 
 /// A function-style tool (function tool or handoff) as seen by the model.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct FunctionToolSpec {
     pub name: String,
     pub description: String,
     pub parameters: Value,
     pub strict: bool,
     pub defer_loading: bool,
+    /// Namespace attached with `tool_namespace` (Responses API only).
+    pub namespace: Option<String>,
+    /// Description of the namespace.
+    pub namespace_description: Option<String>,
+    /// Programmatic callers allowed to invoke the tool (Responses API only).
+    pub allowed_callers: Option<Vec<String>>,
 }
 
 impl FunctionToolSpec {
@@ -56,6 +62,9 @@ impl FunctionToolSpec {
         });
         if self.defer_loading {
             v["defer_loading"] = Value::Bool(true);
+        }
+        if let Some(c) = &self.allowed_callers {
+            v["allowed_callers"] = serde_json::json!(c);
         }
         v
     }
