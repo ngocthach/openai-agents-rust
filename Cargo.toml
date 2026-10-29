@@ -35,6 +35,8 @@ bytes = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 futures = "0.3"
 log = "0.4"
+# Pins the aws-lc-rs crypto provider so rustls never panics when `ring` is also present.
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "query", "rustls", "http2", "charset", "system-proxy"] }
 schemars = "1"
 serde = { version = "1", features = ["derive"] }
@@ -57,9 +59,9 @@ sha2 = { version = "0.11", optional = true }
 # Optional dependency for RedisSession (feature `redis`).
 redis = { version = "1", default-features = false, features = ["tokio-comp", "aio"], optional = true }
 # Optional dependency for MongoDBSession (feature `mongodb`).
-mongodb = { version = "3", optional = true }
+mongodb = { version = "3", default-features = false, features = ["compat-3-0-0", "rustls-tls-aws-lc", "dns-resolver"], optional = true }
 # Optional dependency for SqlxSession on PostgreSQL / MySQL (feature `sqlx`).
-sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "mysql", "any", "json", "chrono"], optional = true }
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls-aws-lc-rs", "postgres", "mysql", "any", "json", "chrono"], optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }

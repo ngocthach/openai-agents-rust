@@ -60,7 +60,7 @@ impl OpenAISTTModel {
         OpenAISTTModel {
             model: model.into(),
             client,
-            http: reqwest::Client::new(),
+            http: crate::util::http_client(),
         }
     }
 
@@ -316,6 +316,7 @@ impl OpenAISTTTranscriptionSession {
             .into_client_request()
             .map_err(|e| AgentsError::user(format!("Invalid transcription websocket URL: {e}")))?;
         request.headers_mut().extend(request_headers(client)?);
+        crate::util::ensure_crypto_provider();
         let (ws, _) = tokio_tungstenite::connect_async(request)
             .await
             .map_err(|e| websocket_error(format!("Could not open the STT websocket: {e}")))?;

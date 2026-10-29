@@ -146,6 +146,7 @@ impl OpenAIResponsesWSModel {
         for (k, v) in self.client.headers(extra_headers)?.iter() {
             req.headers_mut().insert(k.clone(), v.clone());
         }
+        crate::util::ensure_crypto_provider();
         let (socket, _) = tokio_tungstenite::connect_async(req)
             .await
             .map_err(|e| AgentsError::other(format!("Responses websocket connect failed: {e}")))?;

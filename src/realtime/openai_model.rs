@@ -323,6 +323,8 @@ impl RealtimeModel for OpenAIRealtimeWebSocketModel {
             }
         }
 
+        crate::util::ensure_crypto_provider();
+
         let (stream, _response) = tokio_tungstenite::connect_async(request)
             .await
             .map_err(|e| AgentsError::other(format!("Realtime connection failed: {e}")))?;

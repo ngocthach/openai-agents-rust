@@ -110,7 +110,7 @@ impl DaprSession {
         let (messages_key, metadata_key) = dapr_session_keys(&session_id);
         DaprSession {
             session_id,
-            http: reqwest::Client::new(),
+            http: crate::util::http_client(),
             endpoint: endpoint.into().trim_end_matches('/').to_string(),
             state_store_name: state_store_name.into(),
             api_token: None,

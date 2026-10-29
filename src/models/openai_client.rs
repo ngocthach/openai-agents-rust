@@ -55,7 +55,7 @@ impl OpenAIClient {
     pub fn from_env() -> Self {
         let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
         OpenAIClient {
-            http: reqwest::Client::new(),
+            http: crate::util::http_client(),
             api_key: None,
             base_url: env("OPENAI_BASE_URL").unwrap_or_else(|| DEFAULT_BASE_URL.to_string()),
             organization: env("OPENAI_ORG_ID"),

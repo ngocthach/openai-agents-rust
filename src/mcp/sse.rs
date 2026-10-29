@@ -118,6 +118,7 @@ pub(crate) async fn connect(
     impl Stream<Item = ServerJsonRpcMessage> + Send + Unpin + 'static,
 )> {
     let header_map = build_headers(headers)?;
+    crate::util::ensure_crypto_provider();
     let client = reqwest::Client::builder()
         .connect_timeout(timeout)
         .read_timeout(sse_read_timeout)

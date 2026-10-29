@@ -101,7 +101,7 @@ impl BackendSpanExporter {
             project: std::env::var("OPENAI_PROJECT_ID").ok(),
             max_retries: 3,
             runtime: Arc::new(Mutex::new(None)),
-            http: reqwest::Client::new(),
+            http: crate::util::http_client(),
         }
     }
 

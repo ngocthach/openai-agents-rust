@@ -37,6 +37,8 @@ Last updated: 2026-10-29.
 | Sandbox mounts, PTY sessions, sandbox memory and skills | Large provider-specific surface; PTY needs `unsafe` |
 | Realtime SIP model and playback tracker | Telephony-specific |
 | `#[function_tool]` macro | Closure-based `FunctionTool::new` covers the same need |
+| Sandbox per-turn preparation | Handoff targets of a `SandboxAgent` are not re-prepared with capability tools; resuming after an approval needs `SandboxRunConfig::session` |
+| `EncryptedSession` wire compatibility | Uses XChaCha20-Poly1305 instead of Fernet; not readable by the Python SDK |
 | Retry-after header capture | `AgentsError::ApiError` does not carry response headers; policies use body hints and backoff |
 
 Module-level divergences are listed in `plans/reports/*-port-report.md`.

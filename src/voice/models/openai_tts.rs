@@ -26,7 +26,7 @@ impl OpenAITTSModel {
         OpenAITTSModel {
             model: model.into(),
             client,
-            http: reqwest::Client::new(),
+            http: crate::util::http_client(),
         }
     }
 

@@ -22,6 +22,22 @@ pub fn transform_string_function_style(name: &str) -> String {
         .collect()
 }
 
+/// Install the aws-lc-rs rustls crypto provider as the process default, unless one is already
+/// installed. rustls panics when both `ring` and `aws-lc-rs` are compiled in and no default is
+/// set, which happens as soon as any other dependency enables `ring`.
+pub fn ensure_crypto_provider() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    });
+}
+
+/// A `reqwest` client built after [`ensure_crypto_provider`].
+pub fn http_client() -> reqwest::Client {
+    ensure_crypto_provider();
+    reqwest::Client::new()
+}
+
 /// Current UTC time in RFC 3339 format with microseconds.
 pub fn time_iso() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true)

@@ -361,6 +361,7 @@ impl OpenAIHostedMultiAgentModel {
         for (k, v) in self.client.headers(Some(&extra))?.iter() {
             req.headers_mut().insert(k.clone(), v.clone());
         }
+        crate::util::ensure_crypto_provider();
         let (socket, _) = tokio_tungstenite::connect_async(req)
             .await
             .map_err(|e| AgentsError::other(format!("Hosted multi-agent connect failed: {e}")))?;
