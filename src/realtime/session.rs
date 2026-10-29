@@ -1,0 +1,1288 @@
+//! The realtime session: history, tool calls, handoffs and guardrails. Mirrors
+//! `agents.realtime.session`.
+
+use std::collections::{HashMap, HashSet};
+use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+
+use futures::Stream;
+use serde_json::{Value, json};
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+
+use crate::agent::Agent;
+use crate::error::{AgentsError, Result};
+use crate::guardrail::{OutputGuardrail, OutputGuardrailResult};
+use crate::items::{FunctionCall, ToolApprovalItem};
+use crate::realtime::agent::RealtimeAgent;
+use crate::realtime::config::{
+    RealtimeFunctionToolSpec, RealtimeModelTracing, RealtimeRunConfig,
+    RealtimeSessionModelSettings, RealtimeUserInput,
+};
+use crate::realtime::events::{RealtimeEventInfo, RealtimeSessionEvent};
+use crate::realtime::handoffs::RealtimeHandoff;
+use crate::realtime::items::{
+    RealtimeItem, RealtimeToolCallItem, apply_assistant_transcript, apply_input_transcription,
+    merge_item,
+};
+use crate::realtime::model::{RealtimeModel, RealtimeModelConfig};
+use crate::realtime::model_events::{RealtimeModelEvent, RealtimeModelToolCallEvent};
+use crate::realtime::model_inputs::RealtimeModelSendEvent;
+use crate::run_context::RunContext;
+use crate::tool::{
+    DEFAULT_APPROVAL_REJECTION_MESSAGE, FunctionTool, ToolOutput, ToolTimeoutBehavior,
+};
+use crate::tool_context::ToolContext;
+use crate::tool_guardrails::{
+    ToolGuardrailBehavior, ToolInputGuardrailData, ToolOutputGuardrailData,
+};
+
+/// What a function tool's input guardrails decided.
+enum ToolInputVerdict {
+    /// Run the tool.
+    Allow,
+    /// Skip the tool and send this message to the model instead.
+    Reject(String),
+    /// The named guardrail tripped its wire.
+    Raise(String),
+}
+
+/// A tool call waiting for a human decision.
+struct PendingToolCall<C> {
+    call: RealtimeModelToolCallEvent,
+    agent: Arc<RealtimeAgent<C>>,
+    tool: Arc<FunctionTool<C>>,
+    approval_item: ToolApprovalItem,
+}
+
+/// Mutable session state. Guards are never held across an `await`.
+struct SessionState<C> {
+    agent: Arc<RealtimeAgent<C>>,
+    tools: Vec<Arc<FunctionTool<C>>>,
+    handoffs: Vec<RealtimeHandoff<C>>,
+    history: Vec<RealtimeItem>,
+    pending_tool_calls: HashMap<String, PendingToolCall<C>>,
+    item_transcripts: HashMap<String, String>,
+    item_guardrail_runs: HashMap<String, usize>,
+    interrupted_response_ids: HashSet<String>,
+    active_response_id: Option<String>,
+    active_response_agent: Option<Arc<RealtimeAgent<C>>>,
+}
+
+struct SessionInner<C> {
+    model: Arc<dyn RealtimeModel>,
+    context: RunContext<C>,
+    run_config: RealtimeRunConfig<C>,
+    base_settings: RealtimeSessionModelSettings,
+    debounce_text_length: usize,
+    state: Mutex<SessionState<C>>,
+    sender: Mutex<Option<mpsc::UnboundedSender<RealtimeSessionEvent<C>>>>,
+    closed: AtomicBool,
+    pump: Mutex<Option<JoinHandle<()>>>,
+    guardrail_tasks: Mutex<Vec<JoinHandle<()>>>,
+}
+
+/// A live connection to a realtime model.
+///
+/// The session owns the local history, executes tools, runs output guardrails and performs
+/// handoffs. Clones share the same connection, history and event stream, so one clone can read
+/// events while another sends messages.
+///
+/// ```no_run
+/// # use std::sync::Arc;
+/// # use openai_agents_sdk::realtime::{RealtimeAgent, RealtimeRunner};
+/// # async fn demo() -> Result<(), Box<dyn std::error::Error>> {
+/// let agent = RealtimeAgent::<()>::new("Assistant").into_arc();
+/// let session = RealtimeRunner::new(agent).run(()).await?;
+/// session.send_message("Hello").await?;
+/// while let Some(event) = session.recv().await {
+///     println!("{}", event.event_type());
+/// }
+/// session.close().await?;
+/// # Ok(())
+/// # }
+/// ```
+pub struct RealtimeSession<C> {
+    inner: Arc<SessionInner<C>>,
+    events: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<RealtimeSessionEvent<C>>>>,
+}
+
+impl<C> Clone for RealtimeSession<C> {
+    fn clone(&self) -> Self {
+        RealtimeSession {
+            inner: self.inner.clone(),
+            events: self.events.clone(),
+        }
+    }
+}
+
+impl<C> fmt::Debug for RealtimeSession<C> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RealtimeSession")
+            .field("agent", &self.current_agent_name())
+            .field("closed", &self.inner.closed.load(Ordering::SeqCst))
+            .finish_non_exhaustive()
+    }
+}
+
+impl<C: Send + Sync + 'static> RealtimeSession<C> {
+    /// Connect to `model` and start a session for `agent`.
+    ///
+    /// Prefer [`crate::realtime::RealtimeRunner`], which builds the model for you.
+    pub async fn connect(
+        model: Arc<dyn RealtimeModel>,
+        agent: Arc<RealtimeAgent<C>>,
+        context: C,
+        model_config: Option<RealtimeModelConfig>,
+        run_config: Option<RealtimeRunConfig<C>>,
+    ) -> Result<Self> {
+        Self::connect_with_context(
+            model,
+            agent,
+            RunContext::new(context),
+            model_config,
+            run_config,
+        )
+        .await
+    }
+
+    /// Connect using an existing [`RunContext`], so usage and approvals are shared with a wider
+    /// application.
+    pub async fn connect_with_context(
+        model: Arc<dyn RealtimeModel>,
+        agent: Arc<RealtimeAgent<C>>,
+        context: RunContext<C>,
+        model_config: Option<RealtimeModelConfig>,
+        run_config: Option<RealtimeRunConfig<C>>,
+    ) -> Result<Self> {
+        let mut model_config = model_config.unwrap_or_default();
+        let run_config = run_config.unwrap_or_default();
+
+        let mut base_settings = run_config.model_settings.clone().unwrap_or_default();
+        if let Some(initial) = &model_config.initial_model_settings {
+            base_settings.merge(initial);
+        }
+
+        let inner = Arc::new(SessionInner {
+            model: model.clone(),
+            context,
+            debounce_text_length: run_config.guardrails_settings.debounce_text_length.max(1),
+            run_config,
+            base_settings,
+            state: Mutex::new(SessionState {
+                agent: agent.clone(),
+                tools: Vec::new(),
+                handoffs: Vec::new(),
+                history: Vec::new(),
+                pending_tool_calls: HashMap::new(),
+                item_transcripts: HashMap::new(),
+                item_guardrail_runs: HashMap::new(),
+                interrupted_response_ids: HashSet::new(),
+                active_response_id: None,
+                active_response_agent: None,
+            }),
+            sender: Mutex::new(None),
+            closed: AtomicBool::new(false),
+            pump: Mutex::new(None),
+            guardrail_tasks: Mutex::new(Vec::new()),
+        });
+
+        let starting = model_config.initial_model_settings.clone();
+        let resolved = inner.build_settings(&agent, starting.as_ref()).await?;
+        {
+            let mut state = inner.state.lock().expect("realtime session poisoned");
+            state.tools = resolved.tools.clone();
+            state.handoffs = resolved.handoffs.clone();
+        }
+        model_config.initial_model_settings = Some(resolved.settings);
+
+        let model_events = model.connect(model_config).await?;
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        *inner.sender.lock().expect("realtime session poisoned") = Some(tx);
+
+        let pump_inner = inner.clone();
+        let pump = tokio::spawn(async move { pump_inner.pump(model_events).await });
+        *inner.pump.lock().expect("realtime session poisoned") = Some(pump);
+
+        let session = RealtimeSession {
+            inner,
+            events: Arc::new(tokio::sync::Mutex::new(rx)),
+        };
+        let history = session.history();
+        session.inner.emit(RealtimeSessionEvent::HistoryUpdated {
+            history,
+            info: session.inner.info(),
+        });
+        Ok(session)
+    }
+
+    /// Send a text or structured message and ask the model to respond.
+    pub async fn send_message(&self, message: impl Into<RealtimeUserInput>) -> Result<()> {
+        self.inner
+            .model
+            .send_event(RealtimeModelSendEvent::UserInput {
+                user_input: message.into(),
+            })
+            .await
+    }
+
+    /// Append raw audio to the model's input buffer.
+    ///
+    /// With `commit` set, the buffer is committed, which is what sessions without server-side
+    /// turn detection need in order to end the user's turn.
+    pub async fn send_audio(&self, audio: impl Into<Vec<u8>>, commit: bool) -> Result<()> {
+        self.inner
+            .model
+            .send_event(RealtimeModelSendEvent::Audio {
+                audio: audio.into(),
+                commit,
+            })
+            .await
+    }
+
+    /// Interrupt generation and audio playback without cancelling running tools.
+    pub async fn interrupt(&self) -> Result<()> {
+        self.inner
+            .model
+            .send_event(RealtimeModelSendEvent::Interrupt {
+                force_response_cancel: true,
+            })
+            .await
+    }
+
+    /// Make `agent` the active agent and apply its settings to the model.
+    pub async fn update_agent(&self, agent: Arc<RealtimeAgent<C>>) -> Result<()> {
+        let resolved = self.inner.build_settings(&agent, None).await?;
+        {
+            let mut state = self.inner.state.lock().expect("realtime session poisoned");
+            state.agent = agent;
+            state.tools = resolved.tools.clone();
+            state.handoffs = resolved.handoffs.clone();
+        }
+        self.inner
+            .model
+            .send_event(RealtimeModelSendEvent::session_update(resolved.settings))
+            .await
+    }
+
+    /// Approve a tool call that raised
+    /// [`RealtimeSessionEvent::ToolApprovalRequired`]
+    /// and run it.
+    ///
+    /// With `always`, later calls to the same tool by the same agent are approved automatically.
+    /// The call runs before this future resolves, so `tool_start` and `tool_end` are already
+    /// queued when it returns.
+    pub async fn approve_tool_call(&self, call_id: &str, always: bool) -> Result<()> {
+        let Some(pending) = self.inner.take_pending(call_id) else {
+            return Ok(());
+        };
+        self.inner
+            .context
+            .approve_tool(&pending.approval_item, always);
+        self.inner
+            .execute_tool(pending.agent, pending.tool, pending.call)
+            .await
+    }
+
+    /// Reject a pending tool call and tell the model it was not approved.
+    ///
+    /// With `always`, later calls to the same tool by the same agent are rejected automatically.
+    pub async fn reject_tool_call(
+        &self,
+        call_id: &str,
+        always: bool,
+        rejection_message: Option<String>,
+    ) -> Result<()> {
+        let Some(pending) = self.inner.take_pending(call_id) else {
+            return Ok(());
+        };
+        self.inner
+            .context
+            .reject_tool(&pending.approval_item, always, rejection_message);
+        self.inner
+            .send_tool_rejection(&pending.agent, &pending.tool, &pending.call)
+            .await
+    }
+
+    /// Wait for the next session event, or `None` once the session is closed and drained.
+    pub async fn recv(&self) -> Option<RealtimeSessionEvent<C>> {
+        let mut events = self.events.lock().await;
+        events.recv().await
+    }
+
+    /// The session events as an async stream.
+    pub fn event_stream(&self) -> impl Stream<Item = RealtimeSessionEvent<C>> + Send + 'static {
+        futures::stream::unfold(self.clone(), |session| async move {
+            session.recv().await.map(|event| (event, session))
+        })
+    }
+
+    /// Close the session and its transport.
+    pub async fn close(&self) -> Result<()> {
+        if self.inner.closed.swap(true, Ordering::SeqCst) {
+            return Ok(());
+        }
+        if let Some(pump) = self
+            .inner
+            .pump
+            .lock()
+            .expect("realtime session poisoned")
+            .take()
+        {
+            pump.abort();
+        }
+        for task in self
+            .inner
+            .guardrail_tasks
+            .lock()
+            .expect("realtime session poisoned")
+            .drain(..)
+        {
+            task.abort();
+        }
+        *self.inner.sender.lock().expect("realtime session poisoned") = None;
+        {
+            let mut state = self.inner.state.lock().expect("realtime session poisoned");
+            state.pending_tool_calls.clear();
+            state.item_transcripts.clear();
+            state.item_guardrail_runs.clear();
+            state.interrupted_response_ids.clear();
+        }
+        self.inner.model.close().await
+    }
+}
+
+impl<C> RealtimeSession<C> {
+    /// A snapshot of the session history.
+    pub fn history(&self) -> Vec<RealtimeItem> {
+        self.inner
+            .state
+            .lock()
+            .expect("realtime session poisoned")
+            .history
+            .clone()
+    }
+
+    /// The active agent.
+    pub fn current_agent(&self) -> Arc<RealtimeAgent<C>> {
+        self.inner
+            .state
+            .lock()
+            .expect("realtime session poisoned")
+            .agent
+            .clone()
+    }
+
+    /// The name of the active agent.
+    pub fn current_agent_name(&self) -> String {
+        self.current_agent().name.clone()
+    }
+
+    /// The run context shared with tools, handoffs and guardrails.
+    pub fn context(&self) -> &RunContext<C> {
+        &self.inner.context
+    }
+
+    /// The transport backing this session.
+    pub fn model(&self) -> &Arc<dyn RealtimeModel> {
+        &self.inner.model
+    }
+
+    /// Whether [`RealtimeSession::close`] has been called.
+    pub fn is_closed(&self) -> bool {
+        self.inner.closed.load(Ordering::SeqCst)
+    }
+}
+
+/// Settings plus the tools and handoffs they were built from.
+struct ResolvedSettings<C> {
+    settings: RealtimeSessionModelSettings,
+    tools: Vec<Arc<FunctionTool<C>>>,
+    handoffs: Vec<RealtimeHandoff<C>>,
+}
+
+impl<C: Send + Sync + 'static> SessionInner<C> {
+    fn info(&self) -> RealtimeEventInfo<C> {
+        RealtimeEventInfo {
+            context: self.context.clone(),
+        }
+    }
+
+    fn emit(&self, event: RealtimeSessionEvent<C>) -> bool {
+        if self.closed.load(Ordering::SeqCst) {
+            return false;
+        }
+        let sender = {
+            self.sender
+                .lock()
+                .expect("realtime session poisoned")
+                .clone()
+        };
+        match sender {
+            Some(tx) => tx.send(event).is_ok(),
+            None => false,
+        }
+    }
+
+    fn emit_error(&self, message: impl Into<String>) {
+        self.emit(RealtimeSessionEvent::Error {
+            error: json!({ "message": message.into() }),
+            info: self.info(),
+        });
+    }
+
+    fn emit_history_updated(&self) {
+        let history = {
+            self.state
+                .lock()
+                .expect("realtime session poisoned")
+                .history
+                .clone()
+        };
+        self.emit(RealtimeSessionEvent::HistoryUpdated {
+            history,
+            info: self.info(),
+        });
+    }
+
+    fn take_pending(&self, call_id: &str) -> Option<PendingToolCall<C>> {
+        self.state
+            .lock()
+            .expect("realtime session poisoned")
+            .pending_tool_calls
+            .remove(call_id)
+    }
+
+    /// Build the settings sent to the model for `agent`.
+    async fn build_settings(
+        &self,
+        agent: &Arc<RealtimeAgent<C>>,
+        starting: Option<&RealtimeSessionModelSettings>,
+    ) -> Result<ResolvedSettings<C>> {
+        let mut settings = self.base_settings.clone();
+        if let Some(agent_settings) = &agent.model_settings {
+            settings.merge(agent_settings);
+        }
+
+        settings.instructions = Some(
+            agent
+                .get_system_prompt(&self.context)
+                .await?
+                .unwrap_or_default(),
+        );
+        if let Some(prompt) = &agent.prompt {
+            settings.prompt = Some(prompt.clone());
+        }
+
+        let mut tools = Vec::new();
+        for tool in agent.function_tools() {
+            if tool.is_enabled.evaluate(&self.context, &agent.name).await {
+                tools.push(tool);
+            }
+        }
+        let mut handoffs = Vec::new();
+        for handoff in &agent.handoffs {
+            if handoff
+                .is_enabled
+                .evaluate(&self.context, &agent.name)
+                .await
+            {
+                handoffs.push(handoff.clone());
+            }
+        }
+
+        let mut specs: Vec<RealtimeFunctionToolSpec> = tools
+            .iter()
+            .map(|tool| {
+                RealtimeFunctionToolSpec::new(
+                    tool.name.clone(),
+                    tool.description.clone(),
+                    tool.params_json_schema.clone(),
+                )
+            })
+            .collect();
+        specs.extend(handoffs.iter().map(RealtimeHandoff::to_spec));
+        validate_tool_names(&specs)?;
+        settings.tools = Some(specs);
+
+        if let Some(starting) = starting {
+            settings.merge(starting);
+        }
+        if self.run_config.tracing_disabled {
+            settings.tracing = Some(RealtimeModelTracing::Disabled);
+        }
+
+        Ok(ResolvedSettings {
+            settings,
+            tools,
+            handoffs,
+        })
+    }
+
+    /// Read transport events until the connection ends.
+    async fn pump(self: Arc<Self>, mut events: mpsc::UnboundedReceiver<RealtimeModelEvent>) {
+        while let Some(event) = events.recv().await {
+            if self.closed.load(Ordering::SeqCst) {
+                break;
+            }
+            Box::pin(Self::handle_model_event(&self, event)).await;
+        }
+        *self.sender.lock().expect("realtime session poisoned") = None;
+    }
+
+    async fn handle_model_event(self: &Arc<Self>, event: RealtimeModelEvent) {
+        if !self.emit(RealtimeSessionEvent::RawModelEvent {
+            data: event.clone(),
+            info: self.info(),
+        }) {
+            return;
+        }
+
+        match event {
+            RealtimeModelEvent::Error { error } => {
+                self.emit(RealtimeSessionEvent::Error {
+                    error,
+                    info: self.info(),
+                });
+            }
+            RealtimeModelEvent::Exception { message, context } => {
+                let message = match context {
+                    Some(context) => format!("{context}: {message}"),
+                    None => message,
+                };
+                self.emit_error(message);
+            }
+            RealtimeModelEvent::FunctionCall(call) => {
+                if let Err(error) = self.handle_tool_call(call).await {
+                    self.emit_error(error.to_string());
+                }
+            }
+            RealtimeModelEvent::Audio(audio) => {
+                let interrupted = {
+                    self.state
+                        .lock()
+                        .expect("realtime session poisoned")
+                        .interrupted_response_ids
+                        .contains(&audio.response_id)
+                };
+                if !interrupted {
+                    let item_id = audio.item_id.clone();
+                    let content_index = audio.content_index;
+                    self.emit(RealtimeSessionEvent::Audio {
+                        audio,
+                        item_id,
+                        content_index,
+                        info: self.info(),
+                    });
+                }
+            }
+            RealtimeModelEvent::AudioInterrupted {
+                item_id,
+                content_index,
+            } => {
+                self.emit(RealtimeSessionEvent::AudioInterrupted {
+                    item_id,
+                    content_index,
+                    info: self.info(),
+                });
+            }
+            RealtimeModelEvent::AudioDone {
+                item_id,
+                content_index,
+            } => {
+                self.emit(RealtimeSessionEvent::AudioEnd {
+                    item_id,
+                    content_index,
+                    info: self.info(),
+                });
+            }
+            RealtimeModelEvent::InputAudioTranscriptionCompleted {
+                item_id,
+                transcript,
+            } => {
+                let added = {
+                    let mut state = self.state.lock().expect("realtime session poisoned");
+                    apply_input_transcription(&mut state.history, &item_id, &transcript)
+                };
+                if added {
+                    let item = {
+                        self.state
+                            .lock()
+                            .expect("realtime session poisoned")
+                            .history
+                            .last()
+                            .cloned()
+                    };
+                    if let Some(item) = item {
+                        self.emit(RealtimeSessionEvent::HistoryAdded {
+                            item: Box::new(item),
+                            info: self.info(),
+                        });
+                    }
+                } else {
+                    self.emit_history_updated();
+                }
+            }
+            RealtimeModelEvent::InputAudioTimeoutTriggered { .. } => {
+                self.emit(RealtimeSessionEvent::InputAudioTimeoutTriggered { info: self.info() });
+            }
+            RealtimeModelEvent::TranscriptDelta {
+                item_id,
+                delta,
+                response_id,
+            } => {
+                let transcript = {
+                    let mut state = self.state.lock().expect("realtime session poisoned");
+                    state
+                        .item_transcripts
+                        .entry(item_id.clone())
+                        .or_default()
+                        .push_str(&delta);
+                    state.item_transcripts[&item_id].clone()
+                };
+                {
+                    let mut state = self.state.lock().expect("realtime session poisoned");
+                    apply_assistant_transcript(&mut state.history, &item_id, &transcript);
+                }
+                self.spawn_output_guardrails(&item_id, &response_id);
+            }
+            RealtimeModelEvent::OutputTextDelta {
+                item_id,
+                delta,
+                response_id,
+            } => {
+                {
+                    let mut state = self.state.lock().expect("realtime session poisoned");
+                    state
+                        .item_transcripts
+                        .entry(item_id.clone())
+                        .or_default()
+                        .push_str(&delta);
+                }
+                self.spawn_output_guardrails(&item_id, &response_id);
+            }
+            RealtimeModelEvent::ItemUpdated { item } => {
+                let item = *item;
+                let (is_new, stored) = {
+                    let mut state = self.state.lock().expect("realtime session poisoned");
+                    let is_new = !state
+                        .history
+                        .iter()
+                        .any(|existing| existing.item_id() == item.item_id());
+                    let item_id = item.item_id().to_string();
+                    merge_item(&mut state.history, item);
+                    let stored = state
+                        .history
+                        .iter()
+                        .find(|existing| existing.item_id() == item_id)
+                        .cloned();
+                    (is_new, stored)
+                };
+                match (is_new, stored) {
+                    (true, Some(item)) => {
+                        self.emit(RealtimeSessionEvent::HistoryAdded {
+                            item: Box::new(item),
+                            info: self.info(),
+                        });
+                    }
+                    _ => self.emit_history_updated(),
+                }
+            }
+            RealtimeModelEvent::ItemDeleted { item_id } => {
+                {
+                    let mut state = self.state.lock().expect("realtime session poisoned");
+                    state.history.retain(|item| item.item_id() != item_id);
+                }
+                self.emit_history_updated();
+            }
+            RealtimeModelEvent::TurnStarted { response_id } => {
+                let agent = {
+                    let mut state = self.state.lock().expect("realtime session poisoned");
+                    state.active_response_id = response_id;
+                    state.active_response_agent = Some(state.agent.clone());
+                    state.agent.clone()
+                };
+                self.emit(RealtimeSessionEvent::AgentStart {
+                    agent,
+                    info: self.info(),
+                });
+            }
+            RealtimeModelEvent::Usage { usage } => {
+                self.context.add_usage(&usage);
+            }
+            RealtimeModelEvent::TurnEnded { response_id } => {
+                let agent = {
+                    let mut state = self.state.lock().expect("realtime session poisoned");
+                    let is_active =
+                        response_id.is_none() || response_id == state.active_response_id;
+                    if !is_active {
+                        None
+                    } else {
+                        state.item_transcripts.clear();
+                        state.item_guardrail_runs.clear();
+                        let agent = state
+                            .active_response_agent
+                            .take()
+                            .unwrap_or_else(|| state.agent.clone());
+                        state.active_response_id = None;
+                        Some(agent)
+                    }
+                };
+                if let Some(agent) = agent {
+                    self.emit(RealtimeSessionEvent::AgentEnd {
+                        agent,
+                        info: self.info(),
+                    });
+                }
+            }
+            RealtimeModelEvent::ConnectionStatus { .. }
+            | RealtimeModelEvent::EndOfStream
+            | RealtimeModelEvent::Other { .. }
+            | RealtimeModelEvent::RawServerEvent { .. } => {}
+        }
+    }
+
+    /// Route a model tool call to a function tool, a handoff, or an error.
+    async fn handle_tool_call(&self, call: RealtimeModelToolCallEvent) -> Result<()> {
+        let (agent, tools, handoffs) = {
+            let state = self.state.lock().expect("realtime session poisoned");
+            (
+                state.agent.clone(),
+                state.tools.clone(),
+                state.handoffs.clone(),
+            )
+        };
+
+        if let Some(tool) = tools.iter().find(|tool| tool.name == call.name).cloned() {
+            let approval_item = approval_item(&agent.name, &tool.name, &call);
+            let needs_approval = tool
+                .needs_approval
+                .evaluate(&self.context, &call.arguments, &call.call_id)
+                .await;
+            if needs_approval {
+                match self
+                    .context
+                    .is_tool_approved(&agent.name, &tool.name, &call.call_id)
+                {
+                    None => {
+                        if self
+                            .run_config
+                            .tool_execution
+                            .pre_approval_tool_input_guardrails
+                            && !tool.tool_input_guardrails.is_empty()
+                        {
+                            // Catch a blocked call before bothering a human with it. The same
+                            // guardrails run again before the tool executes.
+                            let function_call = function_call_item(&call);
+                            let tool_context = ToolContext::from_call(
+                                self.context.clone(),
+                                &agent.name,
+                                &function_call,
+                            );
+                            match self
+                                .run_tool_input_guardrails(&tool, &tool_context, &agent.name)
+                                .await?
+                            {
+                                ToolInputVerdict::Allow => {}
+                                ToolInputVerdict::Reject(message) => {
+                                    return self
+                                        .complete_tool_call(
+                                            &agent,
+                                            &tool,
+                                            &call,
+                                            ToolOutput::Text(message),
+                                        )
+                                        .await;
+                                }
+                                ToolInputVerdict::Raise(name) => {
+                                    self.emit_error(format!(
+                                        "Tool input guardrail {name} triggered tripwire"
+                                    ));
+                                    return Ok(());
+                                }
+                            }
+                        }
+                        {
+                            let mut state = self.state.lock().expect("realtime session poisoned");
+                            state.pending_tool_calls.insert(
+                                call.call_id.clone(),
+                                PendingToolCall {
+                                    call: call.clone(),
+                                    agent: agent.clone(),
+                                    tool: tool.clone(),
+                                    approval_item,
+                                },
+                            );
+                        }
+                        self.emit(RealtimeSessionEvent::ToolApprovalRequired {
+                            agent,
+                            tool,
+                            call_id: call.call_id.clone(),
+                            arguments: call.arguments.clone(),
+                            info: self.info(),
+                        });
+                        return Ok(());
+                    }
+                    Some(false) => return self.send_tool_rejection(&agent, &tool, &call).await,
+                    Some(true) => {}
+                }
+            }
+            return self.execute_tool(agent, tool, call).await;
+        }
+
+        if let Some(handoff) = handoffs
+            .iter()
+            .find(|handoff| handoff.tool_name == call.name)
+            .cloned()
+        {
+            return self.execute_handoff(agent, handoff, call).await;
+        }
+
+        let message = format!("Tool {} not found", call.name);
+        self.model
+            .send_event(RealtimeModelSendEvent::ToolOutput {
+                tool_call: call,
+                output: message.clone(),
+                start_response: false,
+            })
+            .await?;
+        self.emit_error(message);
+        Ok(())
+    }
+
+    /// Run a function tool's input guardrails and report what they decided.
+    async fn run_tool_input_guardrails(
+        &self,
+        tool: &Arc<FunctionTool<C>>,
+        tool_context: &ToolContext<C>,
+        agent_name: &str,
+    ) -> Result<ToolInputVerdict> {
+        for guardrail in &tool.tool_input_guardrails {
+            let output = guardrail
+                .run(ToolInputGuardrailData {
+                    context: tool_context.clone(),
+                    agent_name: agent_name.to_string(),
+                })
+                .await?;
+            match output.behavior {
+                ToolGuardrailBehavior::Allow => {}
+                ToolGuardrailBehavior::RejectContent { message } => {
+                    return Ok(ToolInputVerdict::Reject(message));
+                }
+                ToolGuardrailBehavior::RaiseException => {
+                    return Ok(ToolInputVerdict::Raise(guardrail.name.clone()));
+                }
+            }
+        }
+        Ok(ToolInputVerdict::Allow)
+    }
+
+    /// Run a function tool and send its output back to the model.
+    async fn execute_tool(
+        &self,
+        agent: Arc<RealtimeAgent<C>>,
+        tool: Arc<FunctionTool<C>>,
+        call: RealtimeModelToolCallEvent,
+    ) -> Result<()> {
+        let function_call = function_call_item(&call);
+        let tool_context =
+            ToolContext::from_call(self.context.clone(), &agent.name, &function_call);
+
+        match self
+            .run_tool_input_guardrails(&tool, &tool_context, &agent.name)
+            .await?
+        {
+            ToolInputVerdict::Allow => {}
+            ToolInputVerdict::Reject(message) => {
+                return self
+                    .complete_tool_call(&agent, &tool, &call, ToolOutput::Text(message))
+                    .await;
+            }
+            ToolInputVerdict::Raise(name) => {
+                self.emit_error(format!("Tool input guardrail {name} triggered tripwire"));
+                return Ok(());
+            }
+        }
+
+        self.emit(RealtimeSessionEvent::ToolStart {
+            agent: agent.clone(),
+            tool: tool.clone(),
+            arguments: call.arguments.clone(),
+            info: self.info(),
+        });
+
+        let invocation = tool.invoke(tool_context.clone(), call.arguments.clone());
+        let result = match tool.timeout {
+            Some(duration) => match tokio::time::timeout(duration, invocation).await {
+                Ok(result) => result,
+                Err(_) => {
+                    let error = AgentsError::ToolTimeoutError {
+                        tool_name: tool.name.clone(),
+                        timeout_seconds: duration.as_secs_f64(),
+                        run_data: None,
+                    };
+                    match tool.timeout_behavior {
+                        ToolTimeoutBehavior::RaiseException => return Err(error),
+                        ToolTimeoutBehavior::ErrorAsResult => {
+                            let message = match &tool.timeout_error_function {
+                                Some(f) => f(&self.context, &error),
+                                None => format!(
+                                    "Tool '{}' timed out after {} seconds.",
+                                    tool.name,
+                                    duration.as_secs_f64()
+                                ),
+                            };
+                            Ok(ToolOutput::Text(message))
+                        }
+                    }
+                }
+            },
+            None => invocation.await,
+        };
+
+        let mut output = match result {
+            Ok(output) => output,
+            Err(error) => match &tool.failure_error_function {
+                Some(f) => ToolOutput::Text(f(&self.context, &error)),
+                None => return Err(error),
+            },
+        };
+
+        for guardrail in &tool.tool_output_guardrails {
+            let checked = guardrail
+                .run(ToolOutputGuardrailData {
+                    context: tool_context.clone(),
+                    agent_name: agent.name.clone(),
+                    output: output.clone(),
+                })
+                .await?;
+            match checked.behavior {
+                ToolGuardrailBehavior::Allow => {}
+                ToolGuardrailBehavior::RejectContent { message } => {
+                    output = ToolOutput::Text(message);
+                    break;
+                }
+                ToolGuardrailBehavior::RaiseException => {
+                    self.emit_error(format!(
+                        "Tool output guardrail {} triggered tripwire",
+                        guardrail.name
+                    ));
+                    return Ok(());
+                }
+            }
+        }
+
+        self.complete_tool_call(&agent, &tool, &call, output).await
+    }
+
+    /// Send a tool output, record it in the history and emit `tool_end`.
+    async fn complete_tool_call(
+        &self,
+        agent: &Arc<RealtimeAgent<C>>,
+        tool: &Arc<FunctionTool<C>>,
+        call: &RealtimeModelToolCallEvent,
+        output: ToolOutput,
+    ) -> Result<()> {
+        let serialized = output.to_model_string();
+        self.model
+            .send_event(RealtimeModelSendEvent::ToolOutput {
+                tool_call: call.clone(),
+                output: serialized.clone(),
+                start_response: true,
+            })
+            .await?;
+        {
+            let mut state = self.state.lock().expect("realtime session poisoned");
+            merge_item(
+                &mut state.history,
+                tool_call_history_item(call, &serialized),
+            );
+        }
+        self.emit(RealtimeSessionEvent::ToolEnd {
+            agent: agent.clone(),
+            tool: tool.clone(),
+            arguments: call.arguments.clone(),
+            output,
+            info: self.info(),
+        });
+        Ok(())
+    }
+
+    /// Tell the model a call was not approved.
+    async fn send_tool_rejection(
+        &self,
+        agent: &Arc<RealtimeAgent<C>>,
+        tool: &Arc<FunctionTool<C>>,
+        call: &RealtimeModelToolCallEvent,
+    ) -> Result<()> {
+        let message = self
+            .context
+            .rejection_message(&agent.name, &tool.name, &call.call_id)
+            .unwrap_or_else(|| DEFAULT_APPROVAL_REJECTION_MESSAGE.to_string());
+        self.complete_tool_call(agent, tool, call, ToolOutput::Text(message))
+            .await
+    }
+
+    /// Switch to the handoff target, push its settings and answer the call.
+    async fn execute_handoff(
+        &self,
+        from_agent: Arc<RealtimeAgent<C>>,
+        handoff: RealtimeHandoff<C>,
+        call: RealtimeModelToolCallEvent,
+    ) -> Result<()> {
+        let to_agent = handoff
+            .invoke(self.context.clone(), call.arguments.clone())
+            .await?;
+        let resolved = self.build_settings(&to_agent, None).await?;
+        {
+            let mut state = self.state.lock().expect("realtime session poisoned");
+            state.agent = to_agent.clone();
+            state.tools = resolved.tools.clone();
+            state.handoffs = resolved.handoffs.clone();
+        }
+
+        self.emit(RealtimeSessionEvent::Handoff {
+            from_agent,
+            to_agent: to_agent.clone(),
+            info: self.info(),
+        });
+
+        // The session update must reach the model before the tool output starts a new response.
+        self.model
+            .send_event(RealtimeModelSendEvent::session_update(resolved.settings))
+            .await?;
+        let output = RealtimeHandoff::<C>::transfer_message(&to_agent.name);
+        self.model
+            .send_event(RealtimeModelSendEvent::ToolOutput {
+                tool_call: call.clone(),
+                output: output.clone(),
+                start_response: true,
+            })
+            .await?;
+        {
+            let mut state = self.state.lock().expect("realtime session poisoned");
+            merge_item(&mut state.history, tool_call_history_item(&call, &output));
+        }
+        Ok(())
+    }
+
+    /// Run output guardrails once the accumulated transcript crosses the debounce threshold.
+    ///
+    /// The run happens on its own task so a slow guardrail cannot stall delivery of the audio and
+    /// transcript events queued behind it, which is what the Python SDK's background tasks buy.
+    fn spawn_output_guardrails(self: &Arc<Self>, item_id: &str, response_id: &str) {
+        let threshold = self.debounce_text_length;
+        let (text, agent) = {
+            let mut state = self.state.lock().expect("realtime session poisoned");
+            let Some(text) = state.item_transcripts.get(item_id).cloned() else {
+                return;
+            };
+            let runs = state
+                .item_guardrail_runs
+                .get(item_id)
+                .copied()
+                .unwrap_or_default();
+            if text.chars().count() < (runs + 1) * threshold {
+                return;
+            }
+            let crossed = text.chars().count() / threshold;
+            state
+                .item_guardrail_runs
+                .insert(item_id.to_string(), crossed.max(runs + 1));
+            let agent = state
+                .active_response_agent
+                .clone()
+                .unwrap_or_else(|| state.agent.clone());
+            (text, agent)
+        };
+
+        let inner = self.clone();
+        let response_id = response_id.to_string();
+        let task = tokio::spawn(async move {
+            inner
+                .run_output_guardrails(&text, &response_id, &agent)
+                .await;
+        });
+        let mut tasks = self
+            .guardrail_tasks
+            .lock()
+            .expect("realtime session poisoned");
+        tasks.retain(|task| !task.is_finished());
+        tasks.push(task);
+    }
+
+    async fn run_output_guardrails(
+        &self,
+        text: &str,
+        response_id: &str,
+        agent: &Arc<RealtimeAgent<C>>,
+    ) {
+        let mut guardrails: Vec<OutputGuardrail<C>> = agent.output_guardrails.clone();
+        guardrails.extend(self.run_config.output_guardrails.iter().cloned());
+        if guardrails.is_empty() {
+            return;
+        }
+        {
+            let state = self.state.lock().expect("realtime session poisoned");
+            if state.interrupted_response_ids.contains(response_id) {
+                return;
+            }
+        }
+
+        // Output guardrails are defined against `Agent`; realtime agents carry no model, so the
+        // guardrail sees a stand-in agent with the same name, as the Python SDK does.
+        let stand_in = Arc::new(Agent::<C>::new(agent.name.clone()));
+        let mut triggered: Vec<OutputGuardrailResult> = Vec::new();
+        for guardrail in &guardrails {
+            match guardrail
+                .run(
+                    self.context.clone(),
+                    stand_in.clone(),
+                    Value::String(text.to_string()),
+                )
+                .await
+            {
+                Ok(result) if result.output.tripwire_triggered => triggered.push(result),
+                Ok(_) => {}
+                Err(error) => {
+                    log::warn!(
+                        "Realtime output guardrail {} failed, skipping it: {error}",
+                        guardrail.name
+                    );
+                }
+            }
+        }
+        if triggered.is_empty() {
+            return;
+        }
+
+        {
+            let mut state = self.state.lock().expect("realtime session poisoned");
+            if !state
+                .interrupted_response_ids
+                .insert(response_id.to_string())
+            {
+                return;
+            }
+        }
+
+        let names: Vec<String> = triggered
+            .iter()
+            .map(|result| result.guardrail_name.clone())
+            .collect();
+        self.emit(RealtimeSessionEvent::GuardrailTripped {
+            guardrail_results: triggered,
+            message: text.to_string(),
+            info: self.info(),
+        });
+
+        if let Err(error) = self
+            .model
+            .send_event(RealtimeModelSendEvent::Interrupt {
+                force_response_cancel: true,
+            })
+            .await
+        {
+            self.emit_error(error.to_string());
+            return;
+        }
+        if let Err(error) = self
+            .model
+            .send_event(RealtimeModelSendEvent::UserInput {
+                user_input: RealtimeUserInput::Text(format!(
+                    "guardrail triggered: {}",
+                    names.join(", ")
+                )),
+            })
+            .await
+        {
+            self.emit_error(error.to_string());
+        }
+    }
+}
+
+fn approval_item(
+    agent_name: &str,
+    tool_name: &str,
+    call: &RealtimeModelToolCallEvent,
+) -> ToolApprovalItem {
+    ToolApprovalItem {
+        agent: agent_name.to_string(),
+        raw_item: function_call_item(call),
+        tool_name: tool_name.to_string(),
+    }
+}
+
+fn function_call_item(call: &RealtimeModelToolCallEvent) -> FunctionCall {
+    FunctionCall {
+        id: call.id.clone(),
+        call_id: call.call_id.clone(),
+        name: call.name.clone(),
+        arguments: call.arguments.clone(),
+        status: None,
+        extra: serde_json::Map::new(),
+    }
+}
+
+fn tool_call_history_item(call: &RealtimeModelToolCallEvent, output: &str) -> RealtimeItem {
+    RealtimeItem::FunctionCall(RealtimeToolCallItem {
+        item_id: call.id.clone().unwrap_or_else(|| call.call_id.clone()),
+        previous_item_id: call.previous_item_id.clone(),
+        call_id: Some(call.call_id.clone()),
+        status: "completed".to_string(),
+        arguments: call.arguments.clone(),
+        name: call.name.clone(),
+        output: Some(output.to_string()),
+    })
+}
+
+/// Reject duplicate model-visible tool names, as `_tool_validation` does in Python.
+fn validate_tool_names(specs: &[RealtimeFunctionToolSpec]) -> Result<()> {
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut duplicates: Vec<&str> = Vec::new();
+    for spec in specs {
+        if !seen.insert(spec.name.as_str()) && !duplicates.contains(&spec.name.as_str()) {
+            duplicates.push(spec.name.as_str());
+        }
+    }
+    if duplicates.is_empty() {
+        return Ok(());
+    }
+    Err(AgentsError::user(format!(
+        "Duplicate realtime tool names found: {}. Realtime function tool and handoff names must \
+         be unique. Rename one of them before starting the session.",
+        duplicates.join(", ")
+    )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn duplicate_tool_names_are_rejected() {
+        let specs = vec![
+            RealtimeFunctionToolSpec::new("a", "", json!({})),
+            RealtimeFunctionToolSpec::new("a", "", json!({})),
+        ];
+        let error = validate_tool_names(&specs).unwrap_err();
+        assert!(error.to_string().contains("Duplicate realtime tool names"));
+        assert!(validate_tool_names(&specs[..1]).is_ok());
+    }
+
+    #[test]
+    fn history_item_prefers_item_id_over_call_id() {
+        let mut call = RealtimeModelToolCallEvent::new("t", "call_1", "{}");
+        let item = tool_call_history_item(&call, "out");
+        assert_eq!(item.item_id(), "call_1");
+        call.id = Some("fc_1".to_string());
+        let item = tool_call_history_item(&call, "out");
+        assert_eq!(item.item_id(), "fc_1");
+        assert_eq!(
+            item.as_function_call().unwrap().output.as_deref(),
+            Some("out")
+        );
+    }
+}

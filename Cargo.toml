@@ -81,3 +81,7 @@ required-features = ["websocket"]
 [[example]]
 name = "voice_static"
 required-features = ["voice"]
+
+[[example]]
+name = "realtime_text"
+required-features = ["realtime"]
