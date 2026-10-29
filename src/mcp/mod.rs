@@ -1,11 +1,12 @@
 //! Model Context Protocol servers (feature `mcp`). Mirrors `agents.mcp`.
 //!
 //! Local MCP servers run their tools through the SDK: the runner lists the server's tools on
-//! each run and calls them as function tools. Two transports are supported, matching the
-//! transports recommended by the MCP project: stdio ([`MCPServerStdio`]) and Streamable HTTP
-//! ([`MCPServerStreamableHttp`]). The deprecated HTTP+SSE transport is not supported. For
-//! OpenAI-hosted MCP, use [`crate::tool::HostedMCPTool`] instead.
+//! each run and calls them as function tools. Supported transports: stdio
+//! ([`MCPServerStdio`]), Streamable HTTP ([`MCPServerStreamableHttp`]) and the deprecated
+//! HTTP+SSE transport ([`MCPServerSse`]). For OpenAI-hosted MCP, use
+//! [`crate::tool::HostedMCPTool`] instead.
 
+mod sse;
 pub mod util;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -236,6 +237,31 @@ pub trait MCPServer: Send + Sync + fmt::Debug {
 enum TransportSpec {
     Stdio(MCPServerStdioParams),
     StreamableHttp(MCPServerStreamableHttpParams),
+    Sse(MCPServerSseParams),
+}
+
+/// Parameters for an HTTP+SSE MCP server.
+#[derive(Debug, Clone)]
+pub struct MCPServerSseParams {
+    /// The SSE endpoint URL.
+    pub url: String,
+    /// Extra headers sent on the SSE request and on every POST.
+    pub headers: HashMap<String, String>,
+    /// Connection timeout (default 5 seconds).
+    pub timeout: Duration,
+    /// How long to wait for a new SSE event (default 5 minutes).
+    pub sse_read_timeout: Duration,
+}
+
+impl Default for MCPServerSseParams {
+    fn default() -> Self {
+        MCPServerSseParams {
+            url: String::new(),
+            headers: HashMap::new(),
+            timeout: Duration::from_secs(5),
+            sse_read_timeout: Duration::from_secs(300),
+        }
+    }
 }
 
 /// Parameters for a stdio MCP server.
@@ -308,6 +334,11 @@ impl Core {
                 }
                 config = config.custom_headers(custom);
                 let transport = StreamableHttpClientTransport::from_config(config);
+                ().serve(transport).await.map_err(svc_err)?
+            }
+            TransportSpec::Sse(p) => {
+                let transport =
+                    sse::connect(&p.url, &p.headers, p.timeout, p.sse_read_timeout).await?;
                 ().serve(transport).await.map_err(svc_err)?
             }
         };
@@ -571,6 +602,12 @@ mcp_server_type!(
     MCPServerStreamableHttpParams,
     StreamableHttp,
     "An MCP server reached over the Streamable HTTP transport."
+);
+mcp_server_type!(
+    MCPServerSse,
+    MCPServerSseParams,
+    Sse,
+    "An MCP server reached over the deprecated HTTP+SSE transport."
 );
 
 /// Connects several servers and exposes the ones that connected.
