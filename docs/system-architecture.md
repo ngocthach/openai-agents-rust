@@ -12,14 +12,16 @@ Last updated: 2026-10-29. Port of `openai-agents` (Python) 0.24.0.
 | Models | `models::{interface, openai_client, openai_responses, openai_chatcompletions, openai_provider, multi_provider, default_models}` | `Model`/`ModelProvider` traits and OpenAI HTTP implementations |
 | Data | `items`, `usage`, `model_settings`, `agent_output`, `strict_schema` | Responses-format items, usage, settings, structured output schemas |
 | Local tools | `tool::local`, `computer`, `editor`, `apply_diff`, `run_internal::local_tools` | Shell, local shell, apply patch (V4A diffs), computer and custom tools, namespaces, tool search |
-| Retries | `retry` | Retry policies, provider advice, replay-safety vetoes |
+| Retries | `retry` | Retry policies, provider advice, retry headers, replay-safety vetoes |
+| Logging | `debug` | Model/tool data redaction flags shared by all modules |
 | Memory | `memory` | `Session` trait; in-memory, SQLite, advanced SQLite, OpenAI Conversations, compaction, encrypted, Redis, MongoDB, sqlx, Dapr |
 | Tracing | `tracing` | Traces/spans, task-local scope, processors, OpenAI exporter |
 | MCP | `mcp` (feature `mcp`) | stdio, Streamable HTTP and legacy HTTP+SSE servers on `rmcp`, tool conversion |
 | Realtime | `realtime` (feature `realtime`) | Realtime agents, sessions, OpenAI realtime WebSocket model |
 | Voice | `voice` (feature `voice`) | Voice pipeline, OpenAI STT/TTS, single-agent workflow |
 | Sandbox | `sandbox` (feature `sandbox`) | Sandbox agents, manifests, capabilities, unix-local and Docker clients |
-| Extensions | `extensions`, `repl`, `testing` | Handoff filters and prompts, DOT visualization, tool output trimmer, Codex tool, hosted multi-agent (feature `websocket`), REPL, scripted `FakeModel` |
+| Macros | `openai-agents-sdk-macros` crate (feature `macros`) | `#[function_tool]` |
+| Extensions | `extensions`, `repl`, `testing` | Handoff filters and prompts, DOT visualization, tool output trimmer, Codex tool, LiteLLM/any-llm style providers, cloud sandbox providers (feature `sandbox`), hosted multi-agent (feature `websocket`), REPL, scripted `FakeModel` |
 
 ## Run loop
 

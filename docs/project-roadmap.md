@@ -28,17 +28,22 @@ Last updated: 2026-10-29.
 - MCP legacy HTTP+SSE transport
 - Extensions: tool output trimmer, Codex tool, hosted multi-agent (experimental)
 
-## Not ported
+## 0.3.0 (released)
 
-| Area | Reason |
+- Sandbox: mounts (bind, Docker volume, in-container, cloud buckets), PTY sessions, memory,
+  skills, snapshots and resumable session state, handoff graph preparation (cycles included)
+- Cloud sandbox providers: E2B, Modal, Daytona, Vercel, Cloudflare, Blaxel
+- Realtime: SIP model, playback tracker, generation-scoped guardrail interrupts, scripted model
+- `EncryptedSession` is Fernet-compatible with Python; compaction suffix replacement
+- `LitellmModel` / `AnyLLMModel` over OpenAI-compatible endpoints; `#[function_tool]` macro
+- Retry-after / `x-should-retry` headers on API errors; shared log redaction flags
+
+## Differences from Python
+
+| Area | Difference |
 | --- | --- |
-| LiteLLM / Any-LLM adapters | Wrap Python libraries; use `OpenAIChatCompletionsModel` with a base URL or a custom `Model` |
-| Cloud sandbox providers (E2B, Modal, Daytona, Vercel, Cloudflare, Blaxel) | Vendor SDK integrations; implement `SandboxClient` for a provider |
-| Sandbox mounts, PTY sessions, sandbox memory and skills | Large provider-specific surface; PTY needs `unsafe` |
-| Realtime SIP model and playback tracker | Telephony-specific |
-| `#[function_tool]` macro | Closure-based `FunctionTool::new` covers the same need |
-| Sandbox per-turn preparation | Handoff targets of a `SandboxAgent` are not re-prepared with capability tools; resuming after an approval needs `SandboxRunConfig::session` |
-| `EncryptedSession` wire compatibility | Uses XChaCha20-Poly1305 instead of Fernet; not readable by the Python SDK |
-| Retry-after header capture | `AgentsError::ApiError` does not carry response headers; policies use body hints and backoff |
+| LiteLLM / any-llm | Registry of OpenAI-compatible endpoints instead of the Python libraries |
+| Modal sandbox | Uses the `modal` Python package through a helper (no public REST API) |
+| `sqlx` feature | Needs Rust 1.94 (everything else builds on 1.89) |
 
-Module-level divergences are listed in `plans/reports/*-port-report.md`.
+Module-level divergences are listed in `plans/reports/*-report.md`.

@@ -18,7 +18,7 @@ This crate is not affiliated with or endorsed by OpenAI.
 
 ```toml
 [dependencies]
-openai-agents-sdk = "0.2"
+openai-agents-sdk = "0.3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
@@ -31,8 +31,9 @@ Optional features:
 | `websocket` | Responses API over WebSocket (`OpenAIResponsesWSModel`, `ResponsesWebSocketSession`) and the experimental hosted multi-agent model |
 | `realtime` | Realtime agents and sessions over the OpenAI realtime WebSocket API |
 | `voice` | Voice pipeline with OpenAI speech-to-text and text-to-speech |
-| `sandbox` | Sandbox agents with unix-local and Docker workspaces |
-| `encrypt` | `memory::EncryptedSession` (XChaCha20-Poly1305, not wire-compatible with Python's Fernet) |
+| `sandbox` | Sandbox agents with unix-local and Docker workspaces, mounts, PTY sessions, memory, skills, snapshots, and E2B, Modal, Daytona, Vercel, Cloudflare and Blaxel providers |
+| `macros` | `#[function_tool]` attribute macro |
+| `encrypt` | `memory::EncryptedSession` (Fernet, wire-compatible with the Python SDK) |
 | `redis` / `mongodb` / `sqlx` | `RedisSession`, `MongoDBSession`, `SqlxSession` (PostgreSQL/MySQL; needs Rust 1.94) |
 
 `DaprSession` and `OpenAIResponsesCompactionSession` need no feature.
@@ -82,6 +83,24 @@ let get_weather = FunctionTool::new("get_weather", "Get the weather for a city",
 let agent = Agent::<()>::new("Weather agent").with_tool(get_weather);
 let result = Runner::run(&agent, "What's the weather in Tokyo?").await?;
 # Ok(()) }
+```
+
+With the `macros` feature, `#[function_tool]` builds the same tool from a plain function and
+its doc comment:
+
+```rust,ignore
+use openai_agents_sdk::function_tool;
+
+/// Get the weather for a city.
+///
+/// # Arguments
+/// * `city` - The city to get the weather for.
+#[function_tool]
+async fn get_weather(city: String) -> Result<String, openai_agents_sdk::AgentsError> {
+    Ok(format!("The weather in {city} is sunny"))
+}
+
+let agent = Agent::<()>::new("Weather agent").with_tool(get_weather_tool::<()>());
 ```
 
 Hosted OpenAI tools are available too: `WebSearchTool`, `FileSearchTool`, `CodeInterpreterTool`,
@@ -221,7 +240,8 @@ per-attempt timeouts and raw request extras.
 | Python | Rust |
 | --- | --- |
 | `Agent(name=..., instructions=...)` | `Agent::<C>::new(name).with_instructions(...)` |
-| `@function_tool` | `FunctionTool::new(name, description, async closure)` |
+| `@function_tool` | `#[function_tool]` (feature `macros`) or `FunctionTool::new(name, description, async closure)` |
+| `LitellmModel` / `AnyLLMModel` | `extensions::models::LitellmModel` / `AnyLLMModel` |
 | `Runner.run / run_sync / run_streamed` | `Runner::run / run_sync / run_streamed` (+ `_with_options`) |
 | `RunConfig(...)` | `RunConfig::new().with_...()` |
 | `result.final_output` | `result.final_output` (`serde_json::Value`), `final_output_text()`, `final_output_as::<T>()` |
@@ -239,15 +259,17 @@ per-attempt timeouts and raw request extras.
 | `SandboxAgent` | `sandbox::SandboxAgent` (feature `sandbox`) |
 | `codex_tool(...)` | `extensions::codex::codex_tool(...)` |
 
-## Not ported
+## Differences from Python
 
-- LiteLLM and Any-LLM adapters: they wrap Python libraries. Use `OpenAIChatCompletionsModel`
-  with `OpenAIClient::with_base_url` for OpenAI-compatible providers, or implement `Model`.
-- Cloud sandbox providers (E2B, Modal, Daytona, Vercel, Cloudflare, Blaxel), sandbox mounts and
-  PTY sessions.
-- A `#[function_tool]` attribute macro: `FunctionTool::new` with a typed closure covers it.
+- LiteLLM and any-llm are Python libraries, so `extensions::models::{LitellmModel, AnyLLMModel}`
+  resolve `provider/model` names against a registry of OpenAI-compatible endpoints (Anthropic,
+  Gemini, Mistral, Groq, DeepSeek, OpenRouter, xAI, Ollama, a LiteLLM proxy, ...).
+- Modal sandboxes drive the official `modal` Python package through a bundled helper, because
+  Modal has no public REST API.
+- `#[function_tool]` (feature `macros`) generates a `<name>_tool()` constructor instead of
+  replacing the function.
 
-See [`docs/project-roadmap.md`](docs/project-roadmap.md) for details.
+Module-level notes live in `plans/reports/*-report.md`.
 
 ## Examples
 

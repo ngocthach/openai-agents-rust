@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.3.0 (2026-10-29)
+
+Completes the port. See the 0.3.0 section of `docs/project-roadmap.md`.
+
+Breaking changes (pre-1.0):
+
+- `AgentsError::ApiError` has a `headers` field; `AgentsError::Sandbox` is a new variant.
+- `EncryptedSession` now uses Fernet (Python-compatible); items written by 0.2.0 are not readable.
+- `SandboxRunner::run_streamed*` returns `SandboxStreamedRun<C>`.
+- New `Session` and `Model` trait methods have default implementations.
+
 ## 0.2.0 (2026-10-29)
 
 Ports the rest of the Python SDK surface. See the 0.2.0 section of `docs/project-roadmap.md`.
