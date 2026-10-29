@@ -383,9 +383,14 @@ mod tests {
         assert_eq!(update.exit_code, None);
         assert!(sessions.processes.is_empty());
         let sent = server.await.unwrap();
+        // Compare parsed frames: key order depends on serde_json's `preserve_order` feature.
+        let sent: Vec<serde_json::Value> = sent
+            .iter()
+            .map(|f| serde_json::from_str(f).unwrap())
+            .collect();
         assert_eq!(
             sent,
-            vec![r#"{"data":"sh -lc 'echo hi'\n","type":"input"}"#]
+            vec![serde_json::json!({"type": "input", "data": "sh -lc 'echo hi'\n"})]
         );
     }
 
