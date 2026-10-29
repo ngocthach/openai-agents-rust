@@ -16,6 +16,20 @@ pub enum ErrorCode {
     ExecTimeout,
     /// The sandbox transport failed before the command produced a result.
     ExecTransportError,
+    /// A PTY session id does not refer to a running process.
+    PtySessionNotFound,
+    /// The PTY process was not started with a TTY, so it has no stdin.
+    PtyStdinUnavailable,
+    /// A mount is configured in a way the backend cannot satisfy.
+    MountConfigInvalid,
+    /// Attaching or detaching a mount failed.
+    MountFailed,
+    /// The tool a mount pattern needs is missing inside the sandbox.
+    MountMissingTool,
+    /// The persisted sandbox session state does not match the trusted configuration.
+    SessionStateMismatch,
+    /// The persisted sandbox session state is malformed.
+    SessionStateInvalid,
     /// An `apply_patch` operation targeted an invalid path.
     ApplyPatchInvalidPath,
     /// An `apply_patch` diff could not be applied.
@@ -44,12 +58,16 @@ pub enum ErrorCode {
     GitCloneError,
     /// The requested git subpath does not exist in the clone.
     GitSubpathError,
+    /// The skills capability is misconfigured.
+    SkillsConfigInvalid,
     /// The sandbox configuration is invalid.
     SandboxConfigInvalid,
     /// Persisting a workspace snapshot failed.
     SnapshotPersistError,
     /// Restoring a workspace snapshot failed.
     SnapshotRestoreError,
+    /// The snapshot stores no workspace archive.
+    SnapshotNotRestorable,
 }
 
 impl ErrorCode {
@@ -60,6 +78,13 @@ impl ErrorCode {
             ErrorCode::ExecNonZero => "exec_nonzero",
             ErrorCode::ExecTimeout => "exec_timeout",
             ErrorCode::ExecTransportError => "exec_transport_error",
+            ErrorCode::PtySessionNotFound => "pty_session_not_found",
+            ErrorCode::PtyStdinUnavailable => "pty_stdin_unavailable",
+            ErrorCode::MountConfigInvalid => "mount_config_invalid",
+            ErrorCode::MountFailed => "mount_failed",
+            ErrorCode::MountMissingTool => "mount_missing_tool",
+            ErrorCode::SessionStateMismatch => "session_state_mismatch",
+            ErrorCode::SessionStateInvalid => "session_state_invalid",
             ErrorCode::ApplyPatchInvalidPath => "apply_patch_invalid_path",
             ErrorCode::ApplyPatchInvalidDiff => "apply_patch_invalid_diff",
             ErrorCode::ApplyPatchFileNotFound => "apply_patch_file_not_found",
@@ -74,9 +99,11 @@ impl ErrorCode {
             ErrorCode::GitMissingInImage => "git_missing_in_image",
             ErrorCode::GitCloneError => "git_clone_error",
             ErrorCode::GitSubpathError => "git_subpath_error",
+            ErrorCode::SkillsConfigInvalid => "skills_config_invalid",
             ErrorCode::SandboxConfigInvalid => "sandbox_config_invalid",
             ErrorCode::SnapshotPersistError => "snapshot_persist_error",
             ErrorCode::SnapshotRestoreError => "snapshot_restore_error",
+            ErrorCode::SnapshotNotRestorable => "snapshot_not_restorable",
         }
     }
 }
@@ -147,7 +174,11 @@ impl From<SandboxError> for AgentsError {
         match value.code {
             ErrorCode::InvalidManifestPath
             | ErrorCode::ApplyPatchInvalidPath
-            | ErrorCode::SandboxConfigInvalid => AgentsError::user(value.to_string()),
+            | ErrorCode::SandboxConfigInvalid
+            | ErrorCode::SkillsConfigInvalid
+            | ErrorCode::MountConfigInvalid
+            | ErrorCode::SessionStateMismatch
+            | ErrorCode::SessionStateInvalid => AgentsError::user(value.to_string()),
             _ => AgentsError::other(value.to_string()),
         }
     }

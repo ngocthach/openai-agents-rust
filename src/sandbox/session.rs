@@ -9,6 +9,10 @@ use async_trait::async_trait;
 
 use crate::sandbox::errors::{ErrorCode, SandboxError, SandboxResult};
 use crate::sandbox::manifest::Manifest;
+use crate::sandbox::mounts::Mount;
+use crate::sandbox::pty::{PtyExecRequest, PtyExecUpdate, PtyWriteRequest};
+use crate::sandbox::snapshot::{Snapshot, resolve_snapshot};
+use crate::sandbox::state::SandboxSessionState;
 use crate::sandbox::types::{ExecResult, FileEntry, User, parse_ls_la};
 use crate::sandbox::workspace_paths::resolve_workspace_path;
 
@@ -195,9 +199,45 @@ pub trait SandboxSession: Send + Sync + fmt::Debug {
     /// Write a file to the workspace, creating parent directories.
     async fn write_file(&self, path: &str, contents: &[u8]) -> SandboxResult<()>;
 
-    /// Whether the session can allocate a PTY. The Rust port never does.
+    /// Whether the session can run commands in a PTY (`exec_command` / `write_stdin`).
     fn supports_pty(&self) -> bool {
         false
+    }
+
+    /// Whether the container runtime attaches mounts before the session starts, so that
+    /// [`MountStrategy::docker_create_args`](crate::sandbox::mounts::MountStrategy::docker_create_args)
+    /// replaces a live activation command.
+    fn attaches_mounts_at_create(&self) -> bool {
+        false
+    }
+
+    /// Check a mount against the manifest's credential-exposure policy before activating it.
+    fn authorize_mount_activation(&self, mount: &Mount, mount_path: &str) -> SandboxResult<()> {
+        self.manifest()
+            .authorize_mount_activation(mount, mount_path)
+    }
+
+    /// Start a command in a PTY and collect its first output window.
+    async fn pty_exec_start(&self, request: PtyExecRequest) -> SandboxResult<PtyExecUpdate> {
+        let _ = request;
+        Err(SandboxError::new(
+            ErrorCode::ExecTransportError,
+            "PTY execution is not supported by this sandbox session",
+        ))
+    }
+
+    /// Write to (or poll) a running PTY session.
+    async fn pty_write_stdin(&self, request: PtyWriteRequest) -> SandboxResult<PtyExecUpdate> {
+        let _ = request;
+        Err(SandboxError::new(
+            ErrorCode::ExecTransportError,
+            "PTY execution is not supported by this sandbox session",
+        ))
+    }
+
+    /// Terminate every live PTY session.
+    async fn pty_terminate_all(&self) -> SandboxResult<()> {
+        Ok(())
     }
 
     /// Normalize a model-provided path to an absolute sandbox path inside the workspace root.
@@ -274,7 +314,22 @@ pub trait SandboxSession: Send + Sync + fmt::Debug {
     /// The default implementation shells out to `tar`, which every supported backend provides.
     async fn persist_workspace(&self) -> SandboxResult<Vec<u8>> {
         let root = self.workspace_root().to_string();
-        let command = format!("tar -czf - -C {} .", shell_quote(&root));
+        let mut command = format!("tar -czf - -C {}", shell_quote(&root));
+        // Mounts and other ephemeral entries are runtime-attached state, never durable workspace
+        // content: archiving them would copy whole mounted buckets into the snapshot.
+        for path in self.manifest().ephemeral_paths() {
+            let relative = path
+                .strip_prefix(root.trim_end_matches('/'))
+                .map(|r| r.trim_start_matches('/'))
+                .filter(|r| !r.is_empty());
+            if let Some(relative) = relative {
+                command.push_str(&format!(
+                    " --exclude {}",
+                    shell_quote(&format!("./{relative}"))
+                ));
+            }
+        }
+        command.push_str(" .");
         let result = self.exec(ExecRequest::shell(command.clone())).await?;
         if !result.ok() {
             return Err(SandboxError::new(
@@ -295,6 +350,68 @@ pub trait SandboxSession: Send + Sync + fmt::Debug {
     fn describe(&self) -> String {
         self.manifest().describe()
     }
+
+    /// The credential-free state a caller can persist to resume this session later.
+    fn session_state(&self) -> SandboxSessionState {
+        SandboxSessionState::new(
+            self.backend_id(),
+            self.id(),
+            self.workspace_root(),
+            self.manifest(),
+        )
+    }
+
+    /// Where this session stores workspace archives.
+    fn snapshot(&self) -> Arc<dyn Snapshot> {
+        resolve_snapshot(None, self.id())
+    }
+}
+
+/// Capture a session's workspace into its snapshot.
+///
+/// Mounts whose strategy cannot be snapshotted in place are detached first and re-attached
+/// afterwards, mirroring Python's `teardown_for_snapshot` / `restore_after_snapshot` pair.
+/// Sessions without a configured snapshot are a no-op.
+pub async fn persist_session_snapshot(session: &dyn SandboxSession) -> SandboxResult<()> {
+    let snapshot = session.snapshot();
+    if snapshot.snapshot_type() == "noop" {
+        return Ok(());
+    }
+    let manifest = session.manifest().clone();
+    let detached: Vec<(&Mount, String)> = manifest
+        .mount_targets()
+        .into_iter()
+        .filter(|(mount, _)| !mount.strategy.supports_native_snapshot_detach())
+        .collect();
+    for (mount, path) in &detached {
+        mount
+            .strategy
+            .teardown_for_snapshot(mount, session, path)
+            .await?;
+    }
+    let archive = session.persist_workspace().await;
+    for (mount, path) in &detached {
+        mount
+            .strategy
+            .restore_after_snapshot(mount, session, path)
+            .await?;
+    }
+    snapshot.persist(&archive?).await
+}
+
+/// Restore a session's workspace from its snapshot and re-apply the ephemeral entries.
+///
+/// Returns `false` when no archive is stored, leaving the workspace untouched.
+pub async fn restore_session_snapshot(session: &dyn SandboxSession) -> SandboxResult<bool> {
+    let snapshot = session.snapshot();
+    if !snapshot.restorable().await? {
+        return Ok(false);
+    }
+    let archive = snapshot.restore().await?;
+    session.hydrate_workspace(&archive).await?;
+    let manifest = session.manifest().clone();
+    manifest.apply_ephemeral(session).await?;
+    Ok(true)
 }
 
 /// Creates and releases [`SandboxSession`]s for one backend.
@@ -308,6 +425,27 @@ pub trait SandboxClient: Send + Sync + fmt::Debug {
 
     /// Release the backend resources behind a session created by this client.
     async fn delete(&self, session: Arc<dyn SandboxSession>) -> SandboxResult<()>;
+
+    /// Reattach to (or recreate) the session described by `state`.
+    ///
+    /// `manifest` is the trusted manifest the application builds; `state` carries no manifest
+    /// contents of its own, so the client checks the two agree before touching anything. A
+    /// backend whose resource is gone may create a replacement and hydrate it from the snapshot
+    /// recorded in `state`.
+    async fn resume(
+        &self,
+        state: &SandboxSessionState,
+        manifest: Manifest,
+    ) -> SandboxResult<Arc<dyn SandboxSession>> {
+        let _ = (state, manifest);
+        Err(SandboxError::new(
+            ErrorCode::SessionStateInvalid,
+            format!(
+                "the `{}` sandbox backend does not support resuming a persisted session",
+                self.backend_id()
+            ),
+        ))
+    }
 }
 
 #[cfg(test)]

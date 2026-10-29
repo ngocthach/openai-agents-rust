@@ -4,31 +4,45 @@
 use std::fmt;
 use std::sync::Arc;
 
-use crate::agent::Agent;
 use crate::error::{AgentsError, Result};
 use crate::items::RunInput;
 use crate::result::{RunResult, RunResultStreaming};
 use crate::run::{RunOptions, Runner};
-use crate::sandbox::agent::SandboxAgent;
+use crate::run_config::ModelInputData;
+use crate::sandbox::agent::{PreparedSandboxGraph, SandboxAgent};
 use crate::sandbox::capabilities::CapabilityBinding;
 use crate::sandbox::manifest::Manifest;
-use crate::sandbox::session::{ExecRequest, SandboxClient, SandboxSession};
+use crate::sandbox::memory::SandboxMemoryGenerationManager;
+use crate::sandbox::session::{
+    ExecRequest, SandboxClient, SandboxSession, persist_session_snapshot,
+};
+use crate::sandbox::state::SandboxSessionState;
 use crate::sandbox::workspace_paths::SandboxWorkspaceScope;
 
 /// Where a sandbox run executes, mirroring Python's `RunConfig(sandbox=...)` options.
 ///
 /// Either [`client`](Self::client) or [`session`](Self::session) must be set: a client creates
-/// (and tears down) a fresh session for the run, while a session is reused as-is and never torn
-/// down by the runner.
+/// (and tears down) a session for the run, while a session is reused as-is and never torn down
+/// by the runner. With [`session_state`](Self::session_state) the client reattaches to the
+/// session a previous run left suspended.
 #[derive(Debug, Clone, Default)]
 pub struct SandboxRunConfig {
-    /// Sandbox client used to create a fresh session for the run.
+    /// Sandbox client used to create or resume a session for the run.
     pub client: Option<Arc<dyn SandboxClient>>,
     /// A live sandbox session to reuse instead of creating one.
     pub session: Option<Arc<dyn SandboxSession>>,
-    /// Manifest override for a fresh session, taking precedence over
-    /// [`SandboxAgent::default_manifest`].
+    /// State persisted by a previous run, used to resume its workspace.
+    ///
+    /// The state carries no manifest contents: the trusted manifest still comes from the agent
+    /// or from [`manifest`](Self::manifest), and the client rejects a mismatch.
+    pub session_state: Option<SandboxSessionState>,
+    /// Manifest override, taking precedence over [`SandboxAgent::default_manifest`].
     pub manifest: Option<Manifest>,
+    /// Identifier of the memory rollout this run belongs to.
+    ///
+    /// Runs that share a rollout id are consolidated into one memory artifact. A fresh id is
+    /// generated when this is unset.
+    pub rollout_id: Option<String>,
     /// Model-facing working directory, relative to the sandbox workspace root.
     ///
     /// Relative paths used by the capability tools resolve from this directory. It changes
@@ -54,7 +68,13 @@ impl SandboxRunConfig {
         }
     }
 
-    /// Override the manifest used for a fresh session.
+    /// Resume the session a previous run suspended.
+    pub fn session_state(mut self, state: SandboxSessionState) -> Self {
+        self.session_state = Some(state);
+        self
+    }
+
+    /// Override the manifest used for the session.
     pub fn manifest(mut self, manifest: Manifest) -> Self {
         self.manifest = Some(manifest);
         self
@@ -65,13 +85,19 @@ impl SandboxRunConfig {
         self.cwd = Some(cwd.into());
         self
     }
+
+    /// Set the memory rollout this run belongs to.
+    pub fn rollout_id(mut self, rollout_id: impl Into<String>) -> Self {
+        self.rollout_id = Some(rollout_id.into());
+        self
+    }
 }
 
 /// Owns the teardown of a sandbox session for the duration of a run.
 ///
-/// A session created from a [`SandboxRunConfig::client`] is shut down by
-/// [`close`](Self::close); a session supplied through [`SandboxRunConfig::session`] is left
-/// untouched, because the caller owns it.
+/// A session created from a [`SandboxRunConfig::client`] is released by
+/// [`close`](Self::close) or kept alive by [`suspend`](Self::suspend); a session supplied
+/// through [`SandboxRunConfig::session`] is left untouched, because the caller owns it.
 #[derive(Debug, Clone)]
 pub struct SandboxSessionGuard {
     session: Arc<dyn SandboxSession>,
@@ -90,51 +116,108 @@ impl SandboxSessionGuard {
     }
 
     /// Tear down the session when the guard owns it.
+    ///
+    /// PTY sessions are terminated first, so no interactive process outlives the workspace.
     pub async fn close(self) -> Result<()> {
+        let _ = self.session.pty_terminate_all().await;
         match self.client {
             None => Ok(()),
             Some(client) => Ok(client.delete(self.session).await?),
         }
     }
+
+    /// Keep the session alive for a later run and return the state needed to reattach to it.
+    ///
+    /// Interactive processes are terminated and the workspace is captured into the session's
+    /// snapshot, but neither the workspace nor the backend resource is released.
+    pub async fn suspend(self) -> Result<SandboxSessionState> {
+        let _ = self.session.pty_terminate_all().await;
+        persist_session_snapshot(self.session.as_ref()).await?;
+        Ok(self.session.session_state())
+    }
 }
 
-/// A [`SandboxAgent`] prepared against a live session, ready for [`Runner`].
+/// A [`SandboxAgent`] graph prepared against a live session, ready for [`Runner`].
 pub struct PreparedSandboxRun<C> {
-    /// The plain agent carrying the sandbox instructions and capability tools.
-    pub agent: Agent<C>,
+    /// The prepared agent graph.
+    pub graph: PreparedSandboxGraph<C>,
     /// The session teardown guard.
     pub guard: SandboxSessionGuard,
+    /// The memory generation manager for this session, when the agent enables generation.
+    pub memory_manager: Option<Arc<SandboxMemoryGenerationManager>>,
 }
 
 impl<C> fmt::Debug for PreparedSandboxRun<C> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PreparedSandboxRun")
-            .field("agent", &self.agent.name)
+            .field("graph", &self.graph)
             .field("session", &self.guard.session().id())
-            .finish_non_exhaustive()
+            .field("memory_manager", &self.memory_manager.is_some())
+            .finish()
     }
 }
 
-impl<C> PreparedSandboxRun<C> {
-    /// The live sandbox session the agent is bound to.
+impl<C: Send + Sync + 'static> PreparedSandboxRun<C> {
+    /// The memory generation manager bound to this session, when there is one.
+    pub fn memory_manager(&self) -> Option<&Arc<SandboxMemoryGenerationManager>> {
+        self.memory_manager.as_ref()
+    }
+
+    /// The live sandbox session the graph is bound to.
     pub fn session(&self) -> &Arc<dyn SandboxSession> {
         self.guard.session()
     }
+
+    /// The prepared agent the run starts from.
+    pub fn agent(&self) -> &Arc<crate::agent::Agent<C>> {
+        self.graph.starting_agent()
+    }
 }
 
-/// Runs [`SandboxAgent`]s: creates or reuses a sandbox session, binds the capability tools to
-/// it, hands the prepared agent to [`Runner`], and tears the session down afterwards.
-///
-/// Handoffs to other [`SandboxAgent`]s are not prepared automatically: only the starting agent is
-/// bound to the session. Prepare handoff targets yourself with
-/// [`SandboxAgent::prepare`] against the same session when a run needs them.
+/// A finished sandbox run plus the state needed to resume its workspace.
+pub struct SandboxRunOutcome<C> {
+    /// The result of the agent run.
+    pub result: RunResult<C>,
+    /// Session state to persist, present when the run left the sandbox suspended.
+    ///
+    /// This is set when the run ended with approval interruptions: the workspace and the backend
+    /// resource are kept, so a later run can continue with
+    /// [`SandboxRunConfig::session_state`].
+    pub sandbox_state: Option<SandboxSessionState>,
+    /// The memory generation manager of the session, when the run did not flush it.
+    ///
+    /// The runner flushes only when it tears down a session it owns, so this is set for a
+    /// suspended run and for a session the caller supplied.
+    pub memory_manager: Option<Arc<SandboxMemoryGenerationManager>>,
+}
+
+impl<C: Send + Sync + 'static> SandboxRunOutcome<C> {
+    /// The memory generation manager of the session, when the run did not flush it.
+    pub fn memory_manager(&self) -> Option<&Arc<SandboxMemoryGenerationManager>> {
+        self.memory_manager.as_ref()
+    }
+}
+
+impl<C> fmt::Debug for SandboxRunOutcome<C> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SandboxRunOutcome")
+            .field("result", &self.result)
+            .field("sandbox_state", &self.sandbox_state)
+            .field("memory_manager", &self.memory_manager.is_some())
+            .finish()
+    }
+}
+
+/// Runs [`SandboxAgent`]s: creates, resumes or reuses a sandbox session, binds the capability
+/// tools of the whole handoff graph to it, hands the prepared agent to [`Runner`], and either
+/// tears the session down or suspends it afterwards.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SandboxRunner;
 
 impl SandboxRunner {
-    /// Create or reuse the sandbox session and prepare the agent against it.
+    /// Create, resume or reuse the sandbox session and prepare the agent graph against it.
     ///
-    /// The caller owns the returned [`SandboxSessionGuard`] and must `close()` it.
+    /// The caller owns the returned [`SandboxSessionGuard`] and must `close()` or `suspend()` it.
     pub async fn prepare<C: Send + Sync + 'static>(
         agent: &SandboxAgent<C>,
         config: &SandboxRunConfig,
@@ -144,7 +227,10 @@ impl SandboxRunner {
             (Some(session), _) => (session.clone(), None),
             (None, Some(client)) => {
                 let manifest = agent.resolved_manifest(config.manifest.clone());
-                let session = client.create(Some(manifest)).await?;
+                let session = match &config.session_state {
+                    None => client.create(Some(manifest)).await?,
+                    Some(state) => client.resume(state, manifest).await?,
+                };
                 if let Err(error) = session.start().await {
                     // Release the backend resources the failed start may already hold.
                     let _ = client.delete(session.clone()).await;
@@ -170,10 +256,21 @@ impl SandboxRunner {
         let binding = CapabilityBinding::new(session)
             .with_run_as(agent.run_as.clone())
             .with_scope(scope);
-        match agent.prepare(&binding).await {
-            Ok(prepared) => Ok(PreparedSandboxRun {
-                agent: prepared,
+        // One manager per session, so reusing an agent across sessions or concurrent runs never
+        // shares rollout state or latches generation off.
+        let memory_manager = match agent.memory_capability().map(|m| m.build_manager()) {
+            None => None,
+            Some(Ok(manager)) => manager,
+            Some(Err(error)) => {
+                let _ = guard.close().await;
+                return Err(error);
+            }
+        };
+        match agent.prepare_graph(&binding).await {
+            Ok(graph) => Ok(PreparedSandboxRun {
+                graph,
                 guard,
+                memory_manager,
             }),
             Err(error) => {
                 let _ = guard.close().await;
@@ -193,29 +290,96 @@ impl SandboxRunner {
 
     /// Run a sandbox agent with explicit [`RunOptions`].
     ///
-    /// The session is torn down before this returns, including when the run fails. A run that
-    /// ends with approval interruptions therefore cannot be resumed against the same workspace
-    /// unless the session was supplied through [`SandboxRunConfig::session`], or the run was set
-    /// up with [`prepare`](Self::prepare).
+    /// A run that completes releases the session. A run that pauses on approval interruptions
+    /// keeps it: use [`run_to_outcome`](Self::run_to_outcome) to receive the
+    /// [`SandboxSessionState`] needed to resume it.
     pub async fn run_with_options<C: Send + Sync + 'static>(
         agent: &SandboxAgent<C>,
         input: impl Into<RunInput>,
         config: &SandboxRunConfig,
         options: RunOptions<C>,
     ) -> Result<RunResult<C>> {
+        Self::run_to_outcome(agent, input, config, options)
+            .await
+            .map(|outcome| outcome.result)
+    }
+
+    /// Run a sandbox agent and report whether the sandbox was suspended.
+    ///
+    /// When the run pauses on approval interruptions the session is suspended rather than torn
+    /// down: PTY processes are terminated, the workspace is captured into the session snapshot,
+    /// and [`SandboxRunOutcome::sandbox_state`] carries the state to persist alongside
+    /// [`RunResult::to_state`](crate::RunResult::to_state).
+    pub async fn run_to_outcome<C: Send + Sync + 'static>(
+        agent: &SandboxAgent<C>,
+        input: impl Into<RunInput>,
+        config: &SandboxRunConfig,
+        options: RunOptions<C>,
+    ) -> Result<SandboxRunOutcome<C>> {
         let prepared = Self::prepare(agent, config).await?;
-        let input = prepare_input(agent, input.into());
-        let result = Runner::run_with_options(prepared.agent, input, options).await;
-        if let Err(error) = prepared.guard.close().await {
-            log::warn!("Failed to tear down the sandbox session: {error}");
+        let model_provider = options.run_config.model_provider.clone();
+        let options = install_per_turn_preparation(options, &prepared.graph);
+        let starting_agent = prepared.graph.starting_agent().clone();
+        let result = Runner::run_with_options(starting_agent, input, options).await;
+
+        // Record the run as a memory rollout segment, whether it finished or paused.
+        let memory = prepared.memory_manager.clone();
+        if let (Some(manager), Ok(result)) = (&memory, &result) {
+            let rollout_id = config
+                .rollout_id
+                .clone()
+                .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
+            if let Err(error) = manager
+                .enqueue_result(prepared.guard.session().as_ref(), &rollout_id, result)
+                .await
+            {
+                log::warn!("Failed to record the sandbox memory rollout: {error}");
+            }
         }
-        result
+
+        let suspend = matches!(&result, Ok(result) if !result.interruptions.is_empty());
+        // Memory generation runs only on a final close: a suspended session will be resumed, and
+        // a caller-owned session is flushed by the caller.
+        let mut flushed = false;
+        if !suspend
+            && prepared.guard.owns_session()
+            && let Some(manager) = &memory
+        {
+            flushed = true;
+            if let Err(error) = manager
+                .flush(prepared.guard.session().clone(), model_provider)
+                .await
+            {
+                log::warn!("Failed to generate sandbox memory: {error}");
+            }
+        }
+
+        let sandbox_state = if suspend {
+            match prepared.guard.suspend().await {
+                Ok(state) => Some(state),
+                Err(error) => {
+                    log::warn!("Failed to suspend the sandbox session: {error}");
+                    None
+                }
+            }
+        } else {
+            if let Err(error) = prepared.guard.close().await {
+                log::warn!("Failed to tear down the sandbox session: {error}");
+            }
+            None
+        };
+        Ok(SandboxRunOutcome {
+            result: result?,
+            sandbox_state,
+            // The manager is handed back only when this run did not flush it.
+            memory_manager: if flushed { None } else { memory },
+        })
     }
 
     /// Run a sandbox agent in streaming mode.
     ///
-    /// The returned guard must be closed once the stream is drained; tearing the session down
-    /// earlier would pull the workspace out from under the running tools.
+    /// The returned guard must be closed (or suspended) once the stream is drained; tearing the
+    /// session down earlier would pull the workspace out from under the running tools.
     pub async fn run_streamed_with_options<C: Send + Sync + 'static>(
         agent: &SandboxAgent<C>,
         input: impl Into<RunInput>,
@@ -223,17 +387,48 @@ impl SandboxRunner {
         options: RunOptions<C>,
     ) -> Result<(RunResultStreaming<C>, SandboxSessionGuard)> {
         let prepared = Self::prepare(agent, config).await?;
-        let input = prepare_input(agent, input.into());
-        let streaming = Runner::run_streamed_with_options(prepared.agent, input, options);
+        let options = install_per_turn_preparation(options, &prepared.graph);
+        let starting_agent = prepared.graph.starting_agent().clone();
+        let streaming = Runner::run_streamed_with_options(starting_agent, input, options);
         Ok((streaming, prepared.guard))
     }
 }
 
-fn prepare_input<C: Send + Sync + 'static>(agent: &SandboxAgent<C>, input: RunInput) -> RunInput {
-    match input {
-        RunInput::Items(items) => RunInput::Items(agent.prepare_input(items)),
-        other => other,
-    }
+/// Install the capability `process_context` chain as a per-turn model input filter.
+///
+/// Python re-prepares a sandbox agent on every turn, which re-applies `process_context` to the
+/// model input. `RunConfig::call_model_input_filter` is the equivalent hook here, and it also
+/// covers handoff targets, because the filter looks the capability set up by agent name. Any
+/// filter the caller already configured still runs first.
+fn install_per_turn_preparation<C: Send + Sync + 'static>(
+    mut options: RunOptions<C>,
+    graph: &PreparedSandboxGraph<C>,
+) -> RunOptions<C> {
+    let graph = graph.clone();
+    let existing = options.run_config.call_model_input_filter.take();
+    options.run_config.call_model_input_filter = Some(Arc::new(move |data| {
+        let graph = graph.clone();
+        let existing = existing.clone();
+        Box::pin(async move {
+            let agent_name = data.agent.name.clone();
+            let model_data = match existing {
+                None => data.model_data,
+                Some(filter) => {
+                    filter(crate::run_config::CallModelData {
+                        model_data: data.model_data,
+                        agent: data.agent,
+                        context: data.context,
+                    })
+                    .await?
+                }
+            };
+            Ok(ModelInputData {
+                input: graph.process_context(&agent_name, model_data.input),
+                instructions: model_data.instructions,
+            })
+        })
+    }));
+    options
 }
 
 /// Confirm the configured working directory exists and is traversable for the sandbox user.

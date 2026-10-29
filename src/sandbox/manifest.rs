@@ -4,10 +4,18 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::sandbox::entries::{Entry, EntryKind};
-use crate::sandbox::errors::SandboxResult;
+use crate::sandbox::errors::{ErrorCode, SandboxError, SandboxResult};
+use crate::sandbox::mounts::{HostPathGrant, Mount, MountCredentialAuthority};
 use crate::sandbox::session::{ExecRequest, SandboxSession};
 use crate::sandbox::types::{Group, User};
 use crate::sandbox::workspace_paths::resolve_workspace_path;
+
+/// Commands the model may run on remote mounts by default. Mirrors
+/// `DEFAULT_REMOTE_MOUNT_COMMAND_ALLOWLIST`.
+pub const DEFAULT_REMOTE_MOUNT_COMMAND_ALLOWLIST: &[&str] = &[
+    "ls", "find", "stat", "cat", "less", "head", "tail", "du", "grep", "rg", "wc", "sort", "cut",
+    "cp", "tee", "echo", "mkdir", "rm",
+];
 
 /// The default workspace root. Backends that own their workspace (such as Unix-local) replace
 /// it with a real directory when they create a session.
@@ -19,8 +27,8 @@ pub const MAX_MANIFEST_DESCRIPTION_CHARS: usize = 5000;
 /// Depth of the rendered workspace layout.
 const MANIFEST_DESCRIPTION_DEPTH: usize = 3;
 
-/// The files, directories and accounts a fresh sandbox session starts from.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// The files, directories, mounts and accounts a fresh sandbox session starts from.
+#[derive(Debug, Clone)]
 pub struct Manifest {
     version: u8,
     root: String,
@@ -28,6 +36,9 @@ pub struct Manifest {
     environment: BTreeMap<String, String>,
     users: Vec<User>,
     groups: Vec<Group>,
+    remote_mount_command_allowlist: Vec<String>,
+    credential_exposure_acknowledged: BTreeSet<String>,
+    broad_credential_exposure_acknowledged: BTreeSet<String>,
 }
 
 impl Default for Manifest {
@@ -39,6 +50,12 @@ impl Default for Manifest {
             environment: BTreeMap::new(),
             users: Vec::new(),
             groups: Vec::new(),
+            remote_mount_command_allowlist: DEFAULT_REMOTE_MOUNT_COMMAND_ALLOWLIST
+                .iter()
+                .map(|c| (*c).to_string())
+                .collect(),
+            credential_exposure_acknowledged: BTreeSet::new(),
+            broad_credential_exposure_acknowledged: BTreeSet::new(),
         }
     }
 }
@@ -115,6 +132,148 @@ impl Manifest {
         self
     }
 
+    /// Commands the model may run on remote mounts.
+    pub fn remote_mount_command_allowlist(&self) -> &[String] {
+        &self.remote_mount_command_allowlist
+    }
+
+    /// Replace the remote mount command allowlist.
+    pub fn with_remote_mount_command_allowlist<I, S>(mut self, commands: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.remote_mount_command_allowlist = commands.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Acknowledge mount-scoped credential exposure for exact in-container mount paths.
+    ///
+    /// An in-container mount whose pattern writes a credential inside the sandbox cannot be
+    /// activated until its exact mount path is acknowledged here. This is trusted
+    /// application-side policy: it is runtime-only and never serialized into session state.
+    pub fn with_in_container_mount_credential_exposure_acknowledged<I, S>(
+        mut self,
+        mount_paths: I,
+    ) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.credential_exposure_acknowledged
+            .extend(mount_paths.into_iter().map(Into::into));
+        self
+    }
+
+    /// Acknowledge broad credential exposure (managed or workload identity, external credential
+    /// files) for exact in-container mount paths.
+    pub fn with_in_container_mount_broad_credential_exposure_acknowledged<I, S>(
+        mut self,
+        mount_paths: I,
+    ) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.broad_credential_exposure_acknowledged
+            .extend(mount_paths.into_iter().map(Into::into));
+        self
+    }
+
+    /// Visit every entry, including the children of directory entries, with its absolute
+    /// workspace path.
+    pub fn iter_entries(&self) -> Vec<(String, &Entry)> {
+        fn walk<'a>(out: &mut Vec<(String, &'a Entry)>, dest: String, entry: &'a Entry) {
+            out.push((dest.clone(), entry));
+            if let EntryKind::Dir { children } = &entry.kind {
+                for (name, child) in children {
+                    walk(
+                        out,
+                        format!("{}/{}", dest.trim_end_matches('/'), name.trim_matches('/')),
+                        child,
+                    );
+                }
+            }
+        }
+        let mut out = Vec::new();
+        if let Ok(validated) = self.validated_entries() {
+            for (_, dest, entry) in validated {
+                walk(&mut out, dest, entry);
+            }
+        }
+        out
+    }
+
+    /// Every mount in the manifest with its resolved mount path, deepest first.
+    pub fn mount_targets(&self) -> Vec<(&Mount, String)> {
+        let mut mounts: Vec<(&Mount, String)> = Vec::new();
+        for (dest, entry) in self.iter_entries() {
+            let Some(mount) = entry.as_mount() else {
+                continue;
+            };
+            let Ok(path) = mount.resolve_mount_path(&self.root, &dest) else {
+                continue;
+            };
+            mounts.push((mount, path));
+        }
+        mounts.sort_by_key(|(_, path)| std::cmp::Reverse(path.matches('/').count()));
+        mounts
+    }
+
+    /// Host paths the SDK may use directly because a mount exposes them.
+    pub fn host_path_grants(&self) -> Vec<HostPathGrant> {
+        self.mount_targets()
+            .into_iter()
+            .filter_map(|(mount, _)| mount.strategy.host_path_grant(mount))
+            .collect()
+    }
+
+    /// Absolute workspace paths that snapshots must exclude and resume must re-apply.
+    pub fn ephemeral_paths(&self) -> Vec<String> {
+        let mut paths: Vec<String> = self
+            .iter_entries()
+            .into_iter()
+            .filter(|(_, entry)| entry.ephemeral)
+            .map(|(dest, _)| dest)
+            .collect();
+        paths.extend(self.mount_targets().into_iter().map(|(_, path)| path));
+        paths.sort_unstable();
+        paths.dedup();
+        paths
+    }
+
+    /// Check that activating `mount` at `mount_path` respects the credential-exposure policy.
+    ///
+    /// Returns [`ErrorCode::MountConfigInvalid`] when the mount would write a credential into
+    /// the sandbox at a path the application has not acknowledged. The error text never
+    /// includes the mount configuration.
+    pub fn authorize_mount_activation(&self, mount: &Mount, mount_path: &str) -> SandboxResult<()> {
+        let authority = mount.strategy.credential_authority();
+        let acknowledged = match authority {
+            MountCredentialAuthority::None => return Ok(()),
+            MountCredentialAuthority::MountScoped => {
+                self.credential_exposure_acknowledged.contains(mount_path)
+                    || self
+                        .broad_credential_exposure_acknowledged
+                        .contains(mount_path)
+            }
+            MountCredentialAuthority::Broad => self
+                .broad_credential_exposure_acknowledged
+                .contains(mount_path),
+        };
+        if acknowledged {
+            return Ok(());
+        }
+        Err(SandboxError::new(
+            ErrorCode::MountConfigInvalid,
+            format!(
+                "mount at `{mount_path}` exposes `{}` credential authority inside the sandbox; \
+                 acknowledge the exact mount path on the Manifest before activating it",
+                authority.as_str()
+            ),
+        ))
+    }
+
     /// Validate every entry path against the workspace root.
     pub fn validated_entries(&self) -> SandboxResult<Vec<(String, String, &Entry)>> {
         let mut validated = Vec::with_capacity(self.entries.len());
@@ -130,19 +289,55 @@ impl Manifest {
     /// Accounts are provisioned first (best effort, as in Python: a sandbox without `useradd`
     /// simply keeps running), then the workspace root, then every entry.
     pub async fn apply(&self, session: &dyn SandboxSession) -> SandboxResult<Vec<String>> {
+        self.apply_entries(session, false).await
+    }
+
+    /// Re-apply only the ephemeral entries, as a resumed session does after restoring a snapshot.
+    pub async fn apply_ephemeral(
+        &self,
+        session: &dyn SandboxSession,
+    ) -> SandboxResult<Vec<String>> {
+        self.apply_entries(session, true).await
+    }
+
+    async fn apply_entries(
+        &self,
+        session: &dyn SandboxSession,
+        only_ephemeral: bool,
+    ) -> SandboxResult<Vec<String>> {
         let validated = self.validated_entries()?;
         session.mkdir(&self.root, true).await?;
-        self.provision_accounts(session).await;
+        if !only_ephemeral {
+            self.provision_accounts(session).await;
+        }
         let mut written = Vec::new();
         for (_, dest, entry) in validated {
-            if entry.is_dir() {
-                session.mkdir(&dest, true).await?;
-            } else if let Some(parent) = parent_path(&dest) {
-                session.mkdir(&parent, true).await?;
+            if only_ephemeral && !entry.ephemeral {
+                continue;
+            }
+            if entry.as_mount().is_none() {
+                if entry.is_dir() {
+                    session.mkdir(&dest, true).await?;
+                } else if let Some(parent) = parent_path(&dest) {
+                    session.mkdir(&parent, true).await?;
+                }
             }
             written.extend(entry.apply(session, &dest).await?);
         }
         Ok(written)
+    }
+
+    /// Detach every mount, deepest first, before the session stops.
+    pub async fn unmount_all(&self, session: &dyn SandboxSession) -> SandboxResult<()> {
+        for (mount, path) in self.mount_targets() {
+            if session.attaches_mounts_at_create()
+                && mount.strategy.docker_create_args(mount, &path).is_some()
+            {
+                continue;
+            }
+            mount.strategy.deactivate(mount, session, &path).await?;
+        }
+        Ok(())
     }
 
     async fn provision_accounts(&self, session: &dyn SandboxSession) {
@@ -218,6 +413,9 @@ fn render_entry(out: &mut String, name: &str, entry: &Entry, level: usize, depth
     out.push_str(&indent);
     out.push_str(name.trim_matches('/'));
     out.push_str(suffix);
+    if entry.as_mount().is_some() {
+        out.push_str(" (mount)");
+    }
     if let Some(description) = &entry.description {
         out.push_str(" - ");
         out.push_str(description);

@@ -1,0 +1,281 @@
+//! The PTY-backed `exec_command` and `write_stdin` tools. Mirrors
+//! `agents.sandbox.capabilities.tools.shell_tool`.
+
+use std::sync::Arc;
+
+use schemars::JsonSchema;
+use serde::Deserialize;
+
+use crate::error::AgentsError;
+use crate::sandbox::errors::ErrorCode;
+use crate::sandbox::pty::{
+    DEFAULT_EXEC_YIELD_TIME_MS, DEFAULT_WRITE_STDIN_YIELD_TIME_MS, PtyExecRequest, PtyExecUpdate,
+    PtyWriteRequest,
+};
+use crate::sandbox::session::{ExecShell, SandboxSession};
+use crate::sandbox::types::User;
+use crate::sandbox::workspace_paths::SandboxWorkspaceScope;
+use crate::tool::{FunctionTool, Tool};
+
+/// The name of the PTY command tool.
+pub const EXEC_COMMAND_TOOL_NAME: &str = "exec_command";
+/// The name of the PTY stdin tool.
+pub const WRITE_STDIN_TOOL_NAME: &str = "write_stdin";
+
+const EXEC_COMMAND_DESCRIPTION: &str =
+    "Runs a command in a PTY, returning output or a session ID for ongoing interaction.";
+const WRITE_STDIN_DESCRIPTION: &str =
+    "Writes characters to an existing unified exec session and returns recent output.";
+const TOOL_OUTPUT_HEADER: &str = "Output:";
+
+fn default_exec_yield_time_ms() -> u64 {
+    DEFAULT_EXEC_YIELD_TIME_MS
+}
+
+fn default_write_stdin_yield_time_ms() -> u64 {
+    DEFAULT_WRITE_STDIN_YIELD_TIME_MS
+}
+
+fn default_login() -> bool {
+    true
+}
+
+/// Arguments of the `exec_command` tool.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct ExecCommandArgs {
+    /// Shell command to execute.
+    pub cmd: String,
+    /// Optional working directory to run the command in; defaults to the turn cwd.
+    #[serde(default)]
+    pub workdir: Option<String>,
+    /// Shell binary to launch. Defaults to the user's default shell.
+    #[serde(default)]
+    pub shell: Option<String>,
+    /// Whether to run the shell with `-l`/`-i` semantics. Defaults to true.
+    #[serde(default = "default_login")]
+    pub login: bool,
+    /// Whether to allocate a TTY for the command. Defaults to false (plain pipes); set to true
+    /// to open a PTY and access the TTY process.
+    #[serde(default)]
+    pub tty: bool,
+    /// How long to wait (in milliseconds) for output before yielding.
+    #[serde(default = "default_exec_yield_time_ms")]
+    pub yield_time_ms: u64,
+    /// Maximum number of tokens to return. Excess output will be truncated.
+    #[serde(default)]
+    pub max_output_tokens: Option<usize>,
+}
+
+/// Arguments of the `write_stdin` tool.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct WriteStdinArgs {
+    /// Identifier of the running unified exec session.
+    pub session_id: u32,
+    /// Bytes to write to stdin (may be empty to poll).
+    #[serde(default)]
+    pub chars: String,
+    /// How long to wait (in milliseconds) for output before yielding.
+    #[serde(default = "default_write_stdin_yield_time_ms")]
+    pub yield_time_ms: u64,
+    /// Maximum number of tokens to return. Excess output will be truncated.
+    #[serde(default)]
+    pub max_output_tokens: Option<usize>,
+}
+
+/// Resolve the shell prefix the way Python's `_resolve_shell` does.
+fn resolve_shell(shell: Option<&str>, login: bool) -> ExecShell {
+    match shell {
+        None if login => ExecShell::Login,
+        None => ExecShell::Custom(vec!["sh".into(), "-c".into()]),
+        Some(shell) => ExecShell::Custom(vec![
+            shell.to_string(),
+            if login { "-lc" } else { "-c" }.to_string(),
+        ]),
+    }
+}
+
+/// Format a PTY result the way the Python tool does.
+fn format_response(
+    output: &str,
+    wall_time_seconds: f64,
+    exit_code: Option<i32>,
+    process_id: Option<u32>,
+    original_token_count: Option<usize>,
+) -> String {
+    let mut sections = vec![
+        format!(
+            "Chunk ID: {}",
+            &uuid::Uuid::new_v4().simple().to_string()[..6]
+        ),
+        format!("Wall time: {wall_time_seconds:.4} seconds"),
+    ];
+    if let Some(exit_code) = exit_code {
+        sections.push(format!("Process exited with code {exit_code}"));
+    }
+    if let Some(process_id) = process_id {
+        sections.push(format!("Process running with session ID {process_id}"));
+    }
+    if let Some(original_token_count) = original_token_count {
+        sections.push(format!("Original token count: {original_token_count}"));
+    }
+    sections.push(TOOL_OUTPUT_HEADER.to_string());
+    sections.push(output.to_string());
+    sections.join("\n")
+}
+
+fn response_from_update(update: &PtyExecUpdate, elapsed: f64) -> String {
+    format_response(
+        &update.output_text(),
+        elapsed,
+        update.exit_code,
+        update.process_id,
+        update.original_token_count,
+    )
+}
+
+/// Build the `exec_command` tool bound to a session.
+pub fn exec_command_tool<C: Send + Sync + 'static>(
+    session: Arc<dyn SandboxSession>,
+    run_as: Option<User>,
+    scope: SandboxWorkspaceScope,
+    needs_approval: bool,
+) -> Tool<C> {
+    let tool = FunctionTool::<C>::new(
+        EXEC_COMMAND_TOOL_NAME,
+        EXEC_COMMAND_DESCRIPTION,
+        move |_ctx, args: ExecCommandArgs| {
+            let session = session.clone();
+            let run_as = run_as.clone();
+            let scope = scope.clone();
+            async move {
+                let started = std::time::Instant::now();
+                let workdir = match args.workdir.as_deref().map(str::trim) {
+                    None | Some("") => scope.cwd().map(str::to_string),
+                    Some(workdir) => Some(scope.anchor(workdir)),
+                };
+                if let Some(workdir) = &workdir
+                    && session.normalize_path(workdir).is_err()
+                {
+                    return Ok::<_, AgentsError>(
+                        "Invalid workdir. Use a path within the workspace.".to_string(),
+                    );
+                }
+                let request = PtyExecRequest::new(args.cmd)
+                    .with_shell(resolve_shell(args.shell.as_deref(), args.login))
+                    .with_tty(args.tty)
+                    .with_user(run_as)
+                    .with_cwd(workdir)
+                    .with_yield_time_ms(args.yield_time_ms)
+                    .with_max_output_tokens(args.max_output_tokens);
+                match session.pty_exec_start(request).await {
+                    Ok(update) => Ok(response_from_update(
+                        &update,
+                        started.elapsed().as_secs_f64(),
+                    )),
+                    Err(error) if error.is_timeout() => Ok(format_response(
+                        &format!(
+                            "Command timed out after {:.3} seconds.",
+                            args.yield_time_ms as f64 / 1000.0
+                        ),
+                        started.elapsed().as_secs_f64(),
+                        None,
+                        None,
+                        None,
+                    )),
+                    Err(error) => Err(AgentsError::from(error)),
+                }
+            }
+        },
+    )
+    .with_strict_json_schema(false)
+    .with_needs_approval(needs_approval);
+    Tool::Function(Arc::new(tool))
+}
+
+/// Build the `write_stdin` tool bound to a session.
+pub fn write_stdin_tool<C: Send + Sync + 'static>(
+    session: Arc<dyn SandboxSession>,
+    needs_approval: bool,
+) -> Tool<C> {
+    let tool = FunctionTool::<C>::new(
+        WRITE_STDIN_TOOL_NAME,
+        WRITE_STDIN_DESCRIPTION,
+        move |_ctx, args: WriteStdinArgs| {
+            let session = session.clone();
+            async move {
+                let started = std::time::Instant::now();
+                let request = PtyWriteRequest::new(args.session_id, args.chars)
+                    .with_yield_time_ms(args.yield_time_ms)
+                    .with_max_output_tokens(args.max_output_tokens);
+                match session.pty_write_stdin(request).await {
+                    Ok(update) => Ok::<_, AgentsError>(response_from_update(
+                        &update,
+                        started.elapsed().as_secs_f64(),
+                    )),
+                    Err(error) if error.code == ErrorCode::PtySessionNotFound => {
+                        Ok(format_response(
+                            &format!("write_stdin failed: {}", error.message),
+                            started.elapsed().as_secs_f64(),
+                            Some(1),
+                            None,
+                            None,
+                        ))
+                    }
+                    Err(error) if error.code == ErrorCode::PtyStdinUnavailable => {
+                        Ok(format_response(
+                            "stdin is not available for this process. Start the command with \
+                             `tty=true` in `exec_command` before using `write_stdin`.",
+                            started.elapsed().as_secs_f64(),
+                            Some(1),
+                            None,
+                            None,
+                        ))
+                    }
+                    Err(error) => Err(AgentsError::from(error)),
+                }
+            }
+        },
+    )
+    .with_strict_json_schema(false)
+    .with_needs_approval(needs_approval);
+    Tool::Function(Arc::new(tool))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolves_shell_prefixes() {
+        assert_eq!(resolve_shell(None, true), ExecShell::Login);
+        assert_eq!(
+            resolve_shell(None, false),
+            ExecShell::Custom(vec!["sh".into(), "-c".into()])
+        );
+        assert_eq!(
+            resolve_shell(Some("bash"), true),
+            ExecShell::Custom(vec!["bash".into(), "-lc".into()])
+        );
+        assert_eq!(
+            resolve_shell(Some("bash"), false),
+            ExecShell::Custom(vec!["bash".into(), "-c".into()])
+        );
+    }
+
+    #[test]
+    fn formats_the_python_response_layout() {
+        let response = format_response("hello\n", 1.5, Some(0), None, Some(42));
+        let lines: Vec<&str> = response.lines().collect();
+        assert!(lines[0].starts_with("Chunk ID: "));
+        assert_eq!(lines[0].len(), "Chunk ID: ".len() + 6);
+        assert_eq!(lines[1], "Wall time: 1.5000 seconds");
+        assert_eq!(lines[2], "Process exited with code 0");
+        assert_eq!(lines[3], "Original token count: 42");
+        assert_eq!(lines[4], "Output:");
+        assert_eq!(lines[5], "hello");
+
+        let running = format_response("", 0.25, None, Some(1234), None);
+        assert!(running.contains("Process running with session ID 1234"));
+        assert!(!running.contains("Process exited"));
+    }
+}

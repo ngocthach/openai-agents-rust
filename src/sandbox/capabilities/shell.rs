@@ -6,6 +6,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 
 use crate::error::{AgentsError, Result};
+use crate::sandbox::capabilities::pty_tools::{exec_command_tool, write_stdin_tool};
 use crate::sandbox::capabilities::{Capability, CapabilityBinding};
 use crate::sandbox::manifest::Manifest;
 use crate::sandbox::session::ExecRequest;
@@ -19,22 +20,54 @@ const SHELL_INSTRUCTIONS: &str = "When using the shell:
 - Prefer `rg` and `rg --files` for text/file discovery when available.
 - Avoid using Python scripts just to print large file chunks.";
 
+const PTY_INSTRUCTIONS: &str = "When using the shell:
+- Use `shell` for one-shot command batches, and `exec_command` when you need a PTY or an \
+interactive session.
+- If available, use `write_stdin` to interact with or poll running sessions.
+- To interrupt a long-running process via `write_stdin`, start it with `tty=true` in \
+`exec_command` and send Ctrl-C (`\\u0003`).
+- Commands run from the run working directory inside the sandbox workspace.
+- Prefer `rg` and `rg --files` for text/file discovery when available.
+- Avoid using Python scripts just to print large file chunks.";
+
 /// Exposes the sandbox shell to the model as a [`ShellTool`].
 ///
 /// Each `shell_call` command is executed through
 /// [`SandboxSession::exec`](crate::sandbox::SandboxSession::exec) and reported back with its
 /// stdout, stderr and exit code. A command that exceeds the call's `timeout_ms` is reported as
 /// [`ShellCallOutcome::Timeout`] rather than failing the tool call.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Shell {
     tool_name: Option<String>,
     needs_approval: bool,
+    pty: bool,
+}
+
+impl Default for Shell {
+    fn default() -> Self {
+        Shell::new()
+    }
 }
 
 impl Shell {
-    /// The shell capability with the default tool name (`shell`).
+    /// The shell capability with the default tool name (`shell`), exposing the PTY tools on
+    /// sessions that support them.
     pub fn new() -> Self {
-        Shell::default()
+        Shell {
+            tool_name: None,
+            needs_approval: false,
+            pty: true,
+        }
+    }
+
+    /// Expose `exec_command` and `write_stdin` when the session supports a PTY (default: true).
+    ///
+    /// Python's shell capability exposes only these two tools. This port keeps the crate's
+    /// native `shell` tool as the one-shot path and adds the PTY pair alongside it, because
+    /// `write_stdin` needs a session id that a `shell_call` cannot return.
+    pub fn with_pty(mut self, pty: bool) -> Self {
+        self.pty = pty;
+        self
     }
 
     /// Rename the tool exposed to the model.
@@ -104,10 +137,30 @@ impl<C: Send + Sync + 'static> Capability<C> for Shell {
         if let Some(name) = &self.tool_name {
             tool = tool.with_name(name.clone());
         }
-        Ok(vec![Tool::Shell(Arc::new(tool))])
+        let mut tools = vec![Tool::Shell(Arc::new(tool))];
+        if self.pty && binding.session.supports_pty() {
+            tools.push(exec_command_tool(
+                binding.session.clone(),
+                binding.run_as.clone(),
+                binding.scope.clone(),
+                self.needs_approval,
+            ));
+            tools.push(write_stdin_tool(
+                binding.session.clone(),
+                self.needs_approval,
+            ));
+        }
+        Ok(tools)
     }
 
     async fn instructions(&self, _manifest: &Manifest) -> Result<Option<String>> {
-        Ok(Some(SHELL_INSTRUCTIONS.to_string()))
+        Ok(Some(
+            if self.pty {
+                PTY_INSTRUCTIONS
+            } else {
+                SHELL_INSTRUCTIONS
+            }
+            .to_string(),
+        ))
     }
 }

@@ -20,7 +20,12 @@ use async_trait::async_trait;
 
 use crate::sandbox::errors::{ErrorCode, SandboxError, SandboxResult};
 use crate::sandbox::manifest::{DEFAULT_MANIFEST_ROOT, Manifest};
-use crate::sandbox::session::{ExecRequest, SandboxClient, SandboxSession};
+use crate::sandbox::pty::{PtyExecRequest, PtyExecUpdate, PtyManager, PtySpawn, PtyWriteRequest};
+use crate::sandbox::session::{
+    ExecRequest, SandboxClient, SandboxSession, restore_session_snapshot,
+};
+use crate::sandbox::snapshot::{Snapshot, SnapshotSpec, resolve_snapshot};
+use crate::sandbox::state::{SandboxSessionState, is_sdk_owned_workspace_root};
 use crate::sandbox::types::ExecResult;
 
 /// Prefix of the temporary workspace directories created for Unix-local sessions.
@@ -36,6 +41,7 @@ const WORKSPACE_PREFIX: &str = "openai-agents-sandbox-";
 #[derive(Debug, Clone)]
 pub struct UnixLocalSandboxClient {
     inherit_host_environment: bool,
+    snapshot: Option<SnapshotSpec>,
 }
 
 impl Default for UnixLocalSandboxClient {
@@ -49,12 +55,19 @@ impl UnixLocalSandboxClient {
     pub fn new() -> Self {
         UnixLocalSandboxClient {
             inherit_host_environment: true,
+            snapshot: None,
         }
     }
 
     /// Whether sandbox commands inherit the host process environment (default: true).
     pub fn with_inherit_host_environment(mut self, inherit: bool) -> Self {
         self.inherit_host_environment = inherit;
+        self
+    }
+
+    /// Store workspace snapshots so a paused run can resume the same workspace.
+    pub fn with_snapshot(mut self, snapshot: SnapshotSpec) -> Self {
+        self.snapshot = Some(snapshot);
         self
     }
 }
@@ -76,7 +89,34 @@ impl SandboxClient for UnixLocalSandboxClient {
             (manifest, false)
         };
         let session = UnixLocalSandboxSession::new(manifest, owned_root)?
-            .with_inherit_host_environment(self.inherit_host_environment);
+            .with_inherit_host_environment(self.inherit_host_environment)
+            .with_snapshot(self.snapshot.clone());
+        Ok(Arc::new(session))
+    }
+
+    async fn resume(
+        &self,
+        state: &SandboxSessionState,
+        manifest: Manifest,
+    ) -> SandboxResult<Arc<dyn SandboxSession>> {
+        if state.backend != "unix_local" {
+            return Err(SandboxError::new(
+                ErrorCode::SessionStateMismatch,
+                format!(
+                    "sandbox session state was created by the `{}` backend",
+                    state.backend
+                ),
+            ));
+        }
+        state.verify_manifest(&manifest)?;
+        // The state carries no manifest contents of its own: the workspace root comes from it,
+        // but everything that could read host paths comes from the caller's trusted manifest.
+        let manifest = manifest.with_root(state.workspace_root.clone());
+        let session = UnixLocalSandboxSession::new(manifest, state.may_remove_workspace_root())?
+            .with_inherit_host_environment(self.inherit_host_environment)
+            .with_snapshot(Some(state.snapshot.clone()))
+            .with_identity(state.session_id.clone(), state.snapshot_id.clone())
+            .resuming();
         Ok(Arc::new(session))
     }
 
@@ -137,6 +177,10 @@ pub struct UnixLocalSandboxSession {
     owned_root: bool,
     inherit_host_environment: bool,
     running: AtomicBool,
+    ptys: PtyManager,
+    snapshot: Option<SnapshotSpec>,
+    snapshot_id: String,
+    resuming: bool,
 }
 
 impl UnixLocalSandboxSession {
@@ -154,14 +198,39 @@ impl UnixLocalSandboxSession {
                 ),
             ));
         }
+        let id = uuid::Uuid::new_v4().to_string();
         Ok(UnixLocalSandboxSession {
-            id: uuid::Uuid::new_v4().to_string(),
+            snapshot_id: id.clone(),
+            id,
             manifest,
             root,
             owned_root,
             inherit_host_environment: true,
             running: AtomicBool::new(false),
+            ptys: PtyManager::new(),
+            snapshot: None,
+            resuming: false,
         })
+    }
+
+    /// Store workspace snapshots at `snapshot`.
+    pub fn with_snapshot(mut self, snapshot: Option<SnapshotSpec>) -> Self {
+        self.snapshot = snapshot;
+        self
+    }
+
+    /// Reuse a persisted session and snapshot identity.
+    pub fn with_identity(mut self, session_id: String, snapshot_id: String) -> Self {
+        self.id = session_id;
+        self.snapshot_id = snapshot_id;
+        self
+    }
+
+    /// Mark the session as resuming, so `start` restores the snapshot instead of materializing
+    /// the full manifest.
+    pub fn resuming(mut self) -> Self {
+        self.resuming = true;
+        self
     }
 
     /// Whether sandbox commands inherit the host process environment.
@@ -178,6 +247,13 @@ impl UnixLocalSandboxSession {
     /// Resolve a model-provided path to a host path inside the workspace root, rejecting
     /// absolute paths outside the root, `..` segments and symlinks that escape the workspace.
     pub async fn host_path(&self, path: &str) -> SandboxResult<PathBuf> {
+        self.host_path_for(path, false).await
+    }
+
+    /// Resolve a model-provided path for reading or writing.
+    ///
+    /// Writes through a read-only mount are rejected.
+    pub async fn host_path_for(&self, path: &str, for_write: bool) -> SandboxResult<PathBuf> {
         let resolved = self.normalize_path(path)?;
         let candidate = PathBuf::from(&resolved);
         let real = resolve_existing_prefix(&candidate).await;
@@ -185,13 +261,36 @@ impl UnixLocalSandboxSession {
         // `/var/folders/...` resolves to `/private/var/folders/...`), and comparing a resolved
         // candidate against an unresolved root would reject every path inside the workspace.
         let real_root = resolve_existing_prefix(&self.root).await;
-        if !real.starts_with(&real_root) {
-            return Err(SandboxError::new(
-                ErrorCode::InvalidManifestPath,
-                format!("sandbox path `{path}` escapes the workspace root"),
-            ));
+        if real.starts_with(&real_root) {
+            return Ok(candidate);
         }
-        Ok(candidate)
+        // A bind mount deliberately points outside the workspace, so its source is an explicit
+        // grant. Writes through a read-only grant are still refused.
+        for grant in self.manifest.host_path_grants() {
+            let real_grant = resolve_existing_prefix(&grant.path).await;
+            if real.starts_with(&real_grant) {
+                if grant.read_only && for_write {
+                    return Err(SandboxError::new(
+                        ErrorCode::WorkspaceWriteTypeError,
+                        format!("sandbox path `{path}` is inside a read-only mount"),
+                    ));
+                }
+                return Ok(real);
+            }
+        }
+        Err(SandboxError::new(
+            ErrorCode::InvalidManifestPath,
+            format!("sandbox path `{path}` escapes the workspace root"),
+        ))
+    }
+
+    /// Whether the workspace root still holds anything, used to decide how much a resumed
+    /// session has to re-materialize.
+    async fn workspace_has_content(&self) -> bool {
+        match tokio::fs::read_dir(&self.root).await {
+            Err(_) => false,
+            Ok(mut entries) => matches!(entries.next_entry().await, Ok(Some(_))),
+        }
     }
 
     fn exec_env(&self) -> Vec<(String, String)> {
@@ -254,21 +353,49 @@ impl SandboxSession for UnixLocalSandboxSession {
             )
         })?;
         self.running.store(true, Ordering::SeqCst);
-        let manifest = self.manifest.clone();
-        manifest.apply(self).await.inspect_err(|_| {
+        let result = if self.resuming {
+            match restore_session_snapshot(self).await {
+                Ok(true) => Ok(()),
+                // Without a stored archive, the workspace the paused run left behind is all
+                // there is. Re-apply only the ephemeral entries when it survived; when it is
+                // gone (an evicted temp directory, a replacement container, a snapshot-less
+                // backend) materialize the whole manifest instead of handing the model an
+                // empty workspace.
+                Ok(false) => {
+                    let preserved = self.workspace_has_content().await;
+                    let manifest = self.manifest.clone();
+                    if preserved {
+                        manifest.apply_ephemeral(self).await.map(|_| ())
+                    } else {
+                        manifest.apply(self).await.map(|_| ())
+                    }
+                }
+                Err(error) => Err(error),
+            }
+        } else {
+            self.manifest.clone().apply(self).await.map(|_| ())
+        };
+        result.inspect_err(|_| {
             self.running.store(false, Ordering::SeqCst);
         })?;
         Ok(())
     }
 
     async fn stop(&self) -> SandboxResult<()> {
+        self.ptys.terminate_all();
+        self.manifest.unmount_all(self).await?;
         self.running.store(false, Ordering::SeqCst);
         Ok(())
     }
 
     async fn shutdown(&self) -> SandboxResult<()> {
+        self.ptys.terminate_all();
         self.running.store(false, Ordering::SeqCst);
-        if self.owned_root {
+        // Detach every mount before touching the workspace: an in-container mount materializes a
+        // real filesystem inside the root, and removing the root over a live mount would delete
+        // the mounted storage, not just the workspace.
+        self.manifest.unmount_all(self).await?;
+        if self.owned_root && is_sdk_owned_workspace_root(&self.root) {
             match tokio::fs::remove_dir_all(&self.root).await {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -287,6 +414,40 @@ impl SandboxSession for UnixLocalSandboxSession {
         Ok(self.running.load(Ordering::SeqCst))
     }
 
+    fn supports_pty(&self) -> bool {
+        true
+    }
+
+    async fn pty_exec_start(&self, request: PtyExecRequest) -> SandboxResult<PtyExecUpdate> {
+        let cwd = match &request.cwd {
+            None => self.root.clone(),
+            Some(cwd) => self.host_path_for(cwd, false).await?,
+        };
+        let spawn = PtySpawn {
+            argv: request.resolved_argv(),
+            cwd: Some(cwd),
+            env: self.exec_env(),
+            clear_env: !self.inherit_host_environment,
+            tty: request.tty,
+            remote_kill_command: None,
+        };
+        let (update, _cleanup) = self
+            .ptys
+            .start(spawn, request.yield_time_ms, request.max_output_tokens)
+            .await?;
+        Ok(update)
+    }
+
+    async fn pty_write_stdin(&self, request: PtyWriteRequest) -> SandboxResult<PtyExecUpdate> {
+        let (update, _cleanup) = self.ptys.write_stdin(&request).await?;
+        Ok(update)
+    }
+
+    async fn pty_terminate_all(&self) -> SandboxResult<()> {
+        self.ptys.terminate_all();
+        Ok(())
+    }
+
     async fn exec(&self, request: ExecRequest) -> SandboxResult<ExecResult> {
         let argv = request.resolved_argv();
         let Some((program, args)) = argv.split_first() else {
@@ -297,7 +458,7 @@ impl SandboxSession for UnixLocalSandboxSession {
         };
         let cwd = match &request.cwd {
             None => self.root.clone(),
-            Some(cwd) => self.host_path(cwd).await?,
+            Some(cwd) => self.host_path_for(cwd, false).await?,
         };
         let mut command = tokio::process::Command::new(program);
         command
@@ -343,7 +504,7 @@ impl SandboxSession for UnixLocalSandboxSession {
     }
 
     async fn read_file(&self, path: &str) -> SandboxResult<Vec<u8>> {
-        let host = self.host_path(path).await?;
+        let host = self.host_path_for(path, false).await?;
         tokio::fs::read(&host).await.map_err(|e| {
             let code = if e.kind() == std::io::ErrorKind::NotFound {
                 ErrorCode::WorkspaceReadNotFound
@@ -355,7 +516,7 @@ impl SandboxSession for UnixLocalSandboxSession {
     }
 
     async fn write_file(&self, path: &str, contents: &[u8]) -> SandboxResult<()> {
-        let host = self.host_path(path).await?;
+        let host = self.host_path_for(path, true).await?;
         if let Some(parent) = host.parent() {
             tokio::fs::create_dir_all(parent).await.map_err(|e| {
                 SandboxError::new(
@@ -370,6 +531,21 @@ impl SandboxSession for UnixLocalSandboxSession {
                 format!("Failed to write `{path}`: {e}"),
             )
         })
+    }
+
+    fn session_state(&self) -> SandboxSessionState {
+        SandboxSessionState::new(
+            "unix_local",
+            &self.id,
+            self.workspace_root(),
+            &self.manifest,
+        )
+        .with_workspace_root_owned(self.owned_root)
+        .with_snapshot(self.snapshot.clone().unwrap_or_default())
+    }
+
+    fn snapshot(&self) -> Arc<dyn Snapshot> {
+        resolve_snapshot(self.snapshot.as_ref(), &self.snapshot_id)
     }
 
     async fn hydrate_workspace(&self, archive: &[u8]) -> SandboxResult<()> {

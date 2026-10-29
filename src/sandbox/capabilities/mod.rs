@@ -20,11 +20,16 @@ use crate::tool::Tool;
 
 pub mod compaction;
 pub mod filesystem;
+pub mod memory;
+pub mod pty_tools;
 pub mod shell;
+pub mod skills;
 
 pub use compaction::{Compaction, CompactionPolicy, context_window_for_model};
 pub use filesystem::Filesystem;
+pub use memory::Memory;
 pub use shell::Shell;
+pub use skills::{LazySkillSource, LocalDirLazySkillSource, Skill, SkillMetadata, Skills};
 
 /// Everything a capability needs to build session-bound tools for one run.
 #[derive(Debug, Clone)]
@@ -92,6 +97,26 @@ where
     async fn instructions(&self, manifest: &Manifest) -> Result<Option<String>> {
         let _ = manifest;
         Ok(None)
+    }
+
+    /// An instruction fragment that needs the live session, appended after
+    /// [`instructions`](Self::instructions).
+    ///
+    /// The memory capability uses this to read the stored memory summary out of the workspace.
+    async fn bound_instructions(
+        &self,
+        binding: &CapabilityBinding,
+        manifest: &Manifest,
+    ) -> Result<Option<String>> {
+        let _ = (binding, manifest);
+        Ok(None)
+    }
+
+    /// The memory capability behind this value, when it is one.
+    ///
+    /// Lets the runner find the memory manager to flush without downcasting trait objects.
+    fn as_memory(&self) -> Option<&Memory> {
+        None
     }
 
     /// Extra model request parameters, merged into `ModelSettings::extra_args`.

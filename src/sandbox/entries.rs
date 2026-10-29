@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use crate::sandbox::errors::{ErrorCode, SandboxError, SandboxResult};
+use crate::sandbox::mounts::Mount;
 use crate::sandbox::session::{ExecRequest, SandboxSession, shell_quote};
 use crate::sandbox::types::{Group, Permissions, User, file_mode};
 
@@ -19,7 +20,7 @@ fn default_dir_permissions() -> Permissions {
 }
 
 /// What a manifest entry materializes into the workspace.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum EntryKind {
     /// A file with inline contents.
     File {
@@ -41,6 +42,11 @@ pub enum EntryKind {
         /// The host path read by the SDK process; `None` creates an empty directory.
         src: Option<PathBuf>,
     },
+    /// External storage attached inside the workspace.
+    Mount {
+        /// The mount and its strategy.
+        mount: Mount,
+    },
     /// A git repository cloned inside the sandbox with the `git` CLI.
     GitRepo {
         /// Host serving the repository (`github.com` by default).
@@ -55,7 +61,7 @@ pub enum EntryKind {
 }
 
 /// One manifest entry: what to place in the workspace, and with which metadata.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct Entry {
     /// What the entry materializes.
     pub kind: EntryKind,
@@ -65,14 +71,21 @@ pub struct Entry {
     pub permissions: Permissions,
     /// Group or user ownership applied after the entry is written.
     pub group: Option<Group>,
+    /// Whether the entry is runtime-attached state that snapshots must exclude and resume must
+    /// re-apply. Mounts are always ephemeral.
+    pub ephemeral: bool,
 }
 
 impl Entry {
     fn with_kind(kind: EntryKind) -> Self {
         let directory = matches!(
             kind,
-            EntryKind::Dir { .. } | EntryKind::LocalDir { .. } | EntryKind::GitRepo { .. }
+            EntryKind::Dir { .. }
+                | EntryKind::LocalDir { .. }
+                | EntryKind::GitRepo { .. }
+                | EntryKind::Mount { .. }
         );
+        let ephemeral = matches!(kind, EntryKind::Mount { .. });
         Entry {
             kind,
             description: None,
@@ -82,6 +95,26 @@ impl Entry {
                 Permissions::default()
             },
             group: None,
+            ephemeral,
+        }
+    }
+
+    /// External storage attached inside the workspace.
+    pub fn mount(mount: Mount) -> Self {
+        Entry::with_kind(EntryKind::Mount { mount })
+    }
+
+    /// Mark the entry as runtime-attached state excluded from snapshots.
+    pub fn with_ephemeral(mut self, ephemeral: bool) -> Self {
+        self.ephemeral = ephemeral;
+        self
+    }
+
+    /// The mount this entry attaches, when it is a mount entry.
+    pub fn as_mount(&self) -> Option<&Mount> {
+        match &self.kind {
+            EntryKind::Mount { mount } => Some(mount),
+            _ => None,
         }
     }
 
@@ -172,7 +205,10 @@ impl Entry {
     pub fn is_dir(&self) -> bool {
         matches!(
             self.kind,
-            EntryKind::Dir { .. } | EntryKind::LocalDir { .. } | EntryKind::GitRepo { .. }
+            EntryKind::Dir { .. }
+                | EntryKind::LocalDir { .. }
+                | EntryKind::GitRepo { .. }
+                | EntryKind::Mount { .. }
         )
     }
 
@@ -183,6 +219,7 @@ impl Entry {
             EntryKind::Dir { .. } => "dir",
             EntryKind::LocalFile { .. } => "local_file",
             EntryKind::LocalDir { .. } => "local_dir",
+            EntryKind::Mount { .. } => "mount",
             EntryKind::GitRepo { .. } => "git_repo",
         }
     }
@@ -226,6 +263,20 @@ impl Entry {
                 if let Some(src) = src {
                     written.extend(copy_host_dir(session, src, &dest).await?);
                 }
+            }
+            EntryKind::Mount { mount } => {
+                // Mounts attached by the container runtime are already in place; only
+                // in-container strategies run a command here.
+                if session.attaches_mounts_at_create()
+                    && mount.strategy.docker_create_args(mount, &dest).is_some()
+                {
+                    return Ok(written);
+                }
+                let mount_path = mount.resolve_mount_path(session.workspace_root(), &dest)?;
+                mount.validate()?;
+                session.authorize_mount_activation(mount, &mount_path)?;
+                mount.strategy.activate(mount, session, &mount_path).await?;
+                return Ok(written);
             }
             EntryKind::GitRepo {
                 host,
@@ -409,6 +460,19 @@ pub struct Accounts {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn marks_mounts_ephemeral() {
+        use crate::sandbox::mounts::BindMountStrategy;
+
+        let entry = Entry::mount(BindMountStrategy::mount("/host/data"));
+        assert!(entry.ephemeral);
+        assert!(entry.is_dir());
+        assert_eq!(entry.type_name(), "mount");
+        assert!(entry.as_mount().is_some());
+        assert!(!Entry::text_file("x").ephemeral);
+        assert!(Entry::text_file("x").as_mount().is_none());
+    }
 
     #[test]
     fn builds_entries() {
