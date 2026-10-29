@@ -47,7 +47,7 @@ impl OpenAIResponsesModel {
     pub fn build_request_body(&self, req: &ModelRequest, stream: bool) -> Result<Value> {
         let s = &req.model_settings;
         let mut body = Map::new();
-        if !(req.prompt.is_some() && !self.model_is_explicit) {
+        if req.prompt.is_none() || self.model_is_explicit {
             body.insert("model".into(), Value::String(self.model.clone()));
         }
         body.insert(
@@ -60,7 +60,10 @@ impl OpenAIResponsesModel {
         for t in &req.tools {
             match t {
                 ToolSpec::Function(f) => tools.push(f.to_responses_param()),
-                ToolSpec::Hosted { param, includes: inc } => {
+                ToolSpec::Hosted {
+                    param,
+                    includes: inc,
+                } => {
                     tools.push(param.clone());
                     includes.extend(inc.iter().cloned());
                 }
@@ -80,7 +83,10 @@ impl OpenAIResponsesModel {
             body.insert("tools".into(), Value::Array(tools));
         }
         if !includes.is_empty() {
-            body.insert("include".into(), json!(includes.into_iter().collect::<Vec<_>>()));
+            body.insert(
+                "include".into(),
+                json!(includes.into_iter().collect::<Vec<_>>()),
+            );
         }
         if let Some(tc) = &s.tool_choice {
             let converted = convert_tool_choice(tc);
@@ -124,20 +130,35 @@ impl OpenAIResponsesModel {
                 body.insert(k.to_string(), v);
             }
         };
-        put("instructions", req.system_instructions.clone().map(Value::String));
-        put("previous_response_id", req.previous_response_id.clone().map(Value::String));
-        put("conversation", req.conversation_id.clone().map(Value::String));
+        put(
+            "instructions",
+            req.system_instructions.clone().map(Value::String),
+        );
+        put(
+            "previous_response_id",
+            req.previous_response_id.clone().map(Value::String),
+        );
+        put(
+            "conversation",
+            req.conversation_id.clone().map(Value::String),
+        );
         put("prompt", req.prompt.as_ref().map(|p| json!(p)));
         put("temperature", s.temperature.map(|v| json!(v)));
         put("top_p", s.top_p.map(|v| json!(v)));
         put("truncation", s.truncation.clone().map(Value::String));
         put("max_output_tokens", s.max_tokens.map(|v| json!(v)));
         put("store", s.store.map(Value::Bool));
-        put("prompt_cache_retention", s.prompt_cache_retention.clone().map(Value::String));
+        put(
+            "prompt_cache_retention",
+            s.prompt_cache_retention.clone().map(Value::String),
+        );
         put("prompt_cache_options", s.prompt_cache_options.clone());
         put("reasoning", s.reasoning.as_ref().map(|r| json!(r)));
         put("metadata", s.metadata.as_ref().map(|m| json!(m)));
-        put("context_management", s.context_management.as_ref().map(|c| json!(c)));
+        put(
+            "context_management",
+            s.context_management.as_ref().map(|c| json!(c)),
+        );
         put("top_logprobs", s.top_logprobs.map(|v| json!(v)));
         if stream {
             body.insert("stream".into(), Value::Bool(true));
@@ -149,7 +170,10 @@ impl OpenAIResponsesModel {
             if !dups.is_empty() {
                 return Err(AgentsError::user(format!(
                     "responses.create() got multiple values for keyword argument(s): {}",
-                    dups.iter().map(|d| format!("'{d}'")).collect::<Vec<_>>().join(", ")
+                    dups.iter()
+                        .map(|d| format!("'{d}'"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 )));
             }
             for (k, v) in extra {
@@ -168,11 +192,18 @@ impl OpenAIResponsesModel {
 /// Convert a `ToolChoice` to the Responses API format.
 pub(crate) fn convert_tool_choice(tc: &ToolChoice) -> Value {
     match tc {
-        ToolChoice::Mcp(m) => json!({"type": "mcp", "server_label": m.server_label, "name": m.name}),
+        ToolChoice::Mcp(m) => {
+            json!({"type": "mcp", "server_label": m.server_label, "name": m.name})
+        }
         ToolChoice::Named(n) => match n.as_str() {
             "auto" | "required" | "none" => Value::String(n.clone()),
-            "file_search" | "web_search" | "web_search_preview" | "image_generation"
-            | "code_interpreter" | "mcp" | "computer_use_preview" => json!({"type": n}),
+            "file_search"
+            | "web_search"
+            | "web_search_preview"
+            | "image_generation"
+            | "code_interpreter"
+            | "mcp"
+            | "computer_use_preview" => json!({"type": n}),
             other => json!({"type": "function", "name": other}),
         },
     }
@@ -247,7 +278,11 @@ pub(crate) fn parse_response(
             .filter(|id| *id != FAKE_RESPONSES_ID)
             .map(str::to_string),
         request_id,
-        raw_usage: if preserve_raw_usage { usage_v.cloned() } else { None },
+        raw_usage: if preserve_raw_usage {
+            usage_v.cloned()
+        } else {
+            None
+        },
     })
 }
 
@@ -296,7 +331,10 @@ impl Model for OpenAIResponsesModel {
         .await;
         match &result {
             Ok(resp) => finish_response_span(&span, resp, true),
-            Err(e) => span.set_error("Error getting response", Some(json!({"error": e.to_string()}))),
+            Err(e) => span.set_error(
+                "Error getting response",
+                Some(json!({"error": e.to_string()})),
+            ),
         }
         span.finish();
         result
@@ -318,7 +356,10 @@ impl Model for OpenAIResponsesModel {
         {
             Ok(s) => s,
             Err(e) => {
-                span.set_error("Error streaming response", Some(json!({"error": e.to_string()})));
+                span.set_error(
+                    "Error streaming response",
+                    Some(json!({"error": e.to_string()})),
+                );
                 span.finish();
                 return Err(e);
             }
@@ -328,7 +369,10 @@ impl Model for OpenAIResponsesModel {
             let span = &guard.0;
             match ev {
                 Ok(event) => {
-                    let ty = event.get("type").and_then(Value::as_str).unwrap_or_default();
+                    let ty = event
+                        .get("type")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
                     match ty {
                         "response.completed" => {
                             if let Some(r) = event.get("response")
@@ -343,14 +387,20 @@ impl Model for OpenAIResponsesModel {
                             let err = parse_response(&r, None, false).err().unwrap_or_else(|| {
                                 AgentsError::model_behavior(format!("Stream ended with {ty}"))
                             });
-                            span.set_error("Error streaming response", Some(json!({"error": err.to_string()})));
+                            span.set_error(
+                                "Error streaming response",
+                                Some(json!({"error": err.to_string()})),
+                            );
                             Err(err)
                         }
                         _ => Ok(event),
                     }
                 }
                 Err(e) => {
-                    span.set_error("Error streaming response", Some(json!({"error": e.to_string()})));
+                    span.set_error(
+                        "Error streaming response",
+                        Some(json!({"error": e.to_string()})),
+                    );
                     Err(e)
                 }
             }
@@ -396,7 +446,10 @@ mod tests {
         let body = model.build_request_body(&req, true).unwrap();
         assert_eq!(body["model"], "gpt-5.6-luna");
         assert_eq!(body["instructions"], "be nice");
-        assert_eq!(body["tool_choice"], json!({"type": "function", "name": "get_weather"}));
+        assert_eq!(
+            body["tool_choice"],
+            json!({"type": "function", "name": "get_weather"})
+        );
         assert_eq!(body["parallel_tool_calls"], false);
         assert_eq!(body["text"]["format"]["name"], "final_output");
         assert_eq!(body["text"]["verbosity"], "low");

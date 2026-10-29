@@ -131,13 +131,25 @@ mod tests {
     #[tokio::test]
     async fn in_memory_session_operations() {
         let s = InMemorySession::new("s1");
-        s.add_items(vec![InputItem::user("a"), InputItem::assistant("b"), InputItem::user("c")])
-            .await
-            .unwrap();
+        s.add_items(vec![
+            InputItem::user("a"),
+            InputItem::assistant("b"),
+            InputItem::user("c"),
+        ])
+        .await
+        .unwrap();
         assert_eq!(s.get_items(None).await.unwrap().len(), 3);
         let last2 = s.get_items(Some(2)).await.unwrap();
         assert_eq!(last2[0].text_content().as_deref(), Some("b"));
-        assert_eq!(s.pop_item().await.unwrap().unwrap().text_content().as_deref(), Some("c"));
+        assert_eq!(
+            s.pop_item()
+                .await
+                .unwrap()
+                .unwrap()
+                .text_content()
+                .as_deref(),
+            Some("c")
+        );
         s.clear_session().await.unwrap();
         assert!(s.get_items(None).await.unwrap().is_empty());
     }

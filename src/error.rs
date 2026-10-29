@@ -82,14 +82,14 @@ pub enum AgentsError {
     /// An input guardrail tripwire was triggered.
     #[error("Guardrail {} triggered tripwire", guardrail_result.guardrail_name)]
     InputGuardrailTripwireTriggered {
-        guardrail_result: InputGuardrailResult,
+        guardrail_result: Box<InputGuardrailResult>,
         run_data: Option<Box<RunErrorDetails>>,
     },
 
     /// An output guardrail tripwire was triggered.
     #[error("Guardrail {} triggered tripwire", guardrail_result.guardrail_name)]
     OutputGuardrailTripwireTriggered {
-        guardrail_result: OutputGuardrailResult,
+        guardrail_result: Box<OutputGuardrailResult>,
         run_data: Option<Box<RunErrorDetails>>,
     },
 
@@ -97,7 +97,7 @@ pub enum AgentsError {
     #[error("Tool input guardrail {guardrail_name} triggered tripwire")]
     ToolInputGuardrailTripwireTriggered {
         guardrail_name: String,
-        output: ToolGuardrailFunctionOutput,
+        output: Box<ToolGuardrailFunctionOutput>,
         run_data: Option<Box<RunErrorDetails>>,
     },
 
@@ -105,7 +105,7 @@ pub enum AgentsError {
     #[error("Tool output guardrail {guardrail_name} triggered tripwire")]
     ToolOutputGuardrailTripwireTriggered {
         guardrail_name: String,
-        output: ToolGuardrailFunctionOutput,
+        output: Box<ToolGuardrailFunctionOutput>,
         run_data: Option<Box<RunErrorDetails>>,
     },
 
@@ -114,7 +114,7 @@ pub enum AgentsError {
     ApiError {
         status: u16,
         message: String,
-        body: Option<serde_json::Value>,
+        body: Option<Box<serde_json::Value>>,
         request_id: Option<String>,
     },
 
@@ -170,10 +170,10 @@ impl AgentsError {
             | AgentsError::InputGuardrailTripwireTriggered { run_data, .. }
             | AgentsError::OutputGuardrailTripwireTriggered { run_data, .. }
             | AgentsError::ToolInputGuardrailTripwireTriggered { run_data, .. }
-            | AgentsError::ToolOutputGuardrailTripwireTriggered { run_data, .. } => {
-                if run_data.is_none() {
-                    *run_data = boxed;
-                }
+            | AgentsError::ToolOutputGuardrailTripwireTriggered { run_data, .. }
+                if run_data.is_none() =>
+            {
+                *run_data = boxed;
             }
             _ => {}
         }

@@ -106,8 +106,14 @@ impl RunState {
     }
 
     /// Reject a pending tool call, optionally with a custom model-visible message.
-    pub fn reject(&mut self, item: &ToolApprovalItem, always_reject: bool, rejection_message: Option<String>) {
-        self.approvals.reject(item, always_reject, rejection_message);
+    pub fn reject(
+        &mut self,
+        item: &ToolApprovalItem,
+        always_reject: bool,
+        rejection_message: Option<String>,
+    ) {
+        self.approvals
+            .reject(item, always_reject, rejection_message);
     }
 
     /// Stage new user input for the next model call of the resumed run.
@@ -120,7 +126,9 @@ impl RunState {
         if let Some(max) = self.max_turns
             && self.current_turn >= max
         {
-            return Err(AgentsError::user("Cannot add input: no model turns remain."));
+            return Err(AgentsError::user(
+                "Cannot add input: no model turns remain.",
+            ));
         }
         match input.into() {
             StagedInput::Text(t) => self.pending_input.push(InputItem::user(t)),

@@ -51,10 +51,14 @@ impl OpenAIProvider {
 impl ModelProvider for OpenAIProvider {
     fn get_model(&self, model_name: Option<&str>) -> Result<Arc<dyn Model>> {
         let explicit = model_name.is_some();
-        let name = model_name.map(str::to_string).unwrap_or_else(get_default_model);
+        let name = model_name
+            .map(str::to_string)
+            .unwrap_or_else(get_default_model);
         let client = self.client();
         if self.use_responses() {
-            Ok(Arc::new(OpenAIResponsesModel::new(name, client).with_explicit(explicit)))
+            Ok(Arc::new(
+                OpenAIResponsesModel::new(name, client).with_explicit(explicit),
+            ))
         } else {
             Ok(Arc::new(OpenAIChatCompletionsModel::new(name, client)))
         }

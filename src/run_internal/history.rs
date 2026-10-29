@@ -76,7 +76,12 @@ pub(crate) fn build_summary_message(transcript: &[InputItem]) -> InputItem {
     if lines.is_empty() {
         content.push("(no previous turns recorded)".to_string());
     } else {
-        content.extend(lines.iter().enumerate().map(|(i, l)| format!("{}. {l}", i + 1)));
+        content.extend(
+            lines
+                .iter()
+                .enumerate()
+                .map(|(i, l)| format!("{}. {l}", i + 1)),
+        );
     }
     content.push(END.to_string());
     InputItem(json!({"role": "assistant", "content": content.join("\n")}))

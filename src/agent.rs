@@ -107,7 +107,10 @@ pub struct StopAtTools {
 }
 
 type ToolsToFinalOutputFn<C> = Arc<
-    dyn Fn(RunContext<C>, Vec<FunctionToolResult>) -> BoxFuture<'static, Result<ToolsToFinalOutputResult>>
+    dyn Fn(
+            RunContext<C>,
+            Vec<FunctionToolResult>,
+        ) -> BoxFuture<'static, Result<ToolsToFinalOutputResult>>
         + Send
         + Sync,
 >;
@@ -239,10 +242,17 @@ impl<C> fmt::Debug for Agent<C> {
             .field("handoff_description", &self.handoff_description)
             .field("instructions", &self.instructions)
             .field("model", &self.model)
-            .field("tools", &self.tools.iter().map(|t| t.name()).collect::<Vec<_>>())
+            .field(
+                "tools",
+                &self.tools.iter().map(|t| t.name()).collect::<Vec<_>>(),
+            )
             .field(
                 "handoffs",
-                &self.handoffs.iter().map(|h| h.agent_name.clone()).collect::<Vec<_>>(),
+                &self
+                    .handoffs
+                    .iter()
+                    .map(|h| h.agent_name.clone())
+                    .collect::<Vec<_>>(),
             )
             .field("output_type", &self.output_type.as_ref().map(|o| o.name()))
             .finish_non_exhaustive()
@@ -286,7 +296,9 @@ impl<C: Send + Sync + 'static> Agent<C> {
         F: Fn(RunContext<C>, Arc<Agent<C>>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<String>> + Send + 'static,
     {
-        self.instructions = Some(Instructions::Dynamic(Arc::new(move |c, a| Box::pin(f(c, a)))));
+        self.instructions = Some(Instructions::Dynamic(Arc::new(move |c, a| {
+            Box::pin(f(c, a))
+        })));
         self
     }
 
@@ -427,7 +439,10 @@ impl<C: Send + Sync + 'static> Agent<C> {
     }
 
     /// Resolve the system prompt for a run.
-    pub async fn get_system_prompt(self: &Arc<Self>, ctx: &RunContext<C>) -> Result<Option<String>> {
+    pub async fn get_system_prompt(
+        self: &Arc<Self>,
+        ctx: &RunContext<C>,
+    ) -> Result<Option<String>> {
         match &self.instructions {
             None => Ok(None),
             Some(Instructions::Static(s)) => Ok(Some(s.clone())),
@@ -693,70 +708,93 @@ impl<C: Send + Sync + 'static> Agent<C> {
         let is_enabled = options.is_enabled.clone();
         let opts = Arc::new(options);
         let schema_for_builder = schema.clone();
-        let mut tool = FunctionTool::new_raw(name, description, schema, move |tool_ctx, args: String| {
-            let agent = agent.clone();
-            let opts = opts.clone();
-            let schema = schema_for_builder.clone();
-            async move {
-                let parsed: Value = serde_json::from_str(if args.trim().is_empty() { "{}" } else { &args })
-                    .map_err(|e| crate::error::AgentsError::model_behavior(format!("Invalid JSON input for tool: {e}")))?;
-                let input_text = if structured {
-                    let schema_ref = if opts.include_input_schema { Some(&schema) } else { None };
-                    match &opts.input_builder {
-                        Some(b) => b(&parsed, schema_ref),
-                        None => default_tool_input_builder(&parsed, schema_ref),
-                    }
-                } else {
-                    parsed
-                        .get("input")
-                        .and_then(Value::as_str)
-                        .map(str::to_string)
-                        .unwrap_or_else(|| args.clone())
-                };
-                let parent = tool_ctx.run_context().clone();
-                let run_ctx = if structured { parent.with_tool_input(parsed.clone()) } else { parent.clone() };
-                let mut run_opts = RunOptions::with_run_context(run_ctx);
-                run_opts.shares_parent_context = true;
-                if let Some(m) = opts.max_turns {
-                    run_opts.max_turns = Some(m);
-                }
-                if let Some(c) = &opts.run_config {
-                    run_opts.run_config = c.clone();
-                }
-                run_opts.hooks = opts.hooks.clone();
-                run_opts.previous_response_id = opts.previous_response_id.clone();
-                run_opts.conversation_id = opts.conversation_id.clone();
-                run_opts.session = opts.session.clone();
-                let input: RunInput = match parent.take_nested_state(&tool_ctx.tool_call_id) {
-                    Some(state) => RunInput::State(Box::new(RunState::from_json(state)?)),
-                    None => RunInput::Text(input_text),
-                };
-                let result = match &opts.on_stream {
-                    Some(cb) => {
-                        let mut streamed = Runner::run_streamed_with_options(agent.clone(), input, run_opts);
-                        {
-                            let mut events = std::pin::pin!(streamed.stream_events());
-                            while let Some(ev) = events.next().await {
-                                cb(ev?).await;
-                            }
+        let mut tool =
+            FunctionTool::new_raw(name, description, schema, move |tool_ctx, args: String| {
+                let agent = agent.clone();
+                let opts = opts.clone();
+                let schema = schema_for_builder.clone();
+                async move {
+                    let parsed: Value =
+                        serde_json::from_str(if args.trim().is_empty() { "{}" } else { &args })
+                            .map_err(|e| {
+                                crate::error::AgentsError::model_behavior(format!(
+                                    "Invalid JSON input for tool: {e}"
+                                ))
+                            })?;
+                    let input_text = if structured {
+                        let schema_ref = if opts.include_input_schema {
+                            Some(&schema)
+                        } else {
+                            None
+                        };
+                        match &opts.input_builder {
+                            Some(b) => b(&parsed, schema_ref),
+                            None => default_tool_input_builder(&parsed, schema_ref),
                         }
-                        streamed
-                            .into_result()
-                            .ok_or_else(|| crate::error::AgentsError::other("Nested agent run did not complete"))?
+                    } else {
+                        parsed
+                            .get("input")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                            .unwrap_or_else(|| args.clone())
+                    };
+                    let parent = tool_ctx.run_context().clone();
+                    let run_ctx = if structured {
+                        parent.with_tool_input(parsed.clone())
+                    } else {
+                        parent.clone()
+                    };
+                    let mut run_opts = RunOptions::with_run_context(run_ctx);
+                    run_opts.shares_parent_context = true;
+                    if let Some(m) = opts.max_turns {
+                        run_opts.max_turns = Some(m);
                     }
-                    None => Runner::run_with_options(agent.clone(), input, run_opts).await?,
-                };
-                if !result.interruptions.is_empty() {
-                    let state = result.to_state().to_json()?;
-                    parent.set_nested_interruption(&tool_ctx.tool_call_id, state, result.interruptions.clone());
-                    return Ok(ToolOutput::Text(String::new()));
+                    if let Some(c) = &opts.run_config {
+                        run_opts.run_config = c.clone();
+                    }
+                    run_opts.hooks = opts.hooks.clone();
+                    run_opts.previous_response_id = opts.previous_response_id.clone();
+                    run_opts.conversation_id = opts.conversation_id.clone();
+                    run_opts.session = opts.session.clone();
+                    let input: RunInput = match parent.take_nested_state(&tool_ctx.tool_call_id) {
+                        Some(state) => RunInput::State(Box::new(RunState::from_json(state)?)),
+                        None => RunInput::Text(input_text),
+                    };
+                    let result = match &opts.on_stream {
+                        Some(cb) => {
+                            let mut streamed =
+                                Runner::run_streamed_with_options(agent.clone(), input, run_opts);
+                            {
+                                let mut events = std::pin::pin!(streamed.stream_events());
+                                while let Some(ev) = events.next().await {
+                                    cb(ev?).await;
+                                }
+                            }
+                            streamed.into_result().ok_or_else(|| {
+                                crate::error::AgentsError::other(
+                                    "Nested agent run did not complete",
+                                )
+                            })?
+                        }
+                        None => Runner::run_with_options(agent.clone(), input, run_opts).await?,
+                    };
+                    if !result.interruptions.is_empty() {
+                        let state = result.to_state().to_json()?;
+                        parent.set_nested_interruption(
+                            &tool_ctx.tool_call_id,
+                            state,
+                            result.interruptions.clone(),
+                        );
+                        return Ok(ToolOutput::Text(String::new()));
+                    }
+                    match &opts.custom_output_extractor {
+                        Some(ex) => Ok(ToolOutput::Text(ex(result).await?)),
+                        None => Ok(ToolOutput::Text(
+                            result.final_output_text().unwrap_or_default(),
+                        )),
+                    }
                 }
-                match &opts.custom_output_extractor {
-                    Some(ex) => Ok(ToolOutput::Text(ex(result).await?)),
-                    None => Ok(ToolOutput::Text(result.final_output_text().unwrap_or_default())),
-                }
-            }
-        });
+            });
         tool.needs_approval = needs_approval;
         tool.is_enabled = is_enabled;
         tool.is_agent_tool = true;
@@ -793,9 +831,9 @@ mod tests {
 
     #[tokio::test]
     async fn dynamic_instructions() {
-        let agent = Arc::new(Agent::<String>::new("a").with_dynamic_instructions(|ctx, agent| async move {
-            Ok(format!("{} helps {}", agent.name, ctx.context()))
-        }));
+        let agent = Arc::new(Agent::<String>::new("a").with_dynamic_instructions(
+            |ctx, agent| async move { Ok(format!("{} helps {}", agent.name, ctx.context())) },
+        ));
         let p = agent
             .get_system_prompt(&RunContext::new("Bob".to_string()))
             .await

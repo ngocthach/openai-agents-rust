@@ -25,7 +25,13 @@ pub trait RunHooks<C: Send + Sync + 'static>: Send + Sync {
     }
 
     /// Called after the model returns.
-    async fn on_llm_end(&self, _context: &RunContext<C>, _agent: &Agent<C>, _response: &ModelResponse) {}
+    async fn on_llm_end(
+        &self,
+        _context: &RunContext<C>,
+        _agent: &Agent<C>,
+        _response: &ModelResponse,
+    ) {
+    }
 
     /// Called when an agent starts (each time the current agent changes).
     async fn on_agent_start(&self, _context: &RunContext<C>, _agent: &Agent<C>) {}
@@ -34,7 +40,13 @@ pub trait RunHooks<C: Send + Sync + 'static>: Send + Sync {
     async fn on_agent_end(&self, _context: &RunContext<C>, _agent: &Agent<C>, _output: &Value) {}
 
     /// Called when a handoff occurs.
-    async fn on_handoff(&self, _context: &RunContext<C>, _from_agent: &Agent<C>, _to_agent: &Agent<C>) {}
+    async fn on_handoff(
+        &self,
+        _context: &RunContext<C>,
+        _from_agent: &Agent<C>,
+        _to_agent: &Agent<C>,
+    ) {
+    }
 
     /// Called before a function tool is invoked.
     async fn on_tool_start(&self, _context: &ToolContext<C>, _agent: &Agent<C>, _tool: &Tool<C>) {}
@@ -86,7 +98,13 @@ pub trait AgentHooks<C: Send + Sync + 'static>: Send + Sync {
     }
 
     /// Called after the model returns.
-    async fn on_llm_end(&self, _context: &RunContext<C>, _agent: &Agent<C>, _response: &ModelResponse) {}
+    async fn on_llm_end(
+        &self,
+        _context: &RunContext<C>,
+        _agent: &Agent<C>,
+        _response: &ModelResponse,
+    ) {
+    }
 }
 
 /// A `RunHooks` implementation that does nothing.

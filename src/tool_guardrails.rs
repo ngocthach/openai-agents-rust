@@ -175,7 +175,10 @@ impl<C: Send + Sync + 'static> ToolInputGuardrail<C> {
         }
     }
 
-    pub async fn run(&self, data: ToolInputGuardrailData<C>) -> Result<ToolGuardrailFunctionOutput> {
+    pub async fn run(
+        &self,
+        data: ToolInputGuardrailData<C>,
+    ) -> Result<ToolGuardrailFunctionOutput> {
         (self.func)(data).await
     }
 }
@@ -221,7 +224,10 @@ impl<C: Send + Sync + 'static> ToolOutputGuardrail<C> {
         }
     }
 
-    pub async fn run(&self, data: ToolOutputGuardrailData<C>) -> Result<ToolGuardrailFunctionOutput> {
+    pub async fn run(
+        &self,
+        data: ToolOutputGuardrailData<C>,
+    ) -> Result<ToolGuardrailFunctionOutput> {
         (self.func)(data).await
     }
 }

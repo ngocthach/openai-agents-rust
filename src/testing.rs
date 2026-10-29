@@ -122,9 +122,16 @@ impl FakeModel {
 
     fn next(&self, request: &ModelRequest) -> Result<ModelResponse> {
         self.calls.lock().expect("poisoned").push(request.clone());
-        let step = self.steps.lock().expect("poisoned").pop_front().ok_or_else(|| {
-            AgentsError::other("FakeModel received an unexpected call: no scripted steps remain")
-        })?;
+        let step = self
+            .steps
+            .lock()
+            .expect("poisoned")
+            .pop_front()
+            .ok_or_else(|| {
+                AgentsError::other(
+                    "FakeModel received an unexpected call: no scripted steps remain",
+                )
+            })?;
         let output = match step {
             ModelStep::Output(o) => o,
             ModelStep::Error(e) => return Err(AgentsError::Other(e)),
@@ -161,7 +168,9 @@ impl FakeModel {
 
 /// Build Responses-style stream events for a response.
 pub fn response_to_stream_events(response: &ModelResponse) -> Vec<Value> {
-    let mut events = vec![json!({"type": "response.created", "response": {"id": response.response_id, "status": "in_progress", "output": []}})];
+    let mut events = vec![
+        json!({"type": "response.created", "response": {"id": response.response_id, "status": "in_progress", "output": []}}),
+    ];
     for (i, item) in response.output.iter().enumerate() {
         let v = item.to_value();
         events.push(json!({"type": "response.output_item.added", "output_index": i, "item": v}));

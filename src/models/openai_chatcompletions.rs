@@ -15,7 +15,9 @@ use super::FAKE_RESPONSES_ID;
 use super::interface::{Model, ModelRequest, ResponseEventStream, ToolSpec};
 use super::openai_client::OpenAIClient;
 use crate::error::{AgentsError, Result};
-use crate::items::{FunctionCall, InputItem, MessageContent, MessageOutput, ModelResponse, OutputItem};
+use crate::items::{
+    FunctionCall, InputItem, MessageContent, MessageOutput, ModelResponse, OutputItem,
+};
 use crate::model_settings::ToolChoice;
 use crate::tracing::{Span, SpanData, generation_span};
 use crate::usage::Usage;
@@ -52,7 +54,10 @@ impl OpenAIChatCompletionsModel {
                 ToolSpec::Hosted { param, .. } => {
                     return Err(AgentsError::user(format!(
                         "Hosted tools are not supported with the ChatCompletions API. Got tool type: {}",
-                        param.get("type").and_then(Value::as_str).unwrap_or("unknown")
+                        param
+                            .get("type")
+                            .and_then(Value::as_str)
+                            .unwrap_or("unknown")
                     )));
                 }
             }
@@ -100,13 +105,23 @@ impl OpenAIChatCompletionsModel {
         put("max_tokens", s.max_tokens.map(|v| json!(v)));
         put(
             "reasoning_effort",
-            s.reasoning.as_ref().and_then(|r| r.effort.clone()).map(Value::String),
+            s.reasoning
+                .as_ref()
+                .and_then(|r| r.effort.clone())
+                .map(Value::String),
         );
         put("verbosity", s.verbosity.clone().map(Value::String));
         put("metadata", s.metadata.as_ref().map(|m| json!(m)));
-        put("prompt_cache_retention", s.prompt_cache_retention.clone().map(Value::String));
+        put(
+            "prompt_cache_retention",
+            s.prompt_cache_retention.clone().map(Value::String),
+        );
         put("prompt_cache_options", s.prompt_cache_options.clone());
-        let store = s.store.or(if self.client.is_openai_api() { Some(true) } else { None });
+        let store = s.store.or(if self.client.is_openai_api() {
+            Some(true)
+        } else {
+            None
+        });
         put("store", store.map(Value::Bool));
         if let Some(n) = s.top_logprobs {
             put("top_logprobs", Some(json!(n)));
@@ -145,7 +160,11 @@ impl OpenAIChatCompletionsModel {
     fn start_span(&self, req: &ModelRequest, body: &Value) -> Span {
         let include = req.tracing.include_data();
         let span = generation_span(
-            if include { body.get("messages").cloned() } else { None },
+            if include {
+                body.get("messages").cloned()
+            } else {
+                None
+            },
             Some(self.model.clone()),
             Some(req.model_settings.to_traceable_value()),
             req.tracing.is_disabled(),
@@ -159,7 +178,9 @@ fn finish_generation_span(span: &Span, resp: &ModelResponse, include_data: bool)
     span.update_data(|d| {
         if let SpanData::Generation { output, usage, .. } = d {
             if include_data {
-                *output = Some(Value::Array(resp.output.iter().map(OutputItem::to_value).collect()));
+                *output = Some(Value::Array(
+                    resp.output.iter().map(OutputItem::to_value).collect(),
+                ));
             }
             *usage = Some(resp.usage.to_span_usage());
         }
@@ -233,7 +254,11 @@ pub fn items_to_messages(items: &[InputItem], system: Option<&str>) -> Result<Ve
     let mut current: Option<Map<String, Value>> = None;
     fn flush(result: &mut Vec<Value>, current: &mut Option<Map<String, Value>>) {
         if let Some(mut a) = current.take() {
-            if a.get("tool_calls").and_then(Value::as_array).map(Vec::is_empty).unwrap_or(false) {
+            if a.get("tool_calls")
+                .and_then(Value::as_array)
+                .map(Vec::is_empty)
+                .unwrap_or(false)
+            {
                 a.remove("tool_calls");
             }
             result.push(Value::Object(a));
@@ -270,10 +295,11 @@ pub fn items_to_messages(items: &[InputItem], system: Option<&str>) -> Result<Ve
                         let mut refusal = String::new();
                         for p in parts {
                             match p.get("type").and_then(Value::as_str) {
-                                Some("refusal") => {
-                                    refusal.push_str(p.get("refusal").and_then(Value::as_str).unwrap_or(""))
-                                }
-                                _ => text.push_str(p.get("text").and_then(Value::as_str).unwrap_or("")),
+                                Some("refusal") => refusal.push_str(
+                                    p.get("refusal").and_then(Value::as_str).unwrap_or(""),
+                                ),
+                                _ => text
+                                    .push_str(p.get("text").and_then(Value::as_str).unwrap_or("")),
                             }
                         }
                         if !text.is_empty() {
@@ -378,8 +404,16 @@ pub(crate) fn parse_chat_completion(
         for c in calls {
             output.push(OutputItem::FunctionCall(FunctionCall {
                 id: Some(FAKE_RESPONSES_ID.into()),
-                call_id: c.get("id").and_then(Value::as_str).unwrap_or_default().to_string(),
-                name: c.pointer("/function/name").and_then(Value::as_str).unwrap_or_default().to_string(),
+                call_id: c
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                name: c
+                    .pointer("/function/name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
                 arguments: c
                     .pointer("/function/arguments")
                     .and_then(Value::as_str)
@@ -405,7 +439,11 @@ pub(crate) fn parse_chat_completion(
         usage,
         response_id: None,
         request_id,
-        raw_usage: if preserve_raw_usage { usage_v.cloned() } else { None },
+        raw_usage: if preserve_raw_usage {
+            usage_v.cloned()
+        } else {
+            None
+        },
     })
 }
 
@@ -525,7 +563,11 @@ impl StreamState {
         }
         for (id, name, args) in self.tool_calls.values() {
             let output_index = output.len();
-            let args = if args.is_empty() { "{}".to_string() } else { args.clone() };
+            let args = if args.is_empty() {
+                "{}".to_string()
+            } else {
+                args.clone()
+            };
             let added = json!({
                 "type": "function_call", "id": FAKE_RESPONSES_ID, "call_id": id,
                 "name": name, "arguments": "",
@@ -570,7 +612,9 @@ impl StreamState {
             finish_generation_span(&self.span, &parsed, self.include_data);
         }
         self.span.finish();
-        self.pending.push_back(Ok(json!({"type": "response.completed", "response": response})));
+        self.pending.push_back(Ok(
+            json!({"type": "response.completed", "response": response}),
+        ));
     }
 }
 
@@ -598,7 +642,10 @@ impl Model for OpenAIChatCompletionsModel {
         .await;
         match &result {
             Ok(r) => finish_generation_span(&span, r, request.tracing.include_data()),
-            Err(e) => span.set_error("Error getting response", Some(json!({"error": e.to_string()}))),
+            Err(e) => span.set_error(
+                "Error getting response",
+                Some(json!({"error": e.to_string()})),
+            ),
         }
         span.finish();
         result
@@ -619,7 +666,10 @@ impl Model for OpenAIChatCompletionsModel {
         {
             Ok(s) => s,
             Err(e) => {
-                span.set_error("Error streaming response", Some(json!({"error": e.to_string()})));
+                span.set_error(
+                    "Error streaming response",
+                    Some(json!({"error": e.to_string()})),
+                );
                 span.finish();
                 return Err(e);
             }
@@ -653,7 +703,10 @@ impl Model for OpenAIChatCompletionsModel {
                     Some(Ok(chunk)) => st.handle_chunk(&chunk),
                     Some(Err(e)) => {
                         st.finished = true;
-                        st.span.set_error("Error streaming response", Some(json!({"error": e.to_string()})));
+                        st.span.set_error(
+                            "Error streaming response",
+                            Some(json!({"error": e.to_string()})),
+                        );
                         st.span.finish();
                         return Some((Err(e), st));
                     }
@@ -710,9 +763,15 @@ mod tests {
         let chunks = vec![
             Ok(json!({"choices": [{"delta": {"content": "Hel"}}]})),
             Ok(json!({"choices": [{"delta": {"content": "lo"}}]})),
-            Ok(json!({"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "call_9", "function": {"name": "f", "arguments": "{\"x\""}}]}}]})),
-            Ok(json!({"choices": [{"delta": {"tool_calls": [{"index": 0, "function": {"arguments": ":1}"}}]}}]})),
-            Ok(json!({"choices": [], "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}})),
+            Ok(
+                json!({"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "call_9", "function": {"name": "f", "arguments": "{\"x\""}}]}}]}),
+            ),
+            Ok(
+                json!({"choices": [{"delta": {"tool_calls": [{"index": 0, "function": {"arguments": ":1}"}}]}}]}),
+            ),
+            Ok(
+                json!({"choices": [], "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}}),
+            ),
         ];
         let mut st = StreamState {
             inner: futures::stream::iter(chunks).boxed(),
@@ -724,7 +783,14 @@ mod tests {
             usage: None,
             finished: false,
             model: "m".into(),
-            span: crate::tracing::create_span(SpanData::Custom { name: "t".into(), data: Value::Null }, None, true),
+            span: crate::tracing::create_span(
+                SpanData::Custom {
+                    name: "t".into(),
+                    data: Value::Null,
+                },
+                None,
+                true,
+            ),
             include_data: false,
         };
         while let Some(Ok(c)) = st.inner.next().await {

@@ -16,8 +16,8 @@ use crate::error::{AgentsError, Result, RunErrorDetails};
 use crate::guardrail::{InputGuardrail, InputGuardrailResult, OutputGuardrailResult};
 use crate::handoffs::{Handoff, HandoffInputData};
 use crate::items::{
-    FunctionCall, InputItem, ItemHelpers, MessageOutput, ModelResponse, OutputItem, RunInput, RunItem,
-    RunItemKind, ToolApprovalItem,
+    FunctionCall, InputItem, ItemHelpers, MessageOutput, ModelResponse, OutputItem, RunInput,
+    RunItem, RunItemKind, ToolApprovalItem,
 };
 use crate::lifecycle::RunHooks;
 use crate::memory::Session;
@@ -25,9 +25,13 @@ use crate::model_settings::ModelSettings;
 use crate::models::interface::{Model, ModelRequest, ModelTracing, ToolSpec};
 use crate::result::{RunResult, StreamMsg};
 use crate::run::RunOptions;
-use crate::run_config::{CallModelData, ModelInputData, ReasoningItemIdPolicy, RunConfig, ToolNotFoundBehavior};
+use crate::run_config::{
+    CallModelData, ModelInputData, ReasoningItemIdPolicy, RunConfig, ToolNotFoundBehavior,
+};
 use crate::run_context::RunContext;
-use crate::run_error_handlers::{RunErrorData, RunErrorHandler, RunErrorHandlerInput, RunErrorHandlers};
+use crate::run_error_handlers::{
+    RunErrorData, RunErrorHandler, RunErrorHandlerInput, RunErrorHandlers,
+};
 use crate::run_state::{CURRENT_SCHEMA_VERSION, RunState};
 use crate::stream_events::{RunItemStreamEventName, StreamEvent};
 use crate::tool::{FunctionTool, HostedMCPTool, MCPToolApprovalRequest, Tool, ToolOutput};
@@ -149,9 +153,14 @@ fn items_to_input(items: &[RunItem]) -> Vec<InputItem> {
 
 fn call_id_of(item: &RunItem) -> Option<String> {
     match &item.kind {
-        RunItemKind::ToolCallOutput { raw_item, .. } | RunItemKind::HandoffOutput { raw_item: InputItem(raw_item), .. } => {
-            raw_item.get("call_id").and_then(Value::as_str).map(str::to_string)
-        }
+        RunItemKind::ToolCallOutput { raw_item, .. }
+        | RunItemKind::HandoffOutput {
+            raw_item: InputItem(raw_item),
+            ..
+        } => raw_item
+            .get("call_id")
+            .and_then(Value::as_str)
+            .map(str::to_string),
         RunItemKind::MCPApprovalResponse { raw_item } => raw_item
             .get("approval_request_id")
             .and_then(Value::as_str)
@@ -232,8 +241,9 @@ pub(crate) async fn run_loop<C: Send + Sync + 'static>(
         turn_start: 0,
     };
 
-    let server_managed =
-        lp.conversation_id.is_some() || lp.previous_response_id.is_some() || lp.auto_previous_response_id;
+    let server_managed = lp.conversation_id.is_some()
+        || lp.previous_response_id.is_some()
+        || lp.auto_previous_response_id;
     if lp.session.is_some() && server_managed {
         return Err(AgentsError::user(
             "Session persistence cannot be combined with conversation_id, previous_response_id, or auto_previous_response_id.",
@@ -333,15 +343,17 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
                 "This run state already finished; start a new run instead.",
             ));
         }
-        let agent = find_agent(&self.starting_agent, &state.current_agent_name).ok_or_else(|| {
-            AgentsError::user(format!(
-                "Could not find agent '{}' reachable from the starting agent",
-                state.current_agent_name
-            ))
-        })?;
+        let agent =
+            find_agent(&self.starting_agent, &state.current_agent_name).ok_or_else(|| {
+                AgentsError::user(format!(
+                    "Could not find agent '{}' reachable from the starting agent",
+                    state.current_agent_name
+                ))
+            })?;
         self.current_agent = agent;
         self.ctx.import_approvals(&state.approvals);
-        self.ctx.import_nested_states(&state.nested_agent_tool_states);
+        self.ctx
+            .import_nested_states(&state.nested_agent_tool_states);
         if restore_usage {
             self.ctx.set_usage(state.usage.clone());
         }
@@ -421,7 +433,9 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
     }
 
     fn server_managed(&self) -> bool {
-        self.conversation_id.is_some() || self.previous_response_id.is_some() || self.auto_previous_response_id
+        self.conversation_id.is_some()
+            || self.previous_response_id.is_some()
+            || self.auto_previous_response_id
     }
 
     async fn run(&mut self) -> Result<RunResult<C>> {
@@ -501,7 +515,11 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
                     );
                     turn_span.start();
                     let before = self.ctx.usage();
-                    let res = scope::with_span(turn_span.clone(), Box::pin(self.run_turn(tools, handoffs))).await;
+                    let res = scope::with_span(
+                        turn_span.clone(),
+                        Box::pin(self.run_turn(tools, handoffs)),
+                    )
+                    .await;
                     let after = self.ctx.usage();
                     turn_span.update_data(|d| {
                         if let SpanData::Turn { usage, .. } = d {
@@ -641,7 +659,7 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
                 if r.output.tripwire_triggered {
                     self.save_session().await?;
                     return Err(AgentsError::OutputGuardrailTripwireTriggered {
-                        guardrail_result: r,
+                        guardrail_result: Box::new(r),
                         run_data: None,
                     });
                 }
@@ -659,7 +677,11 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
         Ok(r)
     }
 
-    fn build_result(&self, final_output: Option<Value>, interruptions: Vec<ToolApprovalItem>) -> RunResult<C> {
+    fn build_result(
+        &self,
+        final_output: Option<Value>,
+        interruptions: Vec<ToolApprovalItem>,
+    ) -> RunResult<C> {
         let state = RunState {
             schema_version: CURRENT_SCHEMA_VERSION.to_string(),
             current_turn: self.current_turn,
@@ -781,9 +803,11 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
                 input.extend(self.model_prefix.clone());
             }
             input.extend(
-                items_to_input(&self.model_items[self.server_sent_items.min(self.model_items.len())..])
-                    .into_iter()
-                    .map(|i| strip_reasoning_id(i, policy)),
+                items_to_input(
+                    &self.model_items[self.server_sent_items.min(self.model_items.len())..],
+                )
+                .into_iter()
+                .map(|i| strip_reasoning_id(i, policy)),
             );
             input
         } else {
@@ -836,14 +860,18 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
         }
         match tripped {
             Some(r) => Err(AgentsError::InputGuardrailTripwireTriggered {
-                guardrail_result: r,
+                guardrail_result: Box::new(r),
                 run_data: None,
             }),
             None => Ok(()),
         }
     }
 
-    async fn run_turn(&mut self, tools: Vec<Tool<C>>, handoffs: Vec<Handoff<C>>) -> Result<NextStep<C>> {
+    async fn run_turn(
+        &mut self,
+        tools: Vec<Tool<C>>,
+        handoffs: Vec<Handoff<C>>,
+    ) -> Result<NextStep<C>> {
         let agent = self.current_agent.clone();
         if self.should_run_agent_start_hooks {
             self.should_run_agent_start_hooks = false;
@@ -926,11 +954,12 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
         } else {
             ModelTracing::EnabledWithoutData
         };
-        let previous_response_id = if self.auto_previous_response_id || self.previous_response_id.is_some() {
-            self.previous_response_id.clone()
-        } else {
-            None
-        };
+        let previous_response_id =
+            if self.auto_previous_response_id || self.previous_response_id.is_some() {
+                self.previous_response_id.clone()
+            } else {
+                None
+            };
         let request = ModelRequest {
             system_instructions: instructions.clone(),
             input: input.clone(),
@@ -945,10 +974,12 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
         };
 
         if let Some(h) = &self.hooks {
-            h.on_llm_start(&self.ctx, &agent, instructions.as_deref(), &input).await;
+            h.on_llm_start(&self.ctx, &agent, instructions.as_deref(), &input)
+                .await;
         }
         if let Some(h) = &agent.hooks {
-            h.on_llm_start(&self.ctx, &agent, instructions.as_deref(), &input).await;
+            h.on_llm_start(&self.ctx, &agent, instructions.as_deref(), &input)
+                .await;
         }
 
         let response = if parallel.is_empty() {
@@ -956,7 +987,8 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
         } else {
             let g_input = guardrail_input.clone().unwrap_or_default();
             let (guard_results, model_result) = {
-                let model_fut = Box::pin(model_call::call_model(&model, request, self.sink.as_ref()));
+                let model_fut =
+                    Box::pin(model_call::call_model(&model, request, self.sink.as_ref()));
                 let guard_fut = self.run_input_guardrails(parallel, g_input);
                 tokio::pin!(model_fut);
                 tokio::pin!(guard_fut);
@@ -989,13 +1021,14 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
         }
         self.model_responses.push(response.clone());
 
-        let processed = self.process_response(&agent, &tools, &handoffs, &response, true, &HashSet::new())?;
+        let processed =
+            self.process_response(&agent, &tools, &handoffs, &response, true, &HashSet::new())?;
         if self.server_managed() {
             self.server_input_sent = true;
-            if self.auto_previous_response_id || self.previous_response_id.is_some() {
-                if let Some(id) = &response.response_id {
-                    self.previous_response_id = Some(id.clone());
-                }
+            if (self.auto_previous_response_id || self.previous_response_id.is_some())
+                && let Some(id) = &response.response_id
+            {
+                self.previous_response_id = Some(id.clone());
             }
             self.server_sent_items = self.model_items.len();
         }
@@ -1003,13 +1036,18 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
     }
 
     /// Re-process the last model response after approvals were resolved.
-    async fn resume_tools(&mut self, tools: Vec<Tool<C>>, handoffs: Vec<Handoff<C>>) -> Result<NextStep<C>> {
+    async fn resume_tools(
+        &mut self,
+        tools: Vec<Tool<C>>,
+        handoffs: Vec<Handoff<C>>,
+    ) -> Result<NextStep<C>> {
         let agent = self.current_agent.clone();
         let Some(response) = self.model_responses.last().cloned() else {
             return Ok(NextStep::RunAgain);
         };
         let done: HashSet<String> = self.generated_items.iter().filter_map(call_id_of).collect();
-        let processed = self.process_response(&agent, &tools, &handoffs, &response, false, &done)?;
+        let processed =
+            self.process_response(&agent, &tools, &handoffs, &response, false, &done)?;
         Box::pin(self.execute_side_effects(&agent, processed)).await
     }
 
@@ -1052,13 +1090,23 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
                 OutputItem::Message(m) => {
                     processed.last_message = Some(m.clone());
                     if append {
-                        let item = RunItem::new(name.clone(), RunItemKind::MessageOutput { raw_item: m.clone() });
+                        let item = RunItem::new(
+                            name.clone(),
+                            RunItemKind::MessageOutput {
+                                raw_item: m.clone(),
+                            },
+                        );
                         self.push_item(item, Some(RunItemStreamEventName::MessageOutputCreated));
                     }
                 }
                 OutputItem::Reasoning(r) => {
                     if append {
-                        let item = RunItem::new(name.clone(), RunItemKind::Reasoning { raw_item: r.clone() });
+                        let item = RunItem::new(
+                            name.clone(),
+                            RunItemKind::Reasoning {
+                                raw_item: r.clone(),
+                            },
+                        );
                         self.push_item(item, Some(RunItemStreamEventName::ReasoningItemCreated));
                     }
                 }
@@ -1066,7 +1114,12 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
                     processed.has_tool_activity = true;
                     if let Some(h) = handoff_map.get(fc.name.as_str()) {
                         if append {
-                            let item = RunItem::new(name.clone(), RunItemKind::HandoffCall { raw_item: fc.clone() });
+                            let item = RunItem::new(
+                                name.clone(),
+                                RunItemKind::HandoffCall {
+                                    raw_item: fc.clone(),
+                                },
+                            );
                             self.push_item(item, Some(RunItemStreamEventName::HandoffRequested));
                         }
                         if !skip.contains(&fc.call_id) {
@@ -1074,7 +1127,12 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
                         }
                     } else if let Some(t) = function_map.get(fc.name.as_str()) {
                         if append {
-                            let item = RunItem::new(name.clone(), RunItemKind::ToolCall { raw_item: fc.to_value() });
+                            let item = RunItem::new(
+                                name.clone(),
+                                RunItemKind::ToolCall {
+                                    raw_item: fc.to_value(),
+                                },
+                            );
                             self.push_item(item, Some(RunItemStreamEventName::ToolCalled));
                         }
                         processed.tools_used.push(fc.name.clone());
@@ -1091,10 +1149,21 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
                             }
                             ToolNotFoundBehavior::ReturnErrorToModel => {
                                 if append && !skip.contains(&fc.call_id) {
-                                    let call_item =
-                                        RunItem::new(name.clone(), RunItemKind::ToolCall { raw_item: fc.to_value() });
-                                    self.push_item(call_item, Some(RunItemStreamEventName::ToolCalled));
-                                    let msg = tools::tool_not_found_message(&self.config, &fc.name, &fc.call_id);
+                                    let call_item = RunItem::new(
+                                        name.clone(),
+                                        RunItemKind::ToolCall {
+                                            raw_item: fc.to_value(),
+                                        },
+                                    );
+                                    self.push_item(
+                                        call_item,
+                                        Some(RunItemStreamEventName::ToolCalled),
+                                    );
+                                    let msg = tools::tool_not_found_message(
+                                        &self.config,
+                                        &fc.name,
+                                        &fc.call_id,
+                                    );
                                     let out = ToolOutput::Text(msg);
                                     let raw = ItemHelpers::tool_call_output_item(fc, &out);
                                     let item = RunItem::new(
@@ -1115,16 +1184,28 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
                     match ty {
                         "mcp_list_tools" => {
                             if append {
-                                let item = RunItem::new(name.clone(), RunItemKind::MCPListTools { raw_item: v.clone() });
+                                let item = RunItem::new(
+                                    name.clone(),
+                                    RunItemKind::MCPListTools {
+                                        raw_item: v.clone(),
+                                    },
+                                );
                                 self.push_item(item, Some(RunItemStreamEventName::MCPListTools));
                             }
                         }
                         "mcp_approval_request" => {
                             processed.has_tool_activity = true;
                             if append {
-                                let item =
-                                    RunItem::new(name.clone(), RunItemKind::MCPApprovalRequest { raw_item: v.clone() });
-                                self.push_item(item, Some(RunItemStreamEventName::MCPApprovalRequested));
+                                let item = RunItem::new(
+                                    name.clone(),
+                                    RunItemKind::MCPApprovalRequest {
+                                        raw_item: v.clone(),
+                                    },
+                                );
+                                self.push_item(
+                                    item,
+                                    Some(RunItemStreamEventName::MCPApprovalRequested),
+                                );
                             }
                             let id = v.get("id").and_then(Value::as_str).unwrap_or_default();
                             if !skip.contains(id) {
@@ -1145,7 +1226,10 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
                                         output: Value::Null,
                                     },
                                 );
-                                self.push_item(item, Some(RunItemStreamEventName::ToolSearchOutputCreated));
+                                self.push_item(
+                                    item,
+                                    Some(RunItemStreamEventName::ToolSearchOutputCreated),
+                                );
                             }
                         }
                         _ => {
@@ -1155,7 +1239,12 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
                                 } else {
                                     RunItemStreamEventName::ToolCalled
                                 };
-                                let item = RunItem::new(name.clone(), RunItemKind::ToolCall { raw_item: v.clone() });
+                                let item = RunItem::new(
+                                    name.clone(),
+                                    RunItemKind::ToolCall {
+                                        raw_item: v.clone(),
+                                    },
+                                );
                                 self.push_item(item, Some(event));
                             }
                             if ty.ends_with("_call") {
@@ -1195,8 +1284,10 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
         };
         let mut function_results = Vec::new();
         for r in results {
-            self.tool_input_guardrail_results.extend(r.input_guardrail_results);
-            self.tool_output_guardrail_results.extend(r.output_guardrail_results);
+            self.tool_input_guardrail_results
+                .extend(r.input_guardrail_results);
+            self.tool_output_guardrail_results
+                .extend(r.output_guardrail_results);
             match r.outcome {
                 tools::ToolOutcome::Output { output, item } => {
                     let ri = RunItem::new(
@@ -1234,9 +1325,21 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
         // Hosted MCP approval requests.
         let mut answered_mcp = false;
         for (request, tool) in processed.mcp_approvals {
-            let request_id = request.get("id").and_then(Value::as_str).unwrap_or_default().to_string();
-            let tool_name = request.get("name").and_then(Value::as_str).unwrap_or_default().to_string();
-            let label = request.get("server_label").and_then(Value::as_str).unwrap_or_default().to_string();
+            let request_id = request
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let tool_name = request
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let label = request
+                .get("server_label")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
             let identity = format!("{label}:{tool_name}");
             let decision = match tool.as_ref().and_then(|t| t.on_approval_request().cloned()) {
                 Some(cb) => {
@@ -1250,7 +1353,13 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
                 None => self
                     .ctx
                     .is_tool_approved(&agent.name, &identity, &request_id)
-                    .map(|a| (a, self.ctx.rejection_message(&agent.name, &identity, &request_id))),
+                    .map(|a| {
+                        (
+                            a,
+                            self.ctx
+                                .rejection_message(&agent.name, &identity, &request_id),
+                        )
+                    }),
             };
             match decision {
                 Some((approve, reason)) => {
@@ -1262,7 +1371,10 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
                     if let Some(r) = reason.filter(|_| !approve) {
                         resp["reason"] = Value::String(r);
                     }
-                    let ri = RunItem::new(agent.name.clone(), RunItemKind::MCPApprovalResponse { raw_item: resp });
+                    let ri = RunItem::new(
+                        agent.name.clone(),
+                        RunItemKind::MCPApprovalResponse { raw_item: resp },
+                    );
                     self.push_item(ri, Some(RunItemStreamEventName::MCPApprovalResponse));
                     answered_mcp = true;
                 }
@@ -1311,7 +1423,9 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
         if ran_functions && !function_results.is_empty() {
             let decision = match &agent.tool_use_behavior {
                 ToolUseBehavior::RunLlmAgain => None,
-                ToolUseBehavior::StopOnFirstTool => Some(function_results[0].output.to_json_value()),
+                ToolUseBehavior::StopOnFirstTool => {
+                    Some(function_results[0].output.to_json_value())
+                }
                 ToolUseBehavior::StopAtTools(s) => function_results
                     .iter()
                     .find(|r| s.stop_at_tool_names.contains(&r.tool_name))
@@ -1452,10 +1566,18 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
 
         let span = tr::handoff_span(&agent.name, None);
         span.start();
-        let new_agent = match scope::with_span(span.clone(), handoff.invoke(self.ctx.clone(), call.arguments.clone())).await {
+        let new_agent = match scope::with_span(
+            span.clone(),
+            handoff.invoke(self.ctx.clone(), call.arguments.clone()),
+        )
+        .await
+        {
             Ok(a) => a,
             Err(e) => {
-                span.set_error("Error invoking handoff", Some(json!({"error": e.to_string()})));
+                span.set_error(
+                    "Error invoking handoff",
+                    Some(json!({"error": e.to_string()})),
+                );
                 span.finish();
                 return Err(e);
             }

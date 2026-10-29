@@ -4,7 +4,9 @@ use std::sync::Arc;
 
 use openai_agents_sdk::testing::{FakeModel, assistant_message, function_call};
 use openai_agents_sdk::tool::FunctionTool;
-use openai_agents_sdk::tracing::{InMemoryTraceProcessor, TracingProcessor, set_trace_processors, trace};
+use openai_agents_sdk::tracing::{
+    InMemoryTraceProcessor, TracingProcessor, set_trace_processors, trace,
+};
 use openai_agents_sdk::{Agent, Runner};
 use serde_json::Value;
 
@@ -21,7 +23,9 @@ async fn run_produces_trace_and_nested_spans() {
         span.run(async {}).await;
         Ok("pong")
     });
-    let agent = Agent::<()>::new("Pinger").with_tool(tool).with_model_instance(model.clone());
+    let agent = Agent::<()>::new("Pinger")
+        .with_tool(tool)
+        .with_model_instance(model.clone());
 
     trace("Ping workflow")
         .group_id("thread_1")
@@ -40,10 +44,17 @@ async fn run_produces_trace_and_nested_spans() {
     let trace_id = traces[0]["id"].as_str().unwrap();
     assert!(trace_id.starts_with("trace_") && trace_id.len() == 38);
 
-    let spans: Vec<&Value> = items.iter().filter(|i| i["object"] == "trace.span").collect();
+    let spans: Vec<&Value> = items
+        .iter()
+        .filter(|i| i["object"] == "trace.span")
+        .collect();
     assert!(spans.iter().all(|s| s["trace_id"] == trace_id));
     let by_type = |t: &str| -> Vec<&Value> {
-        spans.iter().copied().filter(|s| s["span_data"]["type"] == t).collect()
+        spans
+            .iter()
+            .copied()
+            .filter(|s| s["span_data"]["type"] == t)
+            .collect()
     };
     let agent_spans = by_type("agent");
     assert_eq!(agent_spans.len(), 2);

@@ -59,14 +59,22 @@ fn edges<C>(agent: &Agent<C>, is_root: bool, visited: &mut HashSet<usize>, out: 
     }
     for t in &agent.tools {
         let tn = escape(&t.name());
-        out.push_str(&format!("\"{name}\" -> \"{tn}\" [style=dotted, penwidth=1.5];"));
-        out.push_str(&format!("\"{tn}\" -> \"{name}\" [style=dotted, penwidth=1.5];"));
+        out.push_str(&format!(
+            "\"{name}\" -> \"{tn}\" [style=dotted, penwidth=1.5];"
+        ));
+        out.push_str(&format!(
+            "\"{tn}\" -> \"{name}\" [style=dotted, penwidth=1.5];"
+        ));
     }
     #[cfg(feature = "mcp")]
     for s in &agent.mcp_servers {
         let sn = escape(s.name());
-        out.push_str(&format!("\"{name}\" -> \"{sn}\" [style=dashed, penwidth=1.5];"));
-        out.push_str(&format!("\"{sn}\" -> \"{name}\" [style=dashed, penwidth=1.5];"));
+        out.push_str(&format!(
+            "\"{name}\" -> \"{sn}\" [style=dashed, penwidth=1.5];"
+        ));
+        out.push_str(&format!(
+            "\"{sn}\" -> \"{name}\" [style=dashed, penwidth=1.5];"
+        ));
     }
     for h in &agent.handoffs {
         out.push_str(&format!("\"{name}\" -> \"{}\";", escape(&h.agent_name)));
@@ -91,7 +99,10 @@ pub fn get_main_graph<C>(agent: &Agent<C>) -> String {
 }
 
 /// Write the DOT graph to `path` (render it with Graphviz, e.g. `dot -Tpng`).
-pub fn draw_graph<C>(agent: &Arc<Agent<C>>, path: impl AsRef<std::path::Path>) -> std::io::Result<()> {
+pub fn draw_graph<C>(
+    agent: &Arc<Agent<C>>,
+    path: impl AsRef<std::path::Path>,
+) -> std::io::Result<()> {
     std::fs::write(path, get_main_graph(agent.as_ref()))
 }
 

@@ -109,7 +109,12 @@ pub fn create_span(data: SpanData, parent: Option<&Span>, disabled: bool) -> Spa
         }
     };
     let trace = scope::current_trace();
-    Span::new(trace.as_ref(), parent, data, disabled || provider().is_disabled())
+    Span::new(
+        trace.as_ref(),
+        parent,
+        data,
+        disabled || provider().is_disabled(),
+    )
 }
 
 /// A custom span with arbitrary data.

@@ -68,7 +68,11 @@ pub struct OutputGuardrailResult {
 }
 
 type InputGuardrailFn<C> = Arc<
-    dyn Fn(RunContext<C>, Arc<Agent<C>>, Vec<InputItem>) -> BoxFuture<'static, Result<GuardrailFunctionOutput>>
+    dyn Fn(
+            RunContext<C>,
+            Arc<Agent<C>>,
+            Vec<InputItem>,
+        ) -> BoxFuture<'static, Result<GuardrailFunctionOutput>>
         + Send
         + Sync,
 >;
@@ -136,7 +140,11 @@ impl<C: Send + Sync + 'static> InputGuardrail<C> {
 }
 
 type OutputGuardrailFn<C> = Arc<
-    dyn Fn(RunContext<C>, Arc<Agent<C>>, Value) -> BoxFuture<'static, Result<GuardrailFunctionOutput>>
+    dyn Fn(
+            RunContext<C>,
+            Arc<Agent<C>>,
+            Value,
+        ) -> BoxFuture<'static, Result<GuardrailFunctionOutput>>
         + Send
         + Sync,
 >;

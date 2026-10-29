@@ -73,7 +73,11 @@ impl OpenAIConversationsSession {
                 .client
                 .get_json(&format!("conversations/{id}/items"), &query)
                 .await?;
-            let data = page.get("data").and_then(Value::as_array).cloned().unwrap_or_default();
+            let data = page
+                .get("data")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
             out.extend(data);
             if let Some(l) = limit
                 && out.len() >= l
@@ -81,8 +85,14 @@ impl OpenAIConversationsSession {
                 out.truncate(l);
                 break;
             }
-            let has_more = page.get("has_more").and_then(Value::as_bool).unwrap_or(false);
-            after = page.get("last_id").and_then(Value::as_str).map(str::to_string);
+            let has_more = page
+                .get("has_more")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            after = page
+                .get("last_id")
+                .and_then(Value::as_str)
+                .map(str::to_string);
             if !has_more || after.is_none() {
                 break;
             }
@@ -125,7 +135,10 @@ impl Session for OpenAIConversationsSession {
                 v
             }
         };
-        Ok(items.into_iter().map(|v| InputItem(strip_server_fields(v))).collect())
+        Ok(items
+            .into_iter()
+            .map(|v| InputItem(strip_server_fields(v)))
+            .collect())
     }
 
     async fn add_items(&self, items: Vec<InputItem>) -> Result<()> {

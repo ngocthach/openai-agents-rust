@@ -33,7 +33,10 @@ const TOOL_TYPES: &[&str] = &[
 ];
 
 fn is_tool_item(item: &RunItem) -> bool {
-    !matches!(item.kind, RunItemKind::MessageOutput { .. } | RunItemKind::Input { .. })
+    !matches!(
+        item.kind,
+        RunItemKind::MessageOutput { .. } | RunItemKind::Input { .. }
+    )
 }
 
 fn remove_tools_from_items(items: Vec<RunItem>) -> Vec<RunItem> {
@@ -43,7 +46,11 @@ fn remove_tools_from_items(items: Vec<RunItem>) -> Vec<RunItem> {
 fn remove_tool_types_from_input(items: Vec<InputItem>) -> Vec<InputItem> {
     items
         .into_iter()
-        .filter(|i| !i.item_type().map(|t| TOOL_TYPES.contains(&t)).unwrap_or(false))
+        .filter(|i| {
+            !i.item_type()
+                .map(|t| TOOL_TYPES.contains(&t))
+                .unwrap_or(false)
+        })
         .collect()
 }
 

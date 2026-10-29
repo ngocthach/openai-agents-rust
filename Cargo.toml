@@ -38,7 +38,7 @@ tokio-util = "0.7"
 uuid = { version = "1", features = ["v4"] }
 rand = "0.9"
 rusqlite = { version = "0.41", features = ["bundled"], optional = true }
-rmcp = { version = "3", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "client-side-sse", "reqwest"], optional = true }
+rmcp = { version = "3", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest"], optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }

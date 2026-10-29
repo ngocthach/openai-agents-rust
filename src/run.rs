@@ -177,7 +177,13 @@ impl Runner {
         input: impl Into<RunInput>,
         options: RunOptions<C>,
     ) -> Result<RunResult<C>> {
-        Box::pin(run_loop(agent.into_agent_arc(), input.into(), options, None)).await
+        Box::pin(run_loop(
+            agent.into_agent_arc(),
+            input.into(),
+            options,
+            None,
+        ))
+        .await
     }
 
     /// Run synchronously on a new tokio runtime. Must not be called from within a runtime.
@@ -234,7 +240,9 @@ impl Runner {
         let scope = ScopeSnapshot::capture();
         let start_agent = agent.clone();
         let handle = tokio::spawn(async move {
-            let result = scope.enter(Box::pin(run_loop(agent, input, options, Some(sink)))).await;
+            let result = scope
+                .enter(Box::pin(run_loop(agent, input, options, Some(sink))))
+                .await;
             let _ = tx.send(StreamMsg::Done(Box::new(result)));
         });
         RunResultStreaming::new(rx, start_agent, cancel, handle)

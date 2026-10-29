@@ -100,7 +100,8 @@ impl SpanData {
                 agent_name,
                 usage,
             } => {
-                let mut data = json!({"sdk_span_type": "turn", "turn": turn, "agent_name": agent_name});
+                let mut data =
+                    json!({"sdk_span_type": "turn", "turn": turn, "agent_name": agent_name});
                 if let Some(u) = usage {
                     data["usage"] = u.clone();
                 }
@@ -141,7 +142,9 @@ impl SpanData {
                 from_agent,
                 to_agent,
             } => json!({"type": "handoff", "from_agent": from_agent, "to_agent": to_agent}),
-            SpanData::Custom { name, data } => json!({"type": "custom", "name": name, "data": data}),
+            SpanData::Custom { name, data } => {
+                json!({"type": "custom", "name": name, "data": data})
+            }
             SpanData::Guardrail { name, triggered } => {
                 json!({"type": "guardrail", "name": name, "triggered": triggered})
             }

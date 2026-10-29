@@ -33,7 +33,8 @@ pub struct HandoffInputData {
 /// A function that rewrites the input the next agent receives.
 pub type HandoffInputFilter = Arc<dyn Fn(HandoffInputData) -> HandoffInputData + Send + Sync>;
 
-type InvokeFn<C> = Arc<dyn Fn(RunContext<C>, String) -> BoxFuture<'static, Result<Arc<Agent<C>>>> + Send + Sync>;
+type InvokeFn<C> =
+    Arc<dyn Fn(RunContext<C>, String) -> BoxFuture<'static, Result<Arc<Agent<C>>>> + Send + Sync>;
 
 /// A handoff to another agent, exposed to the model as a `transfer_to_<agent>` tool.
 pub struct Handoff<C> {
@@ -220,12 +221,13 @@ impl<C: Send + Sync + 'static> Handoff<C> {
             let target = target.clone();
             let tool_name = tool_name.clone();
             Box::pin(async move {
-                let parsed: T = serde_json::from_str(if args.trim().is_empty() { "{}" } else { &args })
-                    .map_err(|e| {
-                        AgentsError::model_behavior(format!(
-                            "Invalid JSON input for handoff {tool_name}: {e}"
-                        ))
-                    })?;
+                let parsed: T =
+                    serde_json::from_str(if args.trim().is_empty() { "{}" } else { &args })
+                        .map_err(|e| {
+                            AgentsError::model_behavior(format!(
+                                "Invalid JSON input for handoff {tool_name}: {e}"
+                            ))
+                        })?;
                 f(ctx.clone(), parsed).await?;
                 match target {
                     Some(a) => Ok(a),
@@ -323,7 +325,8 @@ mod tests {
 
     #[tokio::test]
     async fn default_naming_and_invocation() {
-        let billing = Arc::new(Agent::<()>::new("Billing agent").with_handoff_description("Billing"));
+        let billing =
+            Arc::new(Agent::<()>::new("Billing agent").with_handoff_description("Billing"));
         let h = handoff(billing);
         assert_eq!(h.tool_name, "transfer_to_Billing_agent");
         assert!(h.tool_description.contains("Billing agent agent"));
@@ -344,14 +347,15 @@ mod tests {
     async fn handoff_with_input() {
         let seen = Arc::new(std::sync::Mutex::new(String::new()));
         let s2 = seen.clone();
-        let h = handoff(Arc::new(Agent::<()>::new("Escalation")))
-            .with_on_handoff_input(move |_ctx, data: Escalation| {
+        let h = handoff(Arc::new(Agent::<()>::new("Escalation"))).with_on_handoff_input(
+            move |_ctx, data: Escalation| {
                 let s2 = s2.clone();
                 async move {
                     *s2.lock().unwrap() = data.reason;
                     Ok(())
                 }
-            });
+            },
+        );
         assert_eq!(h.input_json_schema["required"], json!(["reason"]));
         h.invoke(RunContext::new(()), r#"{"reason":"angry"}"#.into())
             .await

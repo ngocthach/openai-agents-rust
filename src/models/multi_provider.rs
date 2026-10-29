@@ -49,7 +49,11 @@ impl MultiProvider {
     }
 
     /// Register a provider for a prefix (e.g. `"litellm"` handles `litellm/...`).
-    pub fn with_provider(mut self, prefix: impl Into<String>, provider: Arc<dyn ModelProvider>) -> Self {
+    pub fn with_provider(
+        mut self,
+        prefix: impl Into<String>,
+        provider: Arc<dyn ModelProvider>,
+    ) -> Self {
         self.providers.insert(prefix.into(), provider);
         self
     }
@@ -98,10 +102,28 @@ mod tests {
     #[test]
     fn routes_prefixes() {
         let p = MultiProvider::new();
-        assert_eq!(p.get_model(Some("openai/gpt-4.1")).unwrap().model_name().as_deref(), Some("gpt-4.1"));
-        assert_eq!(p.get_model(Some("gpt-4.1")).unwrap().model_name().as_deref(), Some("gpt-4.1"));
+        assert_eq!(
+            p.get_model(Some("openai/gpt-4.1"))
+                .unwrap()
+                .model_name()
+                .as_deref(),
+            Some("gpt-4.1")
+        );
+        assert_eq!(
+            p.get_model(Some("gpt-4.1"))
+                .unwrap()
+                .model_name()
+                .as_deref(),
+            Some("gpt-4.1")
+        );
         assert!(p.get_model(Some("foo/bar")).is_err());
         let p = MultiProvider::new().with_unknown_prefix_mode(PrefixMode::ModelId);
-        assert_eq!(p.get_model(Some("foo/bar")).unwrap().model_name().as_deref(), Some("foo/bar"));
+        assert_eq!(
+            p.get_model(Some("foo/bar"))
+                .unwrap()
+                .model_name()
+                .as_deref(),
+            Some("foo/bar")
+        );
     }
 }

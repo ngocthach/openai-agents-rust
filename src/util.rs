@@ -12,7 +12,13 @@ pub fn transform_string_function_style(name: &str) -> String {
     let replaced = name.replace(' ', "_");
     replaced
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 

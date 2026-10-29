@@ -45,8 +45,11 @@ impl Prompt {
     }
 }
 
-type DynamicPromptFn<C> =
-    Arc<dyn Fn(RunContext<C>, Arc<Agent<C>>) -> BoxFuture<'static, Result<Option<Prompt>>> + Send + Sync>;
+type DynamicPromptFn<C> = Arc<
+    dyn Fn(RunContext<C>, Arc<Agent<C>>) -> BoxFuture<'static, Result<Option<Prompt>>>
+        + Send
+        + Sync,
+>;
 
 /// A static prompt or a function generating it at run time.
 pub enum AgentPrompt<C> {
@@ -83,7 +86,11 @@ impl<C: Send + Sync + 'static> AgentPrompt<C> {
     }
 
     /// Resolve the prompt for a run.
-    pub async fn resolve(&self, ctx: &RunContext<C>, agent: Arc<Agent<C>>) -> Result<Option<Prompt>> {
+    pub async fn resolve(
+        &self,
+        ctx: &RunContext<C>,
+        agent: Arc<Agent<C>>,
+    ) -> Result<Option<Prompt>> {
         match self {
             AgentPrompt::Static(p) => Ok(Some(p.clone())),
             AgentPrompt::Dynamic(f) => f(ctx.clone(), agent).await,

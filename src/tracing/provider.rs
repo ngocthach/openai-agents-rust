@@ -47,7 +47,11 @@ pub fn provider() -> &'static TraceProvider {
 /// The default batch processor exporting to OpenAI.
 pub fn default_processor() -> Arc<BatchTraceProcessor> {
     DEFAULT_PROCESSOR
-        .get_or_init(|| Arc::new(BatchTraceProcessor::new(Arc::new(BackendSpanExporter::new()))))
+        .get_or_init(|| {
+            Arc::new(BatchTraceProcessor::new(Arc::new(
+                BackendSpanExporter::new(),
+            )))
+        })
         .clone()
 }
 
@@ -86,7 +90,8 @@ impl TraceProvider {
     /// Add a processor (keeps the default OpenAI exporter).
     pub fn add_processor(&self, processor: Arc<dyn TracingProcessor>) {
         let mut guard = self.processors.write().expect("provider poisoned");
-        let list = guard.get_or_insert_with(|| vec![default_processor() as Arc<dyn TracingProcessor>]);
+        let list =
+            guard.get_or_insert_with(|| vec![default_processor() as Arc<dyn TracingProcessor>]);
         list.push(processor);
     }
 

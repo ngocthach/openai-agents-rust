@@ -39,7 +39,15 @@ const ROOT_REF_NON_CONSTRAINING_SIBLINGS: &[&str] = &[
 
 /// String formats accepted by OpenAI structured outputs.
 const SUPPORTED_STRING_FORMATS: &[&str] = &[
-    "date-time", "time", "date", "duration", "email", "hostname", "ipv4", "ipv6", "uuid",
+    "date-time",
+    "time",
+    "date",
+    "duration",
+    "email",
+    "hostname",
+    "ipv4",
+    "ipv6",
+    "uuid",
 ];
 
 /// Remove `format` values that OpenAI strict mode rejects. schemars emits formats such as
@@ -227,7 +235,10 @@ fn ensure_strict(
     if let Some(items) = obj.get("items").cloned()
         && items.is_object()
     {
-        obj.insert("items".into(), ensure_strict(items, root, budget, next, false)?);
+        obj.insert(
+            "items".into(),
+            ensure_strict(items, root, budget, next, false)?,
+        );
     }
 
     if let Some(Value::Array(any_of)) = obj.get("anyOf").cloned() {
@@ -338,14 +349,20 @@ pub fn resolve_ref(root: &Value, reference: &str) -> Result<Value> {
         let key = raw.replace("~1", "/").replace("~0", "~");
         current = match current {
             Value::Object(m) => m.get(&key).ok_or_else(|| {
-                AgentsError::user(format!("Encountered missing key {key} while resolving {reference}"))
+                AgentsError::user(format!(
+                    "Encountered missing key {key} while resolving {reference}"
+                ))
             })?,
             Value::Array(a) => {
                 let idx: usize = key.parse().map_err(|_| {
-                    AgentsError::user(format!("Invalid array index {key} while resolving {reference}"))
+                    AgentsError::user(format!(
+                        "Invalid array index {key} while resolving {reference}"
+                    ))
                 })?;
                 a.get(idx).ok_or_else(|| {
-                    AgentsError::user(format!("Index {idx} out of range while resolving {reference}"))
+                    AgentsError::user(format!(
+                        "Index {idx} out of range while resolving {reference}"
+                    ))
                 })?
             }
             _ => {

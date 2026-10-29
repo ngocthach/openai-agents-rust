@@ -83,8 +83,7 @@ impl InputItem {
 
     /// True if this item is a plain message (has a role but is not a tool item).
     pub fn is_message(&self) -> bool {
-        self.role().is_some()
-            && matches!(self.item_type(), None | Some("message"))
+        self.role().is_some() && matches!(self.item_type(), None | Some("message"))
     }
 
     /// The textual content of a message item, concatenating text parts.
@@ -292,7 +291,8 @@ impl From<MessageContent> for Value {
                 annotations,
                 logprobs,
             } => {
-                let mut m = json!({"type": "output_text", "text": text, "annotations": annotations});
+                let mut m =
+                    json!({"type": "output_text", "text": text, "annotations": annotations});
                 if let Some(lp) = logprobs {
                     m["logprobs"] = lp;
                 }
@@ -422,8 +422,12 @@ impl OutputItem {
                 m.remove("type");
             }
             match value.get("type").and_then(Value::as_str) {
-                Some("message") if value.get("role").and_then(Value::as_str) == Some("assistant") => {
-                    serde_json::from_value(without_type).ok().map(OutputItem::Message)
+                Some("message")
+                    if value.get("role").and_then(Value::as_str) == Some("assistant") =>
+                {
+                    serde_json::from_value(without_type)
+                        .ok()
+                        .map(OutputItem::Message)
                 }
                 Some("function_call") => serde_json::from_value(without_type)
                     .ok()
@@ -532,7 +536,10 @@ pub enum RunItemKind {
     ToolCallOutput { raw_item: Value, output: Value },
     /// A tool call that paused for approval.
     #[serde(rename = "tool_approval_item")]
-    ToolApproval { raw_item: FunctionCall, tool_name: String },
+    ToolApproval {
+        raw_item: FunctionCall,
+        tool_name: String,
+    },
     /// A handoff request from the model.
     #[serde(rename = "handoff_call_item")]
     HandoffCall { raw_item: FunctionCall },

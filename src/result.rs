@@ -87,7 +87,9 @@ impl<C> RunResult<C> {
 
     /// The id of the last model response (for `previous_response_id` chaining).
     pub fn last_response_id(&self) -> Option<String> {
-        self.raw_responses.last().and_then(|r| r.response_id.clone())
+        self.raw_responses
+            .last()
+            .and_then(|r| r.response_id.clone())
     }
 
     /// Usage accumulated by the run.

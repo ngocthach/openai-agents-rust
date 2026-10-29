@@ -268,7 +268,11 @@ impl ModelSettings {
             if let Some(b) = &other.extra_args {
                 merged.extend(b.clone());
             }
-            out.extra_args = if merged.is_empty() { None } else { Some(merged) };
+            out.extra_args = if merged.is_empty() {
+                None
+            } else {
+                Some(merged)
+            };
         }
         out
     }

@@ -86,8 +86,11 @@ pub enum ReasoningItemIdPolicy {
     Omit,
 }
 
-type SessionInputCallback =
-    Arc<dyn Fn(Vec<InputItem>, Vec<InputItem>) -> BoxFuture<'static, Result<Vec<InputItem>>> + Send + Sync>;
+type SessionInputCallback = Arc<
+    dyn Fn(Vec<InputItem>, Vec<InputItem>) -> BoxFuture<'static, Result<Vec<InputItem>>>
+        + Send
+        + Sync,
+>;
 type CallModelInputFilter<C> =
     Arc<dyn Fn(CallModelData<C>) -> BoxFuture<'static, Result<ModelInputData>> + Send + Sync>;
 type ToolErrorFormatter = Arc<dyn Fn(&ToolErrorFormatterArgs) -> Option<String> + Send + Sync>;

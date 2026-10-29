@@ -257,7 +257,8 @@ pub enum ToolTimeoutBehavior {
 }
 
 /// Dynamic enablement check for tools and handoffs.
-pub type IsEnabledFn<C> = Arc<dyn Fn(RunContext<C>, String) -> BoxFuture<'static, bool> + Send + Sync>;
+pub type IsEnabledFn<C> =
+    Arc<dyn Fn(RunContext<C>, String) -> BoxFuture<'static, bool> + Send + Sync>;
 
 /// A boolean or a dynamic check receiving the run context and the agent name.
 pub enum IsEnabled<C> {
@@ -440,7 +441,11 @@ impl<C: Send + Sync + 'static> FunctionTool<C> {
     ///
     /// `Args` must implement `schemars::JsonSchema` and `serde::Deserialize`; its schema is used
     /// as the tool parameters (converted to strict mode).
-    pub fn new<Args, F, Fut, T>(name: impl Into<String>, description: impl Into<String>, f: F) -> Self
+    pub fn new<Args, F, Fut, T>(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        f: F,
+    ) -> Self
     where
         Args: JsonSchema + DeserializeOwned + Send + 'static,
         F: Fn(ToolContext<C>, Args) -> Fut + Send + Sync + 'static,
@@ -484,7 +489,11 @@ impl<C: Send + Sync + 'static> FunctionTool<C> {
     }
 
     /// Create a tool without parameters.
-    pub fn new_no_args<F, Fut, T>(name: impl Into<String>, description: impl Into<String>, f: F) -> Self
+    pub fn new_no_args<F, Fut, T>(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        f: F,
+    ) -> Self
     where
         F: Fn(ToolContext<C>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<T>> + Send + 'static,
@@ -495,7 +504,12 @@ impl<C: Send + Sync + 'static> FunctionTool<C> {
             let f = f.clone();
             Box::pin(async move { Ok(f(ctx).await?.into_tool_output()) })
         });
-        Self::build(name.into(), description.into(), empty_object_schema(), invoke)
+        Self::build(
+            name.into(),
+            description.into(),
+            empty_object_schema(),
+            invoke,
+        )
     }
 
     /// Create a tool from a raw JSON schema and a closure receiving the raw JSON arguments.
@@ -641,7 +655,6 @@ impl<C: Send + Sync + 'static> FunctionTool<C> {
         self.defer_loading = defer;
         self
     }
-
 }
 
 impl<C> FunctionTool<C> {
@@ -876,8 +889,9 @@ pub struct MCPToolApprovalResult {
     pub reason: Option<String>,
 }
 
-type MCPApprovalFn<C> =
-    Arc<dyn Fn(MCPToolApprovalRequest<C>) -> BoxFuture<'static, MCPToolApprovalResult> + Send + Sync>;
+type MCPApprovalFn<C> = Arc<
+    dyn Fn(MCPToolApprovalRequest<C>) -> BoxFuture<'static, MCPToolApprovalResult> + Send + Sync,
+>;
 
 /// Hosted MCP server tool, executed by the Responses API.
 pub struct HostedMCPTool<C> {
@@ -1135,13 +1149,19 @@ mod tests {
             |_ctx, args: WeatherArgs| async move { Ok(format!("sunny in {}", args.city)) },
         );
         assert!(tool.strict_json_schema);
-        assert_eq!(tool.params_json_schema["properties"]["city"]["type"], "string");
+        assert_eq!(
+            tool.params_json_schema["properties"]["city"]["type"],
+            "string"
+        );
         assert_eq!(
             tool.params_json_schema["properties"]["city"]["description"],
             "The city to look up."
         );
         let ctx = ToolContext::direct(RunContext::new(()), "agent", "get_weather", "{}");
-        let out = tool.invoke(ctx, r#"{"city":"Tokyo"}"#.into()).await.unwrap();
+        let out = tool
+            .invoke(ctx, r#"{"city":"Tokyo"}"#.into())
+            .await
+            .unwrap();
         assert_eq!(out.to_model_string(), "sunny in Tokyo");
         let param = tool.to_responses_param();
         assert_eq!(param["type"], "function");
@@ -1154,6 +1174,9 @@ mod tests {
             FunctionTool::new_no_args("ping", "Ping", |_ctx| async { Ok("pong") });
         assert_eq!(tool.params_json_schema["type"], "object");
         let ctx = ToolContext::direct(RunContext::new(()), "agent", "ping", "");
-        assert_eq!(tool.invoke(ctx, "".into()).await.unwrap().to_model_string(), "pong");
+        assert_eq!(
+            tool.invoke(ctx, "".into()).await.unwrap().to_model_string(),
+            "pong"
+        );
     }
 }

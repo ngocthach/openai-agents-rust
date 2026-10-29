@@ -122,7 +122,11 @@ impl BackendSpanExporter {
             .clone()
             .or_else(super::provider::tracing_export_api_key)
             .or_else(crate::models::default_openai_key)
-            .or_else(|| std::env::var("OPENAI_API_KEY").ok().filter(|k| !k.is_empty()))
+            .or_else(|| {
+                std::env::var("OPENAI_API_KEY")
+                    .ok()
+                    .filter(|k| !k.is_empty())
+            })
     }
 
     fn is_openai_endpoint(&self) -> bool {
@@ -133,7 +137,10 @@ impl BackendSpanExporter {
         let body = json!({"data": data});
         let mut guard = self.runtime.lock().expect("exporter runtime poisoned");
         if guard.is_none() {
-            match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+            match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
                 Ok(rt) => *guard = Some(rt),
                 Err(e) => {
                     log::error!("[non-fatal] Tracing: failed to build export runtime: {e}");
@@ -232,8 +239,14 @@ pub(crate) fn sanitize_for_openai(mut payload: Value) -> Value {
     if !is_generation {
         span_data.remove("usage");
     } else if let Some(usage) = span_data.get("usage").cloned() {
-        let valid = usage.get("input_tokens").map(Value::is_number).unwrap_or(false)
-            && usage.get("output_tokens").map(Value::is_number).unwrap_or(false);
+        let valid = usage
+            .get("input_tokens")
+            .map(Value::is_number)
+            .unwrap_or(false)
+            && usage
+                .get("output_tokens")
+                .map(Value::is_number)
+                .unwrap_or(false);
         if !valid {
             span_data.remove("usage");
         }
@@ -503,7 +516,13 @@ mod tests {
     #[test]
     fn batch_processor_flushes_on_demand() {
         let exporter = Arc::new(Collect::default());
-        let p = BatchTraceProcessor::with_options(exporter.clone(), 100, 10, Duration::from_secs(3600), 0.9);
+        let p = BatchTraceProcessor::with_options(
+            exporter.clone(),
+            100,
+            10,
+            Duration::from_secs(3600),
+            0.9,
+        );
         let t = Trace::new("w".into(), None, None, None, None, false);
         p.on_trace_start(&t);
         p.force_flush();

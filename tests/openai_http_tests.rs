@@ -30,7 +30,9 @@ async fn mock_server(replies: Vec<Reply>) -> (String, Arc<Mutex<Vec<(String, Val
     tokio::spawn(async move {
         let mut replies = replies.into_iter();
         loop {
-            let Ok((mut sock, _)) = listener.accept().await else { return };
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
             let mut buf = Vec::new();
             let mut tmp = [0u8; 8192];
             let (path, body) = loop {
@@ -46,12 +48,14 @@ async fn mock_server(replies: Vec<Reply>) -> (String, Arc<Mutex<Vec<(String, Val
                         .lines()
                         .find_map(|l| {
                             let l = l.to_lowercase();
-                            l.strip_prefix("content-length:").map(|v| v.trim().parse().unwrap())
+                            l.strip_prefix("content-length:")
+                                .map(|v| v.trim().parse().unwrap())
                         })
                         .unwrap_or(0);
                     if buf.len() >= idx + 4 + len {
                         let path = headers.split_whitespace().nth(1).unwrap().to_string();
-                        let body: Value = serde_json::from_slice(&buf[idx + 4..idx + 4 + len]).unwrap_or(Value::Null);
+                        let body: Value = serde_json::from_slice(&buf[idx + 4..idx + 4 + len])
+                            .unwrap_or(Value::Null);
                         break (path, body);
                     }
                 }
@@ -70,7 +74,11 @@ async fn mock_server(replies: Vec<Reply>) -> (String, Arc<Mutex<Vec<(String, Val
                 Reply::Sse(events) => {
                     let mut b = String::new();
                     for e in events {
-                        b.push_str(&format!("event: {}\ndata: {}\n\n", e["type"].as_str().unwrap_or("message"), e));
+                        b.push_str(&format!(
+                            "event: {}\ndata: {}\n\n",
+                            e["type"].as_str().unwrap_or("message"),
+                            e
+                        ));
                     }
                     b.push_str("data: [DONE]\n\n");
                     format!(
@@ -133,10 +141,16 @@ async fn responses_api_round_trip() {
     let body = &reqs[0].1;
     assert_eq!(body["model"], "gpt-5.6-luna");
     assert_eq!(body["instructions"], "Use tools");
-    assert_eq!(body["reasoning"]["effort"], "none", "GPT-5 defaults applied");
+    assert_eq!(
+        body["reasoning"]["effort"], "none",
+        "GPT-5 defaults applied"
+    );
     let params = &body["tools"][0]["parameters"];
     assert_eq!(params["additionalProperties"], false);
-    assert!(params["properties"]["days"].get("format").is_none(), "schemars formats stripped");
+    assert!(
+        params["properties"]["days"].get("format").is_none(),
+        "schemars formats stripped"
+    );
     let second = &reqs[1].1;
     let last = second["input"].as_array().unwrap().last().unwrap();
     assert_eq!(last["type"], "function_call_output");
@@ -156,7 +170,8 @@ async fn responses_api_streaming() {
     ])])
     .await;
     let client = OpenAIClient::new("sk-test").with_base_url(base);
-    let agent = Agent::<()>::new("A").with_model_instance(Arc::new(OpenAIResponsesModel::new("gpt-4.1", client)));
+    let agent = Agent::<()>::new("A")
+        .with_model_instance(Arc::new(OpenAIResponsesModel::new("gpt-4.1", client)));
     let mut result = Runner::run_streamed(&agent, "hi");
     let mut text = String::new();
     {
@@ -214,7 +229,10 @@ async fn chat_completions_round_trip_and_streaming() {
     assert_eq!(msgs[2]["tool_calls"][0]["id"], "call_7");
     assert_eq!(msgs[3]["role"], "tool");
     assert_eq!(msgs[3]["content"], "2 days of sun in Hue");
-    assert_eq!(result.final_output_text().as_deref(), Some("Two sunny days"));
+    assert_eq!(
+        result.final_output_text().as_deref(),
+        Some("Two sunny days")
+    );
     assert_eq!(result.result().unwrap().usage().total_tokens, 37);
 }
 
@@ -236,10 +254,13 @@ async fn api_errors_are_reported() {
         sock.write_all(resp.as_bytes()).await.unwrap();
     });
     let client = OpenAIClient::new("bad").with_base_url(format!("http://{addr}/v1"));
-    let agent = Agent::<()>::new("A").with_model_instance(Arc::new(OpenAIResponsesModel::new("m", client)));
+    let agent =
+        Agent::<()>::new("A").with_model_instance(Arc::new(OpenAIResponsesModel::new("m", client)));
     let err = Runner::run(&agent, "x").await.unwrap_err();
     match err {
-        openai_agents_sdk::AgentsError::ApiError { status, message, .. } => {
+        openai_agents_sdk::AgentsError::ApiError {
+            status, message, ..
+        } => {
             assert_eq!(status, 401);
             assert_eq!(message, "Invalid API key");
         }

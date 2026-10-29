@@ -119,12 +119,20 @@ impl OpenAIClient {
     pub fn api_key(&self) -> Option<String> {
         self.api_key
             .clone()
-            .or_else(|| crate::models::default_openai_key())
-            .or_else(|| std::env::var("OPENAI_API_KEY").ok().filter(|k| !k.is_empty()))
+            .or_else(crate::models::default_openai_key)
+            .or_else(|| {
+                std::env::var("OPENAI_API_KEY")
+                    .ok()
+                    .filter(|k| !k.is_empty())
+            })
     }
 
     fn url(&self, path: &str) -> String {
-        format!("{}/{}", self.base_url.trim_end_matches('/'), path.trim_start_matches('/'))
+        format!(
+            "{}/{}",
+            self.base_url.trim_end_matches('/'),
+            path.trim_start_matches('/')
+        )
     }
 
     fn headers(&self, extra: Option<&HashMap<String, String>>) -> Result<HeaderMap> {
@@ -175,11 +183,17 @@ impl OpenAIClient {
             .and_then(|b| b.pointer("/error/message"))
             .and_then(Value::as_str)
             .map(str::to_string)
-            .unwrap_or_else(|| if text.is_empty() { status.to_string() } else { text.clone() });
+            .unwrap_or_else(|| {
+                if text.is_empty() {
+                    status.to_string()
+                } else {
+                    text.clone()
+                }
+            });
         Err(AgentsError::ApiError {
             status: status.as_u16(),
             message,
-            body,
+            body: body.map(Box::new),
             request_id,
         })
     }
@@ -218,7 +232,10 @@ impl OpenAIClient {
 
     /// DELETE a resource.
     pub async fn delete(&self, path: &str) -> Result<Value> {
-        let req = self.http.delete(self.url(path)).headers(self.headers(None)?);
+        let req = self
+            .http
+            .delete(self.url(path))
+            .headers(self.headers(None)?);
         let (resp, _) = Self::check(req.send().await?).await?;
         let text = resp.text().await?;
         Ok(serde_json::from_str(&text).unwrap_or(Value::Null))
@@ -249,8 +266,8 @@ impl OpenAIClient {
 fn insert_header(h: &mut HeaderMap, k: &str, v: &str) -> Result<()> {
     let name = HeaderName::from_bytes(k.as_bytes())
         .map_err(|e| AgentsError::user(format!("Invalid header name {k}: {e}")))?;
-    let value =
-        HeaderValue::from_str(v).map_err(|e| AgentsError::user(format!("Invalid header value for {k}: {e}")))?;
+    let value = HeaderValue::from_str(v)
+        .map_err(|e| AgentsError::user(format!("Invalid header value for {k}: {e}")))?;
     h.insert(name, value);
     Ok(())
 }
@@ -346,7 +363,9 @@ fn parse_event(event: &str) -> SseEvent {
     }
     match serde_json::from_str::<Value>(&data) {
         Ok(v) => {
-            if event_name.as_deref() == Some("error") || v.get("type").and_then(Value::as_str) == Some("error") {
+            if event_name.as_deref() == Some("error")
+                || v.get("type").and_then(Value::as_str) == Some("error")
+            {
                 let msg = v
                     .pointer("/error/message")
                     .or_else(|| v.get("message"))
@@ -356,7 +375,7 @@ fn parse_event(event: &str) -> SseEvent {
                 return SseEvent::Error(AgentsError::ApiError {
                     status: 0,
                     message: msg,
-                    body: Some(v),
+                    body: Some(Box::new(v)),
                     request_id: None,
                 });
             }
@@ -387,8 +406,9 @@ mod tests {
 
     #[tokio::test]
     async fn error_events_become_errors() {
-        let chunks: Vec<std::result::Result<Vec<u8>, AgentsError>> =
-            vec![Ok(b"data: {\"type\":\"error\",\"message\":\"boom\"}\n\n".to_vec())];
+        let chunks: Vec<std::result::Result<Vec<u8>, AgentsError>> = vec![Ok(
+            b"data: {\"type\":\"error\",\"message\":\"boom\"}\n\n".to_vec(),
+        )];
         let items: Vec<_> = sse_stream(futures::stream::iter(chunks)).collect().await;
         assert!(items[0].is_err());
     }

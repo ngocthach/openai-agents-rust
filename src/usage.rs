@@ -79,8 +79,7 @@ impl Usage {
         self.input_tokens_details.cached_tokens += other.input_tokens_details.cached_tokens;
         self.input_tokens_details.cache_write_tokens +=
             other.input_tokens_details.cache_write_tokens;
-        self.output_tokens_details.reasoning_tokens +=
-            other.output_tokens_details.reasoning_tokens;
+        self.output_tokens_details.reasoning_tokens += other.output_tokens_details.reasoning_tokens;
 
         if !other.request_usage_entries.is_empty() {
             self.request_usage_entries
@@ -105,7 +104,11 @@ impl Usage {
         let output_tokens = get("output_tokens");
         let total_tokens = {
             let t = get("total_tokens");
-            if t == 0 { input_tokens + output_tokens } else { t }
+            if t == 0 {
+                input_tokens + output_tokens
+            } else {
+                t
+            }
         };
         let cached = value
             .pointer("/input_tokens_details/cached_tokens")
@@ -142,7 +145,11 @@ impl Usage {
         let output_tokens = get("completion_tokens");
         let total_tokens = {
             let t = get("total_tokens");
-            if t == 0 { input_tokens + output_tokens } else { t }
+            if t == 0 {
+                input_tokens + output_tokens
+            } else {
+                t
+            }
         };
         let cached = value
             .pointer("/prompt_tokens_details/cached_tokens")

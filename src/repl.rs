@@ -37,7 +37,8 @@ pub async fn run_demo_loop<C: Default + Send + Sync + 'static>(
         history.push(InputItem::user(line));
         let input = RunInput::Items(history.clone());
         if stream {
-            let mut result = Runner::run_streamed_with_options(current.clone(), input, RunOptions::default());
+            let mut result =
+                Runner::run_streamed_with_options(current.clone(), input, RunOptions::default());
             {
                 let mut events = std::pin::pin!(result.stream_events());
                 while let Some(ev) = events.next().await {
@@ -51,7 +52,10 @@ pub async fn run_demo_loop<C: Default + Send + Sync + 'static>(
                         StreamEvent::RunItem { name, item } => match name {
                             RunItemStreamEventName::ToolCalled => println!("\n[tool called]"),
                             RunItemStreamEventName::ToolOutput => {
-                                println!("\n[tool output: {}]", item.tool_output().cloned().unwrap_or_default())
+                                println!(
+                                    "\n[tool output: {}]",
+                                    item.tool_output().cloned().unwrap_or_default()
+                                )
                             }
                             _ => {}
                         },

@@ -56,7 +56,9 @@ impl AgentOutputSchema {
     }
 
     /// Build an output schema for `T`, choosing whether to convert it to strict mode.
-    pub fn new_with_strict<T: JsonSchema + DeserializeOwned + 'static>(strict: bool) -> Result<Self> {
+    pub fn new_with_strict<T: JsonSchema + DeserializeOwned + 'static>(
+        strict: bool,
+    ) -> Result<Self> {
         let raw = schemars::schema_for!(T).to_value();
         let type_name = std::any::type_name::<T>()
             .rsplit("::")
@@ -65,7 +67,9 @@ impl AgentOutputSchema {
             .to_string();
         let validator: Validator = Arc::new(|s: &str| {
             let parsed: T = serde_json::from_str(s).map_err(|e| {
-                AgentsError::model_behavior(format!("Invalid JSON when parsing {s} for output type: {e}"))
+                AgentsError::model_behavior(format!(
+                    "Invalid JSON when parsing {s} for output type: {e}"
+                ))
             })?;
             // Re-serialize so the caller gets a JSON value; T: Deserialize only, so use the
             // original string parsed as a generic value.

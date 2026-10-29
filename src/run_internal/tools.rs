@@ -11,11 +11,13 @@ use crate::items::{FunctionCall, ItemHelpers, ToolApprovalItem};
 use crate::lifecycle::RunHooks;
 use crate::run_config::{RunConfig, ToolErrorFormatterArgs, ToolErrorKind};
 use crate::run_context::RunContext;
-use crate::tool::{DEFAULT_APPROVAL_REJECTION_MESSAGE, FunctionTool, Tool, ToolOutput, ToolTimeoutBehavior};
+use crate::tool::{
+    DEFAULT_APPROVAL_REJECTION_MESSAGE, FunctionTool, Tool, ToolOutput, ToolTimeoutBehavior,
+};
 use crate::tool_context::ToolContext;
 use crate::tool_guardrails::{
-    ToolGuardrailBehavior, ToolInputGuardrailData, ToolInputGuardrailResult, ToolOutputGuardrailData,
-    ToolOutputGuardrailResult,
+    ToolGuardrailBehavior, ToolInputGuardrailData, ToolInputGuardrailResult,
+    ToolOutputGuardrailData, ToolOutputGuardrailResult,
 };
 use crate::tracing::{SpanData, create_span, scope};
 
@@ -67,7 +69,11 @@ fn format_tool_error<C>(
 }
 
 /// Model-visible output for a tool the model called but the agent does not have.
-pub(crate) fn tool_not_found_message<C>(config: &RunConfig<C>, name: &str, call_id: &str) -> String {
+pub(crate) fn tool_not_found_message<C>(
+    config: &RunConfig<C>,
+    name: &str,
+    call_id: &str,
+) -> String {
     format_tool_error(
         config,
         ToolErrorKind::ToolNotFound,
@@ -113,7 +119,7 @@ async fn run_input_guardrails<C: Send + Sync + 'static>(
             ToolGuardrailBehavior::RaiseException => {
                 return Err(AgentsError::ToolInputGuardrailTripwireTriggered {
                     guardrail_name: g.name.clone(),
-                    output: out,
+                    output: Box::new(out),
                     run_data: None,
                 });
             }
@@ -149,16 +155,27 @@ pub(crate) async fn execute_function_tool<C: Send + Sync + 'static>(
             && let InputGuardrailVerdict::Reject(msg) =
                 run_input_guardrails(env, &tool, &tool_ctx, &mut input_results).await?
         {
-            return Ok(finish(output_outcome(&call, ToolOutput::Text(msg)), input_results, output_results));
+            return Ok(finish(
+                output_outcome(&call, ToolOutput::Text(msg)),
+                input_results,
+                output_results,
+            ));
         }
-        match env.ctx.is_tool_approved(&env.agent.name, &tool.name, &call.call_id) {
+        match env
+            .ctx
+            .is_tool_approved(&env.agent.name, &tool.name, &call.call_id)
+        {
             None => {
                 let item = ToolApprovalItem {
                     agent: env.agent.name.clone(),
                     raw_item: call.clone(),
                     tool_name: tool.name.clone(),
                 };
-                return Ok(finish(ToolOutcome::Interruptions(vec![item]), input_results, output_results));
+                return Ok(finish(
+                    ToolOutcome::Interruptions(vec![item]),
+                    input_results,
+                    output_results,
+                ));
             }
             Some(false) => {
                 let message = env
@@ -200,11 +217,13 @@ pub(crate) async fn execute_function_tool<C: Send + Sync + 'static>(
     let span = create_span(
         SpanData::Function {
             name: tool.name.clone(),
-            input: if include { Some(call.arguments.clone()) } else { None },
+            input: if include {
+                Some(call.arguments.clone())
+            } else {
+                None
+            },
             output: None,
-            mcp_data: tool
-                .mcp_server_name()
-                .map(|s| json!({"server": s})),
+            mcp_data: tool.mcp_server_name().map(|s| json!({"server": s})),
         },
         None,
         false,
@@ -270,12 +289,12 @@ pub(crate) async fn execute_function_tool<C: Send + Sync + 'static>(
                 match (&tool.failure_error_function, propagate) {
                     (Some(f), false) => {
                         let msg = f(env.ctx, &e);
-                        scope::current_span().map(|s| {
+                        if let Some(s) = scope::current_span() {
                             s.set_error(
                                 "Error running tool (non-fatal)",
                                 Some(json!({"tool_name": tool.name, "error": e.to_string()})),
-                            )
-                        });
+                            );
+                        }
                         ToolOutput::Text(msg)
                     }
                     _ => return Err(e),
@@ -305,7 +324,7 @@ pub(crate) async fn execute_function_tool<C: Send + Sync + 'static>(
                 ToolGuardrailBehavior::RaiseException => {
                     return Err(AgentsError::ToolOutputGuardrailTripwireTriggered {
                         guardrail_name: g.name.clone(),
-                        output: out,
+                        output: Box::new(out),
                         run_data: None,
                     });
                 }
@@ -313,10 +332,12 @@ pub(crate) async fn execute_function_tool<C: Send + Sync + 'static>(
         }
 
         if let Some(h) = env.hooks {
-            h.on_tool_end(&tool_ctx, env.agent, &tool_enum, &output).await;
+            h.on_tool_end(&tool_ctx, env.agent, &tool_enum, &output)
+                .await;
         }
         if let Some(h) = &env.agent.hooks {
-            h.on_tool_end(&tool_ctx, env.agent, &tool_enum, &output).await;
+            h.on_tool_end(&tool_ctx, env.agent, &tool_enum, &output)
+                .await;
         }
         Ok(output_outcome(&call, output))
     };

@@ -44,7 +44,10 @@ fn approval_key(agent: &str, tool_name: &str) -> String {
 impl ApprovalsState {
     /// Approve a call; `always` approves future calls to the same tool by the same agent.
     pub fn approve(&mut self, item: &ToolApprovalItem, always: bool) {
-        let rec = self.0.entry(approval_key(&item.agent, &item.tool_name)).or_default();
+        let rec = self
+            .0
+            .entry(approval_key(&item.agent, &item.tool_name))
+            .or_default();
         if always {
             rec.approved_always = true;
             rec.rejected_always = false;
@@ -55,7 +58,10 @@ impl ApprovalsState {
 
     /// Reject a call; `always` rejects future calls to the same tool by the same agent.
     pub fn reject(&mut self, item: &ToolApprovalItem, always: bool, message: Option<String>) {
-        let rec = self.0.entry(approval_key(&item.agent, &item.tool_name)).or_default();
+        let rec = self
+            .0
+            .entry(approval_key(&item.agent, &item.tool_name))
+            .or_default();
         if always {
             rec.rejected_always = true;
             rec.approved_always = false;
@@ -103,8 +109,10 @@ impl ApprovalsState {
             let rec = self.0.entry(k.clone()).or_default();
             rec.approved_always |= v.approved_always;
             rec.rejected_always |= v.rejected_always;
-            rec.approved_call_ids.extend(v.approved_call_ids.iter().cloned());
-            rec.rejected_call_ids.extend(v.rejected_call_ids.iter().cloned());
+            rec.approved_call_ids
+                .extend(v.approved_call_ids.iter().cloned());
+            rec.rejected_call_ids
+                .extend(v.rejected_call_ids.iter().cloned());
             for id in &v.approved_call_ids {
                 if !v.rejected_call_ids.contains(id) {
                     rec.rejected_call_ids.remove(id);
@@ -115,8 +123,11 @@ impl ApprovalsState {
                     rec.approved_call_ids.remove(id);
                 }
             }
-            rec.rejection_messages
-                .extend(v.rejection_messages.iter().map(|(a, b)| (a.clone(), b.clone())));
+            rec.rejection_messages.extend(
+                v.rejection_messages
+                    .iter()
+                    .map(|(a, b)| (a.clone(), b.clone())),
+            );
             if v.sticky_rejection_message.is_some() {
                 rec.sticky_rejection_message = v.sticky_rejection_message.clone();
             }
@@ -192,7 +203,11 @@ impl<C> RunContext<C> {
 
     /// Snapshot of the usage accumulated so far.
     pub fn usage(&self) -> Usage {
-        self.inner.lock().expect("run context poisoned").usage.clone()
+        self.inner
+            .lock()
+            .expect("run context poisoned")
+            .usage
+            .clone()
     }
 
     /// Add usage to the run total.
@@ -236,7 +251,9 @@ impl<C> RunContext<C> {
         always_reject: bool,
         rejection_message: Option<String>,
     ) {
-        self.lock().approvals.reject(item, always_reject, rejection_message);
+        self.lock()
+            .approvals
+            .reject(item, always_reject, rejection_message);
     }
 
     /// Approval status for a tool call: `Some(true)` approved, `Some(false)` rejected, `None`
@@ -247,7 +264,9 @@ impl<C> RunContext<C> {
 
     /// Custom rejection message for a rejected call, if one was provided.
     pub fn rejection_message(&self, agent: &str, tool_name: &str, call_id: &str) -> Option<String> {
-        self.lock().approvals.rejection_message(agent, tool_name, call_id)
+        self.lock()
+            .approvals
+            .rejection_message(agent, tool_name, call_id)
     }
 
     /// Export approval state (for `RunState`).
@@ -322,6 +341,9 @@ mod tests {
         assert_eq!(ctx.is_tool_approved("b", "t", item.call_id()), None);
         ctx.reject_tool(&item, true, Some("no".into()));
         assert_eq!(ctx.is_tool_approved("a", "t", "other"), Some(false));
-        assert_eq!(ctx.rejection_message("a", "t", "other").as_deref(), Some("no"));
+        assert_eq!(
+            ctx.rejection_message("a", "t", "other").as_deref(),
+            Some("no")
+        );
     }
 }
