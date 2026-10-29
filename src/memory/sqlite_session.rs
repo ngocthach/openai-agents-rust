@@ -156,6 +156,7 @@ impl Session for SqliteSession {
     }
 
     async fn get_items(&self, limit: Option<usize>) -> Result<Vec<InputItem>> {
+        let limit = super::resolve_session_limit(limit, self.session_settings().as_ref());
         self.blocking(move |conn, s| {
             let rows: Vec<String> = match limit {
                 Some(0) => Vec::new(),

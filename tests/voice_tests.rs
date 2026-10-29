@@ -826,3 +826,54 @@ async fn speech_spans_are_grouped_per_turn_and_honor_the_privacy_flags() {
         }
     }
 }
+
+#[tokio::test]
+async fn session_creation_and_tts_settings_are_recorded() {
+    use openai_agents_sdk::voice::TTSVoice;
+
+    trace_processor();
+    let stt = Arc::new(FakeSTTModel::new().with_session(vec!["only turn".to_string()]));
+    let tts = Arc::new(FakeTTSModel::new().with_result(vec![pcm16_bytes(&[3])]));
+    let workflow = Arc::new(FakeVoiceWorkflow::new().with_turn(vec!["Spoken.".to_string()]));
+
+    let pipeline = VoicePipeline::new(workflow)
+        .with_stt_model(stt.clone())
+        .with_tts_model(tts.clone())
+        .with_config(
+            VoicePipelineConfig::default()
+                .with_tracing_disabled(true)
+                .with_trace_include_sensitive_data(false)
+                .with_trace_include_sensitive_audio_data(true)
+                .with_tts_settings(TTSModelSettings {
+                    voice: Some(TTSVoice::Echo),
+                    instructions: "Be brisk.".to_string(),
+                    ..Default::default()
+                }),
+        );
+
+    let input = StreamedAudioInput::new();
+    input.add_audio(vec![0; 4]).unwrap();
+    input.end().unwrap();
+    let mut result = pipeline.run(input).await.unwrap();
+    let (_labels, samples) = extract_events(&mut result).await;
+    assert_eq!(samples, vec![3]);
+
+    // The settings and privacy flags of `create_session` are observable.
+    let session_calls = stt.session_calls();
+    assert_eq!(session_calls.len(), 1);
+    assert!(!session_calls[0].trace_include_sensitive_data);
+    assert!(session_calls[0].trace_include_sensitive_audio_data);
+    assert!(stt.calls().is_empty(), "no static transcription happened");
+
+    // The created session is still observable although the pipeline owns it.
+    let sessions = stt.created_sessions();
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].close_calls(), 1);
+    assert_eq!(sessions[0].remaining_turns(), 0);
+
+    // TTS calls carry the settings the pipeline resolved, not just the text.
+    let tts_calls = tts.calls();
+    assert_eq!(tts_calls[0].text, "Spoken.");
+    assert_eq!(tts_calls[0].settings.voice, Some(TTSVoice::Echo));
+    assert_eq!(tts_calls[0].settings.instructions, "Be brisk.");
+}

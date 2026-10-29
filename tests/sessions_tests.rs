@@ -1252,8 +1252,9 @@ async fn runner_compacts_only_what_the_run_loaded_from_a_limited_session() {
         "{body}"
     );
 
-    // The two ancient items are retained, with the summary replacing the rest.
-    let items = inner.get_items(None).await.unwrap();
+    // The two ancient items are retained, with the summary replacing the rest. The store's own
+    // settings cap `get_items(None)`, so reading all of it takes an explicit large limit.
+    let items = inner.get_items(Some(usize::MAX)).await.unwrap();
     assert_eq!(items[0].text_content().as_deref(), Some("ancient question"));
     assert_eq!(items[1].text_content().as_deref(), Some("ancient answer"));
     assert_eq!(
@@ -1387,4 +1388,245 @@ async fn expired_envelopes_do_not_shrink_a_compaction_snapshot() {
     let snapshot = session.compaction_snapshot(10).await.unwrap().unwrap();
     assert!(!snapshot.complete);
     assert_eq!(snapshot.items.len(), 1);
+}
+
+/// A mock Conversations endpoint: creates `conv_<n>`, records every request, and serves
+/// whatever items were posted to the conversation that is currently alive.
+fn conversations_mock() -> (Handler, Arc<Mutex<Vec<Request>>>) {
+    let captured = Arc::new(Mutex::new(Vec::<Request>::new()));
+    let created = Arc::new(Mutex::new(0u32));
+    let items = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let cap = captured.clone();
+    let handler: Handler = Arc::new(move |req: &Request| {
+        cap.lock().unwrap().push(req.clone());
+        let path = req.path.split('?').next().unwrap_or("").to_string();
+        let path = path.strip_prefix("/v1").unwrap_or(&path).to_string();
+        if req.method == "POST" && path == "/conversations" {
+            let mut n = created.lock().unwrap();
+            *n += 1;
+            items.lock().unwrap().clear();
+            return Reply::json(json!({"id": format!("conv_{n}")}));
+        }
+        if req.method == "POST" && path.ends_with("/items") {
+            let mut stored = items.lock().unwrap();
+            for item in req.body["items"].as_array().cloned().unwrap_or_default() {
+                stored.push(item);
+            }
+            return Reply::json(json!({"data": []}));
+        }
+        if req.method == "GET" && path.ends_with("/items") {
+            let stored = items.lock().unwrap().clone();
+            let desc = req.path.contains("order=desc");
+            let data: Vec<Value> = if desc {
+                stored.into_iter().rev().collect()
+            } else {
+                stored
+            };
+            return Reply::json(json!({"data": data, "has_more": false, "last_id": Value::Null}));
+        }
+        if req.method == "DELETE" {
+            return Reply::json(json!({"deleted": true}));
+        }
+        Reply::empty(404)
+    });
+    (handler, captured)
+}
+
+#[tokio::test]
+async fn conversations_session_batches_writes_and_resets_on_clear() {
+    use openai_agents_sdk::memory::OpenAIConversationsSession;
+
+    let (handler, captured) = conversations_mock();
+    let base = serve(handler).await;
+    let client = OpenAIClient::new("sk-test").with_base_url(base);
+    let session = OpenAIConversationsSession::with_client(client);
+
+    assert_eq!(session.session_id(), "", "no conversation exists yet");
+
+    // 25 items must go out as a request of 20 followed by one of 5: the endpoint rejects more.
+    let items: Vec<InputItem> = (0..25).map(|i| InputItem::user(format!("m{i}"))).collect();
+    session.add_items(items).await.unwrap();
+    assert_eq!(session.session_id(), "conv_1");
+
+    let writes: Vec<usize> = captured
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|r| r.method == "POST" && r.path.ends_with("/items"))
+        .map(|r| r.body["items"].as_array().map(Vec::len).unwrap_or(0))
+        .collect();
+    assert_eq!(writes, vec![20, 5]);
+    assert_eq!(session.get_items(None).await.unwrap().len(), 25);
+
+    // Clearing forgets the deleted conversation, so the next write creates a new one.
+    session.clear_session().await.unwrap();
+    assert_eq!(session.session_id(), "");
+    session
+        .add_items(vec![InputItem::user("fresh")])
+        .await
+        .unwrap();
+    assert_eq!(session.session_id(), "conv_2");
+    let items = session.get_items(None).await.unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].text_content().as_deref(), Some("fresh"));
+}
+
+#[tokio::test]
+async fn conversations_session_honors_its_own_settings_limit() {
+    use openai_agents_sdk::memory::{OpenAIConversationsSession, SessionSettings};
+
+    let (handler, _captured) = conversations_mock();
+    let base = serve(handler).await;
+    let client = OpenAIClient::new("sk-test").with_base_url(base);
+    let session = OpenAIConversationsSession::with_client(client)
+        .with_settings(SessionSettings::with_limit(2));
+    session
+        .add_items(vec![
+            InputItem::user("a"),
+            InputItem::user("b"),
+            InputItem::user("c"),
+        ])
+        .await
+        .unwrap();
+
+    // A direct `get_items(None)` must honour the session's own limit, as Python's
+    // `resolve_session_limit` does inside every backend.
+    let items = session.get_items(None).await.unwrap();
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0].text_content().as_deref(), Some("b"));
+
+    let zero = OpenAIConversationsSession::from_conversation_id(
+        "conv_known",
+        OpenAIClient::new("sk-test"),
+    )
+    .with_settings(SessionSettings { limit: Some(0) });
+    assert_eq!(zero.session_id(), "conv_known");
+    assert!(zero.get_items(None).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn compaction_session_refuses_a_server_managed_store() {
+    use openai_agents_sdk::memory::OpenAIConversationsSession;
+
+    let remote: Arc<dyn Session> = Arc::new(OpenAIConversationsSession::from_conversation_id(
+        "conv_1",
+        OpenAIClient::new("sk-test"),
+    ));
+    let err = OpenAIResponsesCompactionSession::try_new("s1", remote.clone())
+        .expect_err("wrapping a server-managed store must be rejected");
+    assert!(err.to_string().contains("manages its own history"), "{err}");
+
+    // The infallible constructor still refuses to operate on one.
+    let session = OpenAIResponsesCompactionSession::new("s1", remote);
+    assert!(session.get_items(None).await.is_err());
+    assert!(session.add_items(vec![InputItem::user("x")]).await.is_err());
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn advanced_sqlite_reports_turn_structure_and_usage_details() {
+    use openai_agents_sdk::usage::{InputTokensDetails, OutputTokensDetails, Usage};
+
+    let dir = tempfile::tempdir().unwrap();
+    let session = AdvancedSqliteSession::open("s1", dir.path().join("adv.db")).unwrap();
+    session
+        .add_items(vec![InputItem::user("x".repeat(150))])
+        .await
+        .unwrap();
+    session
+        .add_items(vec![InputItem(json!({
+            "type": "function_call", "name": "weather", "call_id": "c1", "arguments": "{}"
+        }))])
+        .await
+        .unwrap();
+    session
+        .store_run_usage(&Usage {
+            requests: 1,
+            input_tokens: 100,
+            input_tokens_details: InputTokensDetails {
+                cached_tokens: 40,
+                cache_write_tokens: 7,
+            },
+            output_tokens: 20,
+            output_tokens_details: OutputTokensDetails {
+                reasoning_tokens: 9,
+            },
+            total_tokens: 120,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let turns = session.get_conversation_turns(None).await.unwrap();
+    assert_eq!(
+        turns[0].content.chars().count(),
+        103,
+        "preview is cut at 100"
+    );
+    assert!(turns[0].content.ends_with("..."));
+    assert_eq!(turns[0].full_content.len(), 150);
+    assert!(turns[0].can_branch);
+
+    let structure = session.get_turn_structure(None).await.unwrap();
+    let first = &structure[&1];
+    assert_eq!(first[0].message_type, "user");
+    assert_eq!(
+        first.iter().find_map(|m| m.tool_name.clone()).as_deref(),
+        Some("weather")
+    );
+
+    // Both detail columns are written; reading them back must not drop them.
+    let usage = session.get_turn_usage(None, None).await.unwrap();
+    assert_eq!(usage[0].input_tokens_details.cached_tokens, 40);
+    assert_eq!(usage[0].input_tokens_details.cache_write_tokens, 7);
+    assert_eq!(usage[0].output_tokens_details.reasoning_tokens, 9);
+}
+
+#[tokio::test]
+async fn whole_history_compaction_reads_past_the_stores_own_limit() {
+    openai_agents_sdk::set_tracing_disabled(true);
+    // A store that only ever hands out its last two items by default. Compaction replaces the
+    // history it read, so reading through that default would delete the two older items.
+    let inner = Arc::new(
+        InMemorySession::new("s1").with_settings(openai_agents_sdk::SessionSettings::with_limit(2)),
+    );
+    let history = vec![
+        InputItem::user("old question"),
+        InputItem::assistant("old answer"),
+        InputItem::user("new question"),
+        InputItem::assistant("new answer"),
+    ];
+    inner.add_items(history.clone()).await.unwrap();
+
+    let (base, captured) = mock_openai(vec![compaction_reply("Recap")]).await;
+    let session =
+        OpenAIResponsesCompactionSession::new("s1", Arc::new(HookLessSession(inner.clone())))
+            .with_client(OpenAIClient::new("sk-test").with_base_url(base))
+            .with_should_trigger_compaction(|_| true);
+
+    session
+        .on_run_completed(&SessionRunCompletion {
+            response_id: Some("resp_1".into()),
+            // `store: false` sends the history itself, which is what makes the read observable.
+            store: Some(false),
+            has_local_tool_outputs: false,
+            model_exchange: exchange_digests(&history),
+        })
+        .await
+        .unwrap();
+
+    // All four items were sent for compaction, not just the two the limit would have returned.
+    let requests = captured.lock().unwrap().clone();
+    assert_eq!(requests.len(), 1, "{requests:?}");
+    let body = requests[0].body.clone();
+    let sent = body["input"].as_array().unwrap_or_else(|| panic!("{body}"));
+    assert_eq!(sent.len(), 4, "{body}");
+    assert_eq!(sent[0]["content"], "old question");
+
+    let kept = inner.get_items(Some(usize::MAX)).await.unwrap();
+    assert_eq!(
+        kept.last().unwrap().text_content().as_deref(),
+        Some("Recap")
+    );
+    assert!(kept.len() < 4, "history should have shrunk: {kept:?}");
 }

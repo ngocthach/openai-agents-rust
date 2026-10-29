@@ -1,6 +1,7 @@
 //! SQLite session with conversation branching, turn tracking and usage analytics
 //! (feature `sqlite`). Mirrors `agents.extensions.memory.advanced_sqlite_session`.
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -40,10 +41,32 @@ pub struct BranchInfo {
 pub struct ConversationTurn {
     /// The branch-local turn number.
     pub turn: i64,
-    /// The full user message content.
+    /// The user message content, truncated to 100 characters for display.
     pub content: String,
+    /// The untruncated user message content.
+    pub full_content: String,
     /// When the turn was recorded.
     pub timestamp: Option<String>,
+    /// Whether a branch can be created from this turn. Every user turn is a valid branch point.
+    pub can_branch: bool,
+}
+
+/// Truncate `text` to `max_length` characters, marking a cut with `...`.
+fn content_preview(text: &str, max_length: usize) -> String {
+    if text.chars().count() <= max_length {
+        return text.to_string();
+    }
+    let cut: String = text.chars().take(max_length).collect();
+    format!("{cut}...")
+}
+
+/// One message of a branch, as [`AdvancedSqliteSession::get_turn_structure`] reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnMessage {
+    /// The structural message type (`user`, `assistant`, `tool_call`, ...).
+    pub message_type: String,
+    /// The tool name, for tool calls and outputs.
+    pub tool_name: Option<String>,
 }
 
 /// How often a tool was used in one turn.
@@ -70,6 +93,10 @@ pub struct TurnUsage {
     pub output_tokens: u64,
     /// Total tokens.
     pub total_tokens: u64,
+    /// Breakdown of the input tokens (cached and cache-write tokens).
+    pub input_tokens_details: crate::usage::InputTokensDetails,
+    /// Breakdown of the output tokens (reasoning tokens).
+    pub output_tokens_details: crate::usage::OutputTokensDetails,
 }
 
 /// Usage aggregated over a session or one of its branches.
@@ -515,14 +542,19 @@ impl AdvancedSqliteSession {
                 .map_err(sql_err)?;
             Ok(rows
                 .filter_map(std::result::Result::ok)
-                .map(|(turn, data, timestamp)| ConversationTurn {
-                    turn,
-                    content: serde_json::from_str::<Value>(&data)
+                .map(|(turn, data, timestamp)| {
+                    let full_content = serde_json::from_str::<Value>(&data)
                         .ok()
                         .map(InputItem)
                         .and_then(|i| i.text_content())
-                        .unwrap_or_default(),
-                    timestamp,
+                        .unwrap_or_default();
+                    ConversationTurn {
+                        turn,
+                        content: content_preview(&full_content, 100),
+                        full_content,
+                        timestamp,
+                        can_branch: true,
+                    }
                 })
                 .collect())
         })
@@ -562,6 +594,47 @@ impl AdvancedSqliteSession {
         .await
     }
 
+    /// The branch's messages grouped by the user turn they belong to, in conversation order.
+    ///
+    /// This is the structure view Python's `get_conversation_by_turns` returns: message types
+    /// and tool names rather than the items themselves. Use
+    /// [`AdvancedSqliteSession::get_conversation_by_turns`] for the items.
+    pub async fn get_turn_structure(
+        &self,
+        branch_id: Option<&str>,
+    ) -> Result<BTreeMap<i64, Vec<TurnMessage>>> {
+        let branch = branch_id.map(str::to_string);
+        self.blocking(move |conn, ctx| {
+            let branch = branch.unwrap_or_else(|| ctx.branch_id());
+            let mut stmt = conn
+                .prepare(
+                    "SELECT user_turn_number, message_type, tool_name
+                     FROM message_structure
+                     WHERE session_id = ? AND branch_id = ?
+                     ORDER BY sequence_number",
+                )
+                .map_err(sql_err)?;
+            let rows = stmt
+                .query_map(params![ctx.session_id, branch], |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                    ))
+                })
+                .map_err(sql_err)?;
+            let mut out: BTreeMap<i64, Vec<TurnMessage>> = BTreeMap::new();
+            for (turn, message_type, tool_name) in rows.filter_map(std::result::Result::ok) {
+                out.entry(turn).or_default().push(TurnMessage {
+                    message_type,
+                    tool_name,
+                });
+            }
+            Ok(out)
+        })
+        .await
+    }
+
     /// Turns on a branch whose user message contains `search`.
     pub async fn find_turns_by_content(
         &self,
@@ -572,7 +645,7 @@ impl AdvancedSqliteSession {
         let turns = self.get_conversation_turns(branch_id).await?;
         Ok(turns
             .into_iter()
-            .filter(|t| t.content.to_lowercase().contains(&needle))
+            .filter(|t| t.full_content.to_lowercase().contains(&needle))
             .collect())
     }
 
@@ -670,7 +743,8 @@ impl AdvancedSqliteSession {
             let branch = branch.unwrap_or_else(|| ctx.branch_id());
             let mut stmt = conn
                 .prepare(
-                    "SELECT user_turn_number, requests, input_tokens, output_tokens, total_tokens
+                    "SELECT user_turn_number, requests, input_tokens, output_tokens, total_tokens,
+                            input_tokens_details, output_tokens_details
                      FROM turn_usage
                      WHERE session_id = ? AND branch_id = ?
                        AND (? IS NULL OR user_turn_number = ?)
@@ -681,12 +755,20 @@ impl AdvancedSqliteSession {
                 .query_map(
                     params![ctx.session_id, branch, user_turn_number, user_turn_number],
                     |r| {
+                        fn details<T: Default + serde::de::DeserializeOwned>(
+                            raw: Option<String>,
+                        ) -> T {
+                            raw.and_then(|s| serde_json::from_str(&s).ok())
+                                .unwrap_or_default()
+                        }
                         Ok(TurnUsage {
                             user_turn_number: r.get(0)?,
                             requests: r.get::<_, i64>(1)? as u64,
                             input_tokens: r.get::<_, i64>(2)? as u64,
                             output_tokens: r.get::<_, i64>(3)? as u64,
                             total_tokens: r.get::<_, i64>(4)? as u64,
+                            input_tokens_details: details(r.get(5)?),
+                            output_tokens_details: details(r.get(6)?),
                         })
                     },
                 )
@@ -822,6 +904,7 @@ impl Session for AdvancedSqliteSession {
     }
 
     async fn get_items(&self, limit: Option<usize>) -> Result<Vec<InputItem>> {
+        let limit = super::resolve_session_limit(limit, self.session_settings().as_ref());
         self.blocking(move |conn, ctx| {
             let branch = ctx.branch_id();
             let rows: Vec<String> = match limit {

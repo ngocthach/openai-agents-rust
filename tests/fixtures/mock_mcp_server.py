@@ -17,6 +17,26 @@ TOOLS = [
         "description": "Delete everything",
         "inputSchema": {"type": "object"},
     },
+    # No description: the client must fall back to the display title.
+    {
+        "name": "titled_only",
+        "title": "Titled Only",
+        "inputSchema": {"type": "object"},
+    },
+    # Echoes the protocol-level request metadata back as text.
+    {
+        "name": "echo_meta",
+        "description": "Echo the _meta of the request",
+        "inputSchema": {"type": "object"},
+    },
+]
+
+RESOURCES = [
+    {"uri": "file:///notes.txt", "name": "notes", "mimeType": "text/plain"},
+]
+
+RESOURCE_TEMPLATES = [
+    {"uriTemplate": "file:///{path}", "name": "any file", "mimeType": "text/plain"},
 ]
 
 
@@ -43,7 +63,7 @@ for line in sys.stdin:
     if method == "initialize":
         reply(msg_id, {
             "protocolVersion": params.get("protocolVersion", "2025-06-18"),
-            "capabilities": {"tools": {}, "prompts": {}},
+            "capabilities": {"tools": {}, "prompts": {}, "resources": {}},
             "serverInfo": {"name": "mock", "version": "1.0.0"},
         })
     elif method == "tools/list":
@@ -53,12 +73,23 @@ for line in sys.stdin:
         if params.get("name") == "add":
             total = args.get("a", 0) + args.get("b", 0)
             reply(msg_id, {"content": [{"type": "text", "text": str(total)}], "isError": False})
+        elif params.get("name") == "echo_meta":
+            meta = json.dumps(params.get("_meta") or {}, sort_keys=True)
+            reply(msg_id, {"content": [{"type": "text", "text": meta}], "isError": False})
         else:
             reply(msg_id, {"content": [{"type": "text", "text": "deleted"}], "isError": False})
     elif method == "prompts/list":
         reply(msg_id, {"prompts": [{"name": "review", "description": "Review code"}]})
     elif method == "prompts/get":
         reply(msg_id, {"messages": [{"role": "user", "content": {"type": "text", "text": "Review carefully"}}]})
+    elif method == "resources/list":
+        reply(msg_id, {"resources": RESOURCES})
+    elif method == "resources/templates/list":
+        reply(msg_id, {"resourceTemplates": RESOURCE_TEMPLATES})
+    elif method == "resources/read":
+        reply(msg_id, {"contents": [
+            {"uri": params.get("uri"), "mimeType": "text/plain", "text": "hello resource"},
+        ]})
     elif method == "ping":
         reply(msg_id, {})
     else:

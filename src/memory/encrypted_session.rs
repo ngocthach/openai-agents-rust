@@ -256,6 +256,7 @@ impl Session for EncryptedSession {
     }
 
     async fn get_items(&self, limit: Option<usize>) -> Result<Vec<InputItem>> {
+        let limit = super::resolve_session_limit(limit, self.session_settings().as_ref());
         let budget = self.max_scan_items;
         match limit {
             Some(0) => return Ok(Vec::new()),

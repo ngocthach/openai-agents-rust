@@ -67,11 +67,40 @@ pub struct STTCall {
     pub trace_include_sensitive_audio_data: bool,
 }
 
+/// A recorded streamed transcription-session creation call.
+///
+/// The streamed input itself is a live queue that cannot be snapshotted, so only the settings
+/// and the two tracing flags are recorded.
+#[derive(Debug, Clone, PartialEq)]
+pub struct STTSessionCall {
+    /// The settings the pipeline passed.
+    pub settings: STTModelSettings,
+    /// Whether sensitive data tracing was enabled.
+    pub trace_include_sensitive_data: bool,
+    /// Whether sensitive audio tracing was enabled.
+    pub trace_include_sensitive_audio_data: bool,
+}
+
 /// A recorded text-to-speech call.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct TTSCall {
     /// The text that was spoken.
     pub text: String,
+    /// The settings the pipeline passed.
+    pub settings: TTSModelSettings,
+}
+
+/// The PCM byte chunks one scripted text-to-speech call returns.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TTSResult {
+    /// The chunks yielded, in order.
+    pub chunks: Vec<Bytes>,
+}
+
+impl From<Vec<Bytes>> for TTSResult {
+    fn from(chunks: Vec<Bytes>) -> Self {
+        TTSResult { chunks }
+    }
 }
 
 /// A speech-to-text model returning scripted transcriptions and sessions.
@@ -80,6 +109,8 @@ pub struct FakeSTTModel {
     transcriptions: Mutex<VecDeque<Step<String>>>,
     sessions: Mutex<VecDeque<Step<Vec<String>>>>,
     calls: Mutex<Vec<STTCall>>,
+    session_calls: Mutex<Vec<STTSessionCall>>,
+    created_sessions: Mutex<Vec<FakeTranscriptionSession>>,
     model_name: String,
 }
 
@@ -138,6 +169,16 @@ impl FakeSTTModel {
     pub fn calls(&self) -> Vec<STTCall> {
         self.calls.lock().expect("poisoned").clone()
     }
+
+    /// The recorded streamed-session creation calls.
+    pub fn session_calls(&self) -> Vec<STTSessionCall> {
+        self.session_calls.lock().expect("poisoned").clone()
+    }
+
+    /// The sessions this model created, sharing state with the ones the pipeline holds.
+    pub fn created_sessions(&self) -> Vec<FakeTranscriptionSession> {
+        self.created_sessions.lock().expect("poisoned").clone()
+    }
 }
 
 #[async_trait]
@@ -174,10 +215,18 @@ impl STTModel for FakeSTTModel {
     async fn create_session(
         &self,
         _input: &StreamedAudioInput,
-        _settings: &STTModelSettings,
-        _trace_include_sensitive_data: bool,
-        _trace_include_sensitive_audio_data: bool,
+        settings: &STTModelSettings,
+        trace_include_sensitive_data: bool,
+        trace_include_sensitive_audio_data: bool,
     ) -> Result<Box<dyn StreamedTranscriptionSession>> {
+        self.session_calls
+            .lock()
+            .expect("poisoned")
+            .push(STTSessionCall {
+                settings: settings.clone(),
+                trace_include_sensitive_data,
+                trace_include_sensitive_audio_data,
+            });
         let turns = self
             .sessions
             .lock()
@@ -189,35 +238,61 @@ impl STTModel for FakeSTTModel {
                 )
             })?
             .take()?;
-        Ok(Box::new(FakeTranscriptionSession {
-            turns: turns.into(),
-            close_calls: 0,
-        }))
+        let session = FakeTranscriptionSession::new(turns);
+        self.created_sessions
+            .lock()
+            .expect("poisoned")
+            .push(session.clone());
+        Ok(Box::new(session))
     }
 }
 
-/// A transcription session yielding scripted turns.
-#[derive(Debug)]
-pub struct FakeTranscriptionSession {
+/// Turns left to yield and how often the session was closed.
+#[derive(Debug, Default)]
+struct TranscriptionSessionState {
     turns: VecDeque<String>,
     close_calls: usize,
 }
 
+/// A transcription session yielding scripted turns.
+///
+/// Clones share one state, so a test can keep observing a session the pipeline took ownership
+/// of (see [`FakeSTTModel::created_sessions`]).
+#[derive(Debug, Clone, Default)]
+pub struct FakeTranscriptionSession {
+    state: std::sync::Arc<Mutex<TranscriptionSessionState>>,
+}
+
 impl FakeTranscriptionSession {
+    /// A session yielding `turns`, one per call to `next_turn`.
+    pub fn new(turns: Vec<String>) -> Self {
+        FakeTranscriptionSession {
+            state: std::sync::Arc::new(Mutex::new(TranscriptionSessionState {
+                turns: turns.into(),
+                close_calls: 0,
+            })),
+        }
+    }
+
     /// How often the session was closed.
     pub fn close_calls(&self) -> usize {
-        self.close_calls
+        self.state.lock().expect("poisoned").close_calls
+    }
+
+    /// Turns the session has not yielded yet.
+    pub fn remaining_turns(&self) -> usize {
+        self.state.lock().expect("poisoned").turns.len()
     }
 }
 
 #[async_trait]
 impl StreamedTranscriptionSession for FakeTranscriptionSession {
     async fn next_turn(&mut self) -> Result<Option<String>> {
-        Ok(self.turns.pop_front())
+        Ok(self.state.lock().expect("poisoned").turns.pop_front())
     }
 
     async fn close(&mut self) -> Result<()> {
-        self.close_calls += 1;
+        self.state.lock().expect("poisoned").close_calls += 1;
         Ok(())
     }
 }
@@ -225,7 +300,7 @@ impl StreamedTranscriptionSession for FakeTranscriptionSession {
 /// A text-to-speech model yielding scripted PCM chunks.
 #[derive(Debug, Default)]
 pub struct FakeTTSModel {
-    results: Mutex<VecDeque<Step<Vec<Bytes>>>>,
+    results: Mutex<VecDeque<Step<TTSResult>>>,
     calls: Mutex<Vec<TTSCall>>,
     model_name: String,
 }
@@ -240,11 +315,11 @@ impl FakeTTSModel {
     }
 
     /// Queue the chunks returned by the next call.
-    pub fn with_result(self, chunks: Vec<Bytes>) -> Self {
+    pub fn with_result(self, chunks: impl Into<TTSResult>) -> Self {
         self.results
             .lock()
             .expect("poisoned")
-            .push_back(Step::Value(chunks));
+            .push_back(Step::Value(chunks.into()));
         self
     }
 
@@ -275,18 +350,19 @@ impl TTSModel for FakeTTSModel {
         &self.model_name
     }
 
-    async fn run(&self, text: &str, _settings: &TTSModelSettings) -> Result<AudioByteStream> {
+    async fn run(&self, text: &str, settings: &TTSModelSettings) -> Result<AudioByteStream> {
         self.calls.lock().expect("poisoned").push(TTSCall {
             text: text.to_string(),
+            settings: settings.clone(),
         });
-        let chunks = self
+        let result = self
             .results
             .lock()
             .expect("poisoned")
             .pop_front()
             .ok_or_else(|| AgentsError::other("Unexpected TTS call: no scripted results remain"))?
             .take()?;
-        Ok(futures::stream::iter(chunks.into_iter().map(Ok)).boxed())
+        Ok(futures::stream::iter(result.chunks.into_iter().map(Ok)).boxed())
     }
 }
 

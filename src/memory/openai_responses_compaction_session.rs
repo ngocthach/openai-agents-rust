@@ -126,44 +126,82 @@ fn strip_orphaned_assistant_ids(items: Vec<InputItem>) -> Vec<InputItem> {
 }
 
 /// Rewrite a compacted `input_image` / `input_file` part into a replay-safe shape.
-fn normalize_content_part(part: &Value) -> Value {
+fn normalize_content_part(part: &Value) -> Result<Value> {
     let Some(obj) = part.as_object() else {
-        return part.clone();
+        return Ok(part.clone());
+    };
+    let non_empty = |key: &str| {
+        obj.get(key)
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
     };
     let kind = obj.get("type").and_then(Value::as_str).unwrap_or_default();
-    let keep: &[&str] = match kind {
-        "input_image" => &["image_url", "file_id", "detail"],
-        "input_file" => &["file_data", "file_url", "file_id", "filename", "detail"],
-        _ => return part.clone(),
+    // The Responses API accepts exactly one source per part, so the first source that is
+    // present wins and the rest are dropped even when the stored item carried several.
+    let (sources, extras): (&[&str], &[&str]) = match kind {
+        "input_image" => (&["image_url", "file_id"], &["detail"]),
+        "input_file" => (
+            &["file_data", "file_url", "file_id"],
+            &["filename", "detail"],
+        ),
+        _ => return Ok(part.clone()),
     };
     let mut out = Map::new();
     out.insert("type".into(), json!(kind));
-    for key in keep {
-        if let Some(v) = obj.get(*key)
-            && v.as_str().is_some_and(|s| !s.is_empty())
-        {
-            out.insert((*key).to_string(), v.clone());
+    let source = sources
+        .iter()
+        .find_map(|key| non_empty(key).map(|v| ((*key).to_string(), v)));
+    let Some((key, value)) = source else {
+        return Err(AgentsError::user(format!(
+            "Compaction {kind} item missing {}.",
+            sources.join(" or ")
+        )));
+    };
+    out.insert(key, json!(value));
+    for key in extras {
+        if let Some(v) = non_empty(key) {
+            out.insert((*key).to_string(), json!(v));
         }
     }
-    Value::Object(out)
+    Ok(Value::Object(out))
+}
+
+/// The limit compaction reads history with: large enough to mean "everything", explicit
+/// enough that a wrapped store's own `SessionSettings::limit` cannot truncate the read.
+///
+/// Compaction replaces the history it read. A truncated read would make the coverage check
+/// pass against a partial view and then delete the items it never saw, so the full-history
+/// path must never pass `None` here. Mirrors Python's `_ALL_SESSION_ITEMS_LIMIT`.
+const ALL_SESSION_ITEMS_LIMIT: usize = 2_147_483_647;
+
+/// The error raised for a wrapped store that owns its history remotely.
+fn unwrappable_session_error() -> AgentsError {
+    AgentsError::user(
+        "OpenAIResponsesCompactionSession cannot wrap a session that manages its own history \
+         on the server, such as OpenAIConversationsSession.",
+    )
 }
 
 /// Normalize the compaction output into items that can be replayed as input.
-fn normalize_output_items(output: &[Value]) -> Vec<InputItem> {
+fn normalize_output_items(output: &[Value]) -> Result<Vec<InputItem>> {
     output
         .iter()
         .map(|item| {
             let is_user_message = item.get("type").and_then(Value::as_str) == Some("message")
                 && item.get("role").and_then(Value::as_str) == Some("user");
             if !is_user_message {
-                return InputItem(item.clone());
+                return Ok(InputItem(item.clone()));
             }
             let mut out = item.clone();
             if let Some(Value::Array(parts)) = out.get("content") {
-                let normalized: Vec<Value> = parts.iter().map(normalize_content_part).collect();
+                let normalized: Vec<Value> = parts
+                    .iter()
+                    .map(normalize_content_part)
+                    .collect::<Result<_>>()?;
                 out["content"] = Value::Array(normalized);
             }
-            InputItem(out)
+            Ok(InputItem(out))
         })
         .collect()
 }
@@ -291,6 +329,31 @@ impl fmt::Debug for OpenAIResponsesCompactionSession {
 
 impl OpenAIResponsesCompactionSession {
     /// Wrap `underlying`, compacting with `gpt-4.1` and a client built from the environment.
+    ///
+    /// Rejects a session that manages its history on the provider's servers, such as
+    /// [`crate::memory::OpenAIConversationsSession`]: compaction rewrites stored items, which
+    /// such a store does not own. [`OpenAIResponsesCompactionSession::new`] accepts one and
+    /// fails on first use instead.
+    pub fn try_new(session_id: impl Into<String>, underlying: Arc<dyn Session>) -> Result<Self> {
+        if underlying.manages_history_remotely() {
+            return Err(unwrappable_session_error());
+        }
+        Ok(Self::new(session_id, underlying))
+    }
+
+    /// Fail when the wrapped store manages its own history on the provider's servers.
+    fn ensure_wrappable(&self) -> Result<()> {
+        if self.underlying.manages_history_remotely() {
+            return Err(unwrappable_session_error());
+        }
+        Ok(())
+    }
+
+    /// Wrap `underlying`, compacting with `gpt-4.1` and a client built from the environment.
+    ///
+    /// A store that manages its own history on the provider's servers cannot be compacted;
+    /// every session operation on such a wrapper fails. Use
+    /// [`OpenAIResponsesCompactionSession::try_new`] to find that out at construction time.
     pub fn new(session_id: impl Into<String>, underlying: Arc<dyn Session>) -> Self {
         OpenAIResponsesCompactionSession {
             session_id: session_id.into(),
@@ -422,7 +485,10 @@ impl OpenAIResponsesCompactionSession {
             ));
         }
 
-        let session_items = self.underlying.get_items(None).await?;
+        let session_items = self
+            .underlying
+            .get_items(Some(ALL_SESSION_ITEMS_LIMIT))
+            .await?;
         let candidates = select_compaction_candidate_items(&session_items);
         let approved_mode = resolved_mode;
         let approved_items = session_items.clone();
@@ -579,7 +645,10 @@ impl OpenAIResponsesCompactionSession {
         // the compaction API call was in flight, and replacing the whole history would drop
         // those items. This also refreshes the rollback snapshot, so a failed replacement
         // cannot revive items that expired meanwhile.
-        let current_items = self.underlying.get_items(None).await?;
+        let current_items = self
+            .underlying
+            .get_items(Some(ALL_SESSION_ITEMS_LIMIT))
+            .await?;
         if current_items != session_items {
             log::warn!(
                 "Skipped compaction replacement because the stored history changed while the \
@@ -626,7 +695,7 @@ impl OpenAIResponsesCompactionSession {
             .unwrap_or_default();
         Ok((
             usage,
-            strip_orphaned_assistant_ids(normalize_output_items(&output)),
+            strip_orphaned_assistant_ids(normalize_output_items(&output)?),
         ))
     }
 
@@ -683,7 +752,10 @@ impl OpenAIResponsesCompactionSession {
             state.last_unstored_response_id.as_deref(),
         );
         drop(state);
-        let session_items = self.underlying.get_items(None).await?;
+        let session_items = self
+            .underlying
+            .get_items(Some(ALL_SESSION_ITEMS_LIMIT))
+            .await?;
         let context = CompactionContext {
             response_id: Some(response_id.to_string()),
             compaction_mode: mode,
@@ -713,15 +785,18 @@ impl Session for OpenAIResponsesCompactionSession {
     }
 
     async fn get_items(&self, limit: Option<usize>) -> Result<Vec<InputItem>> {
+        self.ensure_wrappable()?;
         self.underlying.get_items(limit).await
     }
 
     async fn add_items(&self, items: Vec<InputItem>) -> Result<()> {
+        self.ensure_wrappable()?;
         let _guard = self.mutation_lock.lock().await;
         self.underlying.add_items(items).await
     }
 
     async fn pop_item(&self) -> Result<Option<InputItem>> {
+        self.ensure_wrappable()?;
         let _guard = self.mutation_lock.lock().await;
         let popped = self.underlying.pop_item().await?;
         if popped.is_some() {
@@ -732,6 +807,7 @@ impl Session for OpenAIResponsesCompactionSession {
     }
 
     async fn clear_session(&self) -> Result<()> {
+        self.ensure_wrappable()?;
         let _guard = self.mutation_lock.lock().await;
         self.underlying.clear_session().await?;
         *self.state.lock().await = CompactionState::default();
@@ -739,6 +815,7 @@ impl Session for OpenAIResponsesCompactionSession {
     }
 
     async fn on_run_completed(&self, info: &SessionRunCompletion) -> Result<Usage> {
+        self.ensure_wrappable()?;
         let Some(response_id) = info.response_id.clone() else {
             return Ok(Usage::default());
         };
@@ -818,13 +895,33 @@ mod tests {
                 {"type": "input_text", "text": "hi"}
             ]
         })];
-        let items = normalize_output_items(&output);
+        let items = normalize_output_items(&output).unwrap();
         let parts = items[0].as_value()["content"].as_array().unwrap();
         assert_eq!(
             parts[0],
             json!({"type": "input_image", "image_url": "https://x/y.png"})
         );
         assert_eq!(parts[1]["text"], "hi");
+    }
+
+    #[test]
+    fn content_sources_are_priority_exclusive() {
+        // Both sources set: only the higher-priority one survives.
+        let both = json!({
+            "type": "input_file",
+            "file_data": "ZGF0YQ==",
+            "file_url": "https://x/y.pdf",
+            "file_id": "file_1",
+            "filename": "y.pdf"
+        });
+        assert_eq!(
+            normalize_content_part(&both).unwrap(),
+            json!({"type": "input_file", "file_data": "ZGF0YQ==", "filename": "y.pdf"})
+        );
+        // No source at all is an error rather than a bare, unusable part.
+        let empty = json!({"type": "input_image", "detail": "high"});
+        let err = normalize_content_part(&empty).unwrap_err().to_string();
+        assert!(err.contains("image_url or file_id"), "{err}");
     }
 
     fn exchange(items: &[InputItem]) -> Vec<String> {

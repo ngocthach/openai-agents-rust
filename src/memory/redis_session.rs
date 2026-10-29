@@ -254,6 +254,7 @@ impl Session for RedisSession {
     }
 
     async fn get_items(&self, limit: Option<usize>) -> Result<Vec<InputItem>> {
+        let limit = super::resolve_session_limit(limit, self.session_settings().as_ref());
         let mut conn = self.connection.lock().await;
         let Some(limit) = limit else {
             let raw: Vec<String> = redis::cmd("LRANGE")

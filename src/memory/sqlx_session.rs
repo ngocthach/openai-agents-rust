@@ -351,6 +351,7 @@ impl Session for SqlxSession {
     }
 
     async fn get_items(&self, limit: Option<usize>) -> Result<Vec<InputItem>> {
+        let limit = super::resolve_session_limit(limit, self.session_settings().as_ref());
         let Some(limit) = limit else {
             let rows = sqlx::query(AssertSqlSafe(self.schema.select_all()))
                 .bind(self.session_id.clone())

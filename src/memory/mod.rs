@@ -32,7 +32,7 @@ use crate::items::InputItem;
 #[cfg(feature = "sqlite")]
 pub use advanced_sqlite_session::{
     AdvancedSqliteSession, BranchInfo, ConversationTurn, MAIN_BRANCH, SessionUsage, ToolUsage,
-    TurnUsage,
+    TurnMessage, TurnUsage,
 };
 pub use dapr_session::{
     DEFAULT_DAPR_HTTP_ENDPOINT, DaprConsistency, DaprSession, dapr_session_keys,
@@ -55,6 +55,32 @@ pub use redis_session::{DEFAULT_KEY_PREFIX, RedisSession, redis_session_keys};
 pub use sqlite_session::SqliteSession;
 #[cfg(feature = "sqlx")]
 pub use sqlx_session::{DEFAULT_MESSAGES_TABLE, DEFAULT_SESSIONS_TABLE, SqlxDialect, SqlxSession};
+
+/// Return `explicit`, or fall back to the limit in `settings`.
+///
+/// Mirrors `agents.memory.session_settings.resolve_session_limit`. Backends call it at the top
+/// of `get_items`, so a session configured with a limit honors it even when a caller asks for
+/// "everything". `Some(0)` is preserved and means no items.
+pub fn resolve_session_limit(
+    explicit: Option<usize>,
+    settings: Option<&SessionSettings>,
+) -> Option<usize> {
+    explicit.or_else(|| settings.and_then(|s| s.limit))
+}
+
+/// Combine history with the new input of a turn.
+///
+/// Mirrors `agents.memory.util.SessionInputCallback`: given the session's stored items and the
+/// turn's new items, return the list the agent actually runs on. This is the nameable form of
+/// [`crate::RunConfig::session_input_callback`].
+pub type SessionInputCallback = std::sync::Arc<
+    dyn Fn(
+            Vec<InputItem>,
+            Vec<InputItem>,
+        ) -> futures::future::BoxFuture<'static, Result<Vec<InputItem>>>
+        + Send
+        + Sync,
+>;
 
 /// Settings controlling how history is retrieved.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -166,6 +192,16 @@ pub trait Session: Send + Sync + fmt::Debug {
         None
     }
 
+    /// Whether the store keeps the conversation on the model provider's servers rather than in
+    /// items this SDK owns.
+    ///
+    /// Such a session cannot be wrapped by [`OpenAIResponsesCompactionSession`], which rewrites
+    /// stored history. `OpenAIConversationsSession` is the one in-tree session that returns
+    /// `true`.
+    fn manages_history_remotely(&self) -> bool {
+        false
+    }
+
     /// Retrieve history, the most recent `limit` items when set (chronological order).
     async fn get_items(&self, limit: Option<usize>) -> Result<Vec<InputItem>>;
 
@@ -264,6 +300,7 @@ impl Session for InMemorySession {
     }
 
     async fn get_items(&self, limit: Option<usize>) -> Result<Vec<InputItem>> {
+        let limit = resolve_session_limit(limit, self.settings.as_ref());
         let items = self.items.lock().expect("session poisoned");
         let window = match limit {
             None => &items[..],

@@ -6,8 +6,15 @@
 //! HTTP+SSE transport ([`MCPServerSse`]). For OpenAI-hosted MCP, use
 //! [`crate::tool::HostedMCPTool`] instead.
 
+pub mod logging;
 mod sse;
 pub mod util;
+
+pub use logging::{
+    MCPToolMetadata, extract_mcp_tool_metadata, get_mcp_server_log_message,
+    get_mcp_server_log_name, resolve_mcp_tool_description, resolve_mcp_tool_description_for_model,
+    resolve_mcp_tool_title,
+};
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
@@ -169,8 +176,25 @@ impl RequireApproval {
     }
 }
 
-/// Settings shared by local MCP servers.
+/// What a [`MCPToolMetaResolver`] is told about the call it is producing `_meta` for.
 #[derive(Debug, Clone)]
+pub struct MCPToolMetaContext {
+    /// The server's name, as configured.
+    pub server_name: String,
+    /// The tool's name on the server (never the exposed function-tool name).
+    pub tool_name: String,
+    /// The arguments the model produced, when the call has any.
+    pub arguments: Option<Map<String, Value>>,
+}
+
+/// Produces protocol-level request metadata (`_meta`) for a tool call.
+///
+/// The SDK calls it before `call_tool`; returning `None` sends no `_meta`.
+pub type MCPToolMetaResolver =
+    Arc<dyn Fn(&MCPToolMetaContext) -> Option<Map<String, Value>> + Send + Sync>;
+
+/// Settings shared by local MCP servers.
+#[derive(Clone)]
 pub struct MCPServerConfig {
     /// Cache `list_tools` results (call `invalidate_tools_cache` to refresh).
     pub cache_tools_list: bool,
@@ -184,8 +208,40 @@ pub struct MCPServerConfig {
     pub max_retry_attempts: u32,
     /// Base backoff between retries.
     pub retry_backoff_seconds_base: f64,
+    /// Upper bound on the backoff between retries (`None` leaves it uncapped).
+    pub retry_backoff_seconds_max: Option<f64>,
+    /// Maximum successful pages fetched by one automatic `list_tools`/`list_prompts` call.
+    ///
+    /// `None`, the default, applies no page limit. A list that reaches the limit on its final
+    /// page succeeds; otherwise the call fails rather than returning a partial list.
+    pub max_list_pages: Option<usize>,
     /// Prefer `structuredContent` over content blocks.
     pub use_structured_content: bool,
+    /// Optional source of protocol-level request metadata (`_meta`) for tool calls.
+    pub tool_meta_resolver: Option<MCPToolMetaResolver>,
+}
+
+impl fmt::Debug for MCPServerConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MCPServerConfig")
+            .field("cache_tools_list", &self.cache_tools_list)
+            .field("tool_filter", &self.tool_filter)
+            .field("require_approval", &self.require_approval)
+            .field("client_session_timeout", &self.client_session_timeout)
+            .field("max_retry_attempts", &self.max_retry_attempts)
+            .field(
+                "retry_backoff_seconds_base",
+                &self.retry_backoff_seconds_base,
+            )
+            .field("retry_backoff_seconds_max", &self.retry_backoff_seconds_max)
+            .field("max_list_pages", &self.max_list_pages)
+            .field("use_structured_content", &self.use_structured_content)
+            .field(
+                "tool_meta_resolver",
+                &self.tool_meta_resolver.as_ref().map(|_| "Fn(..)"),
+            )
+            .finish()
+    }
 }
 
 impl Default for MCPServerConfig {
@@ -197,7 +253,10 @@ impl Default for MCPServerConfig {
             client_session_timeout: Some(Duration::from_secs(5)),
             max_retry_attempts: 0,
             retry_backoff_seconds_base: 1.0,
+            retry_backoff_seconds_max: None,
+            max_list_pages: None,
             use_structured_content: false,
+            tool_meta_resolver: None,
         }
     }
 }
@@ -221,6 +280,62 @@ pub trait MCPServer: Send + Sync + fmt::Debug {
         tool_name: &str,
         arguments: Option<Map<String, Value>>,
     ) -> Result<Value>;
+    /// Call a tool, attaching protocol-level request metadata (`_meta`).
+    ///
+    /// The default implementation delegates to [`MCPServer::call_tool`] when `meta` is `None`
+    /// and reports that the server cannot carry `_meta` otherwise.
+    async fn call_tool_with_meta(
+        &self,
+        tool_name: &str,
+        arguments: Option<Map<String, Value>>,
+        meta: Option<Map<String, Value>>,
+    ) -> Result<Value> {
+        if meta.is_some() {
+            return Err(AgentsError::user(format!(
+                "MCP server '{}' does not support request metadata (_meta).",
+                get_mcp_server_log_name(self.name())
+            )));
+        }
+        self.call_tool(tool_name, arguments).await
+    }
+    /// The most recently fetched tool list, when one is cached.
+    ///
+    /// Returns `None` when tools were never fetched or caching is disabled.
+    async fn cached_tools(&self) -> Option<Vec<MCPTool>> {
+        None
+    }
+    /// The server's `initialize` result, available once the server is connected.
+    async fn server_initialize_result(&self) -> Option<Value> {
+        None
+    }
+    /// The transport-level session id, for transports that have one.
+    async fn session_id(&self) -> Option<String> {
+        None
+    }
+    /// List the resources the server exposes.
+    ///
+    /// `cursor` is an opaque pagination cursor returned as `nextCursor` by a previous call;
+    /// `None` fetches the first page. Servers that do not support resources return an error.
+    async fn list_resources(&self, _cursor: Option<&str>) -> Result<Value> {
+        Err(AgentsError::user(format!(
+            "MCP server '{}' does not support list_resources.",
+            get_mcp_server_log_name(self.name())
+        )))
+    }
+    /// List the resource templates the server exposes. See [`MCPServer::list_resources`].
+    async fn list_resource_templates(&self, _cursor: Option<&str>) -> Result<Value> {
+        Err(AgentsError::user(format!(
+            "MCP server '{}' does not support list_resource_templates.",
+            get_mcp_server_log_name(self.name())
+        )))
+    }
+    /// Read the contents of one resource by URI.
+    async fn read_resource(&self, _uri: &str) -> Result<Value> {
+        Err(AgentsError::user(format!(
+            "MCP server '{}' does not support read_resource.",
+            get_mcp_server_log_name(self.name())
+        )))
+    }
     /// List prompt templates.
     async fn list_prompts(&self) -> Result<Vec<Value>>;
     /// Fetch a prompt.
@@ -353,16 +468,34 @@ impl Core {
         Ok(())
     }
 
+    /// The server name with URL credentials, query and fragment removed.
+    fn log_name(&self) -> String {
+        get_mcp_server_log_name(&self.name)
+    }
+
     async fn with_timeout<T>(
         &self,
         fut: impl std::future::Future<Output = Result<T>>,
     ) -> Result<T> {
         match self.config.client_session_timeout {
             Some(d) if !d.is_zero() => tokio::time::timeout(d, fut).await.map_err(|_| {
-                AgentsError::other(format!("MCP request to {} timed out", self.name))
+                AgentsError::other(format!("MCP request to '{}' timed out", self.log_name()))
             })?,
             _ => fut.await,
         }
+    }
+
+    async fn session(
+        &self,
+    ) -> Result<tokio::sync::MutexGuard<'_, Option<RunningService<RoleClient, ()>>>> {
+        let guard = self.service.lock().await;
+        if guard.is_none() {
+            return Err(AgentsError::user(format!(
+                "Server '{}' not initialized. Call connect() first.",
+                self.log_name()
+            )));
+        }
+        Ok(guard)
     }
 
     async fn retry<T, F, Fut>(&self, mut f: F) -> Result<T>
@@ -376,14 +509,55 @@ impl Core {
                 Ok(v) => return Ok(v),
                 Err(e) if attempt < self.config.max_retry_attempts => {
                     attempt += 1;
-                    let delay =
+                    let mut delay =
                         self.config.retry_backoff_seconds_base * 2f64.powi(attempt as i32 - 1);
-                    log::warn!("MCP request to {} failed ({e}); retrying", self.name);
+                    if let Some(max) = self.config.retry_backoff_seconds_max {
+                        delay = delay.min(max);
+                    }
+                    crate::logger::log_tool_action_warning(
+                        &get_mcp_server_log_message(
+                            "Retrying failed request to MCP server",
+                            &self.name,
+                        ),
+                        &e,
+                    );
                     tokio::time::sleep(Duration::from_secs_f64(delay.max(0.0))).await;
                 }
                 Err(e) => return Err(e),
             }
         }
+    }
+
+    /// Decide whether a paginated list continues, bounded by `max_list_pages`.
+    ///
+    /// Returns the next cursor, or `None` when the listing is complete. A server that repeats a
+    /// cursor, or one that still has pages left when the page budget runs out, fails the call
+    /// rather than returning a partial list.
+    fn check_pagination(
+        &self,
+        next: Option<String>,
+        previous: Option<String>,
+        pages: usize,
+        operation: &str,
+    ) -> Result<Option<String>> {
+        let Some(next) = next.filter(|c| !c.is_empty()) else {
+            return Ok(None);
+        };
+        if previous.as_deref() == Some(next.as_str()) {
+            return Err(AgentsError::user(format!(
+                "MCP server '{}' returned a repeated cursor while paginating {operation}.",
+                self.log_name()
+            )));
+        }
+        if let Some(max) = self.config.max_list_pages
+            && pages >= max
+        {
+            return Err(AgentsError::user(format!(
+                "MCP server '{}' exceeded max_list_pages ({max}) while paginating {operation}.",
+                self.log_name()
+            )));
+        }
+        Ok(Some(next))
     }
 
     async fn list_tools(&self) -> Result<Vec<MCPTool>> {
@@ -394,19 +568,33 @@ impl Core {
         }
         let tools = self
             .retry(|| async {
-                let guard = self.service.lock().await;
-                let s = guard.as_ref().ok_or_else(|| {
-                    AgentsError::user(format!(
-                        "Server {} not initialized. Call connect() first.",
-                        self.name
-                    ))
-                })?;
-                let tools = s.list_all_tools().await.map_err(svc_err)?;
-                Ok(tools
-                    .iter()
-                    .filter_map(|t| serde_json::to_value(t).ok())
-                    .filter_map(|v| MCPTool::from_value(&v))
-                    .collect::<Vec<_>>())
+                let mut out = Vec::new();
+                let mut cursor: Option<String> = None;
+                let mut pages = 0usize;
+                loop {
+                    let page = {
+                        let guard = self.session().await?;
+                        let s = guard.as_ref().expect("session checked");
+                        s.list_tools(cursor.clone().map(|c| {
+                            rmcp::model::PaginatedRequestParams::default().with_cursor(Some(c))
+                        }))
+                        .await
+                        .map_err(svc_err)?
+                    };
+                    pages += 1;
+                    out.extend(
+                        page.tools
+                            .iter()
+                            .filter_map(|t| serde_json::to_value(t).ok())
+                            .filter_map(|v| MCPTool::from_value(&v)),
+                    );
+                    let next = page.next_cursor.map(|c| c.to_string());
+                    match self.check_pagination(next, cursor, pages, "list tools")? {
+                        Some(next) => cursor = Some(next),
+                        None => break,
+                    }
+                }
+                Ok(out)
             })
             .await?;
         if self.config.cache_tools_list {
@@ -419,22 +607,22 @@ impl Core {
         &self,
         tool_name: &str,
         arguments: Option<Map<String, Value>>,
+        meta: Option<Map<String, Value>>,
     ) -> Result<Value> {
         self.retry(|| {
             let arguments = arguments.clone();
+            let meta = meta.clone();
             async move {
                 let mut req = json!({"name": tool_name});
                 if let Some(a) = arguments {
                     req["arguments"] = Value::Object(a);
                 }
+                if let Some(m) = meta {
+                    req["_meta"] = Value::Object(m);
+                }
                 let params: rmcp::model::CallToolRequestParams = serde_json::from_value(req)?;
-                let guard = self.service.lock().await;
-                let s = guard.as_ref().ok_or_else(|| {
-                    AgentsError::user(format!(
-                        "Server {} not initialized. Call connect() first.",
-                        self.name
-                    ))
-                })?;
+                let guard = self.session().await?;
+                let s = guard.as_ref().expect("session checked");
                 let result = s.call_tool(params).await.map_err(svc_err)?;
                 Ok(serde_json::to_value(result)?)
             }
@@ -443,17 +631,73 @@ impl Core {
     }
 
     async fn list_prompts(&self) -> Result<Vec<Value>> {
-        let guard = self.service.lock().await;
-        let s = guard
-            .as_ref()
-            .ok_or_else(|| AgentsError::user(format!("Server {} not initialized", self.name)))?;
-        let prompts = self
-            .with_timeout(async { s.list_all_prompts().await.map_err(svc_err) })
+        let mut out: Vec<Value> = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut pages = 0usize;
+        loop {
+            let guard = self.session().await?;
+            let s = guard.as_ref().expect("session checked");
+            let params = cursor
+                .clone()
+                .map(|c| rmcp::model::PaginatedRequestParams::default().with_cursor(Some(c)));
+            let page = self
+                .with_timeout(async { s.list_prompts(params).await.map_err(svc_err) })
+                .await?;
+            pages += 1;
+            out.extend(
+                page.prompts
+                    .iter()
+                    .filter_map(|p| serde_json::to_value(p).ok()),
+            );
+            let next = page.next_cursor.map(|c| c.to_string());
+            drop(guard);
+            match self.check_pagination(next, cursor, pages, "list prompts")? {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+        Ok(out)
+    }
+
+    async fn list_resources(&self, cursor: Option<&str>) -> Result<Value> {
+        let guard = self.session().await?;
+        let s = guard.as_ref().expect("session checked");
+        let params = cursor.map(|c| {
+            rmcp::model::PaginatedRequestParams::default().with_cursor(Some(c.to_string()))
+        });
+        let result = self
+            .with_timeout(async { s.list_resources(params).await.map_err(svc_err) })
             .await?;
-        Ok(prompts
-            .iter()
-            .filter_map(|p| serde_json::to_value(p).ok())
-            .collect())
+        Ok(serde_json::to_value(result)?)
+    }
+
+    async fn list_resource_templates(&self, cursor: Option<&str>) -> Result<Value> {
+        let guard = self.session().await?;
+        let s = guard.as_ref().expect("session checked");
+        let params = cursor.map(|c| {
+            rmcp::model::PaginatedRequestParams::default().with_cursor(Some(c.to_string()))
+        });
+        let result = self
+            .with_timeout(async { s.list_resource_templates(params).await.map_err(svc_err) })
+            .await?;
+        Ok(serde_json::to_value(result)?)
+    }
+
+    async fn read_resource(&self, uri: &str) -> Result<Value> {
+        let params: rmcp::model::ReadResourceRequestParams =
+            serde_json::from_value(json!({"uri": uri}))?;
+        let guard = self.session().await?;
+        let s = guard.as_ref().expect("session checked");
+        let result = self
+            .with_timeout(async { s.read_resource(params).await.map_err(svc_err) })
+            .await?;
+        Ok(serde_json::to_value(result)?)
+    }
+
+    async fn server_initialize_result(&self) -> Option<Value> {
+        let guard = self.service.lock().await;
+        let info = guard.as_ref()?.peer_info()?;
+        serde_json::to_value(&*info).ok()
     }
 
     async fn get_prompt(
@@ -466,10 +710,8 @@ impl Core {
             req["arguments"] = json!(a);
         }
         let params: rmcp::model::GetPromptRequestParams = serde_json::from_value(req)?;
-        let guard = self.service.lock().await;
-        let s = guard
-            .as_ref()
-            .ok_or_else(|| AgentsError::user(format!("Server {} not initialized", self.name)))?;
+        let guard = self.session().await?;
+        let s = guard.as_ref().expect("session checked");
         let r = self
             .with_timeout(async { s.get_prompt(params).await.map_err(svc_err) })
             .await?;
@@ -543,9 +785,30 @@ macro_rules! mcp_server_type {
                 self
             }
 
+            /// Cap the exponential retry backoff (`None` leaves it uncapped).
+            pub fn with_retry_backoff_seconds_max(mut self, seconds: Option<f64>) -> Self {
+                self.core.config.retry_backoff_seconds_max = seconds;
+                self
+            }
+
+            /// Bound the pages fetched by one automatic `list_tools`/`list_prompts` call.
+            pub fn with_max_list_pages(mut self, pages: Option<usize>) -> Self {
+                self.core.config.max_list_pages = pages;
+                self
+            }
+
             /// Prefer structured content in tool results.
             pub fn with_use_structured_content(mut self, use_structured: bool) -> Self {
                 self.core.config.use_structured_content = use_structured;
+                self
+            }
+
+            /// Produce protocol-level request metadata (`_meta`) for every tool call.
+            pub fn with_tool_meta_resolver<F>(mut self, resolver: F) -> Self
+            where
+                F: Fn(&MCPToolMetaContext) -> Option<Map<String, Value>> + Send + Sync + 'static,
+            {
+                self.core.config.tool_meta_resolver = Some(Arc::new(resolver));
                 self
             }
         }
@@ -572,7 +835,30 @@ macro_rules! mcp_server_type {
                 tool_name: &str,
                 arguments: Option<Map<String, Value>>,
             ) -> Result<Value> {
-                self.core.call_tool(tool_name, arguments).await
+                self.core.call_tool(tool_name, arguments, None).await
+            }
+            async fn call_tool_with_meta(
+                &self,
+                tool_name: &str,
+                arguments: Option<Map<String, Value>>,
+                meta: Option<Map<String, Value>>,
+            ) -> Result<Value> {
+                self.core.call_tool(tool_name, arguments, meta).await
+            }
+            async fn cached_tools(&self) -> Option<Vec<MCPTool>> {
+                self.core.tools_cache.lock().await.clone()
+            }
+            async fn server_initialize_result(&self) -> Option<Value> {
+                self.core.server_initialize_result().await
+            }
+            async fn list_resources(&self, cursor: Option<&str>) -> Result<Value> {
+                self.core.list_resources(cursor).await
+            }
+            async fn list_resource_templates(&self, cursor: Option<&str>) -> Result<Value> {
+                self.core.list_resource_templates(cursor).await
+            }
+            async fn read_resource(&self, uri: &str) -> Result<Value> {
+                self.core.read_resource(uri).await
             }
             async fn list_prompts(&self) -> Result<Vec<Value>> {
                 self.core.list_prompts().await
@@ -611,13 +897,21 @@ mcp_server_type!(
 );
 
 /// Connects several servers and exposes the ones that connected.
+///
+/// Python runs every server on its own worker task because anyio requires a transport's
+/// connect and cleanup to happen in the same task. tokio and `rmcp` have no such requirement,
+/// so connect and cleanup run directly here; parallel connect is expressed with `join_all`
+/// rather than a per-server command queue.
 #[derive(Debug)]
 pub struct MCPServerManager {
     servers: Vec<Arc<dyn MCPServer>>,
     active: Vec<Arc<dyn MCPServer>>,
     failed: Vec<(Arc<dyn MCPServer>, String)>,
+    cleanup_errors: Vec<(Arc<dyn MCPServer>, String)>,
     strict: bool,
+    connect_in_parallel: bool,
     connect_timeout: Option<Duration>,
+    cleanup_timeout: Option<Duration>,
 }
 
 impl MCPServerManager {
@@ -632,8 +926,11 @@ impl MCPServerManager {
             servers,
             active: Vec::new(),
             failed: Vec::new(),
+            cleanup_errors: Vec::new(),
             strict: false,
+            connect_in_parallel: false,
             connect_timeout: Some(Duration::from_secs(10)),
+            cleanup_timeout: Some(Duration::from_secs(10)),
         }
     }
 
@@ -643,18 +940,62 @@ impl MCPServerManager {
         self
     }
 
+    /// Connect every server concurrently instead of one after another.
+    ///
+    /// The active and failed lists keep the manager's server order either way, so a run is
+    /// reproducible; in strict mode the first failure in that order is the one returned.
+    pub fn with_connect_in_parallel(mut self, parallel: bool) -> Self {
+        self.connect_in_parallel = parallel;
+        self
+    }
+
     /// Connection timeout per server.
     pub fn with_connect_timeout(mut self, timeout: Option<Duration>) -> Self {
         self.connect_timeout = timeout;
         self
     }
 
-    async fn connect_one(&self, s: &Arc<dyn MCPServer>) -> Result<()> {
-        match self.connect_timeout {
-            Some(d) => tokio::time::timeout(d, s.connect())
-                .await
-                .map_err(|_| AgentsError::other(format!("Timed out connecting to {}", s.name())))?,
+    /// Cleanup timeout per server (`None` waits indefinitely).
+    pub fn with_cleanup_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.cleanup_timeout = timeout;
+        self
+    }
+
+    async fn connect_one(timeout: Option<Duration>, s: &Arc<dyn MCPServer>) -> Result<()> {
+        match timeout {
+            Some(d) => tokio::time::timeout(d, s.connect()).await.map_err(|_| {
+                AgentsError::other(format!(
+                    "Timed out connecting to MCP server '{}'",
+                    get_mcp_server_log_name(s.name())
+                ))
+            })?,
             None => s.connect().await,
+        }
+    }
+
+    fn record_connect_results(
+        &mut self,
+        results: Vec<(Arc<dyn MCPServer>, Result<()>)>,
+    ) -> Result<()> {
+        let mut first_error = None;
+        for (s, outcome) in results {
+            match outcome {
+                Ok(()) => self.active.push(s),
+                Err(e) => {
+                    crate::logger::log_tool_action_warning(
+                        &get_mcp_server_log_message("Failed to connect MCP server", s.name()),
+                        &e,
+                    );
+                    self.failed.push((s, e.to_string()));
+                    if first_error.is_none() {
+                        first_error = Some(e);
+                    }
+                }
+            }
+        }
+        match first_error {
+            Some(e) if self.strict => Err(e),
+            _ => Ok(()),
         }
     }
 
@@ -662,19 +1003,28 @@ impl MCPServerManager {
     pub async fn connect_all(&mut self) -> Result<()> {
         self.active.clear();
         self.failed.clear();
-        for s in self.servers.clone() {
-            match self.connect_one(&s).await {
-                Ok(()) => self.active.push(s),
-                Err(e) => {
-                    if self.strict {
-                        return Err(e);
-                    }
-                    log::warn!("Failed to connect MCP server {}: {e}", s.name());
-                    self.failed.push((s, e.to_string()));
+        let servers = self.servers.clone();
+        let timeout = self.connect_timeout;
+        let results = if self.connect_in_parallel {
+            futures::future::join_all(
+                servers
+                    .iter()
+                    .map(|s| async move { (s.clone(), Self::connect_one(timeout, s).await) }),
+            )
+            .await
+        } else {
+            let mut results = Vec::with_capacity(servers.len());
+            for s in &servers {
+                let outcome = Self::connect_one(timeout, s).await;
+                let failed_fast = self.strict && outcome.is_err();
+                results.push((s.clone(), outcome));
+                if failed_fast {
+                    break;
                 }
             }
-        }
-        Ok(())
+            results
+        };
+        self.record_connect_results(results)
     }
 
     /// Retry failed servers (or reconnect all).
@@ -685,7 +1035,7 @@ impl MCPServerManager {
         }
         let failed = std::mem::take(&mut self.failed);
         for (s, _) in failed {
-            match self.connect_one(&s).await {
+            match Self::connect_one(self.connect_timeout, &s).await {
                 Ok(()) => self.active.push(s),
                 Err(e) => self.failed.push((s, e.to_string())),
             }
@@ -698,15 +1048,50 @@ impl MCPServerManager {
         self.active.clone()
     }
 
+    /// Every server this manager was built with, in order.
+    pub fn all_servers(&self) -> Vec<Arc<dyn MCPServer>> {
+        self.servers.clone()
+    }
+
     /// Servers that failed to connect, with their errors.
     pub fn failed_servers(&self) -> &[(Arc<dyn MCPServer>, String)] {
         &self.failed
     }
 
-    /// Close all servers.
+    /// The recorded connect and cleanup failures, by server name.
+    pub fn errors(&self) -> Vec<(String, String)> {
+        self.failed
+            .iter()
+            .chain(&self.cleanup_errors)
+            .map(|(s, e)| (s.name().to_string(), e.clone()))
+            .collect()
+    }
+
+    /// Close all servers, bounded by the cleanup timeout.
+    ///
+    /// Cleanup failures are recorded in [`MCPServerManager::errors`] so a later reconnect does
+    /// not open a second connection over a transport that was never closed.
     pub async fn cleanup_all(&mut self) {
-        for s in &self.servers {
-            let _ = s.cleanup().await;
+        self.cleanup_errors.clear();
+        for s in self.servers.clone() {
+            let outcome = match self.cleanup_timeout {
+                Some(d) => tokio::time::timeout(d, s.cleanup())
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(AgentsError::other(format!(
+                            "Timed out cleaning up MCP server '{}'",
+                            get_mcp_server_log_name(s.name())
+                        )))
+                    }),
+                None => s.cleanup().await,
+            };
+            if let Err(e) = outcome {
+                crate::logger::log_tool_action_warning(
+                    &get_mcp_server_log_message("Failed to cleanup MCP server", s.name()),
+                    &e,
+                );
+                self.cleanup_errors.push((s, e.to_string()));
+            }
         }
         self.active.clear();
     }

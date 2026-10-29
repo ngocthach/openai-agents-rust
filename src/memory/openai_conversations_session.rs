@@ -1,21 +1,37 @@
 //! Session backed by the OpenAI Conversations API. Mirrors
 //! `agents.memory.openai_conversations_session`.
 
+use std::sync::RwLock;
+
 use async_trait::async_trait;
 use serde_json::{Value, json};
-use tokio::sync::OnceCell;
+use tokio::sync::Mutex;
 
-use super::Session;
+use super::{Session, SessionSettings, resolve_session_limit};
 use crate::error::{AgentsError, Result};
 use crate::items::InputItem;
 use crate::models::OpenAIClient;
 
+/// The Conversations items-create endpoint accepts at most this many items per request.
+const MAX_ITEMS_PER_REQUEST: usize = 20;
+
 /// Stores history server-side in an OpenAI conversation (`conv_...`).
+///
+/// The conversation is created lazily on first use. Reads and mutations through one instance are
+/// serialized; separate instances or external writers need application-level coordination.
 #[derive(Debug)]
 pub struct OpenAIConversationsSession {
     client: OpenAIClient,
-    conversation_id: OnceCell<String>,
-    requested_id: Option<String>,
+    /// The live conversation id. `None` before the conversation is created and again after
+    /// [`Session::clear_session`] deleted it, so a later call creates a fresh one.
+    conversation_id: Mutex<Option<String>>,
+    /// Borrowable view of `conversation_id` for [`Session::session_id`], which returns `&str`.
+    ///
+    /// Each distinct id is leaked once, so the view stays valid for the process. A session leaks
+    /// one small string per conversation it creates.
+    id_view: RwLock<&'static str>,
+    settings: Option<SessionSettings>,
+    mutation_lock: Mutex<()>,
 }
 
 impl OpenAIConversationsSession {
@@ -28,8 +44,10 @@ impl OpenAIConversationsSession {
     pub fn with_client(client: OpenAIClient) -> Self {
         OpenAIConversationsSession {
             client,
-            conversation_id: OnceCell::new(),
-            requested_id: None,
+            conversation_id: Mutex::new(None),
+            id_view: RwLock::new(""),
+            settings: None,
+            mutation_lock: Mutex::new(()),
         }
     }
 
@@ -38,26 +56,46 @@ impl OpenAIConversationsSession {
         let id = conversation_id.into();
         OpenAIConversationsSession {
             client,
-            conversation_id: OnceCell::new_with(Some(id.clone())),
-            requested_id: Some(id),
+            id_view: RwLock::new(Box::leak(id.clone().into_boxed_str())),
+            conversation_id: Mutex::new(Some(id)),
+            settings: None,
+            mutation_lock: Mutex::new(()),
         }
+    }
+
+    /// Set default session settings.
+    pub fn with_settings(mut self, settings: SessionSettings) -> Self {
+        self.settings = Some(settings);
+        self
+    }
+
+    /// Update the borrowable view returned by [`Session::session_id`].
+    fn publish_id(&self, id: Option<&str>) {
+        let view: &'static str = match id {
+            None => "",
+            Some(id) => Box::leak(id.to_string().into_boxed_str()),
+        };
+        *self.id_view.write().expect("session poisoned") = view;
     }
 
     /// The conversation id, creating the conversation if needed.
     pub async fn conversation_id(&self) -> Result<String> {
-        self.conversation_id
-            .get_or_try_init(|| async {
-                let (v, _) = self
-                    .client
-                    .post_json("conversations", &json!({"items": []}), None, None)
-                    .await?;
-                v.get("id")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-                    .ok_or_else(|| AgentsError::other("Conversations API returned no id"))
-            })
-            .await
-            .cloned()
+        let mut guard = self.conversation_id.lock().await;
+        if let Some(id) = guard.as_ref() {
+            return Ok(id.clone());
+        }
+        let (v, _) = self
+            .client
+            .post_json("conversations", &json!({"items": []}), None, None)
+            .await?;
+        let id = v
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| AgentsError::other("Conversations API returned no id"))?;
+        self.publish_id(Some(&id));
+        *guard = Some(id.clone());
+        Ok(id)
     }
 
     async fn list_items(&self, order: &str, limit: Option<usize>) -> Result<Vec<Value>> {
@@ -99,6 +137,26 @@ impl OpenAIConversationsSession {
         }
         Ok(out)
     }
+
+    /// Read history while the caller already holds the mutation lock.
+    async fn read_items(&self, limit: Option<usize>) -> Result<Vec<InputItem>> {
+        let limit = resolve_session_limit(limit, self.settings.as_ref());
+        if limit == Some(0) {
+            return Ok(Vec::new());
+        }
+        let items = match limit {
+            None => self.list_items("asc", None).await?,
+            Some(n) => {
+                let mut v = self.list_items("desc", Some(n)).await?;
+                v.reverse();
+                v
+            }
+        };
+        Ok(items
+            .into_iter()
+            .map(|v| InputItem(strip_server_fields(v)))
+            .collect())
+    }
 }
 
 impl Default for OpenAIConversationsSession {
@@ -118,42 +176,46 @@ fn strip_server_fields(mut v: Value) -> Value {
 
 #[async_trait]
 impl Session for OpenAIConversationsSession {
+    /// The conversation id, or `""` while the conversation has not been created yet.
     fn session_id(&self) -> &str {
-        self.conversation_id
-            .get()
-            .map(String::as_str)
-            .or(self.requested_id.as_deref())
-            .unwrap_or("")
+        *self.id_view.read().expect("session poisoned")
+    }
+
+    fn session_settings(&self) -> Option<SessionSettings> {
+        self.settings.clone()
+    }
+
+    fn manages_history_remotely(&self) -> bool {
+        true
     }
 
     async fn get_items(&self, limit: Option<usize>) -> Result<Vec<InputItem>> {
-        let items = match limit {
-            None => self.list_items("asc", None).await?,
-            Some(n) => {
-                let mut v = self.list_items("desc", Some(n)).await?;
-                v.reverse();
-                v
-            }
-        };
-        Ok(items
-            .into_iter()
-            .map(|v| InputItem(strip_server_fields(v)))
-            .collect())
+        let _guard = self.mutation_lock.lock().await;
+        self.read_items(limit).await
     }
 
+    /// Append items in order, in requests of at most 20 items each.
+    ///
+    /// Writes spanning several requests are not atomic: if one fails, earlier batches stay
+    /// saved and later ones are never sent. Retrying the whole list can duplicate what was
+    /// already stored, so a caller must reconcile the remote history first.
     async fn add_items(&self, items: Vec<InputItem>) -> Result<()> {
         if items.is_empty() {
             return Ok(());
         }
+        let _guard = self.mutation_lock.lock().await;
         let id = self.conversation_id().await?;
-        let body = json!({"items": items.into_iter().map(|i| i.0).collect::<Vec<_>>()});
-        self.client
-            .post_json(&format!("conversations/{id}/items"), &body, None, None)
-            .await?;
+        for chunk in items.chunks(MAX_ITEMS_PER_REQUEST) {
+            let body = json!({"items": chunk.iter().map(|i| i.0.clone()).collect::<Vec<_>>()});
+            self.client
+                .post_json(&format!("conversations/{id}/items"), &body, None, None)
+                .await?;
+        }
         Ok(())
     }
 
     async fn pop_item(&self) -> Result<Option<InputItem>> {
+        let _guard = self.mutation_lock.lock().await;
         let id = self.conversation_id().await?;
         let latest = self.list_items("desc", Some(1)).await?;
         let Some(item) = latest.into_iter().next() else {
@@ -167,10 +229,16 @@ impl Session for OpenAIConversationsSession {
         Ok(Some(InputItem(strip_server_fields(item))))
     }
 
+    /// Delete the conversation and forget its id, so the next call creates a fresh one.
     async fn clear_session(&self) -> Result<()> {
-        if let Some(id) = self.conversation_id.get() {
-            self.client.delete(&format!("conversations/{id}")).await?;
-        }
+        let _guard = self.mutation_lock.lock().await;
+        let mut id_guard = self.conversation_id.lock().await;
+        let Some(id) = id_guard.clone() else {
+            return Ok(());
+        };
+        self.client.delete(&format!("conversations/{id}")).await?;
+        *id_guard = None;
+        self.publish_id(None);
         Ok(())
     }
 }

@@ -205,6 +205,7 @@ impl Session for MongoDBSession {
     }
 
     async fn get_items(&self, limit: Option<usize>) -> Result<Vec<InputItem>> {
+        let limit = super::resolve_session_limit(limit, self.session_settings().as_ref());
         if limit == Some(0) {
             return Ok(Vec::new());
         }

@@ -52,7 +52,7 @@ async fn agent_calls_mcp_tools() {
         create_static_tool_filter(None, Some(vec!["danger_delete".into()])),
     ));
     server.connect().await.unwrap();
-    assert_eq!(server.list_tools().await.unwrap().len(), 2);
+    assert_eq!(server.list_tools().await.unwrap().len(), 4);
     let prompts = server.list_prompts().await.unwrap();
     assert_eq!(prompts[0]["name"], "review");
 
@@ -66,7 +66,77 @@ async fn agent_calls_mcp_tools() {
     assert_eq!(r.final_output_text().as_deref(), Some("29"));
     assert_eq!(r.new_items[1].tool_output().unwrap(), "29");
     let tools = &model.calls()[0].tools;
-    assert_eq!(tools.len(), 1, "blocked tool is filtered out");
+    assert_eq!(tools.len(), 3, "blocked tool is filtered out");
+    server.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn exposes_resources_metadata_and_request_meta() {
+    use openai_agents_sdk::mcp::{MCPToolMetaContext, get_mcp_server_log_name};
+    use serde_json::json;
+
+    openai_agents_sdk::set_tracing_disabled(true);
+    let Some(s) = server("res") else {
+        eprintln!("python not available; skipping");
+        return;
+    };
+    let server: Arc<dyn MCPServer> = Arc::new(
+        s.with_cache_tools_list(true)
+            .with_tool_meta_resolver(|ctx: &MCPToolMetaContext| {
+                let mut meta = serde_json::Map::new();
+                meta.insert("tool".into(), json!(ctx.tool_name.clone()));
+                Some(meta)
+            }),
+    );
+    assert!(server.cached_tools().await.is_none());
+    server.connect().await.unwrap();
+
+    let resources = server.list_resources(None).await.unwrap();
+    assert_eq!(resources["resources"][0]["name"], "notes");
+    let templates = server.list_resource_templates(None).await.unwrap();
+    assert_eq!(
+        templates["resourceTemplates"][0]["uriTemplate"],
+        "file:///{path}"
+    );
+    let read = server.read_resource("file:///notes.txt").await.unwrap();
+    assert_eq!(read["contents"][0]["text"], "hello resource");
+
+    let init = server.server_initialize_result().await.unwrap();
+    assert_eq!(init["serverInfo"]["name"], "mock");
+
+    // A title-only tool reaches the model with its title as the description.
+    let tools = server.list_tools().await.unwrap();
+    assert!(server.cached_tools().await.is_some());
+    let titled = tools.iter().find(|t| t.name == "titled_only").unwrap();
+    assert_eq!(
+        openai_agents_sdk::mcp::resolve_mcp_tool_description_for_model(titled),
+        "Titled Only"
+    );
+
+    // The resolver's `_meta` reaches the server verbatim, with explicit keys winning.
+    let echo = tools.iter().find(|t| t.name == "echo_meta").unwrap();
+    let mut explicit = serde_json::Map::new();
+    explicit.insert("extra".into(), json!(1));
+    let out = openai_agents_sdk::mcp::util::invoke_mcp_tool(
+        &server,
+        echo,
+        "{}",
+        Some(explicit),
+        Some("res_echo_meta"),
+    )
+    .await
+    .unwrap();
+    match out {
+        openai_agents_sdk::tool::ToolOutput::Text(t) => {
+            // The transport adds its own protocol keys; both of ours arrive alongside them.
+            let echoed: serde_json::Value = serde_json::from_str(&t).unwrap();
+            assert_eq!(echoed["tool"], "echo_meta");
+            assert_eq!(echoed["extra"], 1);
+        }
+        other => panic!("{other:?}"),
+    }
+
+    assert_eq!(get_mcp_server_log_name("res"), "res");
     server.cleanup().await.unwrap();
 }
 

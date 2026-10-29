@@ -1,10 +1,11 @@
 //! Conversion of MCP tools into function tools. Mirrors `agents.mcp.util`.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
 use serde_json::{Map, Value, json};
 
+use super::logging::{get_mcp_server_log_name, resolve_mcp_tool_description_for_model};
 use super::{MCPServer, MCPTool, ToolFilterContext};
 use crate::agent::MCPConfig;
 use crate::error::{AgentsError, Result};
@@ -12,6 +13,11 @@ use crate::run_context::RunContext;
 use crate::strict_schema::ensure_strict_json_schema;
 use crate::tool::{FunctionTool, NeedsApproval, Tool, ToolOutput, ToolOutputPart};
 use crate::tracing::{SpanData, mcp_tools_span};
+
+/// Maximum length of a function-tool name derived from an MCP tool.
+const TOOL_NAME_MAX_LENGTH: usize = 64;
+/// Length of the hash suffix appended to disambiguate a derived tool name.
+const TOOL_NAME_HASH_LENGTH: usize = 8;
 
 fn sanitize(name: &str) -> String {
     name.chars()
@@ -23,6 +29,107 @@ fn sanitize(name: &str) -> String {
             }
         })
         .collect()
+}
+
+/// Keep only ASCII alphanumerics, `_` and `-`, trimming the separators from both ends.
+fn safe_tool_name_part(value: &str, fallback: &str) -> String {
+    let safe = sanitize(value);
+    let safe = safe.trim_matches(['_', '-']);
+    if safe.is_empty() {
+        fallback.to_string()
+    } else {
+        safe.to_string()
+    }
+}
+
+/// A stable 64-bit FNV-1a digest of `seed`, rendered as lowercase hex.
+///
+/// Only used to disambiguate derived tool names, so the digest needs to be deterministic across
+/// processes, not cryptographic. Python uses a truncated SHA-1 for the same purpose; the Rust
+/// port has no hash dependency under the `mcp` feature, so the suffix values differ.
+fn name_hash(seed: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in seed.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x1000_0000_01b3);
+    }
+    format!("{hash:016x}")[..TOOL_NAME_HASH_LENGTH].to_string()
+}
+
+/// Shorten `base_name` to the tool-name length limit, appending a hash of `seed`.
+///
+/// A name that already fits is returned unchanged unless `force_hash` asks for the suffix,
+/// which is how a collision is broken.
+fn shorten_tool_name(base_name: &str, seed: &str, force_hash: bool) -> String {
+    if !force_hash && base_name.len() <= TOOL_NAME_MAX_LENGTH {
+        return base_name.to_string();
+    }
+    let suffix = format!("_{}", name_hash(seed));
+    let stem_length = TOOL_NAME_MAX_LENGTH - suffix.len();
+    let mut stem = base_name.to_string();
+    stem.truncate(stem_length);
+    while !stem.is_char_boundary(stem.len()) {
+        stem.pop();
+    }
+    let stem = stem.trim_end_matches(['_', '-']);
+    let stem = if stem.is_empty() { "mcp" } else { stem };
+    format!("{stem}{suffix}")
+}
+
+/// The base public name of an MCP tool exposed with its server name.
+fn prefixed_tool_base_name(server_name: &str, tool_name: &str) -> String {
+    format!(
+        "{}_{}",
+        safe_tool_name_part(server_name, "server"),
+        safe_tool_name_part(tool_name, "tool")
+    )
+}
+
+/// Allocate one public function-tool name per `(server index, tool index)` pair.
+///
+/// Names longer than the limit, and names two servers would both produce, get a deterministic
+/// hash suffix instead of colliding. `reserved` holds names already taken by the agent's own
+/// tools, which are never handed out here.
+fn build_prefixed_tool_name_overrides(
+    batches: &[(usize, String, Vec<String>)],
+    reserved: &HashSet<String>,
+) -> BTreeMap<(usize, usize), String> {
+    let mut base_name_counts: BTreeMap<String, usize> = BTreeMap::new();
+    for (_, server_name, tools) in batches {
+        for tool in tools {
+            *base_name_counts
+                .entry(prefixed_tool_base_name(server_name, tool))
+                .or_default() += 1;
+        }
+    }
+
+    // (initial_name, seed, server_index, tool_index) -> deterministic allocation order.
+    let mut candidates: Vec<(String, String, usize, usize, String)> = Vec::new();
+    for (server_index, server_name, tools) in batches {
+        for (tool_index, tool) in tools.iter().enumerate() {
+            let base_name = prefixed_tool_base_name(server_name, tool);
+            let seed = format!("{server_name}\0{tool}");
+            let force_hash = base_name_counts.get(&base_name).copied().unwrap_or(0) > 1
+                || reserved.contains(&base_name);
+            let initial = shorten_tool_name(&base_name, &seed, force_hash);
+            candidates.push((initial, seed, *server_index, tool_index, base_name));
+        }
+    }
+    candidates.sort();
+
+    let mut used: HashSet<String> = reserved.clone();
+    let mut out = BTreeMap::new();
+    for (initial, seed, server_index, tool_index, base_name) in candidates {
+        let mut public_name = initial;
+        let mut collision = 1;
+        while used.contains(&public_name) {
+            public_name = shorten_tool_name(&base_name, &format!("{seed}\0{collision}"), true);
+            collision += 1;
+        }
+        used.insert(public_name.clone());
+        out.insert((server_index, tool_index), public_name);
+    }
+    out
 }
 
 /// Convert an MCP `CallToolResult` (as JSON) into a tool output.
@@ -79,6 +186,94 @@ fn prepare_schema(schema: &Value, strict: bool) -> (Value, bool) {
     (schema, false)
 }
 
+/// Overlay `explicit` on top of `resolved`, as `MCPUtil._merge_mcp_meta` does.
+///
+/// An explicit key set by the caller wins over the same key from the server's resolver.
+pub fn merge_mcp_meta(
+    resolved: Option<Map<String, Value>>,
+    explicit: Option<Map<String, Value>>,
+) -> Option<Map<String, Value>> {
+    match (resolved, explicit) {
+        (None, None) => None,
+        (Some(m), None) | (None, Some(m)) => Some(m),
+        (Some(mut resolved), Some(explicit)) => {
+            resolved.extend(explicit);
+            Some(resolved)
+        }
+    }
+}
+
+/// Call `tool` on `server` with the model's raw JSON arguments and return its output.
+///
+/// This is the body behind every function tool derived from an MCP server, exposed so callers
+/// can drive one tool directly. `meta` is merged on top of whatever the server's
+/// [`crate::mcp::MCPToolMetaResolver`] produced and sent as the request's `_meta`.
+/// `tool_display_name` names the tool in error messages; it defaults to the MCP tool name.
+pub async fn invoke_mcp_tool(
+    server: &Arc<dyn MCPServer>,
+    tool: &MCPTool,
+    input_json: &str,
+    meta: Option<Map<String, Value>>,
+    tool_display_name: Option<&str>,
+) -> Result<ToolOutput> {
+    let display = tool_display_name.unwrap_or(&tool.name);
+    let arguments: Option<Map<String, Value>> = if input_json.trim().is_empty() {
+        None
+    } else {
+        match serde_json::from_str::<Value>(input_json) {
+            Ok(Value::Object(m)) => Some(m),
+            Ok(_) | Err(_) => {
+                let message = if crate::debug::dont_log_tool_data() {
+                    format!("Invalid JSON input for tool {display}")
+                } else {
+                    format!("Invalid JSON input for tool {display}: {input_json}")
+                };
+                return Err(AgentsError::model_behavior(message));
+            }
+        }
+    };
+
+    let resolved = server.config().tool_meta_resolver.as_ref().and_then(|r| {
+        r(&crate::mcp::MCPToolMetaContext {
+            server_name: server.name().to_string(),
+            tool_name: tool.name.clone(),
+            arguments: arguments.clone(),
+        })
+    });
+    let merged = merge_mcp_meta(resolved, meta);
+
+    let result = match merged {
+        None => server.call_tool(&tool.name, arguments).await,
+        Some(meta) => {
+            server
+                .call_tool_with_meta(&tool.name, arguments, Some(meta))
+                .await
+        }
+    };
+    let result = result.map_err(|e| {
+        crate::logger::log_tool_action_error(
+            &crate::mcp::get_mcp_server_log_message(
+                &format!("Error invoking MCP tool {display} on server"),
+                server.name(),
+            ),
+            &e,
+        );
+        // A misconfiguration or a malformed model call is not a transport failure, so it keeps
+        // its own kind instead of being flattened into a generic invocation error.
+        match e {
+            AgentsError::UserError { .. } | AgentsError::ModelBehaviorError { .. } => e,
+            _ => AgentsError::other(format!(
+                "Error invoking MCP tool {display} on server '{}': {e}",
+                get_mcp_server_log_name(server.name())
+            )),
+        }
+    })?;
+    Ok(convert_call_tool_result(
+        &result,
+        server.config().use_structured_content,
+    ))
+}
+
 /// Convert one MCP tool into a function tool that calls the server.
 pub fn to_function_tool<C: Send + Sync + 'static>(
     server: Arc<dyn MCPServer>,
@@ -88,36 +283,22 @@ pub fn to_function_tool<C: Send + Sync + 'static>(
     agent_name: &str,
 ) -> FunctionTool<C> {
     let (schema, strict) = prepare_schema(&tool.input_schema, convert_to_strict);
-    let original = tool.name.clone();
-    let use_structured = server.config().use_structured_content;
     let srv = server.clone();
+    let mcp_tool = tool.clone();
+    let display = exposed_name.clone();
     let mut f = FunctionTool::new_raw(
         exposed_name,
-        tool.description.clone().unwrap_or_default(),
+        resolve_mcp_tool_description_for_model(tool),
         schema,
         move |_ctx, args: String| {
             let srv = srv.clone();
-            let original = original.clone();
-            async move {
-                let arguments: Option<Map<String, Value>> = if args.trim().is_empty() {
-                    None
-                } else {
-                    match serde_json::from_str::<Value>(&args) {
-                        Ok(Value::Object(m)) => Some(m),
-                        Ok(_) | Err(_) => {
-                            return Err(AgentsError::model_behavior(format!(
-                                "Invalid JSON input for tool {original}: {args}"
-                            )));
-                        }
-                    }
-                };
-                let result = srv.call_tool(&original, arguments).await?;
-                Ok(convert_call_tool_result(&result, use_structured))
-            }
+            let mcp_tool = mcp_tool.clone();
+            let display = display.clone();
+            async move { invoke_mcp_tool(&srv, &mcp_tool, &args, None, Some(&display)).await }
         },
     );
     f.strict_json_schema = strict;
-    f.mcp_server_name = Some(server.name().to_string());
+    f.mcp_server_name = Some(get_mcp_server_log_name(server.name()));
     f.needs_approval =
         NeedsApproval::Static(server.config().require_approval.requires(agent_name, tool));
     f
@@ -130,9 +311,25 @@ pub async fn get_all_function_tools<C: Send + Sync + 'static>(
     _ctx: &RunContext<C>,
     agent_name: &str,
 ) -> Result<Vec<Tool<C>>> {
+    get_all_function_tools_with_reserved(servers, config, _ctx, agent_name, &HashSet::new()).await
+}
+
+/// Like [`get_all_function_tools`], but keeping `reserved` names free.
+///
+/// `reserved` holds the names of tools the agent already defines, so a derived MCP tool name
+/// never shadows one of them.
+pub async fn get_all_function_tools_with_reserved<C: Send + Sync + 'static>(
+    servers: &[Arc<dyn MCPServer>],
+    config: &MCPConfig,
+    _ctx: &RunContext<C>,
+    agent_name: &str,
+    reserved: &HashSet<String>,
+) -> Result<Vec<Tool<C>>> {
     let mut out = Vec::new();
-    let mut names = HashSet::new();
-    for server in servers {
+    let mut batches: Vec<(usize, String, Vec<String>)> = Vec::new();
+    let mut listings: Vec<Vec<MCPTool>> = Vec::new();
+    let mut names: HashSet<String> = reserved.clone();
+    for (server_index, server) in servers.iter().enumerate() {
         let span = mcp_tools_span(server.name(), None);
         span.start();
         let listed = server.list_tools().await;
@@ -161,13 +358,27 @@ pub async fn get_all_function_tools<C: Send + Sync + 'static>(
             }
         });
         span.finish();
-        for t in &tools {
-            let exposed = if config.include_server_in_tool_names {
-                let mut n = format!("{}_{}", sanitize(server.name()), sanitize(&t.name));
-                n.truncate(64);
-                n
-            } else {
-                t.name.clone()
+        batches.push((
+            server_index,
+            get_mcp_server_log_name(server.name()),
+            tools.iter().map(|t| t.name.clone()).collect(),
+        ));
+        listings.push(tools);
+    }
+
+    // With the server name in the tool name, collisions and over-long names are resolved with a
+    // deterministic hash suffix instead of failing the run.
+    let overrides = if config.include_server_in_tool_names {
+        build_prefixed_tool_name_overrides(&batches, reserved)
+    } else {
+        BTreeMap::new()
+    };
+
+    for (server_index, (server, tools)) in servers.iter().zip(&listings).enumerate() {
+        for (tool_index, t) in tools.iter().enumerate() {
+            let exposed = match overrides.get(&(server_index, tool_index)) {
+                Some(name) => name.clone(),
+                None => t.name.clone(),
             };
             if !names.insert(exposed.clone()) {
                 return Err(AgentsError::user(format!(
@@ -207,5 +418,58 @@ mod tests {
             convert_call_tool_result(&r, true),
             ToolOutput::Text("{\"x\":1}".into())
         );
+    }
+
+    #[test]
+    fn disambiguates_prefixed_tool_names() {
+        // Two servers whose sanitized names collide still get distinct, bounded tool names.
+        let batches = vec![
+            (0, "my server".to_string(), vec!["read".to_string()]),
+            (1, "my/server".to_string(), vec!["read".to_string()]),
+            (
+                2,
+                "long".to_string(),
+                vec!["x".repeat(80), "plain".to_string()],
+            ),
+        ];
+        let reserved: HashSet<String> = ["long_plain".to_string()].into_iter().collect();
+        let names = build_prefixed_tool_name_overrides(&batches, &reserved);
+
+        let allocated: Vec<&String> = names.values().collect();
+        let unique: HashSet<&String> = allocated.iter().copied().collect();
+        assert_eq!(
+            allocated.len(),
+            unique.len(),
+            "names collide: {allocated:?}"
+        );
+        assert!(allocated.iter().all(|n| n.len() <= TOOL_NAME_MAX_LENGTH));
+        assert!(
+            !unique.contains(&"long_plain".to_string()),
+            "reserved name reused"
+        );
+        // The 80-character tool name is cut down to the limit, hash suffix included.
+        assert_eq!(names[&(2, 0)].len(), TOOL_NAME_MAX_LENGTH);
+        // A short, unique, unreserved name keeps its base form.
+        assert_eq!(
+            names[&(0, 0)].len(),
+            TOOL_NAME_MAX_LENGTH.min(names[&(0, 0)].len())
+        );
+        assert!(
+            names[&(0, 0)].starts_with("my_server_read_"),
+            "{:?}",
+            names[&(0, 0)]
+        );
+        // Allocation is deterministic.
+        assert_eq!(
+            build_prefixed_tool_name_overrides(&batches, &reserved),
+            names
+        );
+    }
+
+    #[test]
+    fn sanitizes_name_parts() {
+        assert_eq!(safe_tool_name_part("__", "fallback"), "fallback");
+        assert_eq!(safe_tool_name_part("a b/c", "x"), "a_b_c");
+        assert_eq!(prefixed_tool_base_name("srv", "tool"), "srv_tool");
     }
 }
