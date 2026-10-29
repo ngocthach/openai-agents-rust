@@ -1,21 +1,18 @@
 //! Conversation memory encrypted at rest with a TTL (feature `encrypt`).
 //!
-//! Items are stored as authenticated envelopes in the wrapped session, so the underlying store
-//! never sees plaintext, and items older than the TTL are silently skipped when history is read.
+//! Items are stored as Fernet tokens in the wrapped session, so the underlying store never
+//! sees plaintext, and items older than the TTL are silently skipped when history is read.
+//! The format matches the Python SDK's `EncryptedSession`, so the same master key and session
+//! id read a history written by either implementation.
 //!
 //! Run: `cargo run --example sessions_encrypted --features encrypt`
-//!
-//! The envelope format is not compatible with the Python SDK's Fernet payloads; see
-//! `EncryptedSession` for details.
+use std::sync::Arc;
 
-#[cfg(feature = "encrypt")]
+use openai_agents_sdk::memory::{EncryptedSession, InMemorySession};
+use openai_agents_sdk::{Agent, RunOptions, Runner, Session, flush_traces_async};
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    use std::sync::Arc;
-
-    use openai_agents_sdk::memory::{EncryptedSession, InMemorySession};
-    use openai_agents_sdk::{Agent, RunOptions, Runner, Session, flush_traces_async};
-
     // Load a high-entropy key from your secret manager. Reuse the same key and session id to
     // read stored history again after a restart.
     let encryption_key = std::env::var("SESSION_ENCRYPTION_KEY")
@@ -49,11 +46,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    println!(
-        "Plaintext history ({} items):",
-        session.get_items(None).await?.len()
-    );
-    for item in session.get_items(None).await? {
+    let history = session.get_items(None).await?;
+    println!("Plaintext history ({} items):", history.len());
+    for item in &history {
         println!(
             "  {}: {}",
             item.role().unwrap_or("?"),
@@ -67,11 +62,4 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     flush_traces_async().await;
     Ok(())
-}
-
-#[cfg(not(feature = "encrypt"))]
-fn main() {
-    eprintln!(
-        "This example needs the `encrypt` feature: cargo run --example sessions_encrypted --features encrypt"
-    );
 }

@@ -28,7 +28,7 @@ websocket = ["dep:tokio-tungstenite"]
 realtime = ["dep:tokio-tungstenite", "dep:base64"]
 voice = ["dep:base64", "dep:tokio-tungstenite", "reqwest/multipart"]
 sandbox = ["dep:base64", "dep:portable-pty", "dep:sha2"]
-encrypt = ["dep:chacha20poly1305", "dep:hkdf", "dep:sha2", "dep:base64", "dep:aes", "dep:cbc", "dep:hmac"]
+encrypt = ["dep:hkdf", "dep:sha2", "dep:base64", "dep:aes", "dep:cbc", "dep:hmac"]
 redis = ["dep:redis"]
 mongodb = ["dep:mongodb"]
 sqlx = ["dep:sqlx"]
@@ -58,7 +58,6 @@ rmcp = { version = "3", default-features = false, features = ["client", "transpo
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"], optional = true }
 base64 = { version = "0.23", optional = true }
 # Optional dependencies for EncryptedSession (feature `encrypt`).
-chacha20poly1305 = { version = "0.11", optional = true }
 hkdf = { version = "0.13", optional = true }
 sha2 = { version = "0.11", optional = true }
 # Fernet-compatible encryption for EncryptedSession (feature `encrypt`).

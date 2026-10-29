@@ -5,6 +5,8 @@ mod advanced_sqlite_session;
 mod dapr_session;
 #[cfg(feature = "encrypt")]
 mod encrypted_session;
+#[cfg(feature = "encrypt")]
+mod fernet;
 #[cfg(feature = "mongodb")]
 mod mongodb_session;
 mod openai_conversations_session;

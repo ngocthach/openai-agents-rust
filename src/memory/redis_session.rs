@@ -32,6 +32,22 @@ fn redis_err(e: redis::RedisError) -> AgentsError {
     AgentsError::other(format!("Redis error: {e}"))
 }
 
+/// Reject a session key occupied by a different Redis data type.
+///
+/// Redis `TYPE` answers `none` for a key that does not exist, which is always acceptable. A
+/// colliding session id can otherwise share a legacy key with something else; Python detects
+/// that under `WATCH` and refuses to touch it.
+fn validate_key_types(keys: &[(&str, &str, &str)]) -> Result<()> {
+    for (key, actual, expected) in keys {
+        if *actual != "none" && actual != expected {
+            return Err(AgentsError::other(format!(
+                "WRONGTYPE Redis key {key} holds a {actual}, expected a {expected}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Conversation history stored in Redis.
 ///
 /// History lives in a list at `{prefix}:{session_id}:messages`, with a metadata hash at
@@ -42,9 +58,12 @@ fn redis_err(e: redis::RedisError) -> AgentsError {
 ///
 /// Appends and clears run as a single `MULTI`/`EXEC` pipeline instead of a `WATCH`-guarded
 /// transaction, because `WATCH` is per-connection state and is not safe on the multiplexed
-/// connection this session shares. As a result the key-type validation Python performs under
-/// `WATCH` is not reproduced, and expiry is computed from the client clock rather than from
-/// Redis `TIME`. Redis Cluster is not supported.
+/// connection this session shares. Key-type validation and the server clock are therefore read
+/// in the round trip before the write rather than inside the transaction: a key whose type is
+/// changed in the instant between the check and the write is not caught, whereas Python's
+/// `WATCH` would abort. Expiry uses a relative `PEXPIRE` instead of Python's `PEXPIREAT`
+/// computed from server `TIME`, which makes it independent of clock skew. Redis Cluster is not
+/// supported.
 pub struct RedisSession {
     session_id: String,
     connection: Mutex<MultiplexedConnection>,
@@ -136,6 +155,42 @@ impl RedisSession {
             .is_ok()
     }
 
+    /// Check that this session's keys hold the expected Redis types and read the server clock.
+    ///
+    /// A session id can collide with a legacy key of another type; Python rejects that under
+    /// `WATCH`, and this performs the same check in the round trip before the write. Returns
+    /// the server's current time in seconds, which the metadata hash records so timestamps do
+    /// not depend on the client clock.
+    async fn check_keys_and_server_time(&self, conn: &mut MultiplexedConnection) -> Result<u64> {
+        let (session_type, messages_type, counter_type, server_time): (
+            String,
+            String,
+            String,
+            Vec<String>,
+        ) = redis::pipe()
+            .cmd("TYPE")
+            .arg(&self.session_key)
+            .cmd("TYPE")
+            .arg(&self.messages_key)
+            .cmd("TYPE")
+            .arg(&self.counter_key)
+            .cmd("TIME")
+            .query_async(conn)
+            .await
+            .map_err(redis_err)?;
+
+        validate_key_types(&[
+            (&self.session_key, &session_type, "hash"),
+            (&self.messages_key, &messages_type, "list"),
+            (&self.counter_key, &counter_type, "string"),
+        ])?;
+
+        Ok(server_time
+            .first()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0))
+    }
+
     /// Decode a window of raw list entries, skipping corrupted ones.
     fn decode(raw: &[String]) -> Vec<InputItem> {
         raw.iter()
@@ -199,10 +254,10 @@ impl Session for RedisSession {
             .iter()
             .map(serialize_item)
             .collect::<Result<Vec<_>>>()?;
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0)
+        let mut conn = self.connection.lock().await;
+        let now = self
+            .check_keys_and_server_time(&mut conn)
+            .await?
             .to_string();
 
         let mut pipe = redis::pipe();
@@ -233,7 +288,6 @@ impl Session for RedisSession {
                 pipe.cmd("PEXPIRE").arg(key).arg(ttl_ms).ignore();
             }
         }
-        let mut conn = self.connection.lock().await;
         pipe.query_async::<()>(&mut *conn).await.map_err(redis_err)
     }
 
@@ -252,8 +306,13 @@ impl Session for RedisSession {
         }
     }
 
+    /// Delete this session's keys, refusing when one is occupied by another Redis type.
+    ///
+    /// A colliding session id can share a legacy key with something else; in that case nothing
+    /// is deleted, matching Python.
     async fn clear_session(&self) -> Result<()> {
         let mut conn = self.connection.lock().await;
+        self.check_keys_and_server_time(&mut conn).await?;
         redis::cmd("DEL")
             .arg(&self.session_key)
             .arg(&self.messages_key)
@@ -302,6 +361,47 @@ mod tests {
         assert_eq!(items[1].text_content().as_deref(), Some("b"));
     }
 
+    #[test]
+    fn key_type_validation_accepts_missing_keys_and_rejects_collisions() {
+        // `none` means the key does not exist yet, which every operation tolerates.
+        assert!(
+            validate_key_types(&[
+                ("agents:session:u", "none", "hash"),
+                ("agents:session:u:messages", "none", "list"),
+                ("agents:session:u:counter", "none", "string"),
+            ])
+            .is_ok()
+        );
+        assert!(
+            validate_key_types(&[
+                ("agents:session:u", "hash", "hash"),
+                ("agents:session:u:messages", "list", "list"),
+            ])
+            .is_ok()
+        );
+
+        let err = validate_key_types(&[
+            ("agents:session:u", "hash", "hash"),
+            ("agents:session:u:messages", "set", "list"),
+        ])
+        .unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("WRONGTYPE"), "{message}");
+        assert!(message.contains("agents:session:u:messages"), "{message}");
+        assert!(
+            message.contains("holds a set, expected a list"),
+            "{message}"
+        );
+
+        // The first mismatch is the one reported.
+        let err = validate_key_types(&[
+            ("agents:session:u", "stream", "hash"),
+            ("agents:session:u:messages", "set", "list"),
+        ])
+        .unwrap_err();
+        assert!(err.to_string().contains("holds a stream"), "{err}");
+    }
+
     /// Integration coverage against a real server; skipped unless `REDIS_URL` is set.
     #[tokio::test]
     async fn redis_round_trip() {
@@ -325,6 +425,34 @@ mod tests {
             s.pop_item().await.unwrap().unwrap().role(),
             Some("assistant")
         );
+
+        // A key occupied by another type is reported instead of being overwritten.
+        {
+            let mut conn = s.connection.lock().await;
+            let _: () = redis::cmd("DEL")
+                .arg(s.messages_key())
+                .query_async(&mut *conn)
+                .await
+                .unwrap();
+            let _: () = redis::cmd("SADD")
+                .arg(s.messages_key())
+                .arg("x")
+                .query_async(&mut *conn)
+                .await
+                .unwrap();
+        }
+        let err = s.add_items(vec![InputItem::user("c")]).await.unwrap_err();
+        assert!(err.to_string().contains("WRONGTYPE"), "{err}");
+        assert!(s.clear_session().await.is_err());
+        {
+            let mut conn = s.connection.lock().await;
+            let _: () = redis::cmd("DEL")
+                .arg(s.messages_key())
+                .query_async(&mut *conn)
+                .await
+                .unwrap();
+        }
+
         s.clear_session().await.unwrap();
         assert!(s.get_items(None).await.unwrap().is_empty());
     }

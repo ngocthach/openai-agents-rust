@@ -186,7 +186,10 @@ struct CompactionState {
 /// last turn. This port always replaces the complete stored history (`clear_session` followed
 /// by `add_items`, restoring the previous items when the replacement fails), which is the
 /// behaviour Python uses for stores without atomic suffix replacement and for manual
-/// `run_compaction` calls. `max_rollback_items` is not implemented.
+/// `run_compaction` calls. Mutations through this session are serialized against compaction by
+/// an internal lock, and the stored history is re-read after the compaction request so a
+/// concurrent append by another writer makes the replacement be skipped rather than lost.
+/// `max_rollback_items` is not implemented.
 pub struct OpenAIResponsesCompactionSession {
     session_id: String,
     underlying: Arc<dyn Session>,
@@ -371,8 +374,20 @@ impl OpenAIResponsesCompactionSession {
             .unwrap_or_default();
         let output_items = strip_orphaned_assistant_ids(normalize_output_items(&output));
 
-        self.replace_history(output_items, context.session_items)
-            .await?;
+        // Re-read after the request: another writer sharing this store may have appended while
+        // the compaction API call was in flight, and replacing the whole history would drop
+        // those items. This also refreshes the rollback snapshot, so a failed replacement
+        // cannot revive items that expired meanwhile.
+        let current_items = self.underlying.get_items(None).await?;
+        if current_items != context.session_items {
+            log::warn!(
+                "Skipped compaction replacement because the stored history changed while the \
+                 compaction request was in flight; history was retained"
+            );
+            return Ok(usage);
+        }
+
+        self.replace_history(output_items, current_items).await?;
         self.state.lock().await.deferred_response_id = None;
         Ok(usage)
     }

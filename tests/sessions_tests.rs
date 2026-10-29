@@ -679,6 +679,77 @@ async fn dapr_session_round_trips_against_a_mock_sidecar() {
     assert!(session.pop_item().await.unwrap().is_none());
 }
 
+/// A session that appends an extra item the moment compaction reads the history, standing in
+/// for another process writing to the same store.
+#[derive(Debug)]
+struct RacingSession {
+    inner: Arc<InMemorySession>,
+    inject_on_read: Mutex<Option<InputItem>>,
+}
+
+#[async_trait::async_trait]
+impl Session for RacingSession {
+    fn session_id(&self) -> &str {
+        self.inner.session_id()
+    }
+
+    async fn get_items(&self, limit: Option<usize>) -> openai_agents_sdk::Result<Vec<InputItem>> {
+        let items = self.inner.get_items(limit).await?;
+        // The first read is the compaction snapshot; append behind its back afterwards.
+        let extra = self.inject_on_read.lock().unwrap().take();
+        if let Some(extra) = extra {
+            self.inner.add_items(vec![extra]).await?;
+        }
+        Ok(items)
+    }
+
+    async fn add_items(&self, items: Vec<InputItem>) -> openai_agents_sdk::Result<()> {
+        self.inner.add_items(items).await
+    }
+
+    async fn pop_item(&self) -> openai_agents_sdk::Result<Option<InputItem>> {
+        self.inner.pop_item().await
+    }
+
+    async fn clear_session(&self) -> openai_agents_sdk::Result<()> {
+        self.inner.clear_session().await
+    }
+}
+
+#[tokio::test]
+async fn compaction_retains_history_when_another_writer_appends_mid_request() {
+    let (base, captured) = mock_openai(vec![compaction_reply("Summary")]).await;
+    let inner = Arc::new(InMemorySession::new("s1"));
+    inner.add_items(long_history()).await.unwrap();
+    let racing = Arc::new(RacingSession {
+        inner: inner.clone(),
+        inject_on_read: Mutex::new(Some(InputItem::user("snuck in"))),
+    });
+
+    let session = OpenAIResponsesCompactionSession::new("s1", racing)
+        .with_client(OpenAIClient::new("sk-test").with_base_url(base));
+
+    let usage = session
+        .run_compaction(OpenAIResponsesCompactionArgs {
+            response_id: Some("resp_1".into()),
+            store: Some(true),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    // The request was made and billed, but the replacement was skipped because the stored
+    // history no longer matched the snapshot, so the concurrent append is not lost.
+    assert_eq!(captured.lock().unwrap().len(), 1);
+    assert_eq!(usage.requests, 1);
+    let items = inner.get_items(None).await.unwrap();
+    assert_eq!(items.len(), long_history().len() + 1);
+    assert_eq!(
+        items.last().unwrap().text_content().as_deref(),
+        Some("snuck in")
+    );
+}
+
 #[tokio::test]
 async fn compaction_skips_without_a_response_id_and_defers_for_local_tool_outputs() {
     let (base, captured) = mock_openai(vec![compaction_reply("Recap")]).await;
@@ -728,4 +799,58 @@ async fn compaction_skips_without_a_response_id_and_defers_for_local_tool_output
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].body["previous_response_id"], "resp_2");
     assert_eq!(inner.get_items(None).await.unwrap().len(), 1);
+}
+
+/// An envelope and master key produced by the Python SDK's `EncryptedSession` with
+/// `cryptography` 48, pinning cross-language compatibility of the stored history.
+#[cfg(feature = "encrypt")]
+#[tokio::test]
+async fn encrypted_session_reads_history_written_by_the_python_sdk() {
+    const PYTHON_PAYLOAD: &str = "gAAAAABlU_EAyicwKYzApg0fhqXu4Mf3MVoIR0uJ44-qrbeqamzFwpJDScnj0z_en8pDpJuSDaVsUBtisfKKy0CLq497sBTG0Y4xoA_8WDOETvmk20rM7SUC2AHvNPk5Z7cctoi6GNrROOABA0B_fT-L9HlY_1DTjA==";
+    const CREATED_AT: u64 = 1_700_000_000;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    let inner = Arc::new(InMemorySession::new("user-123"));
+    inner
+        .add_items(vec![InputItem(json!({
+            "__enc__": 1,
+            "v": 1,
+            "kid": "hkdf-v1",
+            "payload": PYTHON_PAYLOAD,
+        }))])
+        .await
+        .unwrap();
+
+    // The vector was minted in 2023, so the TTL has to still cover it.
+    let session =
+        EncryptedSession::new("user-123", inner.clone(), TEST_KEY, now - CREATED_AT + 600).unwrap();
+    let items = session.get_items(None).await.unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].role(), Some("user"));
+    assert_eq!(
+        items[0].text_content().as_deref(),
+        Some("hello from python (raw)")
+    );
+
+    // Appending through the Rust session leaves a history Python can still read in full: both
+    // envelopes carry Fernet tokens under the same key.
+    session
+        .add_items(vec![InputItem::assistant("hello from rust")])
+        .await
+        .unwrap();
+    let raw = inner.get_items(None).await.unwrap();
+    assert_eq!(raw.len(), 2);
+    for envelope in &raw {
+        let v = envelope.as_value();
+        assert_eq!(v["__enc__"], 1);
+        assert_eq!(v["v"], 1);
+        assert_eq!(v["kid"], "hkdf-v1");
+        let payload = v["payload"].as_str().unwrap();
+        assert!(payload.starts_with("gAAAAA"), "{payload}");
+        assert!(session.envelope_timestamp(envelope).is_some());
+    }
+    assert_eq!(session.get_items(None).await.unwrap().len(), 2);
 }
