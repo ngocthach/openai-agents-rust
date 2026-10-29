@@ -320,7 +320,11 @@ async fn cloudflare_runs_a_full_session_against_the_worker_protocol() {
     );
 
     let result = session
-        .exec(ExecRequest::shell("echo ok").with_timeout(Some(Duration::from_secs(7))))
+        .exec(
+            ExecRequest::shell("echo ok")
+                .with_timeout(Some(Duration::from_secs(7)))
+                .with_env("FOO", "request"),
+        )
         .await
         .unwrap();
     assert_eq!(result.stdout_text(), "ok\n");
@@ -331,6 +335,13 @@ async fn cloudflare_runs_a_full_session_against_the_worker_protocol() {
         .rfind(|r| r.path.ends_with("/exec"))
         .unwrap();
     assert_eq!(timed.json()["timeout_ms"], 7000);
+    // A per-command variable wins over the manifest value of the same name.
+    assert_eq!(
+        timed.json()["argv"][1],
+        "FOO=request",
+        "{}",
+        timed.json()["argv"]
+    );
 
     assert_eq!(
         session.read_file("task.md").await.unwrap(),
@@ -460,6 +471,48 @@ async fn cloudflare_bucket_mount_activates_through_the_worker() {
         server.find("POST", "/unmount").json(),
         json!({"mountPath": "/workspace/assets"})
     );
+}
+
+#[tokio::test]
+async fn cloudflare_and_blaxel_sessions_support_pty() {
+    let server = MockServer::start(Arc::new(|_| MockResponse::json(json!({"id": "sbx-1"})))).await;
+    let cloudflare = CloudflareSandboxClient::new(
+        CloudflareSandboxClientOptions::new(&server.base_url).with_api_key("cf-token"),
+    )
+    .create(None)
+    .await
+    .unwrap();
+    // Both providers drive a terminal over their WebSocket endpoint.
+    assert!(cloudflare.supports_pty());
+
+    let blaxel_server = {
+        let shared: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let url_slot = shared.clone();
+        let handler: Handler = Arc::new(move |request| {
+            let sandbox_url = url_slot.lock().unwrap().clone().unwrap_or_default();
+            blaxel_handler(sandbox_url)(request)
+        });
+        let server = MockServer::start(handler).await;
+        *shared.lock().unwrap() = Some(server.base_url.clone());
+        server
+    };
+    let blaxel = BlaxelSandboxClient::new(blaxel_options(&blaxel_server.base_url))
+        .create(None)
+        .await
+        .unwrap();
+    assert!(blaxel.supports_pty());
+
+    // Without an API key the terminal URL cannot be built, so the session says so up front.
+    let keyless = BlaxelSandboxClient::new(
+        BlaxelSandboxClientOptions::new()
+            .with_name("agents-test")
+            .with_workspace("acme")
+            .with_api_base_url(format!("{}/v0", blaxel_server.base_url)),
+    )
+    .create(None)
+    .await
+    .unwrap();
+    assert!(!keyless.supports_pty());
 }
 
 #[tokio::test]
@@ -625,7 +678,7 @@ async fn blaxel_runs_a_full_session_against_the_sandbox_api() {
     assert!(write.text().contains("fix it"));
 
     let result = session
-        .exec(ExecRequest::argv(["ls", "-la"]))
+        .exec(ExecRequest::argv(["ls", "-la"]).with_env("EXTRA", "2"))
         .await
         .unwrap();
     assert_eq!(result.stdout_text(), "ran\n");
@@ -642,7 +695,8 @@ async fn blaxel_runs_a_full_session_against_the_sandbox_api() {
             "workingDir": "/workspace",
             "waitForCompletion": true,
             "timeout": 5000,
-            "env": {"BASE": "1", "FOO": "bar"},
+            // The sandbox's creation environment, then the manifest's, then this command's.
+            "env": {"BASE": "1", "EXTRA": "2", "FOO": "bar"},
         })
     );
 
@@ -685,13 +739,22 @@ async fn blaxel_persists_and_hydrates_through_a_tar_file() {
     let tar = server.find("POST", "/process");
     assert_eq!(
         tar.json()["command"],
-        "sh -lc 'tar --exclude ./cache -C /workspace -cf /tmp/bl-persist-agents-test.tar .'"
+        "sh -lc 'tar --exclude ./cache -C /workspace -cf \
+         /tmp/openai-agents-sandbox-blaxel-persist-agents-test.tar .'"
     );
     // The archive is pulled back out of the sandbox and the scratch file removed.
-    assert!(server.count("DELETE", "bl-persist-agents-test.tar") >= 1);
+    assert!(
+        server.count(
+            "DELETE",
+            "openai-agents-sandbox-blaxel-persist-agents-test.tar"
+        ) >= 1
+    );
 
     session.hydrate_workspace(b"payload").await.unwrap();
-    let upload = server.find("PUT", "bl-hydrate-agents-test.tar");
+    let upload = server.find(
+        "PUT",
+        "openai-agents-sandbox-blaxel-hydrate-agents-test.tar",
+    );
     assert!(upload.text().contains("payload"));
     let extract = server
         .requests()
@@ -700,7 +763,8 @@ async fn blaxel_persists_and_hydrates_through_a_tar_file() {
         .unwrap();
     assert_eq!(
         extract.json()["command"],
-        "sh -lc 'tar -C /workspace -xf /tmp/bl-hydrate-agents-test.tar'"
+        "sh -lc 'tar -C /workspace -xf \
+         /tmp/openai-agents-sandbox-blaxel-hydrate-agents-test.tar'"
     );
 }
 
@@ -993,7 +1057,7 @@ async fn modal_persists_a_tar_archive_by_default() {
         staged["path"]
             .as_str()
             .unwrap()
-            .starts_with("/tmp/openai-agents-hydrate-"),
+            .starts_with("/tmp/openai-agents-sandbox-modal-hydrate-"),
         "{staged}"
     );
     assert_eq!(staged["data"], "cGF5bG9hZA==");
@@ -1096,7 +1160,7 @@ async fn modal_starts_a_pty_session_through_the_helper() {
         .await
         .unwrap();
     assert!(
-        update.output_text().contains("pty: sh -lc echo hi"),
+        update.output_text().contains("pty: sh -c echo $$ >"),
         "{}",
         update.output_text()
     );
@@ -1104,6 +1168,44 @@ async fn modal_starts_a_pty_session_through_the_helper() {
     let pty = &fake.of_op("pty")[0];
     assert_eq!(pty["tty"], true);
     assert_eq!(pty["workdir"], "/workspace");
+    let inner = pty["argv"][2].as_str().unwrap();
+    assert!(inner.contains("exec sh -lc 'echo hi'"), "{inner}");
+
+    // Killing the helper would leave the command running inside Modal, so teardown kills the
+    // sandbox-side process by the pid the wrapper recorded.
+    let kill = fake
+        .of_op("exec")
+        .into_iter()
+        .find(|request| {
+            request["argv"].as_array().is_some_and(|argv| {
+                argv.iter()
+                    .any(|part| part.as_str().unwrap_or("").contains("kill -TERM"))
+            })
+        })
+        .expect("the PTY teardown kills the sandbox-side process");
+    assert!(
+        kill["argv"][2]
+            .as_str()
+            .unwrap()
+            .contains("/tmp/openai-agents-sandbox-modal-pty-"),
+        "{kill}"
+    );
+}
+
+#[tokio::test]
+async fn modal_passes_per_command_environment_to_the_helper() {
+    let fake = FakeModal::new();
+    let client = ModalSandboxClient::new(
+        ModalSandboxClientOptions::new("agents-app").with_helper_command(fake.command()),
+    );
+    let session = client.create(None).await.unwrap();
+
+    session
+        .exec(ExecRequest::argv(["env"]).with_env("TOKEN", "abc"))
+        .await
+        .unwrap();
+    let request = fake.of_op("exec").pop().unwrap();
+    assert_eq!(request["env"], json!({"TOKEN": "abc"}));
 }
 
 #[tokio::test]

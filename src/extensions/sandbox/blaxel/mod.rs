@@ -23,15 +23,16 @@
 //! ```
 
 pub mod mounts;
+pub mod pty;
 pub mod sandbox;
 
 pub use mounts::{
     BlaxelBucketProvider, BlaxelCloudBucketMountConfig, BlaxelCloudBucketMountStrategy,
     BlaxelDriveMountConfig, BlaxelDriveMountStrategy,
 };
+pub use pty::{BlaxelPtySessions, terminal_url};
 pub use sandbox::{
     API_KEY_ENV, BlaxelConnection, BlaxelSandboxClient, BlaxelSandboxClientOptions,
     BlaxelSandboxSession, BlaxelTimeouts, DEFAULT_API_BASE_URL, DEFAULT_BLAXEL_WORKSPACE_ROOT,
-    DEFAULT_REGION, DEFAULT_RUN_BASE_URL, REGION_ENV, WORKSPACE_ENV, connection_for_session,
-    encode_sandbox_path,
+    DEFAULT_REGION, DEFAULT_RUN_BASE_URL, REGION_ENV, WORKSPACE_ENV, encode_sandbox_path,
 };

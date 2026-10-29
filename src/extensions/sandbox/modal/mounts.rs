@@ -269,15 +269,9 @@ impl ModalCloudBucketMountStrategy {
     }
 
     /// A [`Mount`] backed by this strategy.
-    ///
-    /// This is the constructor the Modal client expects, because it also records the bucket
-    /// configuration so [`volume_specs`](Self::volume_specs) can find it again.
     pub fn mount(config: ModalCloudBucketMountConfig) -> Mount {
         let read_only = config.read_only;
-        let strategy: Arc<dyn MountStrategy> =
-            Arc::new(ModalCloudBucketMountStrategy::new(config.clone()));
-        register_volume_spec(&strategy, &config);
-        Mount::new(strategy).with_read_only(read_only)
+        Mount::new(Arc::new(ModalCloudBucketMountStrategy::new(config))).with_read_only(read_only)
     }
 
     /// The bucket this strategy attaches.
@@ -294,53 +288,28 @@ impl ModalCloudBucketMountStrategy {
             .mount_targets()
             .into_iter()
             .filter_map(|(mount, mount_path)| {
-                registered_config(&mount.strategy).map(|config| config.to_volume_spec(&mount_path))
+                strategy_config(&mount.strategy).map(|config| config.to_volume_spec(&mount_path))
             })
             .collect()
     }
 }
 
-type VolumeSpecRegistry = std::sync::Mutex<
-    Vec<(
-        std::sync::Weak<dyn MountStrategy>,
-        ModalCloudBucketMountConfig,
-    )>,
->;
-
-/// Bucket configurations, each paired with the mount strategy that carries it.
-///
-/// `MountStrategy` is a trait object the core API never made downcastable, so the Modal client
-/// cannot read a configuration back out of a manifest entry on its own. Registering the `Arc`
-/// here, in the one constructor that builds it, gives the client that path; identity is checked
-/// with [`Arc::ptr_eq`] rather than a raw address, so a freed mount can never be mistaken for a
-/// later one allocated at the same place.
-static MODAL_VOLUME_SPECS: std::sync::LazyLock<VolumeSpecRegistry> =
-    std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
-
-fn register_volume_spec(strategy: &Arc<dyn MountStrategy>, config: &ModalCloudBucketMountConfig) {
-    if let Ok(mut guard) = MODAL_VOLUME_SPECS.lock() {
-        guard.retain(|(weak, _)| weak.strong_count() > 0);
-        guard.push((Arc::downgrade(strategy), config.clone()));
-    }
-}
-
-/// The bucket configuration registered for `strategy`, when it is a Modal bucket mount.
-fn registered_config(strategy: &Arc<dyn MountStrategy>) -> Option<ModalCloudBucketMountConfig> {
-    if strategy.strategy_type() != "modal_cloud_bucket" {
-        return None;
-    }
-    let guard = MODAL_VOLUME_SPECS.lock().ok()?;
-    guard.iter().find_map(|(weak, config)| {
-        weak.upgrade()
-            .filter(|registered| Arc::ptr_eq(registered, strategy))
-            .map(|_| config.clone())
-    })
+/// The bucket configuration `strategy` carries, when it is a Modal bucket mount.
+fn strategy_config(strategy: &Arc<dyn MountStrategy>) -> Option<ModalCloudBucketMountConfig> {
+    strategy
+        .as_any()?
+        .downcast_ref::<ModalCloudBucketMountStrategy>()
+        .map(|strategy| strategy.config.clone())
 }
 
 #[async_trait]
 impl MountStrategy for ModalCloudBucketMountStrategy {
     fn strategy_type(&self) -> &str {
         "modal_cloud_bucket"
+    }
+
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
     }
 
     fn validate(&self, _mount: &Mount) -> SandboxResult<()> {
@@ -371,13 +340,12 @@ impl MountStrategy for ModalCloudBucketMountStrategy {
         // Modal attached the bucket when it created the sandbox, so there is nothing to run
         // here. A mount the client could not read back was never attached at all, and failing
         // loudly beats handing the model an empty directory.
-        if registered_config(&mount.strategy).is_none() {
+        if strategy_config(&mount.strategy).is_none() {
             return Err(SandboxError::new(
                 ErrorCode::MountConfigInvalid,
                 format!(
-                    "the mount at `{mount_path}` was not built with \
-                     `ModalCloudBucketMountStrategy::mount`, so the client could not pass it to \
-                     Modal at sandbox creation"
+                    "the mount at `{mount_path}` does not expose its bucket configuration, so \
+                     the client could not pass it to Modal at sandbox creation"
                 ),
             ));
         }

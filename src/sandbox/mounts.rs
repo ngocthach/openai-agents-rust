@@ -160,6 +160,16 @@ pub trait MountStrategy: Send + Sync + fmt::Debug {
     /// The strategy type, matching the Python `type` discriminator.
     fn strategy_type(&self) -> &str;
 
+    /// This strategy as [`Any`](std::any::Any), for code that needs the concrete strategy type.
+    ///
+    /// A provider that attaches storage when the sandbox is created has to read a strategy's
+    /// configuration back out of a manifest entry, where it is only a `dyn MountStrategy`.
+    /// Returning `Some(self)` makes that possible; the default `None` keeps every other strategy
+    /// working unchanged.
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        None
+    }
+
     /// Validate that this strategy fits `mount`.
     fn validate(&self, mount: &Mount) -> SandboxResult<()> {
         let _ = mount;

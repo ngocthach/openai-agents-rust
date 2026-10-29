@@ -17,11 +17,10 @@
 //! | unmount | `POST {worker}/v1/sandbox/{id}/unmount` with `{mountPath}` |
 //! | shutdown | `DELETE {worker}/v1/sandbox/{id}` |
 //!
-//! The worker's PTY endpoint is a WebSocket, which this port does not speak:
-//! [`supports_pty`](SandboxSession::supports_pty) stays `false`.
+//! PTY sessions run over the worker's WebSocket endpoint; see [`super::pty`].
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -32,6 +31,7 @@ use serde_json::{Value, json};
 
 use crate::sandbox::errors::{ErrorCode, SandboxError, SandboxResult};
 use crate::sandbox::manifest::{DEFAULT_MANIFEST_ROOT, Manifest};
+use crate::sandbox::pty::{PtyExecRequest, PtyExecUpdate, PtyWriteRequest};
 use crate::sandbox::session::{
     ExecRequest, SandboxClient, SandboxSession, restore_session_snapshot,
 };
@@ -39,6 +39,7 @@ use crate::sandbox::snapshot::{Snapshot, SnapshotSpec, resolve_snapshot};
 use crate::sandbox::state::SandboxSessionState;
 use crate::sandbox::types::ExecResult;
 
+use super::pty::{CloudflarePtySessions, pty_url};
 use super::sse::{SseDecoder, SseLineDecoder};
 
 /// The exec timeout the worker is given when a request carries none.
@@ -112,7 +113,7 @@ impl CloudflareSandboxClientOptions {
 
 /// The worker endpoint and credentials behind one sandbox.
 ///
-/// Mount strategies reach it through [`connection_for_session`], because
+/// A mount strategy recovers it through [`SandboxSession::as_any`], because
 /// [`MountStrategy`](crate::sandbox::mounts::MountStrategy) only receives a
 /// `&dyn SandboxSession`.
 #[derive(Debug)]
@@ -204,33 +205,6 @@ impl CloudflareConnection {
             ));
         }
         Ok(())
-    }
-}
-
-type ConnectionRegistry = Mutex<Vec<(String, Weak<CloudflareConnection>)>>;
-
-fn registry() -> &'static ConnectionRegistry {
-    static REGISTRY: OnceLock<ConnectionRegistry> = OnceLock::new();
-    REGISTRY.get_or_init(|| Mutex::new(Vec::new()))
-}
-
-/// The live connection behind a session id, for mount strategies that need the worker endpoint.
-///
-/// [`MountStrategy`](crate::sandbox::mounts::MountStrategy) receives only a `&dyn SandboxSession`,
-/// which cannot hand back a provider endpoint, so each session registers its connection here
-/// under its own id while it is alive.
-pub fn connection_for_session(session_id: &str) -> Option<Arc<CloudflareConnection>> {
-    let guard = registry().lock().ok()?;
-    guard
-        .iter()
-        .find(|(id, _)| id == session_id)
-        .and_then(|(_, weak)| weak.upgrade())
-}
-
-fn register_connection(session_id: &str, connection: &Arc<CloudflareConnection>) {
-    if let Ok(mut guard) = registry().lock() {
-        guard.retain(|(_, weak)| weak.strong_count() > 0);
-        guard.push((session_id.to_string(), Arc::downgrade(connection)));
     }
 }
 
@@ -425,6 +399,7 @@ pub struct CloudflareSandboxSession {
     snapshot_id: String,
     exposed_ports: Vec<u16>,
     resuming: bool,
+    ptys: CloudflarePtySessions,
 }
 
 impl CloudflareSandboxSession {
@@ -434,7 +409,6 @@ impl CloudflareSandboxSession {
         // recorded separately, and a mount must reach the connection of its own session.
         let session_id = uuid::Uuid::new_v4().simple().to_string();
         let snapshot_id = session_id.clone();
-        register_connection(&session_id, &connection);
         CloudflareSandboxSession {
             connection,
             session_id,
@@ -445,6 +419,7 @@ impl CloudflareSandboxSession {
             snapshot_id,
             exposed_ports: Vec::new(),
             resuming: false,
+            ptys: CloudflarePtySessions::new(),
         }
     }
 
@@ -500,7 +475,7 @@ impl CloudflareSandboxSession {
             wrapped.append(&mut argv);
             argv = wrapped;
         }
-        let environment = self.manifest.environment();
+        let environment = request.resolved_env(self.manifest.environment());
         if !environment.is_empty() {
             let mut prefixed = vec!["env".to_string()];
             prefixed.extend(
@@ -743,11 +718,13 @@ impl SandboxSession for CloudflareSandboxSession {
 
     async fn stop(&self) -> SandboxResult<()> {
         // A Cloudflare sandbox has no pause: the worker keeps it until `shutdown` deletes it.
+        self.ptys.terminate_all().await;
         self.started.store(false, Ordering::SeqCst);
         Ok(())
     }
 
     async fn shutdown(&self) -> SandboxResult<()> {
+        self.ptys.terminate_all().await;
         let mut deleted = self.deleted.lock().await;
         if *deleted {
             return Ok(());
@@ -923,6 +900,45 @@ impl SandboxSession for CloudflareSandboxSession {
         )
         .await
         .map(|_| ())
+    }
+
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
+    }
+
+    fn supports_pty(&self) -> bool {
+        true
+    }
+
+    async fn pty_exec_start(&self, request: PtyExecRequest) -> SandboxResult<PtyExecUpdate> {
+        // The worker's terminal takes a command line and no working directory, so an explicit
+        // `cwd` becomes a `cd` in front of it.
+        let cwd = match &request.cwd {
+            None => None,
+            Some(cwd) => Some(self.normalize_path(cwd)?),
+        };
+        self.ptys
+            .start(
+                &pty_url(
+                    &self.connection.worker_url,
+                    &self.connection.sandbox_id,
+                    80,
+                    24,
+                ),
+                self.connection.api_key.as_deref(),
+                &request,
+                cwd.as_deref(),
+            )
+            .await
+    }
+
+    async fn pty_write_stdin(&self, request: PtyWriteRequest) -> SandboxResult<PtyExecUpdate> {
+        self.ptys.write_stdin(&request).await
+    }
+
+    async fn pty_terminate_all(&self) -> SandboxResult<()> {
+        self.ptys.terminate_all().await;
+        Ok(())
     }
 
     fn session_state(&self) -> SandboxSessionState {

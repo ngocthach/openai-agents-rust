@@ -474,7 +474,7 @@ impl SandboxSession for UnixLocalSandboxSession {
                 }
             }
         }
-        for (key, value) in self.exec_env() {
+        for (key, value) in request.resolved_env(self.manifest().environment()) {
             command.env(key, value);
         }
         let run = command.output();

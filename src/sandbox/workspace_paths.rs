@@ -57,6 +57,47 @@ pub fn is_within(root: &str, path: &str) -> bool {
 ///
 /// Returns [`ErrorCode::InvalidManifestPath`] for Windows absolute paths, `..` segments and
 /// absolute paths that fall outside `root`.
+/// The directory prefix the SDK uses for files it stages outside the sandbox workspace.
+///
+/// A backend sometimes has to put a file where the model's workspace cannot reach it: Blaxel
+/// stages a snapshot archive before downloading it, and Modal stages one before extracting it.
+/// Those paths are SDK-owned, never model-provided, and
+/// [`SandboxSession::resolve_internal_path`](crate::sandbox::SandboxSession::resolve_internal_path)
+/// is the only place they bypass the workspace guard.
+pub const PROVIDER_SCRATCH_PREFIX: &str = "/tmp/openai-agents-sandbox-";
+
+/// Build an SDK-owned scratch path outside the workspace, for `stem`.
+///
+/// The stem is reduced to `[A-Za-z0-9._-]` so a caller cannot steer the path elsewhere.
+pub fn provider_scratch_path(stem: &str) -> String {
+    let sanitized: String = stem
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    format!("{PROVIDER_SCRATCH_PREFIX}{sanitized}")
+}
+
+/// Whether `path` is an SDK-owned scratch path built by [`provider_scratch_path`].
+///
+/// The check is deliberately strict: the path must start with the prefix and hold no `/` or
+/// parent segment after it, so nothing under it can point back into the filesystem at large.
+pub fn is_provider_scratch_path(path: &str) -> bool {
+    let Some(stem) = path.strip_prefix(PROVIDER_SCRATCH_PREFIX) else {
+        return false;
+    };
+    !stem.is_empty()
+        && !stem.contains('/')
+        && stem
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
 pub fn resolve_workspace_path(root: &str, path: &str) -> SandboxResult<String> {
     if is_windows_absolute(path) {
         return Err(SandboxError::new(
@@ -206,6 +247,28 @@ mod tests {
             assert_eq!(err.code, ErrorCode::InvalidManifestPath, "{bad}");
         }
         assert!(resolve_workspace_path("/workspace", "/workspace/ok").is_ok());
+    }
+
+    #[test]
+    fn builds_and_recognizes_provider_scratch_paths() {
+        let path = provider_scratch_path("persist-abc123.tar");
+        assert_eq!(path, "/tmp/openai-agents-sandbox-persist-abc123.tar");
+        assert!(is_provider_scratch_path(&path));
+        // A stem cannot steer the path out of the scratch directory: the separators are
+        // replaced, so what is left is one file name inside it.
+        assert_eq!(
+            provider_scratch_path("../../etc/passwd"),
+            "/tmp/openai-agents-sandbox-..-..-etc-passwd"
+        );
+        for bad in [
+            "/tmp/openai-agents-sandbox-",
+            "/tmp/openai-agents-sandbox-a/b",
+            "/tmp/other",
+            "/workspace/file",
+            "relative",
+        ] {
+            assert!(!is_provider_scratch_path(bad), "{bad}");
+        }
     }
 
     #[test]

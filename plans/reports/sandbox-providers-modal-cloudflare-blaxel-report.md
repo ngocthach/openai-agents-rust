@@ -7,14 +7,15 @@ Port of `agents.extensions.sandbox.{modal,cloudflare,blaxel}` onto the Rust core
 
 | File | Contents |
 | --- | --- |
-| `src/extensions/sandbox/cloudflare/{mod,sandbox,sse}.rs`, `mounts.rs` | Worker-backed client/session, SSE decoders, R2/S3/GCS bucket mounts |
-| `src/extensions/sandbox/blaxel/{mod,sandbox,mounts}.rs` | Control-plane + sandbox-API client/session, FUSE bucket mounts, Drive mounts |
+| `src/extensions/sandbox/cloudflare/{mod,sandbox,sse,pty}.rs`, `mounts.rs` | Worker-backed client/session, SSE decoders, WebSocket PTY, R2/S3/GCS bucket mounts |
+| `src/extensions/sandbox/blaxel/{mod,sandbox,mounts,pty}.rs` | Control-plane + sandbox-API client/session, WebSocket PTY, FUSE bucket mounts, Drive mounts |
 | `src/extensions/sandbox/modal/{mod,sandbox,mounts}.rs`, `helper.py` | Helper-driven client/session with PTY, cloud bucket mounts, bundled Python helper |
 | `tests/sandbox_modal_cloudflare_blaxel_tests.rs` | 17 tests against a recording mock HTTP server and a fake Modal helper |
 | `tests/fixtures/fake_modal_helper.py` | Protocol-compatible helper double that logs every request |
 
 The one-line stubs `cloudflare.rs`, `blaxel.rs` and `modal.rs` were replaced by directory modules;
-`src/extensions/sandbox/mod.rs` was not touched. Nothing under `src/sandbox/**` was edited.
+`src/extensions/sandbox/mod.rs` was not touched. Phase 2 added the authorized additive core
+changes listed below and no others; the E2B/Daytona/Vercel modules were not touched.
 
 ## Cloudflare
 
@@ -29,7 +30,12 @@ The Python port talks to a deployed Worker over HTTP, so the protocol is reprodu
   `POST …/persist?excludes=…`, `POST …/hydrate`, `POST …/mount`, `POST …/unmount`.
 - Bodies that arrive SSE-encoded (`metadata`/`chunk`/`complete`, `isBinary`) are decoded by the
   same `decode_streamed_payload` logic Python uses, for both file reads and `persist`.
-- Auth: `Authorization: Bearer …` from options or `CLOUDFLARE_SANDBOX_API_KEY`.
+- PTY: `wss://{worker}/v1/sandbox/{id}/pty?cols=&rows=`. The session waits for the worker's
+  `{"type":"ready"}` frame (30 s), writes the command as raw bytes, streams binary frames as
+  output and ends on `{"type":"exit","code":N}` or `{"type":"error"}`, matching Python frame for
+  frame. `supports_pty()` is now `true`.
+- Auth: `Authorization: Bearer …` from options or `CLOUDFLARE_SANDBOX_API_KEY`, on the WebSocket
+  handshake as well.
 - The manifest root is pinned to `/workspace`, as in Python, because persist/hydrate are fixed to
   it. The worker's exec body carries no `cwd` or `env`, so the manifest environment becomes a
   sorted `env K=V …` prefix and an explicit `cwd` becomes a
@@ -57,6 +63,11 @@ uses (confirmed against `blaxel-ai/sdk-python` sources and docs.blaxel.ai):
 - `reqwest`'s `multipart` feature is not enabled by `sandbox`, so the `multipart/form-data` body
   (`permissions`, `path`, `file`/`binary-file.bin`) is assembled by hand, matching the SDK's
   `write_binary`.
+- PTY: `wss://{sandbox}/terminal/ws?token=&cols=&rows=&sessionId=&workingDir=`, with JSON frames
+  in both directions (`{"type":"input"}` out, `{"type":"output"}`/`{"type":"error"}` in) and
+  percent-encoded query values, as in Python. The terminal reports no exit code, so a closed
+  stream simply ends the session. `supports_pty()` is `true` whenever an API key is configured,
+  because the token travels in the query string.
 - Mounts: `BlaxelCloudBucketMountStrategy` installs and runs `s3fs`/`gcsfuse` inside the sandbox,
   writing a `chmod 600` credential file that is removed whether or not the mount came up, and
   reports `MountCredentialAuthority::MountScoped` when credentials are present, so the manifest
@@ -87,8 +98,10 @@ temp file):
   interpreter. Credentials stay in the environment (`MODAL_TOKEN_ID`, `MODAL_TOKEN_SECRET`,
   `MODAL_ENVIRONMENT`) and are never written to disk by the helper.
 - PTY is real here: `pty_exec_start` runs the helper's `pty` op under the core `PtyManager`, so the
-  model gets a terminal over Modal's own `pty=True` exec. This is the only one of the three
-  providers with working PTY support.
+  model gets a terminal over Modal's own `pty=True` exec. The helper process is only a proxy, so
+  the command is wrapped as `sh -c 'echo $$ > <pid>; exec <argv>'` and the session's
+  `remote_kill_command` kills that pid inside the sandbox on teardown — without it, killing the
+  local helper would leave a dev server or a `sleep` running in Modal until the sandbox expired.
 - Snapshots: `tar` mode is the core flow; `snapshot_filesystem` mode calls Modal and stores the
   `MODAL_SANDBOX_FS_SNAPSHOT_V1\n{…}` envelope Python uses, and hydrating such an envelope boots a
   replacement sandbox from that image and terminates the old one.
@@ -105,29 +118,37 @@ temp file):
   configuration and the client collects the `volumes` list from the manifest; `activate` is a
   no-op that only validates.
 
-## Core API notes (no changes made)
+## Core changes made in phase 2 (all additive)
 
-1. **`MountStrategy` and `SandboxSession` are not downcastable.** Cloudflare bucket mounts and
-   Blaxel drives need the session's provider endpoint, and Modal's client needs to read a bucket
-   configuration back out of a manifest entry. Both are solved locally: each session registers its
-   connection in a module-private `Vec<(session_id, Weak<Conn>)>` and the strategy looks it up by
-   `session.id()`; Modal keys its configurations by the registered `Arc`, compared with
-   `Arc::ptr_eq`. An `as_any(&self) -> &dyn Any` on either trait would remove both registries.
-2. **Session ids.** Cloudflare, Blaxel and Modal now mint their own session id (as Python does) and
-   record the provider's id in `SandboxSessionState::provider_id`. Before that, keying the
-   connection registry by the provider id let two live sessions for one sandbox name collide.
-3. **`ExecRequest` has no `env`.** Each provider derives it from `manifest.environment()`; a
-   first-class field would remove three different workarounds.
-4. **PTY over WebSocket is not reachable.** Cloudflare's `/v1/sandbox/{id}/pty` and Blaxel's
-   `/terminal/ws` are WebSocket endpoints and `tokio-tungstenite` is not enabled by the `sandbox`
-   feature, so both sessions report `supports_pty() == false`. The exact change needed:
-   `sandbox = ["dep:base64", "dep:portable-pty", "dep:sha2", "dep:tokio-tungstenite"]` in
-   `Cargo.toml` (the dependency is already declared for `realtime`/`voice`). Hand-rolling WebSocket
-   framing was deliberately not attempted.
-5. **Absolute scratch paths.** Blaxel's snapshot flow and Modal's hydrate flow both need `/tmp`
-   file access, which `normalize_path` rejects.
-   Blaxel carries its own absolute-path file helpers and Modal calls its helper's `write_file`
-   op directly. A core "outside the workspace, provider-internal" file path would be cleaner.
+| Change | File | Why |
+| --- | --- | --- |
+| `MountStrategy::as_any` and `SandboxSession::as_any`, both defaulting to `None` | `mounts.rs`, `session.rs` | A mount strategy only receives a `&dyn SandboxSession` but needs the provider's transport; Modal's client needs to read a bucket configuration back out of a `dyn MountStrategy`. The `Option<&dyn Any>` shape with a `None` default keeps every backend that does not override it compiling unchanged. |
+| `PROVIDER_SCRATCH_PREFIX`, `provider_scratch_path`, `is_provider_scratch_path` | `workspace_paths.rs` | One SDK-owned place for files a backend stages outside the workspace. The stem is reduced to `[A-Za-z0-9._-]` and the recognizer rejects anything holding a `/`, so nothing under the prefix can point elsewhere. |
+| `SandboxSession::resolve_internal_path`, defaulting to the scratch check then `normalize_path` | `session.rs` | The escape hatch itself. Model-provided paths still go through `normalize_path`, so the workspace guard the model faces is unchanged. |
+| `ExecRequest::env`, `with_env`/`with_envs`, `resolved_env` | `session.rs` | A per-command environment, merged over the manifest's so a command's own value wins. Honored by `docker` (`-e`), `unix_local` (process env), Cloudflare (`env` prefix), Blaxel (`env` map) and Modal (the helper's per-exec `env`). The two existing `ExecRequest { … }` literals use `..request.clone()` spreads, so the field breaks nothing; E2B, Daytona and Vercel simply do not read it yet, which is a one-line merge each for their owner. |
+| `RemotePtyProcess` and `RemotePtyManager` | `pty.rs` | `PtyManager` owns a local pty and its child. A hosted terminal arrives as a stream the SDK does not own, so these provide the same ids, yield windows, limits and pruning for a provider-driven transport, and both WebSocket providers share them instead of duplicating the logic. Their `collect` carries an incomplete UTF-8 tail *within* a window, because a frame splits characters far more often than a local pty read does. |
+
+Core files touched, all additively: `session.rs`, `mounts.rs`, `pty.rs`, `workspace_paths.rs`,
+`mod.rs`, and — for the `env` field only — `sandboxes/docker.rs` (`docker exec -e`) and
+`sandboxes/unix_local.rs` (process environment). Those last two change backend behaviour, though
+only for a command that sets `ExecRequest::env`, which nothing did before.
+
+Both connection registries and the Modal `Arc`-identity registry are gone, replaced by `as_any`
+downcasts. Blaxel's and Modal's scratch files now use `provider_scratch_path` and go through
+`resolve_internal_path`.
+
+No type in the tree wraps another `SandboxSession` today (every `impl SandboxSession for` is a
+concrete backend), so the downcast is safe; a future delegating wrapper must forward `as_any` to
+the session it holds, which its doc comment now says.
+
+### Notes
+
+- **Session ids.** Cloudflare, Blaxel and Modal mint their own session id (as Python does) and
+  record the provider's id in `SandboxSessionState::provider_id`. Worth knowing because a backend
+  keyed on `id()` being the provider's id would be wrong for these three.
+- **Modal needs Python.** Every operation shells out to an interpreter with the `modal` package,
+  because Modal publishes no REST API. `with_helper_command` swaps in a long-lived bridge when
+  that per-call start-up matters.
 
 ## Not ported
 
@@ -139,10 +160,12 @@ limits, and Python's retry/instrumentation decorators.
 
 ```
 export CARGO_TARGET_DIR=/Users/ngocthach/.cache/oars-build/cloud2
-rustfmt --edition 2024 <all new files>                       # clean
+rustfmt --edition 2024 <all new files>                        # clean
 cargo clippy --features sandbox --all-targets -- -D warnings  # clean
-cargo test --features sandbox --test sandbox_modal_cloudflare_blaxel_tests  # 19 passed
-cargo test --features sandbox --lib extensions::sandbox       # 70 passed
+cargo test --features sandbox --test sandbox_modal_cloudflare_blaxel_tests  # 21 passed
+cargo test --features sandbox --lib sandbox                   # 171 passed (core + all providers)
+cargo test --features sandbox --test sandbox_tests            # 45 passed (unchanged)
+cargo test --features sandbox --test sandbox_e2b_daytona_vercel_tests  # 19 passed (unchanged)
 python3 compile check on both helper scripts                  # clean
 ```
 
@@ -153,15 +176,27 @@ snapshot round-trip, the timeout-terminates-the-sandbox rule, that a command wit
 runs unbounded, that the hydrate archive is staged rather than passed as an argument, and a PTY
 session. Two tests run the real bundled helper (not the fake) to check that it compiles and that
 it parses a command-line request. The Cloudflare SSE decoder is additionally exercised with a
-stream split mid-`CRLF` across socket writes. No test
-performs real network I/O or uses a real credential.
+stream split mid-`CRLF` across socket writes.
+
+The WebSocket PTY paths are covered by unit tests inside the provider modules, which run a real
+`tokio_tungstenite` server on a loopback socket: command delivery (including the `cd` prefix),
+output collection, `write_stdin` with and without a TTY, an unknown session id, exit-code
+reporting, teardown, and a terminal that closes before it is ready. They live in `src/` rather
+than `tests/` because `tokio-tungstenite` is a dependency of the crate, not a dev-dependency, so
+an integration test cannot run the server side. `RemotePtyProcess`/`RemotePtyManager` have their
+own core tests, including the split-character carry and pruning of finished sessions. The Modal
+PTY test additionally asserts that teardown kills the sandbox-side process by the recorded pid.
+
+No test performs real network I/O or uses a real credential.
 
 Status: DONE_WITH_CONCERNS
-Summary: Modal, Cloudflare and Blaxel sandbox providers are ported with clients, sessions,
-lifecycle, file and exec operations, mounts and snapshots, covered by 19 integration tests against
-mock servers and a fake Modal helper plus 70 unit tests, all clippy-clean.
-Concerns/Blockers: Cloudflare and Blaxel PTY need `dep:tokio-tungstenite` added to the `sandbox`
-feature (WebSocket endpoints; `supports_pty()` is `false` until then — Modal's PTY works). Modal
-necessarily depends on a Python interpreter with the `modal` package, because Modal publishes no
-REST API. `as_any` on `MountStrategy`/`SandboxSession` would let two provider-local connection
-registries be deleted.
+Summary: All three providers are complete, including PTY for all three (Cloudflare and Blaxel over
+their WebSocket terminals, Modal through its helper, with the sandbox-side process killed on
+teardown), plus all four authorized additive core changes — `as_any`, `ExecRequest::env`, the
+scratch-path hatch and a shared remote-PTY manager — and every provider-local registry workaround
+deleted; 21 integration tests, 171 core and provider unit tests and the neighbouring sandbox suite
+all pass, with my files clippy-clean.
+Concerns/Blockers: `ExecRequest::env` is now a public field that the E2B, Daytona and Vercel
+sessions silently ignore (docker, unix_local, Cloudflare, Blaxel and Modal honor it). It defaults
+to empty so nothing regresses, but a caller using `with_env` against those three would be misled —
+please route the one-line merge to that agent.

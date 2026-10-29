@@ -29,12 +29,11 @@
 //! | remove | `DELETE /filesystem/{path}?recursive=true` |
 //! | mount drive | `POST /drives/mount`, `DELETE /drives/mount/{path}` |
 //!
-//! The sandbox's terminal endpoint is a WebSocket, which this port does not speak:
-//! [`supports_pty`](SandboxSession::supports_pty) stays `false`.
+//! PTY sessions run over the sandbox's terminal WebSocket; see [`super::pty`].
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -42,12 +41,16 @@ use serde_json::{Map, Value, json};
 
 use crate::sandbox::errors::{ErrorCode, SandboxError, SandboxResult};
 use crate::sandbox::manifest::Manifest;
+use crate::sandbox::pty::{PtyExecRequest, PtyExecUpdate, PtyWriteRequest};
 use crate::sandbox::session::{
     ExecRequest, SandboxClient, SandboxSession, restore_session_snapshot, shell_quote,
 };
 use crate::sandbox::snapshot::{Snapshot, SnapshotSpec, resolve_snapshot};
 use crate::sandbox::state::SandboxSessionState;
 use crate::sandbox::types::{ExecResult, FileEntry, Permissions};
+use crate::sandbox::workspace_paths::provider_scratch_path;
+
+use super::pty::{BlaxelPtySessions, terminal_url};
 
 /// The workspace root Blaxel sandboxes use by default.
 pub const DEFAULT_BLAXEL_WORKSPACE_ROOT: &str = "/workspace";
@@ -278,7 +281,7 @@ impl BlaxelSandboxClientOptions {
 
 /// The sandbox endpoint and credentials behind one Blaxel sandbox.
 ///
-/// Mount strategies reach it through [`connection_for_session`], because
+/// A mount strategy recovers it through [`SandboxSession::as_any`], because
 /// [`MountStrategy`](crate::sandbox::mounts::MountStrategy) only receives a
 /// `&dyn SandboxSession`.
 #[derive(Debug)]
@@ -374,33 +377,6 @@ impl BlaxelConnection {
             ));
         }
         Ok(())
-    }
-}
-
-type ConnectionRegistry = Mutex<Vec<(String, Weak<BlaxelConnection>)>>;
-
-fn registry() -> &'static ConnectionRegistry {
-    static REGISTRY: OnceLock<ConnectionRegistry> = OnceLock::new();
-    REGISTRY.get_or_init(|| Mutex::new(Vec::new()))
-}
-
-/// The live connection behind a session id, for mount strategies that need the sandbox endpoint.
-///
-/// [`MountStrategy`](crate::sandbox::mounts::MountStrategy) receives only a `&dyn SandboxSession`,
-/// which cannot hand back a provider endpoint, so each session registers its connection here
-/// under its own id while it is alive.
-pub fn connection_for_session(session_id: &str) -> Option<Arc<BlaxelConnection>> {
-    let guard = registry().lock().ok()?;
-    guard
-        .iter()
-        .find(|(id, _)| id == session_id)
-        .and_then(|(_, weak)| weak.upgrade())
-}
-
-fn register_connection(session_id: &str, connection: &Arc<BlaxelConnection>) {
-    if let Ok(mut guard) = registry().lock() {
-        guard.retain(|(_, weak)| weak.strong_count() > 0);
-        guard.push((session_id.to_string(), Arc::downgrade(connection)));
     }
 }
 
@@ -709,6 +685,7 @@ pub struct BlaxelSandboxSession {
     pause_on_exit: bool,
     resuming: bool,
     preserved_workspace: bool,
+    ptys: BlaxelPtySessions,
 }
 
 impl BlaxelSandboxSession {
@@ -718,7 +695,6 @@ impl BlaxelSandboxSession {
         // several sessions over time, and a mount must reach the connection of its own.
         let session_id = uuid::Uuid::new_v4().simple().to_string();
         let snapshot_id = session_id.clone();
-        register_connection(&session_id, &connection);
         BlaxelSandboxSession {
             connection,
             session_id,
@@ -731,6 +707,7 @@ impl BlaxelSandboxSession {
             pause_on_exit: false,
             resuming: false,
             preserved_workspace: false,
+            ptys: BlaxelPtySessions::new(),
         }
     }
 
@@ -780,12 +757,11 @@ impl BlaxelSandboxSession {
         &self.connection.sandbox_name
     }
 
-    /// The environment every command runs with: the sandbox's own, then the manifest's.
-    fn resolved_env(&self) -> BTreeMap<String, String> {
+    /// The environment a command runs with: the sandbox's own, the manifest's, then the
+    /// request's.
+    fn resolved_env(&self, request: &ExecRequest) -> BTreeMap<String, String> {
         let mut env = self.base_env_vars.clone();
-        for (key, value) in self.manifest.environment() {
-            env.insert(key.clone(), value.clone());
-        }
+        env.extend(request.resolved_env(self.manifest.environment()));
         env
     }
 
@@ -810,7 +786,7 @@ impl BlaxelSandboxSession {
             "timeout".to_string(),
             Value::from(timeout.as_millis().max(1) as u64),
         );
-        let env = self.resolved_env();
+        let env = self.resolved_env(request);
         if !env.is_empty() {
             body.insert(
                 "env".to_string(),
@@ -955,11 +931,14 @@ impl BlaxelSandboxSession {
         Ok(())
     }
 
-    /// Read a file by its absolute sandbox path.
+    /// Read a file the SDK itself placed, which may be an SDK-owned scratch path.
     ///
-    /// Snapshots stage their archive in `/tmp`, outside the workspace the model may touch, so
-    /// the archive path never goes through [`normalize_path`](SandboxSession::normalize_path).
-    async fn read_absolute(&self, resolved: &str) -> SandboxResult<Vec<u8>> {
+    /// Snapshots stage their archive outside the workspace the model may touch, so the path goes
+    /// through [`resolve_internal_path`](SandboxSession::resolve_internal_path) rather than the
+    /// workspace guard that model-provided paths meet.
+    async fn read_internal(&self, path: &str) -> SandboxResult<Vec<u8>> {
+        let resolved = self.resolve_internal_path(path)?;
+        let resolved = resolved.as_str();
         let url_path = format!("/filesystem/{}", encode_sandbox_path(resolved));
         let response = self
             .connection
@@ -997,8 +976,10 @@ impl BlaxelSandboxSession {
         Ok(body.to_vec())
     }
 
-    /// Write a file by its absolute sandbox path, as `multipart/form-data`.
-    async fn write_absolute(&self, resolved: &str, contents: &[u8]) -> SandboxResult<()> {
+    /// Write a file the SDK itself placed, as `multipart/form-data`.
+    async fn write_internal(&self, path: &str, contents: &[u8]) -> SandboxResult<()> {
+        let resolved = self.resolve_internal_path(path)?;
+        let resolved = resolved.as_str();
         let url_path = format!("/filesystem/{}", encode_sandbox_path(resolved));
         let boundary = format!("openai-agents-{}", uuid::Uuid::new_v4().simple());
         let body = multipart_file_body(&boundary, resolved, contents);
@@ -1036,8 +1017,10 @@ impl BlaxelSandboxSession {
         Ok(())
     }
 
-    /// Remove a path by its absolute sandbox path.
-    async fn remove_absolute(&self, resolved: &str, recursive: bool) -> SandboxResult<()> {
+    /// Remove a path the SDK itself placed.
+    async fn remove_internal(&self, path: &str, recursive: bool) -> SandboxResult<()> {
+        let resolved = self.resolve_internal_path(path)?;
+        let resolved = resolved.as_str();
         let url_path = format!("/filesystem/{}", encode_sandbox_path(resolved));
         let mut builder = self
             .connection
@@ -1063,10 +1046,10 @@ impl BlaxelSandboxSession {
     }
 
     fn tar_path(&self, kind: &str) -> String {
-        format!(
-            "/tmp/bl-{kind}-{}.tar",
-            self.connection.sandbox_name.replace('/', "-")
-        )
+        provider_scratch_path(&format!(
+            "blaxel-{kind}-{}.tar",
+            self.connection.sandbox_name
+        ))
     }
 
     fn tar_exclude_args(&self) -> String {
@@ -1136,11 +1119,13 @@ impl SandboxSession for BlaxelSandboxSession {
     }
 
     async fn stop(&self) -> SandboxResult<()> {
+        self.ptys.terminate_all().await;
         self.started.store(false, Ordering::SeqCst);
         Ok(())
     }
 
     async fn shutdown(&self) -> SandboxResult<()> {
+        self.ptys.terminate_all().await;
         let mut deleted = self.deleted.lock().await;
         self.started.store(false, Ordering::SeqCst);
         if *deleted || self.pause_on_exit {
@@ -1238,12 +1223,12 @@ impl SandboxSession for BlaxelSandboxSession {
 
     async fn read_file(&self, path: &str) -> SandboxResult<Vec<u8>> {
         let resolved = self.normalize_path(path)?;
-        self.read_absolute(&resolved).await
+        self.read_internal(&resolved).await
     }
 
     async fn write_file(&self, path: &str, contents: &[u8]) -> SandboxResult<()> {
         let resolved = self.normalize_path(path)?;
-        self.write_absolute(&resolved, contents).await
+        self.write_internal(&resolved, contents).await
     }
 
     async fn mkdir(&self, path: &str, parents: bool) -> SandboxResult<()> {
@@ -1263,7 +1248,7 @@ impl SandboxSession for BlaxelSandboxSession {
 
     async fn rm(&self, path: &str, recursive: bool) -> SandboxResult<()> {
         let resolved = self.normalize_path(path)?;
-        self.remove_absolute(&resolved, recursive).await
+        self.remove_internal(&resolved, recursive).await
     }
 
     async fn ls(&self, path: &str) -> SandboxResult<Vec<FileEntry>> {
@@ -1320,7 +1305,7 @@ impl SandboxSession for BlaxelSandboxSession {
             )
             .await?;
         if !result.ok() {
-            let _ = self.remove_absolute(&tar_path, false).await;
+            let _ = self.remove_internal(&tar_path, false).await;
             return Err(SandboxError::new(
                 ErrorCode::SnapshotPersistError,
                 format!(
@@ -1329,8 +1314,8 @@ impl SandboxSession for BlaxelSandboxSession {
                 ),
             ));
         }
-        let archive = self.read_absolute(&tar_path).await;
-        let _ = self.remove_absolute(&tar_path, false).await;
+        let archive = self.read_internal(&tar_path).await;
+        let _ = self.remove_internal(&tar_path, false).await;
         archive
     }
 
@@ -1338,7 +1323,7 @@ impl SandboxSession for BlaxelSandboxSession {
         let root = self.manifest.root().to_string();
         let tar_path = self.tar_path("hydrate");
         self.mkdir(&root, true).await?;
-        self.write_absolute(&tar_path, archive)
+        self.write_internal(&tar_path, archive)
             .await
             .map_err(|error| {
                 SandboxError::new(
@@ -1357,7 +1342,7 @@ impl SandboxSession for BlaxelSandboxSession {
                     .with_timeout(Some(self.connection.timeouts.workspace_tar)),
             )
             .await;
-        let _ = self.remove_absolute(&tar_path, false).await;
+        let _ = self.remove_internal(&tar_path, false).await;
         let result = result?;
         if !result.ok() {
             return Err(SandboxError::new(
@@ -1368,6 +1353,51 @@ impl SandboxSession for BlaxelSandboxSession {
                 ),
             ));
         }
+        Ok(())
+    }
+
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
+    }
+
+    fn supports_pty(&self) -> bool {
+        // The terminal is addressed with the API key as a query parameter, so a session without
+        // one cannot open it.
+        self.connection.api_key.is_some()
+    }
+
+    async fn pty_exec_start(&self, request: PtyExecRequest) -> SandboxResult<PtyExecUpdate> {
+        let Some(token) = self.connection.api_key.clone() else {
+            return Err(SandboxError::new(
+                ErrorCode::SandboxConfigInvalid,
+                "a Blaxel PTY session needs an API key: set `BL_API_KEY` or \
+                 `BlaxelSandboxClientOptions::with_api_key`",
+            ));
+        };
+        let working_dir = match &request.cwd {
+            None => self.manifest.root().to_string(),
+            Some(cwd) => self.normalize_path(cwd)?,
+        };
+        let session_id = format!("pty-{}", &uuid::Uuid::new_v4().simple().to_string()[..12]);
+        let url = terminal_url(
+            &self.connection.sandbox_url,
+            &token,
+            &session_id,
+            &working_dir,
+            80,
+            24,
+        );
+        self.ptys
+            .start(&url, &request, self.connection.timeouts.exec)
+            .await
+    }
+
+    async fn pty_write_stdin(&self, request: PtyWriteRequest) -> SandboxResult<PtyExecUpdate> {
+        self.ptys.write_stdin(&request).await
+    }
+
+    async fn pty_terminate_all(&self) -> SandboxResult<()> {
+        self.ptys.terminate_all().await;
         Ok(())
     }
 

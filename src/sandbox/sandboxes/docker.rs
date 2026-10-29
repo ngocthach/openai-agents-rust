@@ -312,7 +312,7 @@ impl DockerSandboxSession {
         };
         argv.push("-w".to_string());
         argv.push(workdir);
-        for (key, value) in self.manifest.environment() {
+        for (key, value) in request.resolved_env(self.manifest.environment()) {
             argv.push("-e".to_string());
             argv.push(format!("{key}={value}"));
         }

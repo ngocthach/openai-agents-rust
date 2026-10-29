@@ -705,6 +705,281 @@ async fn collect(
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// Remote PTY sessions
+// ---------------------------------------------------------------------------------------------
+
+/// A PTY session whose process runs behind a transport the SDK does not own.
+///
+/// [`PtyManager`] owns a local pty and the child attached to it. A hosted sandbox instead hands
+/// the SDK a stream — a WebSocket, usually — that carries the terminal's bytes, so the provider
+/// pumps that stream into [`push_output`](Self::push_output) and calls [`close`](Self::close)
+/// when it ends. Process ids, the yield window and pruning then behave exactly as they do for a
+/// local pty.
+#[derive(Debug)]
+pub struct RemotePtyProcess {
+    id: u32,
+    tty: bool,
+    buffer: Mutex<Vec<u8>>,
+    closed: AtomicBool,
+    exit_code: Mutex<Option<i32>>,
+    notify: Notify,
+    last_used: Mutex<Instant>,
+}
+
+impl RemotePtyProcess {
+    fn new(id: u32, tty: bool) -> Self {
+        RemotePtyProcess {
+            id,
+            tty,
+            buffer: Mutex::new(Vec::new()),
+            closed: AtomicBool::new(false),
+            exit_code: Mutex::new(None),
+            notify: Notify::new(),
+            last_used: Mutex::new(Instant::now()),
+        }
+    }
+
+    /// The id the model uses to write to this session.
+    pub fn id(&self) -> u32 {
+        self.id
+    }
+
+    /// Whether the model may write to the process.
+    pub fn tty(&self) -> bool {
+        self.tty
+    }
+
+    /// Append output the transport delivered.
+    pub fn push_output(&self, chunk: &[u8]) {
+        if chunk.is_empty() {
+            return;
+        }
+        self.buffer
+            .lock()
+            .expect("poisoned")
+            .extend_from_slice(chunk);
+        self.notify.notify_waiters();
+    }
+
+    /// Record that the process finished, with its exit code when the transport reports one.
+    pub fn close(&self, exit_code: Option<i32>) {
+        if let Some(code) = exit_code {
+            *self.exit_code.lock().expect("poisoned") = Some(code);
+        }
+        self.closed.store(true, Ordering::SeqCst);
+        self.notify.notify_waiters();
+    }
+
+    /// Whether the process has finished.
+    pub fn is_done(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
+    }
+
+    /// The exit code, once the transport has reported one.
+    pub fn exit_code(&self) -> Option<i32> {
+        *self.exit_code.lock().expect("poisoned")
+    }
+
+    fn touch(&self) {
+        *self.last_used.lock().expect("poisoned") = Instant::now();
+    }
+
+    fn take_output(&self, carry_incomplete: bool) -> Vec<u8> {
+        let mut buffer = self.buffer.lock().expect("poisoned");
+        if buffer.is_empty() {
+            return Vec::new();
+        }
+        let mut out = std::mem::take(&mut *buffer);
+        if carry_incomplete {
+            let carry = incomplete_utf8_suffix_length(&out);
+            if carry > 0 {
+                let tail = out.split_off(out.len() - carry);
+                *buffer = tail;
+            }
+        }
+        out
+    }
+
+    /// Collect the output of one yield window, waiting for the transport to deliver more.
+    pub async fn collect(
+        &self,
+        yield_time_ms: u64,
+        max_output_tokens: Option<usize>,
+    ) -> PtyExecUpdate {
+        self.touch();
+        let deadline =
+            Instant::now() + Duration::from_millis(clamp_pty_yield_time_ms(yield_time_ms));
+        let mut output = Vec::new();
+        let mut closed = false;
+        loop {
+            let done = self.is_done();
+            // A transport delivers whatever fits in a frame, which splits multi-byte characters
+            // far more often than a local pty read does, so an incomplete tail waits for the
+            // bytes that complete it instead of reaching the model as replacement characters.
+            // Once the process is done no more bytes can arrive, so everything is flushed.
+            output.extend(self.take_output(!done));
+            if done {
+                closed = true;
+                // Give the pump a moment to deliver whatever arrived with the close.
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                output.extend(self.take_output(false));
+                break;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            let notified = self.notify.notified();
+            if tokio::time::timeout(deadline - now, notified)
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+        // An unfinished stream may have been cut mid-character; carry those bytes over.
+        output.extend(self.take_output(!closed));
+        self.touch();
+
+        let text = String::from_utf8_lossy(&output).into_owned();
+        let (text, original_token_count) = truncate_text_by_tokens(&text, max_output_tokens);
+        PtyExecUpdate {
+            process_id: (!closed).then_some(self.id),
+            output: text.into_bytes(),
+            exit_code: closed.then(|| self.exit_code()).flatten(),
+            original_token_count,
+        }
+    }
+}
+
+/// Tracks the live [`RemotePtyProcess`] sessions of one sandbox session.
+///
+/// The counterpart of [`PtyManager`] for backends whose terminal lives behind a provider
+/// transport: it allocates the ids the model sees and applies the same limits and pruning, while
+/// the provider keeps whatever it needs to write to and close each stream.
+#[derive(Debug, Default)]
+pub struct RemotePtyManager {
+    processes: Mutex<HashMap<u32, Arc<RemotePtyProcess>>>,
+}
+
+impl RemotePtyManager {
+    /// An empty manager.
+    pub fn new() -> Self {
+        RemotePtyManager::default()
+    }
+
+    /// Number of live sessions.
+    pub fn len(&self) -> usize {
+        self.processes.lock().expect("poisoned").len()
+    }
+
+    /// Whether no session is live.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Register a new session, returning it together with the sessions pruned to make room.
+    ///
+    /// The caller closes the pruned sessions' transports: the manager knows nothing about them.
+    pub fn register(
+        &self,
+        tty: bool,
+    ) -> SandboxResult<(Arc<RemotePtyProcess>, Vec<Arc<RemotePtyProcess>>)> {
+        let mut processes = self.processes.lock().expect("poisoned");
+        let pruned = Self::prune(&mut processes);
+        if processes.len() >= PTY_PROCESSES_MAX {
+            return Err(SandboxError::new(
+                ErrorCode::ExecTransportError,
+                format!("the sandbox already has {PTY_PROCESSES_MAX} live PTY sessions"),
+            ));
+        }
+        if processes.len() >= PTY_PROCESSES_WARNING {
+            log::warn!(
+                "sandbox session has {} live PTY sessions (limit {PTY_PROCESSES_MAX})",
+                processes.len()
+            );
+        }
+        let mut id = 0;
+        for _ in 0..1024 {
+            let span = PTY_PROCESS_ID_MAX_EXCLUSIVE - PTY_PROCESS_ID_MIN;
+            let candidate =
+                PTY_PROCESS_ID_MIN + (uuid::Uuid::new_v4().as_u128() % span as u128) as u32;
+            if !processes.contains_key(&candidate) {
+                id = candidate;
+                break;
+            }
+        }
+        if id == 0 {
+            return Err(SandboxError::new(
+                ErrorCode::ExecTransportError,
+                "could not allocate a free PTY session id",
+            ));
+        }
+        let process = Arc::new(RemotePtyProcess::new(id, tty));
+        processes.insert(id, process.clone());
+        Ok((process, pruned))
+    }
+
+    /// Drop finished sessions, then the least recently used ones, keeping the newest
+    /// [`PTY_PROCESSES_PROTECTED_RECENT`] alive.
+    fn prune(processes: &mut HashMap<u32, Arc<RemotePtyProcess>>) -> Vec<Arc<RemotePtyProcess>> {
+        let mut pruned = Vec::new();
+        processes.retain(|_, process| {
+            if process.is_done() {
+                pruned.push(process.clone());
+                false
+            } else {
+                true
+            }
+        });
+        if processes.len() < PTY_PROCESSES_MAX {
+            return pruned;
+        }
+        let mut by_age: Vec<(u32, Instant)> = processes
+            .iter()
+            .map(|(id, p)| (*id, *p.last_used.lock().expect("poisoned")))
+            .collect();
+        by_age.sort_by_key(|(_, last_used)| *last_used);
+        let prunable = by_age.len().saturating_sub(PTY_PROCESSES_PROTECTED_RECENT);
+        for (id, _) in by_age.into_iter().take(prunable) {
+            if let Some(process) = processes.remove(&id) {
+                pruned.push(process);
+            }
+            if processes.len() < PTY_PROCESSES_MAX {
+                break;
+            }
+        }
+        pruned
+    }
+
+    /// The live session with this id.
+    pub fn get(&self, session_id: u32) -> SandboxResult<Arc<RemotePtyProcess>> {
+        self.processes
+            .lock()
+            .expect("poisoned")
+            .get(&session_id)
+            .cloned()
+            .ok_or_else(|| {
+                SandboxError::new(
+                    ErrorCode::PtySessionNotFound,
+                    format!("PTY session `{session_id}` is not running"),
+                )
+            })
+    }
+
+    /// Forget the session with this id, returning it so the caller can close its transport.
+    pub fn remove(&self, session_id: u32) -> Option<Arc<RemotePtyProcess>> {
+        self.processes.lock().expect("poisoned").remove(&session_id)
+    }
+
+    /// Forget every session, returning them so the caller can close their transports.
+    pub fn take_all(&self) -> Vec<Arc<RemotePtyProcess>> {
+        let mut processes = self.processes.lock().expect("poisoned");
+        processes.drain().map(|(_, process)| process).collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -848,5 +1123,60 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code, ErrorCode::PtySessionNotFound);
+    }
+
+    #[tokio::test]
+    async fn remote_pty_collects_output_and_closes() {
+        let manager = RemotePtyManager::new();
+        let (process, pruned) = manager.register(true).unwrap();
+        assert!(pruned.is_empty());
+        assert_eq!(manager.len(), 1);
+        assert!(process.id() >= PTY_PROCESS_ID_MIN);
+
+        process.push_output(b"hello ");
+        let update = process.collect(250, None).await;
+        assert_eq!(update.output_text(), "hello ");
+        // Still running, so the model keeps the id and sees no exit code.
+        assert_eq!(update.process_id, Some(process.id()));
+        assert_eq!(update.exit_code, None);
+
+        process.push_output(b"world");
+        process.close(Some(7));
+        let update = process.collect(250, None).await;
+        assert_eq!(update.output_text(), "world");
+        assert_eq!(update.process_id, None);
+        assert_eq!(update.exit_code, Some(7));
+
+        assert_eq!(manager.get(process.id()).unwrap().id(), process.id());
+        assert_eq!(
+            manager.get(1).unwrap_err().code,
+            ErrorCode::PtySessionNotFound
+        );
+        assert_eq!(manager.take_all().len(), 1);
+        assert!(manager.is_empty());
+    }
+
+    #[tokio::test]
+    async fn remote_pty_prunes_finished_sessions() {
+        let manager = RemotePtyManager::new();
+        let (first, _) = manager.register(false).unwrap();
+        first.close(Some(0));
+        let (_second, pruned) = manager.register(false).unwrap();
+        assert_eq!(pruned.len(), 1);
+        assert_eq!(pruned[0].id(), first.id());
+        assert_eq!(manager.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn remote_pty_carries_a_split_character_to_the_next_window() {
+        let manager = RemotePtyManager::new();
+        let (process, _) = manager.register(false).unwrap();
+        // The first two bytes of a three-byte character arrive on their own.
+        process.push_output(&[0xE2, 0x82]);
+        let update = process.collect(250, None).await;
+        assert!(update.output.is_empty());
+        process.push_output(&[0xAC]);
+        let update = process.collect(250, None).await;
+        assert_eq!(update.output_text(), "\u{20ac}");
     }
 }

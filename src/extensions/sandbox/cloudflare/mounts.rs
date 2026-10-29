@@ -13,8 +13,6 @@ use crate::sandbox::errors::{ErrorCode, SandboxError, SandboxResult};
 use crate::sandbox::mounts::{Mount, MountStrategy};
 use crate::sandbox::session::SandboxSession;
 
-use super::sandbox::connection_for_session;
-
 /// Which bucket API the worker should speak.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CloudflareBucketProvider {
@@ -230,15 +228,22 @@ impl CloudflareBucketMountStrategy {
                 ),
             ));
         }
-        connection_for_session(session.id()).ok_or_else(|| {
-            SandboxError::new(
-                ErrorCode::MountFailed,
-                format!(
-                    "the Cloudflare sandbox behind `{mount_path}` is no longer connected to a \
-                     worker"
-                ),
-            )
-        })
+        session
+            .as_any()
+            .and_then(|session| {
+                session
+                    .downcast_ref::<super::sandbox::CloudflareSandboxSession>()
+                    .map(|session| session.connection().clone())
+            })
+            .ok_or_else(|| {
+                SandboxError::new(
+                    ErrorCode::MountFailed,
+                    format!(
+                        "the Cloudflare sandbox behind `{mount_path}` does not expose its worker \
+                         connection"
+                    ),
+                )
+            })
     }
 }
 

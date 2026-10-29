@@ -83,7 +83,9 @@ pub use mounts::{
     BindMountStrategy, DockerVolumeMountStrategy, HostPathGrant, InContainerMountStrategy, Mount,
     MountCredentialAuthority, MountPattern, MountPatternConfig, MountStrategy,
 };
-pub use pty::{PtyExecRequest, PtyExecUpdate, PtyManager, PtyWriteRequest};
+pub use pty::{
+    PtyExecRequest, PtyExecUpdate, PtyManager, PtyWriteRequest, RemotePtyManager, RemotePtyProcess,
+};
 pub use remote_mount_policy::build_remote_mount_policy_instructions;
 pub use runtime::{
     PreparedSandboxRun, SandboxRunConfig, SandboxRunOutcome, SandboxRunner, SandboxSessionGuard,
@@ -96,4 +98,6 @@ pub use snapshot::{
 };
 pub use state::{SandboxSessionState, manifest_digest};
 pub use types::{ExecResult, FileEntry, Group, Permissions, User, file_mode};
-pub use workspace_paths::SandboxWorkspaceScope;
+pub use workspace_paths::{
+    PROVIDER_SCRATCH_PREFIX, SandboxWorkspaceScope, is_provider_scratch_path, provider_scratch_path,
+};

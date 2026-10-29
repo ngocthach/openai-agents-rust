@@ -1,6 +1,7 @@
 //! The sandbox session and client interfaces. Mirrors
 //! `agents.sandbox.session.base_sandbox_session` and `agents.sandbox.session.sandbox_client`.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
@@ -14,7 +15,7 @@ use crate::sandbox::pty::{PtyExecRequest, PtyExecUpdate, PtyWriteRequest};
 use crate::sandbox::snapshot::{Snapshot, resolve_snapshot};
 use crate::sandbox::state::SandboxSessionState;
 use crate::sandbox::types::{ExecResult, FileEntry, User, parse_ls_la};
-use crate::sandbox::workspace_paths::resolve_workspace_path;
+use crate::sandbox::workspace_paths::{is_provider_scratch_path, resolve_workspace_path};
 
 /// How a command is handed to the sandbox.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,6 +55,13 @@ pub struct ExecRequest {
     pub cwd: Option<String>,
     /// Sandbox user to run as (`sudo -u <name> --`).
     pub user: Option<User>,
+    /// Environment variables for this command, applied on top of the manifest environment.
+    ///
+    /// A backend passes them the way its transport does: as `docker exec -e`, as the process
+    /// environment of a local command, or as the provider's own per-command environment. A
+    /// backend that does not read them yet ignores them, so a command that depends on one should
+    /// check that its backend honors them.
+    pub env: BTreeMap<String, String>,
 }
 
 impl ExecRequest {
@@ -65,6 +73,7 @@ impl ExecRequest {
             timeout: None,
             cwd: None,
             user: None,
+            env: BTreeMap::new(),
         }
     }
 
@@ -80,6 +89,7 @@ impl ExecRequest {
             timeout: None,
             cwd: None,
             user: None,
+            env: BTreeMap::new(),
         }
     }
 
@@ -105,6 +115,37 @@ impl ExecRequest {
     pub fn with_user(mut self, user: Option<User>) -> Self {
         self.user = user;
         self
+    }
+
+    /// Set one environment variable for this command.
+    pub fn with_env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.env.insert(key.into(), value.into());
+        self
+    }
+
+    /// Set several environment variables for this command.
+    pub fn with_envs<I, K, V>(mut self, env: I) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<String>,
+        V: Into<String>,
+    {
+        self.env
+            .extend(env.into_iter().map(|(k, v)| (k.into(), v.into())));
+        self
+    }
+
+    /// The environment this command runs with: the manifest's, then this request's.
+    ///
+    /// Every backend resolves it the same way, so a per-command variable always wins over the
+    /// manifest value of the same name.
+    pub fn resolved_env(
+        &self,
+        manifest_env: &BTreeMap<String, String>,
+    ) -> BTreeMap<String, String> {
+        let mut resolved = manifest_env.clone();
+        resolved.extend(self.env.iter().map(|(k, v)| (k.clone(), v.clone())));
+        resolved
     }
 
     /// The final argument vector, after applying the shell prefix and the `sudo` wrapper.
@@ -240,9 +281,34 @@ pub trait SandboxSession: Send + Sync + fmt::Debug {
         Ok(())
     }
 
+    /// This session as [`Any`](std::any::Any), for code that needs the concrete backend type.
+    ///
+    /// A provider's mount strategy only ever receives a `&dyn SandboxSession`, yet it may need
+    /// the session's own transport to attach storage. Returning `Some(self)` lets it recover the
+    /// concrete session; the default `None` keeps every other backend working unchanged. A type
+    /// that wraps another session must forward this to the session it holds, or the strategies
+    /// that rely on it stop finding their transport.
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        None
+    }
+
     /// Normalize a model-provided path to an absolute sandbox path inside the workspace root.
     fn normalize_path(&self, path: &str) -> SandboxResult<String> {
         resolve_workspace_path(self.workspace_root(), path)
+    }
+
+    /// Resolve a path the SDK itself placed, which may sit outside the workspace root.
+    ///
+    /// An SDK-owned scratch path (see
+    /// [`provider_scratch_path`](crate::sandbox::workspace_paths::provider_scratch_path)) is
+    /// returned unchanged, because a backend that stages a snapshot archive in `/tmp` must be
+    /// able to read it back; anything else goes through [`normalize_path`](Self::normalize_path).
+    /// Model-provided paths never reach this method.
+    fn resolve_internal_path(&self, path: &str) -> SandboxResult<String> {
+        if is_provider_scratch_path(path) {
+            return Ok(path.to_string());
+        }
+        self.normalize_path(path)
     }
 
     /// List a directory.
@@ -467,6 +533,27 @@ mod tests {
         assert_eq!(
             req.resolved_argv(),
             vec!["sudo", "-u", "agent", "--", "sh", "-lc", "id"]
+        );
+    }
+
+    #[test]
+    fn merges_request_env_over_the_manifest_env() {
+        let manifest_env = BTreeMap::from([
+            ("FOO".to_string(), "manifest".to_string()),
+            ("BAR".to_string(), "keep".to_string()),
+        ]);
+        let request = ExecRequest::shell("env").with_env("FOO", "request");
+        assert_eq!(
+            request.resolved_env(&manifest_env),
+            BTreeMap::from([
+                ("BAR".to_string(), "keep".to_string()),
+                ("FOO".to_string(), "request".to_string()),
+            ])
+        );
+        // A request without its own environment leaves the manifest's untouched.
+        assert_eq!(
+            ExecRequest::shell("env").resolved_env(&manifest_env),
+            manifest_env
         );
     }
 

@@ -12,7 +12,8 @@ Requests (`op` selects the operation):
      "idle_timeout": ..., "use_sleep_cmd": true, "image_builder_version": ...,
      "volumes": [{"mount_path": ..., "bucket_name": ..., ...}]}
         -> {"sandbox_id": ..., "image_id": ...}
-    {"op": "exec", "sandbox_id": ..., "argv": [...], "timeout": ..., "workdir": ...}
+    {"op": "exec", "sandbox_id": ..., "argv": [...], "timeout": ..., "workdir": ...,
+     "env": {...}}
         -> {"exit_code": 0, "stdout": "<base64>", "stderr": "<base64>"}
     {"op": "read_file", "sandbox_id": ..., "path": ...} -> {"data": "<base64>"}
     {"op": "write_file", "sandbox_id": ..., "path": ..., "data": "<base64>"} -> {"ok": true}
@@ -145,6 +146,8 @@ async def _op_exec(modal: Any, request: dict[str, Any]) -> dict[str, Any]:
         kwargs["timeout"] = max(1, int(timeout))
     if request.get("workdir"):
         kwargs["workdir"] = request["workdir"]
+    if request.get("env"):
+        kwargs["env"] = dict(request["env"])
     process = await sandbox.exec.aio(*request["argv"], **kwargs)
     stdout = await process.stdout.read.aio()
     stderr = await process.stderr.read.aio()

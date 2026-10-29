@@ -8,7 +8,7 @@
 //! `Sandbox.exec` and `Sandbox.snapshot_filesystem` exist only in Modal's own SDKs, and the
 //! `modal` CLI exposes no sandbox lifecycle commands. This port therefore drives the official
 //! Python SDK through a small bundled helper
-//! ([`HELPER_SOURCE`](crate::extensions::sandbox::modal::HELPER_SOURCE)): each operation spawns
+//! ([`HELPER_SOURCE`]): each operation spawns
 //! the helper, writes one JSON request to its stdin and reads one JSON response from its stdout.
 //!
 //! Every invocation is stateless and addresses the sandbox by its Modal id, so concurrent calls
@@ -20,6 +20,7 @@
 //! it under the core [`PtyManager`], which gives the model a real terminal over Modal's own
 //! `pty=True` exec.
 
+use std::collections::BTreeMap;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -697,6 +698,17 @@ impl ModalSandboxSession {
         workdir: &str,
         timeout: Option<Duration>,
     ) -> SandboxResult<ExecResult> {
+        self.helper_exec_with_env(argv, workdir, timeout, &BTreeMap::new())
+            .await
+    }
+
+    async fn helper_exec_with_env(
+        &self,
+        argv: &[String],
+        workdir: &str,
+        timeout: Option<Duration>,
+        env: &BTreeMap<String, String>,
+    ) -> SandboxResult<ExecResult> {
         let mut request = Map::new();
         request.insert("op".to_string(), Value::String("exec".to_string()));
         request.insert("sandbox_id".to_string(), Value::String(self.sandbox_id()));
@@ -705,6 +717,18 @@ impl ModalSandboxSession {
             Value::Array(argv.iter().map(|a| Value::String(a.clone())).collect()),
         );
         request.insert("workdir".to_string(), Value::String(workdir.to_string()));
+        if !env.is_empty() {
+            // The sandbox was created with the manifest environment, so this carries only what a
+            // command adds on top of it.
+            request.insert(
+                "env".to_string(),
+                Value::Object(
+                    env.iter()
+                        .map(|(key, value)| (key.clone(), Value::String(value.clone())))
+                        .collect(),
+                ),
+            );
+        }
         if let Some(timeout) = timeout {
             // Modal's exec timeout is whole seconds and never shorter than its own floor.
             request.insert(
@@ -892,10 +916,15 @@ impl SandboxSession for ModalSandboxSession {
         // A command without a timeout runs unbounded, as in the Python port: the timeout path
         // below retires the whole sandbox, which must not happen to an ordinary command merely
         // because it outlived a default.
+        let env = request.env.clone();
         let Some(timeout) = request.timeout else {
-            return self.helper_exec(&argv, &workdir, None).await;
+            return self.helper_exec_with_env(&argv, &workdir, None, &env).await;
         };
-        match tokio::time::timeout(timeout, self.helper_exec(&argv, &workdir, Some(timeout))).await
+        match tokio::time::timeout(
+            timeout,
+            self.helper_exec_with_env(&argv, &workdir, Some(timeout), &env),
+        )
+        .await
         {
             Ok(result) => result,
             Err(_) => {
@@ -952,10 +981,27 @@ impl SandboxSession for ModalSandboxSession {
             None => self.manifest.root().to_string(),
             Some(cwd) => self.normalize_path(cwd)?,
         };
+        // The helper process is only a proxy: killing it leaves the command running inside the
+        // Modal sandbox, so the command records its pid and the session kills it there during
+        // teardown, exactly as the Docker backend does.
+        let pid_path = crate::sandbox::workspace_paths::provider_scratch_path(&format!(
+            "modal-pty-{}.pid",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let inner = format!(
+            "echo $$ > {pid}; exec {argv}",
+            pid = crate::sandbox::session::shell_quote(&pid_path),
+            argv = request
+                .resolved_argv()
+                .iter()
+                .map(|part| crate::sandbox::session::shell_quote(part))
+                .collect::<Vec<_>>()
+                .join(" "),
+        );
         let payload = json!({
             "op": "pty",
             "sandbox_id": self.sandbox_id(),
-            "argv": request.resolved_argv(),
+            "argv": ["sh", "-c", inner],
             "tty": request.tty,
             "workdir": workdir,
         });
@@ -974,7 +1020,11 @@ impl SandboxSession for ModalSandboxSession {
             env: Vec::new(),
             clear_env: false,
             tty: request.tty,
-            remote_kill_command: None,
+            remote_kill_command: Some(format!(
+                "if [ -f {pid} ]; then kill -TERM \"$(cat {pid})\" 2>/dev/null || true; \
+                 rm -f {pid}; fi",
+                pid = crate::sandbox::session::shell_quote(&pid_path)
+            )),
         };
         let (update, cleanup) = self
             .ptys
@@ -1011,10 +1061,10 @@ impl SandboxSession for ModalSandboxSession {
         let root = self.manifest.root().to_string();
         // The archive is staged through the helper's own chunked stdin writer: a base64 command
         // argument would exceed the kernel's per-argument limit for any real workspace.
-        let staged = format!(
-            "/tmp/openai-agents-hydrate-{}.tar.gz",
+        let staged = crate::sandbox::workspace_paths::provider_scratch_path(&format!(
+            "modal-hydrate-{}.tar.gz",
             uuid::Uuid::new_v4().simple()
-        );
+        ));
         self.helper
             .call(json!({
                 "op": "write_file",

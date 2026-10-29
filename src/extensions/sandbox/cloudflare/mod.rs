@@ -25,15 +25,16 @@
 //! ```
 
 pub mod mounts;
+pub mod pty;
 pub mod sandbox;
 pub mod sse;
 
 pub use mounts::{
     CloudflareBucketMountConfig, CloudflareBucketMountStrategy, CloudflareBucketProvider,
 };
+pub use pty::{CloudflarePtySessions, PTY_READY_TIMEOUT, pty_url};
 pub use sandbox::{
     API_KEY_ENV, CloudflareConnection, CloudflareSandboxClient, CloudflareSandboxClientOptions,
-    CloudflareSandboxSession, DEFAULT_EXEC_TIMEOUT, DEFAULT_REQUEST_TIMEOUT,
-    connection_for_session, quote_path,
+    CloudflareSandboxSession, DEFAULT_EXEC_TIMEOUT, DEFAULT_REQUEST_TIMEOUT, quote_path,
 };
 pub use sse::{ServerSentEvent, SseDecoder, SseLineDecoder};

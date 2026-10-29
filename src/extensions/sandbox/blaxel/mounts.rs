@@ -19,8 +19,6 @@ use crate::sandbox::errors::{ErrorCode, SandboxError, SandboxResult};
 use crate::sandbox::mounts::{Mount, MountCredentialAuthority, MountStrategy};
 use crate::sandbox::session::{ExecRequest, SandboxSession, shell_quote};
 
-use super::sandbox::connection_for_session;
-
 const INSTALL_RETRIES: usize = 3;
 const MOUNT_TIMEOUT_SECS: u64 = 60;
 const INSTALL_TIMEOUT_SECS: u64 = 180;
@@ -608,12 +606,22 @@ impl BlaxelDriveMountStrategy {
                 ),
             ));
         }
-        connection_for_session(session.id()).ok_or_else(|| {
-            SandboxError::new(
-                ErrorCode::MountFailed,
-                format!("the Blaxel sandbox behind `{mount_path}` is no longer connected"),
-            )
-        })
+        session
+            .as_any()
+            .and_then(|session| {
+                session
+                    .downcast_ref::<super::sandbox::BlaxelSandboxSession>()
+                    .map(|session| session.connection().clone())
+            })
+            .ok_or_else(|| {
+                SandboxError::new(
+                    ErrorCode::MountFailed,
+                    format!(
+                        "the Blaxel sandbox behind `{mount_path}` does not expose its sandbox \
+                         connection"
+                    ),
+                )
+            })
     }
 }
 
