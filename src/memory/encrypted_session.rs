@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 use sha2::Sha256;
 
 use super::fernet::Fernet;
-use super::{Session, SessionSettings};
+use super::{CompactionSnapshot, Session, SessionSettings, SnapshotHandle};
 use crate::error::{AgentsError, Result};
 use crate::items::InputItem;
 
@@ -326,6 +326,56 @@ impl Session for EncryptedSession {
 
     async fn clear_session(&self) -> Result<()> {
         self.underlying.clear_session().await
+    }
+
+    /// Forward the wrapped store's snapshot, decrypting its items.
+    ///
+    /// An authenticated envelope whose TTL has run out is simply skipped: it is already invisible
+    /// as history and its absence says nothing about coverage. An envelope this key cannot
+    /// authenticate at all is different — it is not necessarily expired, so it and everything
+    /// before it are held outside the replaceable window and `complete` is cleared, because
+    /// compaction must never summarize away an item it could not read.
+    async fn compaction_snapshot(&self, limit: usize) -> Result<Option<CompactionSnapshot>> {
+        let Some(raw) = self.underlying.compaction_snapshot(limit).await? else {
+            return Ok(None);
+        };
+        let now = now_seconds();
+        let mut items = Vec::new();
+        let mut handles = Vec::new();
+        let mut complete = raw.complete;
+        for (envelope, handle) in raw.items.iter().zip(raw.handles) {
+            if let Some(item) = self.unwrap_item(envelope) {
+                items.push(item);
+                handles.push(handle);
+                continue;
+            }
+            if self
+                .envelope_timestamp(envelope)
+                .is_some_and(|created_at| created_at.saturating_add(self.ttl) < now)
+            {
+                // Authenticated and expired: already not part of history.
+                continue;
+            }
+            items.clear();
+            handles.clear();
+            complete = false;
+        }
+        Ok(Some(CompactionSnapshot {
+            items,
+            handles,
+            complete,
+        }))
+    }
+
+    /// Re-encrypt the compacted output before it reaches the wrapped store.
+    async fn replace_compaction_suffix(
+        &self,
+        handles: &[SnapshotHandle],
+        items: Vec<InputItem>,
+    ) -> Result<bool> {
+        self.underlying
+            .replace_compaction_suffix(handles, self.encrypt_items(&items)?)
+            .await
     }
 }
 

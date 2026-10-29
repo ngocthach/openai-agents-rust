@@ -20,9 +20,11 @@ mod sqlx_session;
 
 use std::fmt;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 
 use crate::error::Result;
 use crate::items::InputItem;
@@ -76,6 +78,39 @@ impl SessionSettings {
     }
 }
 
+/// Canonical form of an item, used to match stored history against the last model exchange.
+///
+/// Two items with the same digest are the same conversation item for compaction purposes.
+/// Cosmetic differences that storage and the Responses API introduce are normalized away:
+/// SDK-only metadata is dropped, an assistant message's plain-string content is expanded to
+/// the `output_text` content list the API returns, and a `completed` or absent `status` is
+/// removed. The digest is the item's canonical JSON rather than a hash, so it never collides.
+pub fn compaction_item_digest(item: &InputItem) -> String {
+    let mut value = item.as_value().clone();
+    if let Value::Object(map) = &mut value {
+        // Written by the Conversations API, never part of a replayed item.
+        map.remove("created_by");
+        if map.get("role").and_then(Value::as_str) == Some("assistant") {
+            if let Some(Value::String(text)) = map.get("content") {
+                let text = text.clone();
+                map.insert(
+                    "content".into(),
+                    json!([{"type": "output_text", "text": text}]),
+                );
+            }
+            let drop_status = match map.get("status") {
+                None => true,
+                Some(Value::String(status)) => status == "completed",
+                Some(_) => false,
+            };
+            if drop_status {
+                map.remove("status");
+            }
+        }
+    }
+    value.to_string()
+}
+
 /// Information passed to [`Session::on_run_completed`] after the runner persisted a run.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SessionRunCompletion {
@@ -85,6 +120,37 @@ pub struct SessionRunCompletion {
     pub store: Option<bool>,
     /// Whether the last turn produced local tool outputs.
     pub has_local_tool_outputs: bool,
+    /// [`compaction_item_digest`] of every item of the last model exchange, in order:
+    /// everything the model was sent followed by everything it produced.
+    ///
+    /// Sessions that compact history match the stored tail against this, so only history the
+    /// model actually just saw is eligible for replacement. The runner fills this only for
+    /// sessions whose [`Session::wants_model_exchange`] is `true`; left empty, compaction falls
+    /// back to replacing the whole stored history, which is what manual `run_compaction` calls
+    /// and pre-existing callers already did.
+    pub model_exchange: Vec<String>,
+}
+
+/// An opaque, store-specific identifier for one item inside a [`CompactionSnapshot`].
+///
+/// Only the store that produced a handle interprets it. Callers slice and pass handles back
+/// unchanged.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct SnapshotHandle(pub String);
+
+/// A bounded window of the end of a session's stored history, with handles that let the store
+/// replace a suffix of it atomically.
+///
+/// Produced by [`Session::compaction_snapshot`] and consumed by
+/// [`Session::replace_compaction_suffix`].
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CompactionSnapshot {
+    /// The window's items, oldest first.
+    pub items: Vec<InputItem>,
+    /// One handle per entry of `items`, in the same order.
+    pub handles: Vec<SnapshotHandle>,
+    /// True when the window covers the whole stored history rather than just its tail.
+    pub complete: bool,
 }
 
 /// Stores conversation history for a session.
@@ -118,14 +184,55 @@ pub trait Session: Send + Sync + fmt::Debug {
     async fn on_run_completed(&self, _info: &SessionRunCompletion) -> Result<crate::usage::Usage> {
         Ok(crate::usage::Usage::default())
     }
+
+    /// Whether the runner should record the last model exchange in
+    /// [`SessionRunCompletion::model_exchange`].
+    ///
+    /// Digesting the exchange costs one serialization per item of the run's history, so only
+    /// sessions that actually compact ask for it. `OpenAIResponsesCompactionSession` returns
+    /// `true`; every other session leaves this at `false` and pays nothing.
+    fn wants_model_exchange(&self) -> bool {
+        false
+    }
+
+    /// Read up to the last `limit` items together with handles identifying them.
+    ///
+    /// Stores that can replace a bounded suffix of their history atomically override this;
+    /// `OpenAIResponsesCompactionSession` then replaces only the items the last model exchange
+    /// produced and keeps older history. Returning `None`, the default, makes compaction fall
+    /// back to replacing the whole stored history.
+    ///
+    /// `limit` bounds the window, so `complete` reports whether it reached the start of the
+    /// history. Implementations must return exactly one handle per item, in the same order.
+    async fn compaction_snapshot(&self, _limit: usize) -> Result<Option<CompactionSnapshot>> {
+        Ok(None)
+    }
+
+    /// Atomically replace exactly the items named by `handles` with `items`.
+    ///
+    /// `handles` is a suffix of the handles of a [`Session::compaction_snapshot`], in order.
+    /// Returns `false` without changing anything when the stored history no longer ends with
+    /// those exact items, which is how a concurrent write is detected. The default
+    /// implementation performs no replacement and returns `false`.
+    async fn replace_compaction_suffix(
+        &self,
+        _handles: &[SnapshotHandle],
+        _items: Vec<InputItem>,
+    ) -> Result<bool> {
+        Ok(false)
+    }
 }
 
 /// A session stored in process memory.
+///
+/// Items carry a monotonic id so compaction can name and replace a suffix of history
+/// atomically; ids are never reused, so a replaced suffix cannot be confused with a new one.
 #[derive(Debug, Default)]
 pub struct InMemorySession {
     session_id: String,
     settings: Option<SessionSettings>,
-    items: Mutex<Vec<InputItem>>,
+    items: Mutex<Vec<(u64, InputItem)>>,
+    next_id: AtomicU64,
 }
 
 impl InMemorySession {
@@ -135,6 +242,7 @@ impl InMemorySession {
             session_id: session_id.into(),
             settings: None,
             items: Mutex::new(Vec::new()),
+            next_id: AtomicU64::new(1),
         }
     }
 
@@ -157,25 +265,71 @@ impl Session for InMemorySession {
 
     async fn get_items(&self, limit: Option<usize>) -> Result<Vec<InputItem>> {
         let items = self.items.lock().expect("session poisoned");
-        Ok(match limit {
-            None => items.clone(),
-            Some(0) => Vec::new(),
-            Some(n) => items[items.len().saturating_sub(n)..].to_vec(),
-        })
+        let window = match limit {
+            None => &items[..],
+            Some(0) => &[][..],
+            Some(n) => &items[items.len().saturating_sub(n)..],
+        };
+        Ok(window.iter().map(|(_, item)| item.clone()).collect())
     }
 
     async fn add_items(&self, items: Vec<InputItem>) -> Result<()> {
-        self.items.lock().expect("session poisoned").extend(items);
+        let mut stored = self.items.lock().expect("session poisoned");
+        for item in items {
+            stored.push((self.next_id.fetch_add(1, Ordering::Relaxed), item));
+        }
         Ok(())
     }
 
     async fn pop_item(&self) -> Result<Option<InputItem>> {
-        Ok(self.items.lock().expect("session poisoned").pop())
+        Ok(self
+            .items
+            .lock()
+            .expect("session poisoned")
+            .pop()
+            .map(|(_, item)| item))
     }
 
     async fn clear_session(&self) -> Result<()> {
         self.items.lock().expect("session poisoned").clear();
         Ok(())
+    }
+
+    async fn compaction_snapshot(&self, limit: usize) -> Result<Option<CompactionSnapshot>> {
+        let stored = self.items.lock().expect("session poisoned");
+        let start = stored.len().saturating_sub(limit);
+        Ok(Some(CompactionSnapshot {
+            items: stored[start..].iter().map(|(_, i)| i.clone()).collect(),
+            handles: stored[start..]
+                .iter()
+                .map(|(id, _)| SnapshotHandle(id.to_string()))
+                .collect(),
+            complete: start == 0,
+        }))
+    }
+
+    async fn replace_compaction_suffix(
+        &self,
+        handles: &[SnapshotHandle],
+        items: Vec<InputItem>,
+    ) -> Result<bool> {
+        let mut stored = self.items.lock().expect("session poisoned");
+        if stored.len() < handles.len() {
+            return Ok(false);
+        }
+        let start = stored.len() - handles.len();
+        if stored[start..]
+            .iter()
+            .zip(handles)
+            .any(|((id, _), handle)| id.to_string() != handle.0)
+        {
+            return Ok(false);
+        }
+        stored.truncate(start);
+        for item in items {
+            stored.push((self.next_id.fetch_add(1, Ordering::Relaxed), item));
+        }
+        Ok(true)
     }
 }
 

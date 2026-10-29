@@ -48,6 +48,15 @@ pub fn generation_filter(generation: i64) -> Document {
 ///
 /// Indexes (`session_id` unique on the sessions collection, `session_id`/`generation`/`seq` on
 /// the messages collection) are created lazily on first use.
+///
+/// # Compaction
+///
+/// [`Session::compaction_snapshot`] is deliberately left at its default, so compaction replaces
+/// the whole stored history rather than a suffix. A suffix here would span several batch
+/// documents, and MongoDB offers no multi-document atomicity outside a transaction — which
+/// standalone deployments do not support, and which this backend avoids everywhere else for
+/// exactly that reason. The Python SDK makes the same choice: only its SQLite and SQLAlchemy
+/// backends implement the snapshot hook.
 pub struct MongoDBSession {
     session_id: String,
     sessions: Collection<Document>,

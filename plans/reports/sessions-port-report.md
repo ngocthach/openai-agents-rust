@@ -32,14 +32,11 @@ public API.
   links `sqlite3` through `rusqlite` for `SqliteSession`, and linking it again
   through `sqlx-sqlite` is not sound. `SqlxDialect::from_url` rejects `sqlite:`
   URLs with a message pointing at `SqliteSession`.
-- **Compaction: atomic suffix replacement.** Python can replace a bounded,
-  model-visible suffix atomically on stores that support it, matching stored
-  items against the exact model exchange (reasoning-id policies, orphan
-  function-call checks, hosted-MCP approval pairing). This port always replaces
-  the complete stored history (`clear_session` + `add_items`, restoring the
-  previous items if the replacement fails) — the behaviour Python itself uses
-  for stores without suffix replacement and for manual `run_compaction` calls.
-  `max_rollback_items` and the candidate cache are not implemented.
+- **Compaction suffix replacement is now ported** (phase 3). Automatic compaction replaces only
+  the tail of history that the latest model exchange produced and keeps older history, as
+  Python does. `max_rollback_items` and Python's candidate cache remain unimplemented, and the
+  reasoning-id/digest machinery is simplified (see below).
+
 - **`EncryptedSession` is now wire-compatible with Python** (phase 2). `src/memory/fernet.rs`
   implements Fernet itself — version `0x80`, 64-bit big-endian timestamp, 128-bit IV,
   AES-128-CBC with PKCS7, HMAC-SHA256 over version ‖ timestamp ‖ IV ‖ ciphertext, url-safe
@@ -102,8 +99,38 @@ public API.
 
 All items below are re-exported from `openai_agents_sdk::memory`.
 
+**Core additions (phase 3, `src/memory/mod.rs`)**
+- `compaction_item_digest(&InputItem) -> String` — the canonical form used to match stored
+  history against the last model exchange. Normalizes the cosmetic differences storage and the
+  API introduce: drops `created_by`, expands an assistant message's plain-string content to the
+  `output_text` list the API returns, and drops a `completed`/absent `status`. It is canonical
+  JSON rather than a hash, so unlike Python's SHA-256 digest it cannot collide.
+- `SessionRunCompletion::model_exchange: Vec<String>` — digests of everything the model was sent
+  and produced, in order. **Backward compatibility:** the struct keeps `Default`, so existing
+  construction with `..Default::default()` is unaffected; an exhaustive struct literal needs the
+  new field, and an empty `model_exchange` falls back to whole-history replacement. `Eq` is
+  preserved precisely because the field is digests rather than `InputItem`s.
+- `SnapshotHandle(pub String)` — an opaque, store-specific id for one item in a snapshot.
+- `CompactionSnapshot { items, handles, complete }` — a bounded window of the end of history.
+- `Session::compaction_snapshot(limit) -> Result<Option<CompactionSnapshot>>` and
+  `Session::replace_compaction_suffix(handles, items) -> Result<bool>`, both **defaulted**
+  (`None` / `false`), so every existing `Session` implementation keeps compiling and simply
+  falls back to coverage-guarded whole-history replacement.
+- `Session::wants_model_exchange() -> bool`, defaulted to `false`. Digesting the exchange costs
+  one serialization per item of the run's history, so the runner only does it for sessions that
+  compact; `OpenAIResponsesCompactionSession` returns `true` and nothing else pays. This mirrors
+  Python's gating on `is_openai_responses_compaction_aware_session`.
+
 **Compaction (default features)**
-- `OpenAIResponsesCompactionSession` — `new(session_id, Arc<dyn Session>)`,
+- `OpenAIResponsesCompactionSession` — automatic compaction now follows Python's suffix
+  algorithm: it asks the store for a window of `model_exchange.len() + 1` items, matches the
+  stored tail against the exchange, and replaces only that tail. A partial suffix forces `input`
+  mode (a response chain cannot scope its summary to a suffix), starts at a user message so a
+  retained reasoning item keeps the model item that must follow it, is refused when it would
+  split a tool-call or MCP-approval group, and is re-approved by the decision hook when the
+  reloaded window differs from the one the hook first saw. Anything unmatched, unsafe or
+  concurrently changed retains history instead of replacing it.
+  `new(session_id, Arc<dyn Session>)`,
   `with_client`, `with_model` (validated), `with_compaction_mode`,
   `with_should_trigger_compaction`, `underlying_session`,
   `run_compaction(args) -> Result<Usage>`. Implements `Session`, and
@@ -162,9 +189,55 @@ All items below are re-exported from `openai_agents_sdk::memory`.
 - `SqlxDialect` (`Postgres` | `MySql`) with `from_url` and `placeholder`,
   `DEFAULT_SESSIONS_TABLE`, `DEFAULT_MESSAGES_TABLE`.
 
+## Snapshot hook support
+
+| Store | `compaction_snapshot` | Handle | Atomicity of the replacement |
+| --- | --- | --- | --- |
+| `InMemorySession` | yes | monotonic item id | the session mutex |
+| `SqliteSession` | yes | `AUTOINCREMENT` row id | one transaction |
+| `AdvancedSqliteSession` | yes (branch-scoped) | `message_structure` row id | one transaction |
+| `SqlxSession` | yes | row id | one transaction |
+| `RedisSession` | yes | the entry's stored bytes | one `EVAL` Lua script |
+| `DaprSession` | yes | the entry's stored bytes | `first-write` ETag on the one key |
+| `EncryptedSession` | forwards, decrypting | the wrapped store's | the wrapped store's |
+| `MongoDBSession` | no, by design | — | — |
+| `OpenAIConversationsSession` | no (server-managed) | — | — |
+
+Python implements the hook only for SQLite, async SQLite, SQLAlchemy and Encrypted, so SQLite,
+`SqlxSession` and `EncryptedSession` are the same set of backends — behaviourally equivalent for
+the suffix mechanism itself, with the two documented simplifications below (the conservative
+orphan check, and no `prune_prefix` reclamation of expired envelopes). Redis and Dapr go further than Python,
+which has no suffix hook for them, because each can do the check-and-replace atomically in one
+round trip — Redis inside a Lua script, Dapr under a first-write ETag. MongoDB deliberately
+keeps the default: a suffix would span several batch documents, and multi-document atomicity
+needs a transaction that standalone deployments do not support. That is safe because a store
+without the hook is **not** simply handed the whole history — see the coverage guard below. `AdvancedSqliteSession` scopes both halves to the current branch and
+only removes an underlying message when no other branch still references it.
+
+Two invariants hold for every implementation: exactly one handle per item, and a replacement
+that returns `false` without changing anything when the stored tail no longer matches the
+handles. A row or envelope that cannot be decoded (corrupt JSON, an envelope this key cannot
+authenticate) holds itself and everything before it out of the replaceable window and clears
+`complete`, so compaction never summarizes away an item it could not read. An *authenticated but
+expired* envelope is different: it is already invisible as history, so it is skipped without
+shrinking the window, matching Python's `is_expired` branch. Treating it as unreadable would
+force `input` mode on every TTL'd session as soon as anything aged out.
+
+### Coverage guard for stores without the hook
+
+When `compaction_snapshot` returns `None`, the automatic path does **not** replace the whole
+history outright. It first re-reads a bounded window of `model_exchange.len() + 1` items and
+refuses unless that window is complete *and* the exchange covers all of it, exactly as Python
+does under its "backends without atomic suffix replacement still require complete coverage"
+branch. Without this, a store whose retained history is longer than the run loaded — any
+`SessionSettings::limit`, or a store that keeps more than it serves — would have its older items
+summarized away by a response chain that never contained them. This is the data-loss case the
+whole suffix mechanism exists to prevent, so it is guarded on every path, not only the ones with
+a hook.
+
 ## Tests
 
-- 49 unit tests in `src/memory/**` (`cargo test --features … --lib memory`):
+- 52 unit tests in `src/memory/**` (`cargo test --features … --lib memory`):
   candidate selection, model-name validation, orphan-id stripping, compaction
   output normalization, auto-mode resolution, encryption round trip / key
   handling / scan budget, Redis and Dapr key layouts and decoding, Dapr ETag
@@ -173,6 +246,11 @@ All items below are re-exported from `openai_agents_sdk::memory`.
   (missing keys accepted, collisions rejected, first mismatch reported), sqlx per-dialect SQL
   generation, SQLite message classification and tool-name extraction, SQLite
   branching / turns / usage / pop / clear.
+- Compaction matching (phase 3): the suffix matcher over a full match, a partial tail, an
+  exchange padded with items storage does not hold, a disjoint exchange, an empty exchange and a
+  reordered tail; digest normalization of assistant content, terminal vs. non-terminal `status`
+  and `created_by`; and tool-group completeness for function calls and hosted MCP approvals in
+  both directions (orphan call, orphan output).
 - Fernet conformance (`src/memory/fernet.rs`): the official spec vector from
   <https://github.com/fernet/spec> (`verify.json`) is decrypted **and** reproduced byte for
   byte (the vector fixes the IV, so the whole token must match); all eight cases from the
@@ -189,7 +267,7 @@ All items below are re-exported from `openai_agents_sdk::memory`.
   spelled four ways — standard alphabet with `+` and `/`, url-safe, url-safe with a trailing
   newline, and unpadded — where the first three must agree and the unpadded one must take the
   raw-bytes fallback, exactly as Python does.
-- 12 integration tests in `tests/sessions_tests.rs` (6 of them under default
+- 22 integration tests in `tests/sessions_tests.rs` (12 of them under default
   features):
   - encryption round trip asserting the stored envelope shape and that no
     plaintext appears in the underlying store;
@@ -216,11 +294,41 @@ All items below are re-exported from `openai_agents_sdk::memory`.
   - an end-to-end `Runner` run with `testing::FakeModel`, proving
     `on_run_completed` fires with the model's `resp_fake_1` id and that the
     compaction usage lands in `RunResult::usage`;
+  - compaction replacing **only** the suffix the model exchange covers: the earlier turn is
+    retained verbatim, the request switches to `input` mode carrying exactly the replaceable
+    items, and the summary replaces just the tail;
+  - compaction retaining history it cannot match (a disjoint exchange) and history it cannot
+    safely split (a suffix with no user message to start from) — no request is sent in either
+    case;
+  - compaction refusing a suffix that would split a tool call away from its pending output;
+  - an end-to-end `Runner` run against a session with `SessionSettings::with_limit(2)`, the case
+    where the suffix path actually earns its keep: the run only loads the last two items, the
+    compaction request provably excludes the older ones, and they survive in storage while the
+    rest becomes the summary;
+  - a store with no snapshot hook refusing compaction when the exchange covers only part of its
+    history, and still compacting when it covers all of it (the data-loss guard above);
+  - an authenticated-but-expired envelope being skipped without shrinking the window, while an
+    unauthenticated one still clears it — asserted offline with the 2023 Python vector, so no
+    sleep is needed;
+  - `SqliteSession` snapshot/replace: a bounded window reports `complete: false`, a replacement
+    keeps the retained prefix, and both a replayed handle set and an append after the snapshot
+    are refused without changing anything;
+  - `AdvancedSqliteSession` suffix replacement scoped to one branch, leaving `main` and the
+    shared first turn intact;
+  - `EncryptedSession` forwarding snapshots as plaintext and re-encrypting the replacement, and
+    an unreadable envelope holding everything before it out of the window;
+  - `DaprSession` snapshot/replace under an ETag, including refusal of stale handles;
   - `DaprSession` against a stateful mock sidecar: key names, the stored value
     shape, `created_at` preservation in metadata, `consistency=strong` on every
     read, `metadata.ttlInSeconds` and `options.consistency` on every write,
     `options.concurrency = first-write` on every conditional write, and a
     seeded 409 that the session retries successfully.
+- Redis suffix replacement **was** exercised against a real server: a throwaway
+  `redis:7-alpine` container on a spare port, with `REDIS_URL` set, ran the env-gated test
+  covering the Lua script, the retained prefix, the bounded window's `complete: false`, refusal
+  of a stale tail, and that a full replacement keeps the TTL on all three keys. The TTL
+  assertion was confirmed to have teeth by disabling the script's `PEXPIRE` and watching it fail
+  with `PTTL = -1`. The container was removed afterwards; the test stays skipped by default.
 - The reverse direction was verified empirically rather than in the suite, because the test
   binary cannot call Python: a Rust-written envelope was decrypted by `cryptography` 48 through
   the Python derivation path, yielding `{'content': 'hello from rust', 'role': 'user'}` and the
@@ -239,9 +347,9 @@ export CARGO_TARGET_DIR=/Users/ngocthach/.cache/oars-build/sessions
 
 cargo clippy --all-targets -- -D warnings                                               # clean
 cargo clippy --features sqlite,encrypt,redis,mongodb,sqlx --all-targets -- -D warnings  # clean
-cargo test   --features sqlite,encrypt,redis,mongodb,sqlx --lib memory          # 49 passed
-cargo test   --features sqlite,encrypt,redis,mongodb,sqlx --test sessions_tests # 12 passed
-cargo test   --test sessions_tests                                             # 6 passed (default)
+cargo test   --features sqlite,encrypt,redis,mongodb,sqlx --lib memory          # 52 passed
+cargo test   --features sqlite,encrypt,redis,mongodb,sqlx --test sessions_tests # 22 passed
+cargo test   --test sessions_tests                                             # 12 passed (default)
 cargo test   --features sqlite,encrypt,redis,mongodb,sqlx                       # whole suite passed
 cargo doc    --features sqlite,encrypt,redis,mongodb,sqlx --no-deps             # no warnings in my files
 ```
@@ -252,31 +360,62 @@ not in a file I own.
 
 `rustfmt --edition 2024` applied to every file touched.
 
-## Requested core changes (outside my scope)
+## Core changes made (phase 3, authorized)
 
-1. **Compaction suffix replacement needs two frozen contracts to change.** Python replaces a
-   bounded, model-visible *suffix* atomically, which needs both halves of a mechanism this
-   port cannot build from `src/memory/**`:
-   - the runner must pass the latest model exchange (item digests plus the reasoning-id
-     policy) into the session, which means new fields on `SessionRunCompletion`;
-   - the session must ask the concrete store for an atomic snapshot/replace handle, which means
-     either a new `Session` trait method or an `Any` supertrait so `Arc<dyn Session>` can be
-     downcast.
+1. **`src/memory/mod.rs`** — added `compaction_item_digest`, `SnapshotHandle`,
+   `CompactionSnapshot`, the `model_exchange` field on `SessionRunCompletion`, and the two
+   defaulted `Session` methods. All additive: `Session` implementations outside this crate keep
+   compiling, and `SessionRunCompletion` keeps `Default`, `Clone`, `Debug`, `PartialEq` and `Eq`.
+   The one source-breaking edge is an exhaustive struct literal of `SessionRunCompletion`, which
+   now needs the new field or `..Default::default()`; the in-tree call sites were updated to the
+   latter.
+2. **`src/run_internal/mod.rs`** — 26 added lines inside `notify_session_completed` only, which
+   build `model_exchange` from `model_prefix` plus `items_to_input(&model_items)`. For a
+   non-server-managed run the model input is cumulative, so that set is exactly "the last input
+   plus the last response", matching Python's `prepare_compaction_model_input` /
+   `record_compaction_model_response` pair without threading new state through the runner. Both
+   spellings of a reasoning item are recorded (raw and with the id stripped per
+   `ReasoningItemIdPolicy`), which is how Python's two-digest comparison is reproduced.
+   The work is gated on `session.wants_model_exchange()`, so a non-compacting session is
+   unaffected. No other function and no call site needed changing.
 
-   Until then, whole-history replacement plus the post-request staleness check described above
-   is the faithful subset. The staleness check is what makes this safe rather than lossy.
+### Remaining simplifications
 
-2. **`chacha20poly1305` is now an unused dependency of the `encrypt` feature.** Phase 2 replaced
-   the XChaCha20 envelope with Fernet, and nothing in `src/` references the crate any more
-   (`grep -rn chacha src/` → no matches). It can be dropped from both the feature list and the
-   `[dependencies]` block. An unused optional dependency produces no warning, so this is
-   cleanliness, not a failure. `rand` is still needed — it supplies the 128-bit Fernet IV.
+- `max_rollback_items` and Python's incremental candidate cache are still not implemented; the
+  cache is a performance optimization and the budget is an opt-in guard neither of which changes
+  observable behaviour by default.
+- Python digests items with SHA-256 to bound memory; this port compares canonical JSON, which is
+  exact rather than probabilistic but holds the whole exchange in memory for the duration of the
+  call.
+- Python's encrypted snapshot passes a `prune_prefix` predicate down so a contiguous prefix of
+  authenticated expired envelopes is physically reclaimed during a successful replacement. This
+  port skips expired envelopes when reading but does not reclaim their rows; they are removed by
+  `clear_session` or by a whole-history replacement, exactly as before phase 3.
+- Python's `drop_orphan_function_calls` also prunes reasoning items that precede a dropped call
+  and reasons about program-owned items. The port checks the invariant that actually gates
+  compaction — that call/output and MCP approval request/response sets match within the suffix —
+  and refuses the suffix rather than pruning it, which is strictly more conservative.
+- `chacha20poly1305` is still an unused dependency of the `encrypt` feature (phase 2 removed the
+  XChaCha envelope); `grep -rn chacha src/` returns nothing. It can be dropped from `Cargo.toml`.
+  `rand` is still needed for the Fernet IV.
 
-3. **No changes needed** to `src/run_internal/**` for the automatic-compaction trigger itself:
-   the existing `Session::on_run_completed` hook and `SessionRunCompletion`
-   (`response_id`, `store`, `has_local_tool_outputs`) carry exactly what the trigger needs, and
-   the returned `Usage` is already folded into the run. Item 1 is about the *replacement*
-   strategy, not the trigger.
+## Phase 3 summary
+
+- Added the snapshot/replace hook to `Session` (defaulted) plus `CompactionSnapshot`,
+  `SnapshotHandle`, `compaction_item_digest` and `SessionRunCompletion::model_exchange`.
+- Implemented the hook for in-memory, SQLite, advanced SQLite (branch-scoped), sqlx, Redis
+  (atomic Lua), Dapr (ETag) and Encrypted (forwarding); MongoDB keeps the default by design.
+- Ported Python's automatic suffix algorithm: exchange matching, the partial-suffix mode switch
+  to `input`, the user-message boundary, tool-group and MCP-approval integrity, and re-approval
+  of a reloaded window.
+- Added the coverage guard so a store *without* the hook still refuses to replace history the
+  exchange does not fully cover — the data-loss case the mechanism exists to prevent.
+- Fixed the Redis script to re-apply the TTL after a full replacement (trimming a list to empty
+  deletes the key, which would otherwise come back without an expiry), verified against a real
+  Redis 7.
+- Fixed encrypted snapshots to distinguish an expired envelope from an unauthenticated one.
+- 26-line runner edit confined to `notify_session_completed`, gated on
+  `Session::wants_model_exchange()` so non-compacting sessions pay nothing.
 
 ## Phase 2 summary
 

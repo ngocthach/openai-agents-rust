@@ -998,6 +998,31 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
             [self.turn_start.min(self.generated_items.len())..]
             .iter()
             .any(|i| matches!(i.kind, RunItemKind::ToolCallOutput { .. }));
+        // Everything the model was sent plus everything it produced this run. A compacting
+        // session matches the stored tail against these digests, so it only ever replaces
+        // history the model actually saw. Both spellings of a reasoning item are recorded,
+        // because the stored copy may keep an id the replayed input omitted. Only sessions that
+        // compact ask for this, so an ordinary session pays nothing for it.
+        let mut model_exchange = Vec::new();
+        if session.wants_model_exchange() {
+            let policy = self.config.reasoning_item_id_policy;
+            for item in self
+                .model_prefix
+                .iter()
+                .cloned()
+                .chain(items_to_input(&self.model_items))
+            {
+                let stripped = crate::memory::compaction_item_digest(&strip_reasoning_id(
+                    item.clone(),
+                    policy,
+                ));
+                let digest = crate::memory::compaction_item_digest(&item);
+                if stripped != digest {
+                    model_exchange.push(stripped);
+                }
+                model_exchange.push(digest);
+            }
+        }
         let info = crate::memory::SessionRunCompletion {
             response_id: self
                 .model_responses
@@ -1005,6 +1030,7 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
                 .and_then(|r| r.response_id.clone()),
             store: self.current_agent.model_settings.store,
             has_local_tool_outputs,
+            model_exchange,
         };
         let usage = session.on_run_completed(&info).await?;
         if usage.requests > 0 || usage.total_tokens > 0 {

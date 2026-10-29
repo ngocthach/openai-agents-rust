@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use redis::aio::MultiplexedConnection;
 use tokio::sync::Mutex;
 
-use super::{Session, SessionSettings};
+use super::{CompactionSnapshot, Session, SessionSettings, SnapshotHandle};
 use crate::error::{AgentsError, Result};
 use crate::items::InputItem;
 
@@ -22,6 +22,50 @@ pub fn redis_session_keys(key_prefix: &str, session_id: &str) -> (String, String
     let counter_key = format!("{session_key}:counter");
     (session_key, messages_key, counter_key)
 }
+
+/// Replace a suffix of the message list atomically, refreshing the session's TTL.
+///
+/// `KEYS` are the messages, metadata and counter keys. `ARGV[1]` is the TTL in milliseconds (0
+/// for none), `ARGV[2]` the `updated_at` stamp, `ARGV[3]` the number of handles, then the
+/// handles in order, the number of replacement entries, and the entries themselves.
+///
+/// The script verifies that the list still ends with exactly those handles before trimming them
+/// off and appending the replacement, so a concurrent append makes it return 0 and change
+/// nothing. Running the whole check-and-replace inside Redis is what makes it atomic without
+/// `WATCH`. The expiry is re-applied afterwards because trimming the list to empty deletes the
+/// key, which would otherwise resurrect it without a TTL.
+const REPLACE_SUFFIX_SCRIPT: &str = r#"
+local ttl_ms = tonumber(ARGV[1])
+local now = ARGV[2]
+local handle_count = tonumber(ARGV[3])
+local total = redis.call('LLEN', KEYS[1])
+if total < handle_count then return 0 end
+local start = total - handle_count
+if handle_count > 0 then
+  local tail = redis.call('LRANGE', KEYS[1], start, -1)
+  for i = 1, handle_count do
+    if tail[i] ~= ARGV[3 + i] then return 0 end
+  end
+end
+if start == 0 then
+  redis.call('DEL', KEYS[1])
+else
+  redis.call('LTRIM', KEYS[1], 0, start - 1)
+end
+local item_count = tonumber(ARGV[4 + handle_count])
+for i = 1, item_count do
+  redis.call('RPUSH', KEYS[1], ARGV[4 + handle_count + i])
+end
+redis.call('HSET', KEYS[2], 'updated_at', now)
+if ttl_ms > 0 then
+  for i = 1, 3 do
+    if redis.call('EXISTS', KEYS[i]) == 1 then
+      redis.call('PEXPIRE', KEYS[i], ttl_ms)
+    end
+  end
+end
+return 1
+"#;
 
 /// Serialize an item the way the Python backend does (compact JSON).
 fn serialize_item(item: &InputItem) -> Result<String> {
@@ -310,6 +354,89 @@ impl Session for RedisSession {
     ///
     /// A colliding session id can share a legacy key with something else; in that case nothing
     /// is deleted, matching Python.
+    /// Snapshot the tail of the list; handles are the serialized entries themselves.
+    ///
+    /// A Redis list has no per-item ids, so each entry's exact stored form identifies it. The
+    /// replacement re-checks those entries inside Redis, which detects any concurrent write.
+    async fn compaction_snapshot(&self, limit: usize) -> Result<Option<CompactionSnapshot>> {
+        let mut conn = self.connection.lock().await;
+        // One entry beyond the window tells us whether it reached the start of the history.
+        let window = i64::try_from(limit)
+            .unwrap_or(i64::MAX)
+            .saturating_add(1)
+            .saturating_neg();
+        let raw: Vec<String> = redis::cmd("LRANGE")
+            .arg(&self.messages_key)
+            .arg(window)
+            .arg(-1)
+            .query_async(&mut *conn)
+            .await
+            .map_err(redis_err)?;
+        let complete = raw.len() <= limit;
+        let window = &raw[raw.len() - raw.len().min(limit)..];
+
+        let mut items = Vec::new();
+        let mut handles = Vec::new();
+        let mut intact = complete;
+        for entry in window {
+            match serde_json::from_str(entry) {
+                Ok(value) => {
+                    items.push(InputItem(value));
+                    handles.push(SnapshotHandle(entry.clone()));
+                }
+                Err(_) => {
+                    // A corrupted entry cannot be sent to the compaction API, so it and
+                    // everything before it stay outside the replaceable window.
+                    items.clear();
+                    handles.clear();
+                    intact = false;
+                }
+            }
+        }
+        Ok(Some(CompactionSnapshot {
+            items,
+            handles,
+            complete: intact,
+        }))
+    }
+
+    async fn replace_compaction_suffix(
+        &self,
+        handles: &[SnapshotHandle],
+        items: Vec<InputItem>,
+    ) -> Result<bool> {
+        let replacement = items
+            .iter()
+            .map(serialize_item)
+            .collect::<Result<Vec<_>>>()?;
+        let ttl_ms = match self.ttl {
+            Some(ttl) => i64::try_from(ttl.saturating_mul(1000))
+                .map_err(|_| AgentsError::user("ttl is outside Redis's supported range"))?,
+            None => 0,
+        };
+        let mut conn = self.connection.lock().await;
+        let now = self.check_keys_and_server_time(&mut conn).await?;
+
+        let mut cmd = redis::cmd("EVAL");
+        cmd.arg(REPLACE_SUFFIX_SCRIPT)
+            .arg(3)
+            .arg(&self.messages_key)
+            .arg(&self.session_key)
+            .arg(&self.counter_key)
+            .arg(ttl_ms)
+            .arg(now.to_string())
+            .arg(handles.len());
+        for handle in handles {
+            cmd.arg(&handle.0);
+        }
+        cmd.arg(replacement.len());
+        for entry in &replacement {
+            cmd.arg(entry);
+        }
+        let replaced: i64 = cmd.query_async(&mut *conn).await.map_err(redis_err)?;
+        Ok(replaced == 1)
+    }
+
     async fn clear_session(&self) -> Result<()> {
         let mut conn = self.connection.lock().await;
         self.check_keys_and_server_time(&mut conn).await?;
@@ -455,5 +582,62 @@ mod tests {
 
         s.clear_session().await.unwrap();
         assert!(s.get_items(None).await.unwrap().is_empty());
+
+        // Atomic suffix replacement: the Lua script keeps the retained prefix and refuses a
+        // stale tail.
+        s.add_items(vec![
+            InputItem::user("a"),
+            InputItem::assistant("b"),
+            InputItem::user("c"),
+        ])
+        .await
+        .unwrap();
+        let snapshot = s.compaction_snapshot(10).await.unwrap().unwrap();
+        assert!(snapshot.complete);
+        assert_eq!(snapshot.items.len(), 3);
+        let bounded = s.compaction_snapshot(2).await.unwrap().unwrap();
+        assert!(!bounded.complete);
+        assert_eq!(bounded.items.len(), 2);
+
+        assert!(
+            s.replace_compaction_suffix(
+                &snapshot.handles[1..],
+                vec![InputItem::assistant("recap")]
+            )
+            .await
+            .unwrap()
+        );
+        let items = s.get_items(None).await.unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[1].text_content().as_deref(), Some("recap"));
+        assert!(
+            !s.replace_compaction_suffix(&snapshot.handles[1..], vec![InputItem::user("x")])
+                .await
+                .unwrap()
+        );
+        assert_eq!(s.get_items(None).await.unwrap().len(), 2);
+
+        // Replacing the whole list recreates the key, so the TTL has to be re-applied: the
+        // messages key must not outlive the metadata and counter keys.
+        let snapshot = s.compaction_snapshot(10).await.unwrap().unwrap();
+        assert!(
+            s.replace_compaction_suffix(&snapshot.handles, vec![InputItem::assistant("all new")])
+                .await
+                .unwrap()
+        );
+        {
+            let mut conn = s.connection.lock().await;
+            for key in [s.messages_key(), s.session_key()] {
+                let ttl: i64 = redis::cmd("PTTL")
+                    .arg(key)
+                    .query_async(&mut *conn)
+                    .await
+                    .unwrap();
+                assert!(ttl > 0, "{key} lost its expiry: PTTL = {ttl}");
+            }
+        }
+        assert_eq!(s.get_items(None).await.unwrap().len(), 1);
+
+        s.clear_session().await.unwrap();
     }
 }

@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
 
-use super::{Session, SessionSettings};
+use super::{CompactionSnapshot, Session, SessionSettings, SnapshotHandle};
 use crate::error::{AgentsError, Result};
 use crate::items::InputItem;
 
@@ -477,6 +477,73 @@ impl Session for DaprSession {
         let _guard = self.lock.lock().await;
         self.delete_state(&self.messages_key).await?;
         self.delete_state(&self.metadata_key).await
+    }
+
+    /// Snapshot the tail of the stored array; handles are the serialized items themselves.
+    ///
+    /// Dapr stores the whole history under one key, so there are no per-item ids. Using each
+    /// item's exact serialized form as its handle lets the replacement verify that the tail is
+    /// unchanged, and the ETag makes the read-modify-write itself atomic.
+    async fn compaction_snapshot(&self, limit: usize) -> Result<Option<CompactionSnapshot>> {
+        let _guard = self.lock.lock().await;
+        let (raw, _) = self.read_messages().await?;
+        let start = raw.len().saturating_sub(limit);
+        let window = &raw[start..];
+        let mut items = Vec::new();
+        let mut handles = Vec::new();
+        let mut complete = start == 0;
+        for entry in window {
+            match serde_json::from_str(entry) {
+                Ok(value) => {
+                    items.push(InputItem(value));
+                    handles.push(SnapshotHandle(entry.clone()));
+                }
+                Err(_) => {
+                    // A corrupted entry cannot be sent to the compaction API, so it and
+                    // everything before it stay outside the replaceable window.
+                    items.clear();
+                    handles.clear();
+                    complete = false;
+                }
+            }
+        }
+        Ok(Some(CompactionSnapshot {
+            items,
+            handles,
+            complete,
+        }))
+    }
+
+    async fn replace_compaction_suffix(
+        &self,
+        handles: &[SnapshotHandle],
+        items: Vec<InputItem>,
+    ) -> Result<bool> {
+        let replacement: Vec<String> = items
+            .iter()
+            .map(|i| serde_json::to_string(i.as_value()))
+            .collect::<std::result::Result<_, _>>()?;
+        let _guard = self.lock.lock().await;
+        self.with_retries(|| async {
+            let (raw, etag) = self.read_messages().await?;
+            if raw.len() < handles.len() {
+                return Ok(false);
+            }
+            let start = raw.len() - handles.len();
+            if raw[start..]
+                .iter()
+                .zip(handles)
+                .any(|(entry, handle)| *entry != handle.0)
+            {
+                return Ok(false);
+            }
+            let mut next: Vec<String> = raw[..start].to_vec();
+            next.extend(replacement.iter().cloned());
+            self.save_state(&self.messages_key, json!(next), etag.as_deref())
+                .await?;
+            Ok(true)
+        })
+        .await
     }
 }
 

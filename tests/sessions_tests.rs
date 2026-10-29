@@ -764,6 +764,7 @@ async fn compaction_skips_without_a_response_id_and_defers_for_local_tool_output
             response_id: None,
             store: None,
             has_local_tool_outputs: false,
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -776,6 +777,7 @@ async fn compaction_skips_without_a_response_id_and_defers_for_local_tool_output
             response_id: Some("resp_1".into()),
             store: Some(true),
             has_local_tool_outputs: true,
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -791,6 +793,7 @@ async fn compaction_skips_without_a_response_id_and_defers_for_local_tool_output
             response_id: Some("resp_2".into()),
             store: Some(true),
             has_local_tool_outputs: false,
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -853,4 +856,535 @@ async fn encrypted_session_reads_history_written_by_the_python_sdk() {
         assert!(session.envelope_timestamp(envelope).is_some());
     }
     assert_eq!(session.get_items(None).await.unwrap().len(), 2);
+}
+
+/// Digests of `items`, as the runner records them for the last model exchange.
+fn exchange_digests(items: &[InputItem]) -> Vec<String> {
+    items
+        .iter()
+        .map(openai_agents_sdk::memory::compaction_item_digest)
+        .collect()
+}
+
+#[tokio::test]
+async fn compaction_replaces_only_the_suffix_the_model_exchange_covers() {
+    let (base, captured) = mock_openai(vec![compaction_reply("Recap of the last turn")]).await;
+    let inner = Arc::new(InMemorySession::new("s1"));
+
+    // Two turns: only the second was part of the latest model exchange.
+    let retained = vec![
+        InputItem::user("turn one question"),
+        InputItem::assistant("turn one answer"),
+    ];
+    let replaceable = vec![
+        InputItem::user("turn two question"),
+        InputItem::assistant("turn two answer"),
+    ];
+    let mut history = retained.clone();
+    history.extend(replaceable.clone());
+    inner.add_items(history).await.unwrap();
+
+    let session = OpenAIResponsesCompactionSession::new("s1", inner.clone())
+        .with_client(OpenAIClient::new("sk-test").with_base_url(base))
+        .with_should_trigger_compaction(|_| true);
+
+    let usage = session
+        .on_run_completed(&SessionRunCompletion {
+            response_id: Some("resp_1".into()),
+            store: Some(true),
+            has_local_tool_outputs: false,
+            model_exchange: exchange_digests(&replaceable),
+        })
+        .await
+        .unwrap();
+    assert_eq!(usage.requests, 1);
+
+    // A partial suffix cannot be summarized through a response chain, so the request carries
+    // exactly the replaceable items as explicit input.
+    let body = captured.lock().unwrap()[0].body.clone();
+    assert!(body.get("previous_response_id").is_none(), "{body}");
+    let input = body["input"].as_array().unwrap();
+    assert_eq!(input.len(), 2);
+    assert_eq!(input[0]["content"], "turn two question");
+
+    // The earlier turn survives; only the matched suffix became the summary.
+    let items = inner.get_items(None).await.unwrap();
+    assert_eq!(items.len(), 3);
+    assert_eq!(
+        items[0].text_content().as_deref(),
+        Some("turn one question")
+    );
+    assert_eq!(items[1].text_content().as_deref(), Some("turn one answer"));
+    assert_eq!(
+        items[2].text_content().as_deref(),
+        Some("Recap of the last turn")
+    );
+}
+
+#[tokio::test]
+async fn compaction_retains_history_it_cannot_match_or_safely_split() {
+    let inner = Arc::new(InMemorySession::new("s1"));
+    inner
+        .add_items(vec![
+            InputItem::user("question"),
+            InputItem::assistant("answer"),
+        ])
+        .await
+        .unwrap();
+    let original = inner.get_items(None).await.unwrap();
+
+    // Nothing in the stored tail belongs to the exchange: no request, no change.
+    let (base, captured) = mock_openai(vec![]).await;
+    let session = OpenAIResponsesCompactionSession::new("s1", inner.clone())
+        .with_client(OpenAIClient::new("sk-test").with_base_url(base))
+        .with_should_trigger_compaction(|_| true);
+    let usage = session
+        .on_run_completed(&SessionRunCompletion {
+            response_id: Some("resp_1".into()),
+            store: Some(true),
+            has_local_tool_outputs: false,
+            model_exchange: exchange_digests(&[InputItem::user("something else")]),
+        })
+        .await
+        .unwrap();
+    assert_eq!(usage, Usage::default());
+    assert!(captured.lock().unwrap().is_empty());
+    assert_eq!(inner.get_items(None).await.unwrap(), original);
+
+    // A suffix that starts after the only user message has nothing safe to start from.
+    let usage = session
+        .on_run_completed(&SessionRunCompletion {
+            response_id: Some("resp_2".into()),
+            store: Some(true),
+            has_local_tool_outputs: false,
+            model_exchange: exchange_digests(&original[1..]),
+        })
+        .await
+        .unwrap();
+    assert_eq!(usage, Usage::default());
+    assert!(captured.lock().unwrap().is_empty());
+    assert_eq!(inner.get_items(None).await.unwrap(), original);
+}
+
+#[tokio::test]
+async fn compaction_refuses_to_split_a_pending_tool_call() {
+    let (base, captured) = mock_openai(vec![]).await;
+    let inner = Arc::new(InMemorySession::new("s1"));
+    // The call's output has not been stored yet, so the group is incomplete.
+    let history = vec![
+        InputItem::user("old"),
+        InputItem::assistant("old answer"),
+        InputItem::user("use the tool"),
+        InputItem(json!({"type": "function_call", "call_id": "c1", "name": "f"})),
+    ];
+    inner.add_items(history.clone()).await.unwrap();
+
+    let session = OpenAIResponsesCompactionSession::new("s1", inner.clone())
+        .with_client(OpenAIClient::new("sk-test").with_base_url(base))
+        .with_should_trigger_compaction(|_| true);
+
+    let usage = session
+        .on_run_completed(&SessionRunCompletion {
+            response_id: Some("resp_1".into()),
+            store: Some(true),
+            has_local_tool_outputs: false,
+            model_exchange: exchange_digests(&history[2..]),
+        })
+        .await
+        .unwrap();
+    assert_eq!(usage, Usage::default());
+    assert!(captured.lock().unwrap().is_empty());
+    assert_eq!(inner.get_items(None).await.unwrap().len(), 4);
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn sqlite_sessions_replace_a_compaction_suffix_atomically() {
+    use openai_agents_sdk::memory::{CompactionSnapshot, SqliteSession};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("compaction.db");
+    let session = SqliteSession::open("u1", &path).unwrap();
+    session
+        .add_items(vec![
+            InputItem::user("a"),
+            InputItem::assistant("b"),
+            InputItem::user("c"),
+            InputItem::assistant("d"),
+        ])
+        .await
+        .unwrap();
+
+    // A bounded window reports that it did not reach the start of the history.
+    let window = session.compaction_snapshot(2).await.unwrap().unwrap();
+    assert_eq!(window.items.len(), 2);
+    assert_eq!(window.handles.len(), 2);
+    assert!(!window.complete);
+    assert_eq!(window.items[0].text_content().as_deref(), Some("c"));
+
+    let full: CompactionSnapshot = session.compaction_snapshot(10).await.unwrap().unwrap();
+    assert!(full.complete);
+    assert_eq!(full.items.len(), 4);
+
+    // Replacing the last two leaves the first two untouched.
+    assert!(
+        session
+            .replace_compaction_suffix(&full.handles[2..], vec![InputItem::assistant("summary")])
+            .await
+            .unwrap()
+    );
+    let items = session.get_items(None).await.unwrap();
+    assert_eq!(items.len(), 3);
+    assert_eq!(items[2].text_content().as_deref(), Some("summary"));
+
+    // The stale handles no longer name the stored tail, so a replay changes nothing.
+    assert!(
+        !session
+            .replace_compaction_suffix(&full.handles[2..], vec![InputItem::assistant("again")])
+            .await
+            .unwrap()
+    );
+    assert_eq!(session.get_items(None).await.unwrap().len(), 3);
+
+    // An append after the snapshot is likewise detected rather than overwritten.
+    let snapshot = session.compaction_snapshot(10).await.unwrap().unwrap();
+    session
+        .add_items(vec![InputItem::user("later")])
+        .await
+        .unwrap();
+    assert!(
+        !session
+            .replace_compaction_suffix(&snapshot.handles[..], vec![InputItem::assistant("x")])
+            .await
+            .unwrap()
+    );
+    assert_eq!(session.get_items(None).await.unwrap().len(), 4);
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn advanced_sqlite_suffix_replacement_is_scoped_to_the_branch() {
+    let session = AdvancedSqliteSession::in_memory("u1").unwrap();
+    session
+        .add_items(vec![InputItem::user("q1"), InputItem::assistant("a1")])
+        .await
+        .unwrap();
+    session
+        .add_items(vec![InputItem::user("q2"), InputItem::assistant("a2")])
+        .await
+        .unwrap();
+    let branch = session
+        .create_branch_from_turn(2, Some("fork"))
+        .await
+        .unwrap();
+    session
+        .add_items(vec![
+            InputItem::user("q2 alt"),
+            InputItem::assistant("a2 alt"),
+        ])
+        .await
+        .unwrap();
+
+    // Replace the fork's last turn.
+    let snapshot = session.compaction_snapshot(10).await.unwrap().unwrap();
+    assert_eq!(snapshot.items.len(), 4);
+    assert!(
+        session
+            .replace_compaction_suffix(&snapshot.handles[2..], vec![InputItem::assistant("recap")])
+            .await
+            .unwrap()
+    );
+    let forked = session.get_items(None).await.unwrap();
+    assert_eq!(forked.len(), 3);
+    assert_eq!(forked[2].text_content().as_deref(), Some("recap"));
+
+    // `main` still has its own four items, including the shared first turn.
+    session.switch_to_branch("main").await.unwrap();
+    let main = session.get_items(None).await.unwrap();
+    assert_eq!(main.len(), 4);
+    assert_eq!(main[0].text_content().as_deref(), Some("q1"));
+    assert_eq!(main[3].text_content().as_deref(), Some("a2"));
+    assert_eq!(session.list_branches().await.unwrap().len(), 2);
+    assert_eq!(branch, "fork");
+}
+
+#[cfg(feature = "encrypt")]
+#[tokio::test]
+async fn encrypted_sessions_forward_compaction_snapshots_in_plaintext() {
+    let store = Arc::new(InMemorySession::new("s1"));
+    let session = EncryptedSession::new("s1", store.clone(), TEST_KEY, 600).unwrap();
+    session
+        .add_items(vec![
+            InputItem::user("secret one"),
+            InputItem::assistant("secret two"),
+        ])
+        .await
+        .unwrap();
+
+    let snapshot = session.compaction_snapshot(10).await.unwrap().unwrap();
+    assert!(snapshot.complete);
+    assert_eq!(snapshot.items.len(), 2);
+    assert_eq!(
+        snapshot.items[0].text_content().as_deref(),
+        Some("secret one")
+    );
+
+    // The replacement goes back through the encryption layer.
+    assert!(
+        session
+            .replace_compaction_suffix(&snapshot.handles[1..], vec![InputItem::assistant("recap")])
+            .await
+            .unwrap()
+    );
+    let raw = store.get_items(None).await.unwrap();
+    assert_eq!(raw.len(), 2);
+    assert!(raw.iter().all(|i| i.as_value()["__enc__"] == 1));
+    let items = session.get_items(None).await.unwrap();
+    assert_eq!(items[1].text_content().as_deref(), Some("recap"));
+
+    // An envelope this key cannot read holds everything before it out of the window.
+    store
+        .add_items(vec![InputItem(json!({
+            "__enc__": 1, "v": 1, "kid": "hkdf-v1", "payload": "gAAAAABlU_EAbm90LWEtdG9rZW4=",
+        }))])
+        .await
+        .unwrap();
+    session
+        .add_items(vec![InputItem::user("after the bad one")])
+        .await
+        .unwrap();
+    let snapshot = session.compaction_snapshot(10).await.unwrap().unwrap();
+    assert!(!snapshot.complete);
+    assert_eq!(snapshot.items.len(), 1);
+    assert_eq!(
+        snapshot.items[0].text_content().as_deref(),
+        Some("after the bad one")
+    );
+}
+
+#[tokio::test]
+async fn dapr_sessions_replace_a_compaction_suffix_under_an_etag() {
+    let (base, _state) = mock_dapr(0).await;
+    let session = DaprSession::new("user-123", "statestore", &base);
+    session
+        .add_items(vec![
+            InputItem::user("a"),
+            InputItem::assistant("b"),
+            InputItem::user("c"),
+        ])
+        .await
+        .unwrap();
+
+    let snapshot = session.compaction_snapshot(10).await.unwrap().unwrap();
+    assert!(snapshot.complete);
+    assert_eq!(snapshot.items.len(), 3);
+    let bounded = session.compaction_snapshot(2).await.unwrap().unwrap();
+    assert!(!bounded.complete);
+    assert_eq!(bounded.items.len(), 2);
+
+    assert!(
+        session
+            .replace_compaction_suffix(&snapshot.handles[1..], vec![InputItem::assistant("recap")])
+            .await
+            .unwrap()
+    );
+    let items = session.get_items(None).await.unwrap();
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0].text_content().as_deref(), Some("a"));
+    assert_eq!(items[1].text_content().as_deref(), Some("recap"));
+
+    // Stale handles are refused rather than applied to the new tail.
+    assert!(
+        !session
+            .replace_compaction_suffix(&snapshot.handles[1..], vec![InputItem::assistant("x")])
+            .await
+            .unwrap()
+    );
+    assert_eq!(session.get_items(None).await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn runner_compacts_only_what_the_run_loaded_from_a_limited_session() {
+    openai_agents_sdk::set_tracing_disabled(true);
+    let (base, captured) = mock_openai(vec![compaction_reply("Recap")]).await;
+
+    let model = Arc::new(FakeModel::new());
+    model.add_turn(vec![assistant_message("Hello!")]);
+    let agent = Agent::<()>::new("Assistant").with_model_instance(model.clone());
+
+    // The session only exposes its last two items to a run, so older history was never part of
+    // the model exchange and must survive compaction.
+    let inner = Arc::new(
+        InMemorySession::new("s1").with_settings(openai_agents_sdk::SessionSettings::with_limit(2)),
+    );
+    inner
+        .add_items(vec![
+            InputItem::user("ancient question"),
+            InputItem::assistant("ancient answer"),
+            InputItem::user("recent question"),
+            InputItem::assistant("recent answer"),
+        ])
+        .await
+        .unwrap();
+
+    let session = Arc::new(
+        OpenAIResponsesCompactionSession::new("s1", inner.clone())
+            .with_client(OpenAIClient::new("sk-test").with_base_url(base))
+            .with_should_trigger_compaction(|_| true),
+    );
+
+    let result = Runner::run_with_options(
+        &agent,
+        "Say hello",
+        RunOptions::new(()).session(session.clone()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.final_output_text().as_deref(), Some("Hello!"));
+
+    // The compaction request covers only the loaded window plus this run's items.
+    let body = captured.lock().unwrap()[0].body.clone();
+    let input = body["input"].as_array().unwrap();
+    assert!(
+        input
+            .iter()
+            .all(|i| i["content"] != "ancient question" && i["content"] != "ancient answer"),
+        "{body}"
+    );
+
+    // The two ancient items are retained, with the summary replacing the rest.
+    let items = inner.get_items(None).await.unwrap();
+    assert_eq!(items[0].text_content().as_deref(), Some("ancient question"));
+    assert_eq!(items[1].text_content().as_deref(), Some("ancient answer"));
+    assert_eq!(
+        items.last().unwrap().text_content().as_deref(),
+        Some("Recap")
+    );
+    assert!(items.len() < 7, "history should have shrunk: {items:?}");
+    assert_eq!(result.usage().requests, 2);
+}
+
+/// A session with no atomic suffix replacement, standing in for MongoDB or a user-defined
+/// store: it delegates everything and leaves `compaction_snapshot` at its default `None`.
+#[derive(Debug)]
+struct HookLessSession(Arc<InMemorySession>);
+
+#[async_trait::async_trait]
+impl Session for HookLessSession {
+    fn session_id(&self) -> &str {
+        self.0.session_id()
+    }
+
+    async fn get_items(&self, limit: Option<usize>) -> openai_agents_sdk::Result<Vec<InputItem>> {
+        self.0.get_items(limit).await
+    }
+
+    async fn add_items(&self, items: Vec<InputItem>) -> openai_agents_sdk::Result<()> {
+        self.0.add_items(items).await
+    }
+
+    async fn pop_item(&self) -> openai_agents_sdk::Result<Option<InputItem>> {
+        self.0.pop_item().await
+    }
+
+    async fn clear_session(&self) -> openai_agents_sdk::Result<()> {
+        self.0.clear_session().await
+    }
+}
+
+#[tokio::test]
+async fn stores_without_the_snapshot_hook_require_complete_coverage() {
+    let inner = Arc::new(InMemorySession::new("s1"));
+    let history = vec![
+        InputItem::user("old question"),
+        InputItem::assistant("old answer"),
+        InputItem::user("new question"),
+        InputItem::assistant("new answer"),
+    ];
+    inner.add_items(history.clone()).await.unwrap();
+
+    // Only the last turn was part of the exchange. Replacing the whole history would summarize
+    // away the older turn with a chain that never contained it, so compaction must refuse.
+    let (base, captured) = mock_openai(vec![compaction_reply("Recap")]).await;
+    let session =
+        OpenAIResponsesCompactionSession::new("s1", Arc::new(HookLessSession(inner.clone())))
+            .with_client(OpenAIClient::new("sk-test").with_base_url(base))
+            .with_should_trigger_compaction(|_| true);
+
+    let usage = session
+        .on_run_completed(&SessionRunCompletion {
+            response_id: Some("resp_1".into()),
+            store: Some(true),
+            has_local_tool_outputs: false,
+            model_exchange: exchange_digests(&history[2..]),
+        })
+        .await
+        .unwrap();
+    assert_eq!(usage, Usage::default());
+    assert!(captured.lock().unwrap().is_empty());
+    assert_eq!(inner.get_items(None).await.unwrap().len(), 4);
+
+    // With the complete history covered, the whole-history fallback still applies.
+    let usage = session
+        .on_run_completed(&SessionRunCompletion {
+            response_id: Some("resp_2".into()),
+            store: Some(true),
+            has_local_tool_outputs: false,
+            model_exchange: exchange_digests(&history),
+        })
+        .await
+        .unwrap();
+    assert_eq!(usage.requests, 1);
+    assert_eq!(captured.lock().unwrap().len(), 1);
+    let items = inner.get_items(None).await.unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].text_content().as_deref(), Some("Recap"));
+}
+
+#[cfg(feature = "encrypt")]
+#[tokio::test]
+async fn expired_envelopes_do_not_shrink_a_compaction_snapshot() {
+    // The Python vector is authentic but was minted in 2023, so it is expired under this TTL.
+    // An expired item is already invisible as history, so it must not clear the window the way
+    // an unauthenticated envelope does.
+    const PYTHON_PAYLOAD: &str = "gAAAAABlU_EAyicwKYzApg0fhqXu4Mf3MVoIR0uJ44-qrbeqamzFwpJDScnj0z_en8pDpJuSDaVsUBtisfKKy0CLq497sBTG0Y4xoA_8WDOETvmk20rM7SUC2AHvNPk5Z7cctoi6GNrROOABA0B_fT-L9HlY_1DTjA==";
+    let store = Arc::new(InMemorySession::new("user-123"));
+    store
+        .add_items(vec![InputItem(json!({
+            "__enc__": 1, "v": 1, "kid": "hkdf-v1", "payload": PYTHON_PAYLOAD,
+        }))])
+        .await
+        .unwrap();
+
+    let session = EncryptedSession::new("user-123", store.clone(), TEST_KEY, 600).unwrap();
+    session
+        .add_items(vec![InputItem::user("still fresh")])
+        .await
+        .unwrap();
+
+    let snapshot = session.compaction_snapshot(10).await.unwrap().unwrap();
+    assert!(
+        snapshot.complete,
+        "an expired item must not make the window look partial"
+    );
+    assert_eq!(snapshot.items.len(), 1);
+    assert_eq!(
+        snapshot.items[0].text_content().as_deref(),
+        Some("still fresh")
+    );
+
+    // An envelope that cannot be authenticated at all is still treated as coverage loss.
+    store
+        .add_items(vec![InputItem(json!({
+            "__enc__": 1, "v": 1, "kid": "hkdf-v1", "payload": "gAAAAABlU_EAbm90LWEtdG9rZW4=",
+        }))])
+        .await
+        .unwrap();
+    session
+        .add_items(vec![InputItem::user("after the bad one")])
+        .await
+        .unwrap();
+    let snapshot = session.compaction_snapshot(10).await.unwrap().unwrap();
+    assert!(!snapshot.complete);
+    assert_eq!(snapshot.items.len(), 1);
 }

@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use sqlx::AnyPool;
 use sqlx::{AssertSqlSafe, Row};
 
-use super::{Session, SessionSettings};
+use super::{CompactionSnapshot, Session, SessionSettings, SnapshotHandle};
 use crate::error::{AgentsError, Result};
 use crate::items::InputItem;
 
@@ -18,6 +18,12 @@ pub const DEFAULT_MESSAGES_TABLE: &str = "agent_messages";
 
 fn sqlx_err(e: sqlx::Error) -> AgentsError {
     AgentsError::other(format!("SQL error: {e}"))
+}
+
+/// One row more than the window, so a snapshot can tell whether it reached the start of the
+/// history. Saturates rather than wrapping, since `usize::MAX` is a natural "everything".
+fn window_limit(limit: usize) -> i64 {
+    i64::try_from(limit).unwrap_or(i64::MAX).saturating_add(1)
 }
 
 fn valid_identifier(name: &str) -> bool {
@@ -155,6 +161,28 @@ impl Schema {
     fn select_latest(&self) -> String {
         format!(
             "SELECT message_data FROM {} WHERE session_id = {} \
+             ORDER BY created_at DESC, id DESC LIMIT {}",
+            self.messages_table,
+            self.dialect.placeholder(1),
+            self.dialect.placeholder(2)
+        )
+    }
+
+    /// The newest `n` rows with their ids, newest first.
+    fn select_window(&self) -> String {
+        format!(
+            "SELECT id, message_data FROM {} WHERE session_id = {} \
+             ORDER BY created_at DESC, id DESC LIMIT {}",
+            self.messages_table,
+            self.dialect.placeholder(1),
+            self.dialect.placeholder(2)
+        )
+    }
+
+    /// The ids of the newest `n` rows, newest first.
+    fn select_window_ids(&self) -> String {
+        format!(
+            "SELECT id FROM {} WHERE session_id = {} \
              ORDER BY created_at DESC, id DESC LIMIT {}",
             self.messages_table,
             self.dialect.placeholder(1),
@@ -404,6 +432,94 @@ impl Session for SqlxSession {
             .map_err(sqlx_err)?;
         tx.commit().await.map_err(sqlx_err)?;
         Ok(serde_json::from_str(&data).ok().map(InputItem))
+    }
+
+    /// Row ids make stable handles on both PostgreSQL and MySQL.
+    async fn compaction_snapshot(&self, limit: usize) -> Result<Option<CompactionSnapshot>> {
+        // One row beyond the window tells us whether it reached the start of the history.
+        let rows = sqlx::query(AssertSqlSafe(self.schema.select_window()))
+            .bind(self.session_id.clone())
+            .bind(window_limit(limit))
+            .fetch_all(&self.pool)
+            .await
+            .map_err(sqlx_err)?;
+        let mut window: Vec<(i64, String)> = rows
+            .iter()
+            .filter_map(|r| Some((r.try_get(0).ok()?, r.try_get(1).ok()?)))
+            .collect();
+        let complete = window.len() <= limit;
+        window.truncate(limit);
+        window.reverse();
+
+        let mut items = Vec::new();
+        let mut handles = Vec::new();
+        let mut intact = complete;
+        for (id, data) in window {
+            match serde_json::from_str(&data) {
+                Ok(value) => {
+                    items.push(InputItem(value));
+                    handles.push(SnapshotHandle(id.to_string()));
+                }
+                Err(_) => {
+                    // A corrupted row cannot be sent to the compaction API, so it and
+                    // everything before it stay outside the replaceable window.
+                    items.clear();
+                    handles.clear();
+                    intact = false;
+                }
+            }
+        }
+        Ok(Some(CompactionSnapshot {
+            items,
+            handles,
+            complete: intact,
+        }))
+    }
+
+    async fn replace_compaction_suffix(
+        &self,
+        handles: &[SnapshotHandle],
+        items: Vec<InputItem>,
+    ) -> Result<bool> {
+        let mut tx = self.pool.begin().await.map_err(sqlx_err)?;
+        let rows = sqlx::query(AssertSqlSafe(self.schema.select_window_ids()))
+            .bind(self.session_id.clone())
+            .bind(handles.len() as i64)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(sqlx_err)?;
+        let mut tail: Vec<i64> = rows.iter().filter_map(|r| r.try_get(0).ok()).collect();
+        tail.reverse();
+        if tail.len() != handles.len()
+            || tail
+                .iter()
+                .zip(handles)
+                .any(|(id, handle)| id.to_string() != handle.0)
+        {
+            return Ok(false);
+        }
+        for id in &tail {
+            sqlx::query(AssertSqlSafe(self.schema.delete_message()))
+                .bind(*id)
+                .execute(&mut *tx)
+                .await
+                .map_err(sqlx_err)?;
+        }
+        for item in &items {
+            sqlx::query(AssertSqlSafe(self.schema.insert_message()))
+                .bind(self.session_id.clone())
+                .bind(serde_json::to_string(item.as_value())?)
+                .execute(&mut *tx)
+                .await
+                .map_err(sqlx_err)?;
+        }
+        sqlx::query(AssertSqlSafe(self.schema.touch_session()))
+            .bind(self.session_id.clone())
+            .execute(&mut *tx)
+            .await
+            .map_err(sqlx_err)?;
+        tx.commit().await.map_err(sqlx_err)?;
+        Ok(true)
     }
 
     async fn clear_session(&self) -> Result<()> {

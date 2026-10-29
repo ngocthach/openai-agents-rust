@@ -1,6 +1,7 @@
 //! Session decorator that compacts stored history with the OpenAI `responses.compact` API.
 //! Mirrors `agents.memory.openai_responses_compaction_session`.
 
+use std::collections::BTreeSet;
 use std::fmt;
 use std::sync::Arc;
 
@@ -8,7 +9,9 @@ use async_trait::async_trait;
 use serde_json::{Map, Value, json};
 use tokio::sync::Mutex;
 
-use super::{Session, SessionRunCompletion, SessionSettings};
+use super::{
+    CompactionSnapshot, Session, SessionRunCompletion, SessionSettings, compaction_item_digest,
+};
 use crate::error::{AgentsError, Result};
 use crate::items::InputItem;
 use crate::models::OpenAIClient;
@@ -165,6 +168,80 @@ fn normalize_output_items(output: &[Value]) -> Vec<InputItem> {
         .collect()
 }
 
+/// The index at which the longest suffix of `session_items` that occurs, in order, inside
+/// `model_exchange` begins.
+///
+/// Walks both backwards, consuming exchange digests as it goes: items the exchange contains but
+/// storage does not are skipped, while a stored item that is missing or out of order ends the
+/// match. `session_items.len()` means nothing matched.
+fn match_model_exchange_suffix(session_items: &[InputItem], model_exchange: &[String]) -> usize {
+    let mut remaining = model_exchange.len();
+    let mut matched = 0usize;
+    for item in session_items.iter().rev() {
+        let digest = compaction_item_digest(item);
+        let mut found = false;
+        while remaining > 0 {
+            remaining -= 1;
+            if model_exchange[remaining] == digest {
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            break;
+        }
+        matched += 1;
+    }
+    session_items.len() - matched
+}
+
+/// The `call_id` of a tool or program call item.
+fn tool_call_id(item: &InputItem) -> Option<&str> {
+    let kind = item.item_type()?;
+    if !kind.ends_with("_call") {
+        return None;
+    }
+    item.as_value().get("call_id").and_then(Value::as_str)
+}
+
+/// The `call_id` of a tool or program call output item.
+fn tool_output_call_id(item: &InputItem) -> Option<&str> {
+    let kind = item.item_type()?;
+    if !kind.ends_with("_output") {
+        return None;
+    }
+    item.as_value().get("call_id").and_then(Value::as_str)
+}
+
+/// True when every tool call in `items` has its output and vice versa.
+///
+/// Compaction must not break a call/output pair apart: sending half a group to the compaction
+/// API is rejected, and compacting a call away while its output is still pending would strand
+/// the output. Hosted MCP approvals pair on the request id rather than a call id, so they are
+/// checked separately.
+fn has_complete_tool_groups(items: &[InputItem]) -> bool {
+    let calls: BTreeSet<&str> = items.iter().filter_map(tool_call_id).collect();
+    let outputs: BTreeSet<&str> = items.iter().filter_map(tool_output_call_id).collect();
+    if calls != outputs {
+        return false;
+    }
+    let requests: BTreeSet<&str> = items
+        .iter()
+        .filter(|i| i.item_type() == Some("mcp_approval_request"))
+        .filter_map(|i| i.as_value().get("id").and_then(Value::as_str))
+        .collect();
+    let responses: BTreeSet<&str> = items
+        .iter()
+        .filter(|i| i.item_type() == Some("mcp_approval_response"))
+        .filter_map(|i| {
+            i.as_value()
+                .get("approval_request_id")
+                .and_then(Value::as_str)
+        })
+        .collect();
+    requests == responses
+}
+
 #[derive(Debug, Default)]
 struct CompactionState {
     response_id: Option<String>,
@@ -302,7 +379,21 @@ impl OpenAIResponsesCompactionSession {
     }
 
     async fn run_compaction_locked(&self, args: OpenAIResponsesCompactionArgs) -> Result<Usage> {
-        let (response_id, resolved_mode) = {
+        self.run_compaction_inner(args, None).await
+    }
+
+    /// The compaction body.
+    ///
+    /// `model_exchange` is `Some` only on the automatic path, where it authorizes replacing a
+    /// bounded suffix of history: the stored tail is matched against the items the last model
+    /// exchange produced, and only that tail is compacted away. Manual calls pass `None` and
+    /// replace the complete stored history.
+    async fn run_compaction_inner(
+        &self,
+        args: OpenAIResponsesCompactionArgs,
+        model_exchange: Option<&[String]>,
+    ) -> Result<Usage> {
+        let (response_id, mut resolved_mode) = {
             let mut state = self.state.lock().await;
             if let Some(id) = args.response_id.clone() {
                 state.response_id = Some(id);
@@ -333,6 +424,8 @@ impl OpenAIResponsesCompactionSession {
 
         let session_items = self.underlying.get_items(None).await?;
         let candidates = select_compaction_candidate_items(&session_items);
+        let approved_mode = resolved_mode;
+        let approved_items = session_items.clone();
         let context = CompactionContext {
             response_id: response_id.clone(),
             compaction_mode: resolved_mode,
@@ -344,17 +437,176 @@ impl OpenAIResponsesCompactionSession {
             return Ok(Usage::default());
         }
 
+        // The automatic path asks the store for a bounded window it can replace atomically.
+        // Without one (or on a manual call) the whole stored history is replaced instead.
+        let mut snapshot: Option<CompactionSnapshot> = None;
+        let mut suffix_start = 0usize;
+        let mut items_to_compact = context.session_items.clone();
+
+        if let Some(model_exchange) = model_exchange {
+            let window = model_exchange.len().saturating_add(1);
+            let Some(found) = self.underlying.compaction_snapshot(window).await? else {
+                // A store without atomic suffix replacement still has to prove that the model
+                // exchange covers its complete history before the whole of it is replaced.
+                // Without this a store whose history is longer than the run loaded would have
+                // the older part summarized away by a chain that never contained it.
+                let bounded = self.underlying.get_items(Some(window)).await?;
+                let complete = bounded.len() < window;
+                if !complete || match_model_exchange_suffix(&bounded, model_exchange) > 0 {
+                    log::warn!(
+                        "Skipped automatic compaction because the stored history could not be \
+                         fully matched to the latest model exchange and this store cannot \
+                         replace a suffix; history was retained"
+                    );
+                    return Ok(Usage::default());
+                }
+                return self
+                    .compact_whole_history(response_id, resolved_mode, context.session_items)
+                    .await;
+            };
+            if found.items.len() != found.handles.len() {
+                return Err(AgentsError::other(
+                    "Session::compaction_snapshot returned a different number of handles than \
+                     items",
+                ));
+            }
+
+            suffix_start = match_model_exchange_suffix(&found.items, model_exchange);
+            if suffix_start == found.items.len() {
+                log::warn!(
+                    "Skipped automatic compaction because the stored history could not be \
+                     matched to the latest model exchange; history was retained"
+                );
+                return Ok(Usage::default());
+            }
+
+            if !found.complete || suffix_start > 0 {
+                // A response chain may summarize earlier items that will be retained, so only
+                // an explicit input can scope the summary to exactly this suffix.
+                if args.compaction_mode.unwrap_or(self.compaction_mode)
+                    == CompactionMode::PreviousResponseId
+                {
+                    log::warn!(
+                        "Skipped automatic compaction because previous_response_id mode cannot \
+                         summarize a partial history suffix"
+                    );
+                    return Ok(Usage::default());
+                }
+                resolved_mode = ResolvedCompactionMode::Input;
+
+                // Start at a caller message so a retained reasoning item stays together with
+                // the model item that must follow it.
+                let Some(boundary) = found.items[suffix_start..].iter().position(is_user_message)
+                else {
+                    log::warn!(
+                        "Skipped automatic compaction because the replaceable suffix contains no \
+                         user message to start from"
+                    );
+                    return Ok(Usage::default());
+                };
+                suffix_start += boundary;
+            }
+
+            items_to_compact = found.items[suffix_start..].to_vec();
+
+            // Keep tool and approval groups intact, including calls whose outputs are still
+            // pending: wait for them rather than compacting the call away.
+            if !has_complete_tool_groups(&items_to_compact) {
+                log::warn!(
+                    "Skipped automatic compaction because the replaceable suffix splits a tool \
+                     call group; history was retained"
+                );
+                return Ok(Usage::default());
+            }
+
+            // The bounded reload can expose history the hook's first view did not include, so
+            // the actual snapshot has to be approved too.
+            if (items_to_compact != approved_items || resolved_mode != approved_mode)
+                && !(self.should_trigger)(&CompactionContext {
+                    response_id: response_id.clone(),
+                    compaction_mode: resolved_mode,
+                    compaction_candidate_items: select_compaction_candidate_items(
+                        &items_to_compact,
+                    ),
+                    session_items: items_to_compact.clone(),
+                })
+            {
+                log::debug!("skip: decision hook declined the reloaded compaction snapshot");
+                return Ok(Usage::default());
+            }
+
+            snapshot = Some(found);
+        }
+
+        let Some(snapshot) = snapshot else {
+            return self
+                .compact_whole_history(response_id, resolved_mode, context.session_items)
+                .await;
+        };
+
+        let (usage, output_items) = self
+            .request_compaction(&response_id, resolved_mode, &items_to_compact)
+            .await?;
+
+        let replaced = self
+            .underlying
+            .replace_compaction_suffix(&snapshot.handles[suffix_start..], output_items)
+            .await?;
+        if !replaced {
+            log::warn!(
+                "Skipped compaction replacement because the stored suffix changed while the \
+                 compaction request was in flight; history was retained"
+            );
+            return Ok(usage);
+        }
+        self.state.lock().await.deferred_response_id = None;
+        Ok(usage)
+    }
+
+    /// Replace the complete stored history, for manual calls and stores without an atomic
+    /// suffix replacement.
+    async fn compact_whole_history(
+        &self,
+        response_id: Option<String>,
+        resolved_mode: ResolvedCompactionMode,
+        session_items: Vec<InputItem>,
+    ) -> Result<Usage> {
+        let (usage, output_items) = self
+            .request_compaction(&response_id, resolved_mode, &session_items)
+            .await?;
+
+        // Re-read after the request: another writer sharing this store may have appended while
+        // the compaction API call was in flight, and replacing the whole history would drop
+        // those items. This also refreshes the rollback snapshot, so a failed replacement
+        // cannot revive items that expired meanwhile.
+        let current_items = self.underlying.get_items(None).await?;
+        if current_items != session_items {
+            log::warn!(
+                "Skipped compaction replacement because the stored history changed while the \
+                 compaction request was in flight; history was retained"
+            );
+            return Ok(usage);
+        }
+
+        self.replace_history(output_items, current_items).await?;
+        self.state.lock().await.deferred_response_id = None;
+        Ok(usage)
+    }
+
+    /// Issue the `responses/compact` request and normalize its output.
+    async fn request_compaction(
+        &self,
+        response_id: &Option<String>,
+        resolved_mode: ResolvedCompactionMode,
+        items: &[InputItem],
+    ) -> Result<(Usage, Vec<InputItem>)> {
         let mut body = json!({"model": self.model});
         match resolved_mode {
             ResolvedCompactionMode::PreviousResponseId => {
                 body["previous_response_id"] = json!(response_id);
             }
             ResolvedCompactionMode::Input => {
-                let input: Vec<&Value> = context
-                    .session_items
-                    .iter()
-                    .map(InputItem::as_value)
-                    .collect();
+                let input: Vec<&Value> = items.iter().map(InputItem::as_value).collect();
                 body["input"] = json!(input);
             }
         }
@@ -372,24 +624,10 @@ impl OpenAIResponsesCompactionSession {
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
-        let output_items = strip_orphaned_assistant_ids(normalize_output_items(&output));
-
-        // Re-read after the request: another writer sharing this store may have appended while
-        // the compaction API call was in flight, and replacing the whole history would drop
-        // those items. This also refreshes the rollback snapshot, so a failed replacement
-        // cannot revive items that expired meanwhile.
-        let current_items = self.underlying.get_items(None).await?;
-        if current_items != context.session_items {
-            log::warn!(
-                "Skipped compaction replacement because the stored history changed while the \
-                 compaction request was in flight; history was retained"
-            );
-            return Ok(usage);
-        }
-
-        self.replace_history(output_items, current_items).await?;
-        self.state.lock().await.deferred_response_id = None;
-        Ok(usage)
+        Ok((
+            usage,
+            strip_orphaned_assistant_ids(normalize_output_items(&output)),
+        ))
     }
 
     /// Replace the stored history, restoring `previous` when the replacement fails.
@@ -469,6 +707,11 @@ impl Session for OpenAIResponsesCompactionSession {
         self.underlying.session_settings()
     }
 
+    /// Automatic suffix replacement needs the exchange, so the runner records it.
+    fn wants_model_exchange(&self) -> bool {
+        true
+    }
+
     async fn get_items(&self, limit: Option<usize>) -> Result<Vec<InputItem>> {
         self.underlying.get_items(limit).await
     }
@@ -506,12 +749,18 @@ impl Session for OpenAIResponsesCompactionSession {
             return Ok(Usage::default());
         }
         let force = self.state.lock().await.deferred_response_id.is_some();
-        self.run_compaction_locked(OpenAIResponsesCompactionArgs {
-            response_id: Some(response_id),
-            store: info.store,
-            compaction_mode: None,
-            force,
-        })
+        // An empty exchange means the runner recorded none, so there is nothing to authorize a
+        // suffix replacement; fall back to replacing the whole history.
+        let model_exchange = (!info.model_exchange.is_empty()).then_some(&info.model_exchange[..]);
+        self.run_compaction_inner(
+            OpenAIResponsesCompactionArgs {
+                response_id: Some(response_id),
+                store: info.store,
+                compaction_mode: None,
+                force,
+            },
+            model_exchange,
+        )
         .await
     }
 }
@@ -576,6 +825,99 @@ mod tests {
             json!({"type": "input_image", "image_url": "https://x/y.png"})
         );
         assert_eq!(parts[1]["text"], "hi");
+    }
+
+    fn exchange(items: &[InputItem]) -> Vec<String> {
+        items.iter().map(compaction_item_digest).collect()
+    }
+
+    #[test]
+    fn suffix_matching_finds_the_longest_tail_present_in_the_exchange() {
+        let stored = vec![
+            InputItem::user("old question"),
+            InputItem::assistant("old answer"),
+            InputItem::user("new question"),
+            InputItem::assistant("new answer"),
+        ];
+
+        // The whole history was sent to the model, so everything is replaceable.
+        assert_eq!(match_model_exchange_suffix(&stored, &exchange(&stored)), 0);
+
+        // Only the last turn was part of the exchange: the older turn is retained.
+        assert_eq!(
+            match_model_exchange_suffix(&stored, &exchange(&stored[2..])),
+            2
+        );
+
+        // Items the exchange holds but storage does not are skipped over.
+        let mut padded = exchange(&stored[2..]);
+        padded.insert(1, compaction_item_digest(&InputItem::assistant("dropped")));
+        assert_eq!(match_model_exchange_suffix(&stored, &padded), 2);
+
+        // Nothing in common means nothing is replaceable.
+        assert_eq!(
+            match_model_exchange_suffix(&stored, &exchange(&[InputItem::user("unrelated")])),
+            stored.len()
+        );
+        assert_eq!(match_model_exchange_suffix(&stored, &[]), stored.len());
+
+        // A reordered tail is rejected rather than matched out of order.
+        let reordered = exchange(&[stored[3].clone(), stored[2].clone()]);
+        assert_eq!(match_model_exchange_suffix(&stored, &reordered), 3);
+    }
+
+    #[test]
+    fn digests_normalize_cosmetic_differences() {
+        // Stored history keeps the API's content list and status; a replayed item may not.
+        let stored = InputItem(json!({
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": "hi"}],
+        }));
+        assert_eq!(
+            compaction_item_digest(&stored),
+            compaction_item_digest(&InputItem::assistant("hi"))
+        );
+        // A non-terminal status is a real difference and is kept.
+        let in_progress = InputItem(json!({
+            "role": "assistant",
+            "status": "in_progress",
+            "content": [{"type": "output_text", "text": "hi"}],
+        }));
+        assert_ne!(
+            compaction_item_digest(&in_progress),
+            compaction_item_digest(&stored)
+        );
+        // `created_by` is Conversations API bookkeeping, never part of a replayed item.
+        let with_created_by =
+            InputItem(json!({"role": "user", "content": "hi", "created_by": "x"}));
+        assert_eq!(
+            compaction_item_digest(&with_created_by),
+            compaction_item_digest(&InputItem::user("hi"))
+        );
+    }
+
+    #[test]
+    fn tool_groups_must_be_complete() {
+        let call = InputItem(json!({"type": "function_call", "call_id": "c1", "name": "f"}));
+        let output = InputItem::function_call_output("c1", "done");
+        assert!(has_complete_tool_groups(&[call.clone(), output.clone()]));
+        assert!(has_complete_tool_groups(&[InputItem::user("hi")]));
+        // A call still waiting for its output must not be compacted away.
+        assert!(!has_complete_tool_groups(std::slice::from_ref(&call)));
+        // Nor may an output be sent without the call it answers.
+        assert!(!has_complete_tool_groups(&[output]));
+
+        // Hosted MCP approvals pair on the request id instead of a call id.
+        let request = InputItem(json!({"type": "mcp_approval_request", "id": "r1"}));
+        let response =
+            InputItem(json!({"type": "mcp_approval_response", "approval_request_id": "r1"}));
+        assert!(has_complete_tool_groups(&[
+            request.clone(),
+            response.clone()
+        ]));
+        assert!(!has_complete_tool_groups(std::slice::from_ref(&request)));
+        assert!(!has_complete_tool_groups(&[response]));
     }
 
     #[test]

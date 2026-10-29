@@ -7,8 +7,8 @@ use async_trait::async_trait;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::Value;
 
-use super::sqlite_session::SqliteSession;
-use super::{Session, SessionSettings};
+use super::sqlite_session::{SqliteSession, snapshot_from_rows, window_limit};
+use super::{CompactionSnapshot, Session, SessionSettings, SnapshotHandle};
 use crate::error::{AgentsError, Result};
 use crate::items::InputItem;
 use crate::usage::Usage;
@@ -728,8 +728,18 @@ impl AdvancedSqliteSession {
 
     /// Insert items and their structure metadata in one transaction.
     fn insert_with_structure(conn: &Connection, ctx: &Ctx, items: &[InputItem]) -> Result<()> {
-        let branch = ctx.branch_id();
         let tx = conn.unchecked_transaction().map_err(sql_err)?;
+        Self::insert_with_structure_in(&tx, ctx, items)?;
+        tx.commit().map_err(sql_err)
+    }
+
+    /// Insert items and their structure metadata inside an existing transaction.
+    fn insert_with_structure_in(
+        tx: &rusqlite::Transaction<'_>,
+        ctx: &Ctx,
+        items: &[InputItem],
+    ) -> Result<()> {
+        let branch = ctx.branch_id();
         tx.execute(
             &format!(
                 "INSERT OR IGNORE INTO {s} (session_id) VALUES (?)",
@@ -797,7 +807,7 @@ impl AdvancedSqliteSession {
             params![ctx.session_id],
         )
         .map_err(sql_err)?;
-        tx.commit().map_err(sql_err)
+        Ok(())
     }
 }
 
@@ -929,6 +939,99 @@ impl Session for AdvancedSqliteSession {
             }
             tx.commit().map_err(sql_err)?;
             Ok(serde_json::from_str(&data).ok().map(InputItem))
+        })
+        .await
+    }
+
+    /// Snapshot the end of the current branch; handles are `message_structure` row ids.
+    ///
+    /// Branch rows are what a compaction replacement must act on: the underlying message may be
+    /// shared with another branch, so it is only removed when nothing else references it.
+    async fn compaction_snapshot(&self, limit: usize) -> Result<Option<CompactionSnapshot>> {
+        self.blocking(move |conn, ctx| {
+            let branch = ctx.branch_id();
+            let mut stmt = conn
+                .prepare(&format!(
+                    "SELECT s.id, m.message_data FROM message_structure s
+                     JOIN {m} m ON m.id = s.message_id
+                     WHERE s.session_id = ? AND s.branch_id = ?
+                     ORDER BY s.sequence_number DESC LIMIT ?",
+                    m = ctx.messages_table
+                ))
+                .map_err(sql_err)?;
+            let mut rows: Vec<(i64, String)> = stmt
+                .query_map(params![ctx.session_id, branch, window_limit(limit)], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })
+                .map_err(sql_err)?
+                .filter_map(std::result::Result::ok)
+                .collect();
+            let complete = rows.len() <= limit;
+            rows.truncate(limit);
+            rows.reverse();
+            Ok(Some(snapshot_from_rows(rows, complete)))
+        })
+        .await
+    }
+
+    async fn replace_compaction_suffix(
+        &self,
+        handles: &[SnapshotHandle],
+        items: Vec<InputItem>,
+    ) -> Result<bool> {
+        let handles: Vec<String> = handles.iter().map(|h| h.0.clone()).collect();
+        self.blocking(move |conn, ctx| {
+            let branch = ctx.branch_id();
+            let tx = conn.unchecked_transaction().map_err(sql_err)?;
+            let mut stmt = tx
+                .prepare(
+                    "SELECT id, message_id FROM message_structure
+                     WHERE session_id = ? AND branch_id = ?
+                     ORDER BY sequence_number DESC LIMIT ?",
+                )
+                .map_err(sql_err)?;
+            let mut tail: Vec<(i64, i64)> = stmt
+                .query_map(params![ctx.session_id, branch, handles.len() as i64], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })
+                .map_err(sql_err)?
+                .filter_map(std::result::Result::ok)
+                .collect();
+            drop(stmt);
+            tail.reverse();
+            if tail.len() != handles.len()
+                || tail
+                    .iter()
+                    .zip(&handles)
+                    .any(|((id, _), handle)| id.to_string() != *handle)
+            {
+                return Ok(false);
+            }
+
+            for (structure_id, message_id) in &tail {
+                tx.execute(
+                    "DELETE FROM message_structure WHERE id = ?",
+                    params![structure_id],
+                )
+                .map_err(sql_err)?;
+                let still_referenced: i64 = tx
+                    .query_row(
+                        "SELECT COUNT(*) FROM message_structure WHERE message_id = ?",
+                        params![message_id],
+                        |r| r.get(0),
+                    )
+                    .map_err(sql_err)?;
+                if still_referenced == 0 {
+                    tx.execute(
+                        &format!("DELETE FROM {m} WHERE id = ?", m = ctx.messages_table),
+                        params![message_id],
+                    )
+                    .map_err(sql_err)?;
+                }
+            }
+            Self::insert_with_structure_in(&tx, ctx, &items)?;
+            tx.commit().map_err(sql_err)?;
+            Ok(true)
         })
         .await
     }

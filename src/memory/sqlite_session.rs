@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use rusqlite::{Connection, params};
 
-use super::{Session, SessionSettings};
+use super::{CompactionSnapshot, Session, SessionSettings, SnapshotHandle};
 use crate::error::{AgentsError, Result};
 use crate::items::InputItem;
 
@@ -272,6 +272,125 @@ impl Session for SqliteSession {
             Ok(())
         })
         .await
+    }
+
+    /// Row ids make stable handles: SQLite never reuses an `AUTOINCREMENT` id.
+    async fn compaction_snapshot(&self, limit: usize) -> Result<Option<CompactionSnapshot>> {
+        self.blocking(move |conn, s| {
+            // One row beyond the window tells us whether it reached the start of the history.
+            let mut stmt = conn
+                .prepare(&format!(
+                    "SELECT id, message_data FROM {} WHERE session_id = ? ORDER BY id DESC LIMIT ?",
+                    s.messages_table
+                ))
+                .map_err(sql_err)?;
+            let mut rows: Vec<(i64, String)> = stmt
+                .query_map(params![s.session_id, window_limit(limit)], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })
+                .map_err(sql_err)?
+                .filter_map(std::result::Result::ok)
+                .collect();
+            let complete = rows.len() <= limit;
+            rows.truncate(limit);
+            rows.reverse();
+            Ok(Some(snapshot_from_rows(rows, complete)))
+        })
+        .await
+    }
+
+    async fn replace_compaction_suffix(
+        &self,
+        handles: &[SnapshotHandle],
+        items: Vec<InputItem>,
+    ) -> Result<bool> {
+        let handles: Vec<String> = handles.iter().map(|h| h.0.clone()).collect();
+        self.blocking(move |conn, s| {
+            let tx = conn.unchecked_transaction().map_err(sql_err)?;
+            let mut stmt = tx
+                .prepare(&format!(
+                    "SELECT id FROM {} WHERE session_id = ? ORDER BY id DESC LIMIT ?",
+                    s.messages_table
+                ))
+                .map_err(sql_err)?;
+            let mut tail: Vec<i64> = stmt
+                .query_map(params![s.session_id, handles.len() as i64], |r| r.get(0))
+                .map_err(sql_err)?
+                .filter_map(std::result::Result::ok)
+                .collect();
+            drop(stmt);
+            tail.reverse();
+            if tail.len() != handles.len()
+                || tail
+                    .iter()
+                    .zip(&handles)
+                    .any(|(id, handle)| id.to_string() != *handle)
+            {
+                return Ok(false);
+            }
+            for id in &tail {
+                tx.execute(
+                    &format!("DELETE FROM {} WHERE id = ?", s.messages_table),
+                    params![id],
+                )
+                .map_err(sql_err)?;
+            }
+            for item in &items {
+                tx.execute(
+                    &format!(
+                        "INSERT INTO {} (session_id, message_data) VALUES (?, ?)",
+                        s.messages_table
+                    ),
+                    params![s.session_id, serde_json::to_string(&item.0)?],
+                )
+                .map_err(sql_err)?;
+            }
+            tx.execute(
+                &format!(
+                    "UPDATE {} SET updated_at = CURRENT_TIMESTAMP WHERE session_id = ?",
+                    s.sessions_table
+                ),
+                params![s.session_id],
+            )
+            .map_err(sql_err)?;
+            tx.commit().map_err(sql_err)?;
+            Ok(true)
+        })
+        .await
+    }
+}
+
+/// One row more than the window, so a snapshot can tell whether it reached the start of the
+/// history. Saturates rather than wrapping, since `usize::MAX` is a natural "everything".
+pub(super) fn window_limit(limit: usize) -> i64 {
+    i64::try_from(limit).unwrap_or(i64::MAX).saturating_add(1)
+}
+
+/// Build a snapshot from `(row id, message JSON)` pairs, oldest first.
+///
+/// A row whose JSON no longer parses cannot be handed to the compaction API, so it and
+/// everything before it are excluded from the replaceable window.
+pub(super) fn snapshot_from_rows(rows: Vec<(i64, String)>, complete: bool) -> CompactionSnapshot {
+    let mut items = Vec::new();
+    let mut handles = Vec::new();
+    let mut intact = complete;
+    for (id, data) in rows {
+        match serde_json::from_str(&data) {
+            Ok(value) => {
+                items.push(InputItem(value));
+                handles.push(SnapshotHandle(id.to_string()));
+            }
+            Err(_) => {
+                items.clear();
+                handles.clear();
+                intact = false;
+            }
+        }
+    }
+    CompactionSnapshot {
+        items,
+        handles,
+        complete: intact,
     }
 }
 
