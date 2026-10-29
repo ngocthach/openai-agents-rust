@@ -20,6 +20,15 @@ use crate::tool::{
 use crate::tool_context::ToolContext;
 use crate::tracing::{Span, SpanData, create_span, scope};
 
+/// Log a tool failure, keeping the error text out unless tool data logging is enabled.
+fn log_tool_error(label: &str, msg: &str) {
+    if crate::debug::dont_log_tool_data() {
+        log::error!("{label}");
+    } else {
+        log::error!("{label}: {msg}");
+    }
+}
+
 /// A local tool call found in a model response.
 pub(crate) enum LocalCall<C> {
     Computer(Value, Arc<ComputerTool<C>>),
@@ -500,7 +509,7 @@ async fn run_shell<C: Send + Sync + 'static>(
                         Some(json!({"tool_name": tool.name, "error": msg})),
                     );
                 }
-                log::error!("Shell executor failed: {msg}");
+                log_tool_error("Shell executor failed", &msg);
                 match requested_max {
                     Some(max) => {
                         max_output_length = Some(max);
@@ -667,7 +676,7 @@ async fn run_apply_patch<C: Send + Sync + 'static>(
                         Some(json!({"tool_name": tool.name, "error": msg})),
                     );
                 }
-                log::error!("Apply patch editor failed: {msg}");
+                log_tool_error("Apply patch editor failed", &msg);
                 msg
             }
         };
@@ -752,7 +761,7 @@ async fn run_custom<C: Send + Sync + 'static>(
                         Some(json!({"tool_name": tool.name, "error": msg})),
                     );
                 }
-                log::error!("Custom tool failed: {msg}");
+                log_tool_error("Custom tool failed", &msg);
                 msg
             }
         };
