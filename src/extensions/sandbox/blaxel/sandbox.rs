@@ -1054,16 +1054,11 @@ impl BlaxelSandboxSession {
 
     fn tar_exclude_args(&self) -> String {
         let root = self.manifest.root().trim_end_matches('/').to_string();
-        let mut excludes: Vec<String> = self
-            .manifest
-            .ephemeral_paths()
-            .into_iter()
-            .filter_map(|path| {
-                path.strip_prefix(&root)
-                    .map(|relative| relative.trim_start_matches('/').to_string())
-                    .filter(|relative| !relative.is_empty())
-            })
-            .collect();
+        let mut excludes: Vec<String> =
+            crate::sandbox::session::workspace_archive_excludes(&self.manifest, &root)
+                .into_iter()
+                .map(|e| e.trim_start_matches("./").to_string())
+                .collect();
         excludes.sort();
         excludes.dedup();
         excludes

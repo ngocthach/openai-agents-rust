@@ -358,7 +358,7 @@ async fn cloudflare_runs_a_full_session_against_the_worker_protocol() {
     let archive = session.persist_workspace().await.unwrap();
     assert_eq!(archive, b"tar-bytes");
     // Ephemeral entries and mounts are runtime state, so they are excluded from the archive.
-    assert_eq!(server.find("POST", "/persist").query, "excludes=cache");
+    assert_eq!(server.find("POST", "/persist").query, "excludes=.sandbox-rclone-config%2Ccache");
 
     session.hydrate_workspace(b"restored").await.unwrap();
     assert_eq!(server.find("POST", "/hydrate").text(), "restored");
@@ -739,7 +739,7 @@ async fn blaxel_persists_and_hydrates_through_a_tar_file() {
     let tar = server.find("POST", "/process");
     assert_eq!(
         tar.json()["command"],
-        "sh -lc 'tar --exclude ./cache -C /workspace -cf \
+        "sh -lc 'tar --exclude ./.sandbox-rclone-config --exclude ./cache -C /workspace -cf \
          /tmp/openai-agents-sandbox-blaxel-persist-agents-test.tar .'"
     );
     // The archive is pulled back out of the sandbox and the scratch file removed.
@@ -1046,7 +1046,7 @@ async fn modal_persists_a_tar_archive_by_default() {
     let tar = fake.of_op("exec").pop().unwrap();
     assert_eq!(
         tar["argv"],
-        json!(["sh", "-lc", "tar -czf - -C /workspace --exclude ./cache ."])
+        json!(["sh", "-lc", "tar -czf - -C /workspace --exclude ./cache --exclude ./.sandbox-rclone-config ."])
     );
 
     session.hydrate_workspace(b"payload").await.unwrap();

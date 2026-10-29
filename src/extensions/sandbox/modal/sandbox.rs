@@ -1140,17 +1140,11 @@ async fn default_persist_workspace(session: &ModalSandboxSession) -> SandboxResu
         "tar -czf - -C {}",
         crate::sandbox::session::shell_quote(&root)
     );
-    for path in session.manifest().ephemeral_paths() {
-        if let Some(relative) = path
-            .strip_prefix(root.trim_end_matches('/'))
-            .map(|relative| relative.trim_start_matches('/'))
-            .filter(|relative| !relative.is_empty())
-        {
-            command.push_str(&format!(
-                " --exclude {}",
-                crate::sandbox::session::shell_quote(&format!("./{relative}"))
-            ));
-        }
+    for exclude in crate::sandbox::session::workspace_archive_excludes(session.manifest(), &root) {
+        command.push_str(&format!(
+            " --exclude {}",
+            crate::sandbox::session::shell_quote(&exclude)
+        ));
     }
     command.push_str(" .");
     let result = session.exec(ExecRequest::shell(command)).await?;
