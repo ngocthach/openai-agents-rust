@@ -23,7 +23,7 @@ mcp = ["dep:rmcp"]
 websocket = ["dep:tokio-tungstenite"]
 realtime = ["dep:tokio-tungstenite", "dep:base64"]
 voice = ["dep:base64", "dep:tokio-tungstenite", "reqwest/multipart"]
-sandbox = []
+sandbox = ["dep:base64"]
 encrypt = ["dep:chacha20poly1305", "dep:hkdf", "dep:sha2", "dep:base64"]
 redis = ["dep:redis"]
 mongodb = ["dep:mongodb"]
@@ -89,3 +89,7 @@ required-features = ["realtime"]
 [[example]]
 name = "sessions_encrypted"
 required-features = ["encrypt"]
+
+[[example]]
+name = "sandbox_local"
+required-features = ["sandbox"]
