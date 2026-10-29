@@ -73,3 +73,7 @@ required-features = ["mcp"]
 [[example]]
 name = "sessions_sqlite"
 required-features = ["sqlite"]
+
+[[example]]
+name = "responses_websocket"
+required-features = ["websocket"]
