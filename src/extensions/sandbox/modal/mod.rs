@@ -28,7 +28,8 @@ pub mod sandbox;
 pub use mounts::{ModalCloudBucketMountConfig, ModalCloudBucketMountStrategy};
 pub use sandbox::{
     DEFAULT_IMAGE_BUILDER_VERSION, DEFAULT_SNAPSHOT_FILESYSTEM_TIMEOUT, DEFAULT_TIMEOUT,
-    HELPER_COMMAND_ENV, HELPER_PYTHON_ENV, HELPER_SOURCE, ModalHelper, ModalSandboxClient,
-    ModalSandboxClientOptions, ModalSandboxSession, ModalWorkspacePersistence,
-    decode_snapshot_filesystem_ref, encode_snapshot_filesystem_ref,
+    HELPER_COMMAND_ENV, HELPER_PYTHON_ENV, HELPER_SOURCE, ModalHelper, ModalImageSelector,
+    ModalSandboxClient, ModalSandboxClientOptions, ModalSandboxSelector, ModalSandboxSession,
+    ModalWorkspacePersistence, decode_snapshot_directory_ref, decode_snapshot_filesystem_ref,
+    encode_snapshot_directory_ref, encode_snapshot_filesystem_ref,
 };

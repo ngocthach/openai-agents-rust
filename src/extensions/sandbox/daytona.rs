@@ -72,6 +72,7 @@ use crate::sandbox::pty::{
     PtyExecRequest, PtyExecUpdate, PtyWriteRequest, RemotePtyManager, RemotePtyProcess,
     resolve_pty_write_yield_time_ms,
 };
+use crate::sandbox::retry::{RetryPolicy, is_transient_sandbox_error, retry_async};
 use crate::sandbox::session::{
     ExecRequest, SandboxClient, SandboxSession, restore_session_snapshot, shell_quote,
     workspace_archive_excludes,
@@ -83,6 +84,10 @@ use crate::sandbox::workspace_paths::provider_scratch_path;
 
 use super::e2b::adopt_recorded_root;
 use super::e2b::rclone::{ensure_fuse_support, ensure_rclone};
+use super::ports::{
+    ExposedPortEndpoint, ExposedPortUnavailable, assert_exposed_port_configured, endpoint_from_url,
+    exposed_port_unavailable,
+};
 use crate::sandbox::http::{expect_success, http_error, parse_json, transport};
 
 /// The backend identifier reported by this client and its sessions.
@@ -229,6 +234,8 @@ pub struct DaytonaSandboxClientOptions {
     pub timeouts: DaytonaSandboxTimeouts,
     /// Ports the sandbox exposes.
     pub exposed_ports: Vec<u16>,
+    /// How long a signed preview URL stays valid, in seconds.
+    pub exposed_port_url_ttl_secs: u32,
 }
 
 impl Default for DaytonaSandboxClientOptions {
@@ -251,6 +258,7 @@ impl Default for DaytonaSandboxClientOptions {
             auto_stop_interval: 0,
             timeouts: DaytonaSandboxTimeouts::default(),
             exposed_ports: Vec::new(),
+            exposed_port_url_ttl_secs: 3600,
         }
     }
 }
@@ -380,6 +388,12 @@ impl DaytonaSandboxClientOptions {
     /// Expose a port.
     pub fn with_exposed_port(mut self, port: u16) -> Self {
         self.exposed_ports.push(port);
+        self
+    }
+
+    /// Set how long a signed preview URL stays valid.
+    pub fn with_exposed_port_url_ttl_secs(mut self, ttl_secs: u32) -> Self {
+        self.exposed_port_url_ttl_secs = ttl_secs;
         self
     }
 
@@ -1264,8 +1278,59 @@ impl SandboxSession for DaytonaSandboxSession {
     }
 
     async fn write_file(&self, path: &str, contents: &[u8]) -> SandboxResult<()> {
-        let resolved = self.normalize_path(path)?;
+        let resolved = self.normalize_path_for_write(path)?;
         self.upload_at(&resolved, contents).await
+    }
+
+    fn exposed_ports(&self) -> Vec<u16> {
+        self.options.exposed_ports.clone()
+    }
+
+    /// Resolve an exposed port to a signed preview endpoint.
+    ///
+    /// Mirrors `DaytonaSandboxSession._resolve_exposed_port`, whose `create_signed_preview_url`
+    /// is `GET /sandbox/{id}/ports/{port}/signed-preview-url?expiresInSeconds=…`. The signature
+    /// is part of the returned URL, so the endpoint's query carries it.
+    async fn resolve_exposed_port(&self, port: u16) -> SandboxResult<ExposedPortEndpoint> {
+        assert_exposed_port_configured(BACKEND_ID, port, &self.options.exposed_ports)?;
+        let unavailable = || {
+            exposed_port_unavailable(
+                BACKEND_ID,
+                port,
+                &self.options.exposed_ports,
+                ExposedPortUnavailable::BackendUnavailable,
+            )
+        };
+        let response = self
+            .authorize(
+                self.http
+                    .get(format!(
+                        "{}/sandbox/{}/ports/{port}/signed-preview-url",
+                        self.api_base, self.sandbox_id
+                    ))
+                    .query(&[(
+                        "expiresInSeconds",
+                        self.options.exposed_port_url_ttl_secs.to_string(),
+                    )]),
+            )
+            .send()
+            .await
+            .map_err(|error| {
+                unavailable().caused_by(&transport("resolve a Daytona preview URL", error))
+            })?;
+        let body: Value = parse_json(response, "resolve a Daytona preview URL")
+            .await
+            .map_err(|error| unavailable().caused_by(&error))?;
+        let url = body
+            .get("url")
+            .and_then(Value::as_str)
+            .filter(|url| !url.is_empty())
+            .ok_or_else(unavailable)?;
+        let mut endpoint = endpoint_from_url(url).ok_or_else(unavailable)?;
+        if let Some((_, query)) = url.split_once('?') {
+            endpoint = endpoint.with_query(query);
+        }
+        Ok(endpoint)
     }
 
     fn supports_pty(&self) -> bool {
@@ -1438,14 +1503,22 @@ impl SandboxSession for DaytonaSandboxSession {
         }
         command.push_str(" .");
         // The toolbox reports command output as text, so the archive travels over the file API.
-        let result = self
-            .exec_in_session(
-                vec!["sh".into(), "-lc".into(), command],
-                root.clone(),
-                &self.command_envs(),
-                Some(self.options.timeouts.workspace_tar),
-            )
-            .await?;
+        // Python retries just this command on a transient transport failure
+        // (`daytona/sandbox.py` L1033), not the download that follows it.
+        let envs = self.command_envs();
+        let result = retry_async(
+            RetryPolicy::new(),
+            || {
+                self.exec_in_session(
+                    vec!["sh".into(), "-lc".into(), command.clone()],
+                    root.clone(),
+                    &envs,
+                    Some(self.options.timeouts.workspace_tar),
+                )
+            },
+            |error, _attempt| is_transient_sandbox_error(error),
+        )
+        .await?;
         if !result.ok() {
             return Err(SandboxError::new(
                 ErrorCode::SnapshotPersistError,
@@ -2051,19 +2124,14 @@ impl DaytonaCloudBucketMountStrategy {
         Ok(InContainerMountStrategy::new(Arc::new(pattern), config))
     }
 
-    /// The pattern with the flags this provider's images need.
+    /// The pattern the delegate mounts with.
     ///
-    /// Mirrors Python's `rclone_pattern_for_session`: a FUSE mount is made readable by the
-    /// sandbox's command user, which is not the root user the mount command runs as.
+    /// Daytona passes the configured pattern through untouched, as its Python counterpart does
+    /// (`daytona/mounts.py` `_delegate`). Unlike E2B, it never calls `rclone_pattern_for_session`,
+    /// so no `--allow-other`, `--uid` or `--gid` is added: a FUSE mount that has to be readable
+    /// by a non-root command user carries those flags in the pattern's `extra_args`.
     fn fuse_pattern(&self) -> RcloneMountPattern {
-        if self.pattern.mode != RcloneMountMode::Fuse {
-            return self.pattern.clone();
-        }
-        let mut pattern = self.pattern.clone();
-        if !pattern.extra_args.iter().any(|arg| arg == "--allow-other") {
-            pattern.extra_args.push("--allow-other".to_string());
-        }
-        pattern
+        self.pattern.clone()
     }
 
     async fn preflight(&self, session: &dyn SandboxSession) -> SandboxResult<()> {

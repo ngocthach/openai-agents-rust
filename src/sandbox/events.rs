@@ -96,6 +96,14 @@ impl EventPayloadPolicy {
     }
 }
 
+/// The id of the trace this task is running inside, when tracing is active.
+///
+/// Mirrors how Python stamps `trace_id` onto every sandbox event: a sandbox event stream is only
+/// useful next to the run that produced it, and the trace id is the key that joins them.
+pub fn current_trace_id() -> Option<String> {
+    crate::tracing::current_trace().map(|trace| trace.trace_id().to_string())
+}
+
 /// One recorded sandbox operation. Mirrors Python's `SandboxSessionEvent`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SandboxSessionEvent {
@@ -113,6 +121,12 @@ pub struct SandboxSessionEvent {
     pub seq: u64,
     /// Correlates the start and finish of one operation.
     pub span_id: String,
+    /// The SDK trace this operation belongs to, when the run is traced.
+    ///
+    /// Mirrors Python's `SandboxSessionEvent.trace_id`: it is what lines a sandbox event stream
+    /// up with the model calls and tool spans of the run that produced it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace_id: Option<String>,
     /// The operation.
     pub op: String,
     /// Which half of the operation this is.
@@ -159,6 +173,7 @@ impl SandboxSessionEvent {
             backend: backend.into(),
             seq,
             span_id: span_id.into(),
+            trace_id: current_trace_id(),
             op: op.as_str().to_string(),
             phase: EventPhase::Start,
             data: Vec::new(),
@@ -182,6 +197,12 @@ impl SandboxSessionEvent {
             data: Vec::new(),
             ..self.clone()
         }
+    }
+
+    /// Attach the trace this operation belongs to.
+    pub fn with_trace_id(mut self, trace_id: Option<String>) -> Self {
+        self.trace_id = trace_id;
+        self
     }
 
     /// Attach one piece of metadata.
@@ -329,6 +350,265 @@ impl EventSink for JsonlFileSink {
         if let Some(file) = handle.as_mut() {
             let _ = file.flush().await;
         }
+    }
+}
+
+/// POSTs every event as JSON to an endpoint. Mirrors Python's `HttpProxySink`.
+///
+/// A log that lives on the machine running the sandbox is lost with it. This is the sink for the
+/// case where the audit trail has to outlive the host: a local collector daemon or a remote
+/// service. A failed POST falls back to `spool_path`, so a collector that is down loses nothing
+/// more than the ordering.
+#[derive(Debug)]
+pub struct HttpProxySink {
+    endpoint: String,
+    headers: Vec<(String, String)>,
+    timeout: std::time::Duration,
+    spool: Option<Arc<JsonlFileSink>>,
+    client: reqwest::Client,
+}
+
+impl HttpProxySink {
+    /// A sink posting to `endpoint`.
+    pub fn new(endpoint: impl Into<String>) -> Self {
+        HttpProxySink {
+            endpoint: endpoint.into(),
+            headers: Vec::new(),
+            timeout: std::time::Duration::from_secs(5),
+            spool: None,
+            client: reqwest::Client::new(),
+        }
+    }
+
+    /// Send `value` as `name` on every request.
+    pub fn with_header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.headers.push((name.into(), value.into()));
+        self
+    }
+
+    /// How long one POST may take. The default is five seconds, as in Python.
+    pub fn with_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    /// Append an event to `path` when its POST fails.
+    pub fn with_spool_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.spool = Some(Arc::new(JsonlFileSink::new(path)));
+        self
+    }
+
+    /// Reuse an existing HTTP client instead of building one.
+    pub fn with_client(mut self, client: reqwest::Client) -> Self {
+        self.client = client;
+        self
+    }
+}
+
+#[async_trait]
+impl EventSink for HttpProxySink {
+    async fn emit(&self, event: &SandboxSessionEvent) {
+        let Ok(body) = serde_json::to_vec(event) else {
+            return;
+        };
+        let mut request = self
+            .client
+            .post(&self.endpoint)
+            .header("content-type", "application/json")
+            .timeout(self.timeout)
+            .body(body);
+        for (name, value) in &self.headers {
+            request = request.header(name, value);
+        }
+        let delivered =
+            matches!(request.send().await, Ok(response) if response.status().is_success());
+        if !delivered && let Some(spool) = &self.spool {
+            spool.emit(event).await;
+        }
+    }
+
+    async fn flush(&self) {
+        if let Some(spool) = &self.spool {
+            spool.flush().await;
+        }
+    }
+}
+
+/// Appends events to a JSON Lines file **inside** the sandbox workspace. Mirrors Python's
+/// `WorkspaceJsonlSink`.
+///
+/// The agent can read, rewrite and delete this file, so it is a convenience for the workload —
+/// a tool that wants to see what it has done — and never an authoritative audit record. Use
+/// [`JsonlFileSink`] or [`HttpProxySink`] when the log has to be trusted. The sink buffers and
+/// rewrites the whole file, so `max_bytes` bounds both the buffer and the file it reads back;
+/// exceeding either stops the sink permanently rather than truncating what is already there.
+#[derive(Debug)]
+pub struct WorkspaceJsonlSink {
+    session: Arc<dyn crate::sandbox::session::SandboxSession>,
+    workspace_relpath: String,
+    flush_every: usize,
+    max_bytes: Option<usize>,
+    state: Mutex<WorkspaceSinkState>,
+}
+
+#[derive(Debug, Default)]
+struct WorkspaceSinkState {
+    buffer: String,
+    seen: usize,
+    disabled: bool,
+}
+
+impl WorkspaceJsonlSink {
+    /// A sink appending to `workspace_relpath` inside `session`'s workspace.
+    ///
+    /// `{session_id}` in the path is expanded on construction, as Python expands it on `bind`.
+    pub fn new(
+        session: Arc<dyn crate::sandbox::session::SandboxSession>,
+        workspace_relpath: impl Into<String>,
+    ) -> Self {
+        let workspace_relpath = workspace_relpath
+            .into()
+            .replace("{session_id}", session.id());
+        WorkspaceJsonlSink {
+            session,
+            workspace_relpath,
+            flush_every: 1,
+            max_bytes: None,
+            state: Mutex::new(WorkspaceSinkState::default()),
+        }
+    }
+
+    /// Write to the workspace only every `events` events.
+    pub fn with_flush_every(mut self, events: usize) -> Self {
+        self.flush_every = events.max(1);
+        self
+    }
+
+    /// Stop the sink once the outbox or the pending buffer would exceed `max_bytes`.
+    pub fn with_max_bytes(mut self, max_bytes: Option<usize>) -> SandboxResult<Self> {
+        if max_bytes == Some(0) {
+            return Err(SandboxError::new(
+                ErrorCode::SandboxConfigInvalid,
+                "WorkspaceJsonlSink max_bytes must be positive",
+            ));
+        }
+        self.max_bytes = max_bytes;
+        Ok(self)
+    }
+
+    /// The workspace-relative path being written.
+    pub fn workspace_relpath(&self) -> &str {
+        &self.workspace_relpath
+    }
+
+    /// Whether an event should trigger a write.
+    fn should_flush(&self, event: &SandboxSessionEvent, seen: usize) -> bool {
+        if seen.is_multiple_of(self.flush_every) {
+            return true;
+        }
+        // These are the last chance to get the buffer out: the workspace is about to be
+        // archived, stopped or removed.
+        matches!(
+            (event.op.as_str(), event.phase),
+            ("persist_workspace", EventPhase::Start)
+                | ("stop", _)
+                | ("shutdown", EventPhase::Start)
+        )
+    }
+
+    async fn flush_buffer(&self, state: &mut WorkspaceSinkState) {
+        if state.buffer.is_empty() {
+            return;
+        }
+        // A session that is not running cannot be written to; the buffer waits for the next
+        // event rather than being dropped.
+        if !matches!(self.session.running().await, Ok(true)) {
+            return;
+        }
+        // The outbox is workload-modifiable: the agent can append to it between flushes, so a
+        // bounded sink has to bound the *read* as well as the write. One byte over the budget
+        // is enough to prove it was exceeded without pulling in the rest.
+        let read = match self.max_bytes {
+            None => self.session.read_file(&self.workspace_relpath).await,
+            Some(max_bytes) => {
+                self.session
+                    .read_bounded(&self.workspace_relpath, max_bytes + 1)
+                    .await
+            }
+        };
+        let existing = match read {
+            Ok(bytes) => bytes,
+            Err(error) if error.code == ErrorCode::WorkspaceReadNotFound => Vec::new(),
+            Err(error)
+                if error.context.get("reason").map(String::as_str)
+                    == Some("bounded_read_wire_limit") =>
+            {
+                state.disabled = true;
+                state.buffer.clear();
+                log::warn!(
+                    "WorkspaceJsonlSink outbox exceeded the transport's bounded-read limit; \
+                     delivery stopped."
+                );
+                return;
+            }
+            Err(_) => return,
+        };
+        if let Some(max_bytes) = self.max_bytes
+            && existing.len() + state.buffer.len() > max_bytes
+        {
+            state.disabled = true;
+            state.buffer.clear();
+            log::warn!(
+                "WorkspaceJsonlSink exceeded max_bytes={max_bytes}; delivery stopped. Use a new \
+                 outbox and sink, or JsonlFileSink / HttpProxySink."
+            );
+            return;
+        }
+        let mut payload = existing;
+        payload.extend_from_slice(state.buffer.as_bytes());
+        if self
+            .session
+            .write_file(&self.workspace_relpath, &payload)
+            .await
+            .is_ok()
+        {
+            state.buffer.clear();
+        }
+    }
+}
+
+#[async_trait]
+impl EventSink for WorkspaceJsonlSink {
+    async fn emit(&self, event: &SandboxSessionEvent) {
+        let Ok(line) = event.to_json_line() else {
+            return;
+        };
+        let mut state = self.state.lock().await;
+        if state.disabled {
+            return;
+        }
+        if let Some(max_bytes) = self.max_bytes
+            && state.buffer.len() + line.len() > max_bytes
+        {
+            state.disabled = true;
+            state.buffer.clear();
+            log::warn!("WorkspaceJsonlSink exceeded max_bytes={max_bytes}; delivery stopped.");
+            return;
+        }
+        state.buffer.push_str(&line);
+        state.seen += 1;
+        if !self.should_flush(event, state.seen) {
+            return;
+        }
+        self.flush_buffer(&mut state).await;
+    }
+
+    async fn flush(&self) {
+        let mut state = self.state.lock().await;
+        if state.disabled {
+            return;
+        }
+        self.flush_buffer(&mut state).await;
     }
 }
 

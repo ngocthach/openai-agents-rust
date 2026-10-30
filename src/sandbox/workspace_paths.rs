@@ -565,3 +565,183 @@ mod tests {
         assert!(SandboxWorkspaceScope::from_cwd(Some("/abs")).is_err());
     }
 }
+
+/// Validate and format paths interpreted relative to a sandbox workspace root. Mirrors Python's
+/// `WorkspacePathPolicy`.
+///
+/// The policy is the single place that decides whether a path is inside the workspace, inside an
+/// extra grant, or outside everything — and, for a write, whether the grant it landed in allows
+/// one. Keeping that in one object is what lets a backend answer "may this be written?" without
+/// re-deriving the rules, and what makes the longest-grant-wins precedence consistent between the
+/// file APIs, the editor and the archive paths.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspacePathPolicy {
+    root: String,
+    extra_path_grants: Vec<SandboxPathGrant>,
+}
+
+impl WorkspacePathPolicy {
+    /// A policy for `root` with no extra grants.
+    pub fn new(root: impl AsRef<str>) -> SandboxResult<Self> {
+        WorkspacePathPolicy::with_grants(root, Vec::new())
+    }
+
+    /// A policy for `root` honouring `extra_path_grants`.
+    pub fn with_grants(
+        root: impl AsRef<str>,
+        extra_path_grants: Vec<SandboxPathGrant>,
+    ) -> SandboxResult<Self> {
+        let root = normalize_segments(&to_posix(root.as_ref()));
+        if !root.starts_with('/') {
+            return Err(SandboxError::new(
+                ErrorCode::SandboxConfigInvalid,
+                "sandbox workspace root must be absolute",
+            ));
+        }
+        Ok(WorkspacePathPolicy {
+            root,
+            extra_path_grants,
+        })
+    }
+
+    /// The policy for a manifest's root and grants.
+    pub fn for_manifest(manifest: &crate::sandbox::manifest::Manifest) -> SandboxResult<Self> {
+        WorkspacePathPolicy::with_grants(manifest.root(), manifest.extra_path_grants().to_vec())
+    }
+
+    /// The workspace root, normalized.
+    pub fn sandbox_root(&self) -> &str {
+        &self.root
+    }
+
+    /// Whether the root currently exists as a directory on this host.
+    ///
+    /// Mirrors Python's `root_is_existing_host_path`: only a backend whose workspace really is a
+    /// local directory may resolve symlinks through it.
+    pub fn root_is_existing_host_path(&self) -> bool {
+        std::path::Path::new(&self.root).is_dir()
+    }
+
+    /// An absolute workspace path, with no grant allowed.
+    ///
+    /// Mirrors Python's `absolute_workspace_path`.
+    pub fn absolute_workspace_path(&self, path: &str) -> SandboxResult<String> {
+        resolve_workspace_path(&self.root, path)
+    }
+
+    /// The path relative to the workspace root, or `.` for the root itself.
+    pub fn relative_path(&self, path: &str) -> SandboxResult<String> {
+        let absolute = self.absolute_workspace_path(path)?;
+        let relative = absolute
+            .strip_prefix(self.root.trim_end_matches('/'))
+            .unwrap_or(&absolute)
+            .trim_start_matches('/')
+            .to_string();
+        Ok(if relative.is_empty() {
+            ".".to_string()
+        } else {
+            relative
+        })
+    }
+
+    /// A validated absolute sandbox path, allowing the extra grants.
+    ///
+    /// Mirrors Python's `normalize_sandbox_path`. `for_write` refuses a path whose effective
+    /// grant is read-only.
+    pub fn normalize_sandbox_path(&self, path: &str, for_write: bool) -> SandboxResult<String> {
+        let (resolved, grant) = self.resolve_with_grant(path)?;
+        if for_write {
+            self.raise_if_read_only(&resolved, grant)?;
+        }
+        Ok(resolved)
+    }
+
+    /// Refuse a recursive removal that would delete a read-only grant inside the tree.
+    ///
+    /// Mirrors Python's `validate_recursive_remove`: `rm -rf` on an ancestor is a write to every
+    /// grant beneath it, so a read-only grant nested in the tree has to veto the whole removal.
+    pub fn validate_recursive_remove(&self, path: &str) -> SandboxResult<()> {
+        let root = self.normalize_sandbox_path(path, true)?;
+        for grant in &self.extra_path_grants {
+            let grant_root = normalize_segments(&to_posix(&grant.path));
+            if grant.read_only && is_within(&root, &grant_root) {
+                // Go back through the effective-grant matching so workspace precedence and
+                // overriding grants are honoured exactly once.
+                self.normalize_sandbox_path(&grant_root, true)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The normalized grant roots and their access modes.
+    ///
+    /// Mirrors Python's `extra_path_grant_rules`, which feeds the in-sandbox realpath helper.
+    pub fn extra_path_grant_rules(&self) -> SandboxResult<Vec<(String, bool)>> {
+        let mut rules = Vec::new();
+        for grant in &self.extra_path_grants {
+            if is_windows_absolute(&grant.path) {
+                return Err(SandboxError::new(
+                    ErrorCode::SandboxConfigInvalid,
+                    "sandbox path grant path must be POSIX absolute",
+                ));
+            }
+            let root = normalize_segments(&to_posix(&grant.path));
+            if root == "/" {
+                return Err(SandboxError::new(
+                    ErrorCode::SandboxConfigInvalid,
+                    "sandbox path grant must not be the filesystem root",
+                ));
+            }
+            rules.push((root, grant.read_only));
+        }
+        Ok(rules)
+    }
+
+    /// The effective grant for an already-normalized path, longest root first.
+    pub fn matching_grant(&self, path: &str) -> Option<&SandboxPathGrant> {
+        self.extra_path_grants
+            .iter()
+            .filter(|grant| is_within(&normalize_segments(&to_posix(&grant.path)), path))
+            .max_by_key(|grant| normalize_segments(&to_posix(&grant.path)).len())
+    }
+
+    fn resolve_with_grant(&self, path: &str) -> SandboxResult<(String, Option<&SandboxPathGrant>)> {
+        match resolve_workspace_path(&self.root, path) {
+            // Inside the workspace: the root always wins over a grant that also covers it.
+            Ok(resolved) => Ok((resolved, None)),
+            Err(error) => {
+                let posix = to_posix(path);
+                if !posix.starts_with('/') || is_windows_absolute(path) {
+                    return Err(error);
+                }
+                let normalized = normalize_segments(&posix);
+                match self.matching_grant(&normalized) {
+                    Some(grant) => Ok((normalized, Some(grant))),
+                    None => Err(error),
+                }
+            }
+        }
+    }
+
+    fn raise_if_read_only(
+        &self,
+        path: &str,
+        grant: Option<&SandboxPathGrant>,
+    ) -> SandboxResult<()> {
+        let Some(grant) = grant else {
+            return Ok(());
+        };
+        if !grant.read_only {
+            return Ok(());
+        }
+        Err(SandboxError::new(
+            ErrorCode::WorkspaceArchiveWriteError,
+            format!(
+                "sandbox path `{path}` is under the read-only path grant `{}`",
+                grant.path
+            ),
+        )
+        .with_context("reason", "read_only_extra_path_grant")
+        .with_context("grant_path", grant.path.clone()))
+    }
+}

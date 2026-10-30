@@ -73,6 +73,12 @@ pub enum ErrorCode {
     SkillsConfigInvalid,
     /// The sandbox configuration is invalid.
     SandboxConfigInvalid,
+    /// A port the caller asked to reach cannot be resolved to a host endpoint.
+    ///
+    /// Mirrors Python's `ExposedPortUnavailableError`. The `reason` context says which case it
+    /// is: `not_configured` when the port was never declared on the client options, and
+    /// `backend_unavailable` when the provider cannot hand out an endpoint for it.
+    ExposedPortUnavailable,
     /// Persisting a workspace snapshot failed.
     SnapshotPersistError,
     /// Restoring a workspace snapshot failed.
@@ -117,6 +123,7 @@ impl ErrorCode {
             ErrorCode::GitCopyError => "git_copy_error",
             ErrorCode::SkillsConfigInvalid => "skills_config_invalid",
             ErrorCode::SandboxConfigInvalid => "sandbox_config_invalid",
+            ErrorCode::ExposedPortUnavailable => "exposed_port_unavailable",
             ErrorCode::SnapshotPersistError => "snapshot_persist_error",
             ErrorCode::SnapshotRestoreError => "snapshot_restore_error",
             ErrorCode::SnapshotNotRestorable => "snapshot_not_restorable",

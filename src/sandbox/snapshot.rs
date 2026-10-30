@@ -39,6 +39,29 @@ pub trait Snapshot: Send + Sync + fmt::Debug {
 
     /// Whether a stored archive is available.
     async fn restorable(&self) -> SandboxResult<bool>;
+
+    /// Store the archive with access to the session's runtime objects.
+    ///
+    /// Mirrors Python's `persist(..., dependencies=...)`. A snapshot that talks to a service the
+    /// application supplies by name resolves it here; the default ignores the container, which
+    /// is what every snapshot that only needs its own configuration wants.
+    async fn persist_with(
+        &self,
+        data: &[u8],
+        dependencies: Option<&crate::sandbox::dependencies::Dependencies>,
+    ) -> SandboxResult<()> {
+        let _ = dependencies;
+        self.persist(data).await
+    }
+
+    /// Read the stored archive back, with access to the session's runtime objects.
+    async fn restore_with(
+        &self,
+        dependencies: Option<&crate::sandbox::dependencies::Dependencies>,
+    ) -> SandboxResult<Vec<u8>> {
+        let _ = dependencies;
+        self.restore().await
+    }
 }
 
 /// A snapshot stored as a file on the machine running the SDK.

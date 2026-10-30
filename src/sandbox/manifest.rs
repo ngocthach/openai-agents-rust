@@ -96,6 +96,11 @@ impl SandboxConcurrencyLimits {
     pub fn local_dir_file_width(&self) -> usize {
         self.local_dir_files.unwrap_or(usize::MAX).max(1)
     }
+
+    /// The effective manifest-entry width, with `None` meaning "no limit".
+    pub fn manifest_entry_width(&self) -> usize {
+        self.manifest_entries.unwrap_or(usize::MAX).max(1)
+    }
 }
 
 /// The files, directories, mounts and accounts a fresh sandbox session starts from.
@@ -531,24 +536,34 @@ impl Manifest {
             self.provision_accounts(session).await;
         }
         let mut written = MaterializationResult::new();
+        // Entries materialize concurrently, in batches. Two entries may only share a batch when
+        // neither is a mount and neither path contains the other: a mount has to settle before
+        // anything can be written next to it, and a parent directory has to exist before its
+        // child is created. Everything inside a batch is independent, so a batch is bounded only
+        // by `concurrency_limits.manifest_entries`.
+        let width = self.concurrency_limits.manifest_entry_width();
+        let mut batch: Vec<(String, Entry)> = Vec::new();
         for (_, dest, entry) in validated {
             if only_ephemeral && !entry.ephemeral {
                 continue;
-            }
-            if entry.as_mount().is_none() {
-                if entry.is_dir() {
-                    session.mkdir(&dest, true).await?;
-                } else if let Some(parent) = parent_path(&dest) {
-                    session.mkdir(&parent, true).await?;
-                }
             }
             // The manifest owns the limits, so an entry built before they were set still
             // honours them.
             let entry = entry
                 .clone()
                 .with_copy_concurrency(self.concurrency_limits.local_dir_file_width());
-            written.extend(entry.apply(session, &dest).await?);
+            let is_mount = entry.as_mount().is_some();
+            let overlaps = batch.iter().any(|(queued, _)| paths_overlap(queued, &dest));
+            if is_mount || overlaps {
+                written.extend(apply_entry_batch(session, &mut batch, width).await?);
+            }
+            if is_mount {
+                written.extend(entry.apply(session, &dest).await?);
+                continue;
+            }
+            batch.push((dest, entry));
         }
+        written.extend(apply_entry_batch(session, &mut batch, width).await?);
         Ok(written)
     }
 
@@ -651,6 +666,46 @@ fn render_entry(out: &mut String, name: &str, entry: &Entry, level: usize, depth
             render_entry(out, child_name, child, level + 1, depth);
         }
     }
+}
+
+/// Whether one path is the other, or contains it.
+fn paths_overlap(left: &str, right: &str) -> bool {
+    let left = left.trim_end_matches('/');
+    let right = right.trim_end_matches('/');
+    left == right
+        || right.starts_with(&format!("{left}/"))
+        || left.starts_with(&format!("{right}/"))
+}
+
+/// Materialize a batch of independent entries concurrently and drain it.
+///
+/// The results are collected in the batch's own order, so a manifest's materialization result is
+/// the same whatever order the backend happened to finish the entries in.
+async fn apply_entry_batch(
+    session: &dyn SandboxSession,
+    batch: &mut Vec<(String, Entry)>,
+    width: usize,
+) -> SandboxResult<MaterializationResult> {
+    let mut written = MaterializationResult::new();
+    if batch.is_empty() {
+        return Ok(written);
+    }
+    let queued = std::mem::take(batch);
+    for chunk in queued.chunks(width.max(1)) {
+        let results = futures::future::join_all(chunk.iter().map(|(dest, entry)| async move {
+            if entry.is_dir() {
+                session.mkdir(dest, true).await?;
+            } else if let Some(parent) = parent_path(dest) {
+                session.mkdir(&parent, true).await?;
+            }
+            entry.apply(session, dest).await
+        }))
+        .await;
+        for result in results {
+            written.extend(result?);
+        }
+    }
+    Ok(written)
 }
 
 /// The parent of an absolute sandbox path, when it has one.

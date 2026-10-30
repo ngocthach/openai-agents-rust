@@ -21,6 +21,12 @@ Requests (`op` selects the operation):
     {"op": "poll", "sandbox_id": ...} -> {"running": true}
     {"op": "terminate", "sandbox_id": ...} -> {"ok": true}
     {"op": "snapshot_filesystem", "sandbox_id": ..., "timeout": 60} -> {"image_id": ...}
+    {"op": "snapshot_directory", "sandbox_id": ..., "path": ..., "timeout": 60}
+        -> {"image_id": ...}
+    {"op": "mount_image", "sandbox_id": ..., "path": ..., "image_id": ..., "timeout": 60}
+        -> {"ok": true}
+    {"op": "tunnels", "sandbox_id": ..., "timeout": 10}
+        -> {"tunnels": {"<sandbox port>": {"host": ..., "port": ...}}}
     {"op": "pty", "sandbox_id": ..., "argv": [...], "tty": true, "workdir": ...}
 
 `pty` is the one streaming operation: its request arrives as the first command-line argument
@@ -256,6 +262,48 @@ async def _op_snapshot_filesystem(modal: Any, request: dict[str, Any]) -> dict[s
     return {"image_id": image_id}
 
 
+async def _op_snapshot_directory(modal: Any, request: dict[str, Any]) -> dict[str, Any]:
+    sandbox = await _sandbox(modal, request)
+    timeout = request.get("timeout")
+    snap = sandbox.snapshot_directory.aio(request["path"])
+    image = await (asyncio.wait_for(snap, timeout=timeout) if timeout else snap)
+    image_id = (
+        image
+        if isinstance(image, str)
+        else getattr(image, "object_id", None) or getattr(image, "id", None)
+    )
+    if not isinstance(image_id, str) or not image_id:
+        return {"error": "snapshot_directory returned no image id", "code": "snapshot_failed"}
+    return {"image_id": image_id}
+
+
+async def _op_mount_image(modal: Any, request: dict[str, Any]) -> dict[str, Any]:
+    sandbox = await _sandbox(modal, request)
+    image = modal.Image.from_id(request["image_id"])
+    timeout = request.get("timeout")
+    mount = sandbox.mount_image.aio(request["path"], image)
+    await (asyncio.wait_for(mount, timeout=timeout) if timeout else mount)
+    return {"ok": True}
+
+
+async def _op_tunnels(modal: Any, request: dict[str, Any]) -> dict[str, Any]:
+    sandbox = await _sandbox(modal, request)
+    timeout = request.get("timeout")
+    lookup = sandbox.tunnels.aio()
+    tunnels = await (asyncio.wait_for(lookup, timeout=timeout) if timeout else lookup)
+    if not isinstance(tunnels, dict):
+        return {"error": "tunnels returned no mapping", "code": "tunnels_lookup_failed"}
+    # JSON object keys are strings, so the sandbox-side port is stringified here and parsed back
+    # on the Rust side.
+    resolved: dict[str, Any] = {}
+    for port, tunnel in tunnels.items():
+        host = getattr(tunnel, "host", None)
+        host_port = getattr(tunnel, "port", None)
+        if isinstance(host, str) and host and isinstance(host_port, int):
+            resolved[str(port)] = {"host": host, "port": host_port}
+    return {"tunnels": resolved}
+
+
 async def _op_pty(modal: Any, request: dict[str, Any]) -> None:
     """Bridge a Modal process to this helper's own stdin and stdout."""
     sandbox = await _sandbox(modal, request)
@@ -306,6 +354,9 @@ _OPS = {
     "poll": _op_poll,
     "terminate": _op_terminate,
     "snapshot_filesystem": _op_snapshot_filesystem,
+    "snapshot_directory": _op_snapshot_directory,
+    "mount_image": _op_mount_image,
+    "tunnels": _op_tunnels,
 }
 
 

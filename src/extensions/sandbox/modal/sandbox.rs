@@ -33,9 +33,14 @@ use serde_json::{Map, Value, json};
 use tokio::io::AsyncWriteExt as _;
 use tokio::sync::Mutex;
 
+use super::super::ports::{
+    ExposedPortEndpoint, ExposedPortUnavailable, assert_exposed_port_configured,
+    exposed_port_unavailable,
+};
 use crate::sandbox::errors::{ErrorCode, SandboxError, SandboxResult};
 use crate::sandbox::manifest::Manifest;
 use crate::sandbox::pty::{PtyExecRequest, PtyExecUpdate, PtyManager, PtySpawn, PtyWriteRequest};
+use crate::sandbox::retry::{RetryPolicy, is_transient_sandbox_error, retry_async};
 use crate::sandbox::sandboxes::docker::DEFAULT_PYTHON_SANDBOX_IMAGE;
 use crate::sandbox::session::{
     ExecRequest, SandboxClient, SandboxSession, restore_session_snapshot,
@@ -62,6 +67,8 @@ pub const HELPER_PYTHON_ENV: &str = "OPENAI_AGENTS_MODAL_PYTHON";
 
 /// The magic prefix of a snapshot payload that references a Modal filesystem snapshot.
 const SNAPSHOT_FILESYSTEM_MAGIC: &[u8] = b"MODAL_SANDBOX_FS_SNAPSHOT_V1\n";
+/// The magic prefix of a snapshot payload that references a Modal directory snapshot.
+const SNAPSHOT_DIRECTORY_MAGIC: &[u8] = b"MODAL_SANDBOX_DIR_SNAPSHOT_V1\n";
 
 /// How a Modal workspace is captured into a snapshot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -71,6 +78,58 @@ pub enum ModalWorkspacePersistence {
     Tar,
     /// Call Modal's `snapshot_filesystem` and store a reference to the resulting image.
     SnapshotFilesystem,
+    /// Call Modal's `snapshot_directory` on the workspace root and reattach it with
+    /// `mount_image` on restore.
+    ///
+    /// Unlike [`SnapshotFilesystem`](Self::SnapshotFilesystem), restoring keeps the running
+    /// sandbox and remounts only the workspace, so a restore does not replace the sandbox id.
+    SnapshotDirectory,
+}
+
+/// Which Modal image a sandbox boots from.
+///
+/// Mirrors `agents.extensions.sandbox.modal.sandbox.ModalImageSelector`, minus its `image` kind:
+/// Python can hold a live `modal.Image` because it runs in the same interpreter as the Modal
+/// SDK, while this port drives Modal through a stateless subprocess that addresses everything by
+/// id over one JSON request. Python itself only persists `image.object_id` from a live image, so
+/// [`Id`](Self::Id) carries everything that survives a process boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModalImageSelector {
+    /// An existing Modal image object id, such as the id of an earlier snapshot.
+    Id(String),
+    /// A registry tag, which is the name form: `debian:bookworm`, `ghcr.io/org/img:tag`.
+    Tag(String),
+}
+
+impl ModalImageSelector {
+    /// Select an image by its Modal object id. Mirrors `ModalImageSelector.from_id`.
+    pub fn from_id(image_id: impl Into<String>) -> Self {
+        ModalImageSelector::Id(image_id.into())
+    }
+
+    /// Select an image by registry tag. Mirrors `ModalImageSelector.from_tag`.
+    pub fn from_tag(image_tag: impl Into<String>) -> Self {
+        ModalImageSelector::Tag(image_tag.into())
+    }
+}
+
+/// Which Modal sandbox a session runs in.
+///
+/// Mirrors `agents.extensions.sandbox.modal.sandbox.ModalSandboxSelector`, minus its `sandbox`
+/// kind, for the same reason [`ModalImageSelector`] drops `image`: Python stores only
+/// `sandbox.object_id` from a live `modal.Sandbox`, and an id is what crosses the helper
+/// boundary. Python has no name form for a sandbox, so neither does this.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModalSandboxSelector {
+    /// An existing Modal sandbox id to adopt instead of creating a sandbox.
+    Id(String),
+}
+
+impl ModalSandboxSelector {
+    /// Adopt the sandbox with this Modal id. Mirrors `ModalSandboxSelector.from_id`.
+    pub fn from_id(sandbox_id: impl Into<String>) -> Self {
+        ModalSandboxSelector::Id(sandbox_id.into())
+    }
 }
 
 /// Settings used when creating a Modal-backed session.
@@ -82,6 +141,8 @@ pub struct ModalSandboxClientOptions {
     pub image_tag: Option<String>,
     /// An existing Modal image id, which takes precedence over the tag.
     pub image_id: Option<String>,
+    /// An existing Modal sandbox id to adopt instead of creating one.
+    pub sandbox_id: Option<String>,
     /// How the workspace is captured into a snapshot.
     pub workspace_persistence: ModalWorkspacePersistence,
     /// Ports Modal exposes over an encrypted tunnel.
@@ -130,6 +191,7 @@ impl ModalSandboxClientOptions {
             app_name: app_name.into(),
             image_tag: None,
             image_id: None,
+            sandbox_id: None,
             workspace_persistence: ModalWorkspacePersistence::Tar,
             exposed_ports: Vec::new(),
             gpu: None,
@@ -159,6 +221,35 @@ impl ModalSandboxClientOptions {
     /// Boot the sandbox from an existing Modal image.
     pub fn with_image_id(mut self, image_id: impl Into<String>) -> Self {
         self.image_id = Some(image_id.into());
+        self
+    }
+
+    /// Choose the image with one selector instead of juggling the tag and the id.
+    ///
+    /// Mirrors the `image=ModalImageSelector(...)` argument of Python's `ModalSandboxClient`.
+    /// Setting a selector clears the other form, so the last call wins.
+    pub fn with_image(mut self, image: ModalImageSelector) -> Self {
+        match image {
+            ModalImageSelector::Id(image_id) => {
+                self.image_id = Some(image_id);
+                self.image_tag = None;
+            }
+            ModalImageSelector::Tag(image_tag) => {
+                self.image_tag = Some(image_tag);
+                self.image_id = None;
+            }
+        }
+        self
+    }
+
+    /// Adopt an existing Modal sandbox instead of creating one.
+    ///
+    /// Mirrors the `sandbox=ModalSandboxSelector(...)` argument of Python's
+    /// `ModalSandboxClient`: `create` attaches to the named sandbox, which must still be
+    /// running, rather than calling `Sandbox.create`.
+    pub fn with_sandbox(mut self, sandbox: ModalSandboxSelector) -> Self {
+        let ModalSandboxSelector::Id(sandbox_id) = sandbox;
+        self.sandbox_id = Some(sandbox_id);
         self
     }
 
@@ -531,11 +622,81 @@ impl ModalSandboxClient {
         Value::Object(request)
     }
 
+    /// Refuse a manifest that `snapshot_directory` cannot capture.
+    ///
+    /// Mirrors Python's `_validate_manifest_for_workspace_persistence`: the directory snapshot
+    /// replaces the workspace root wholesale, so a Modal cloud bucket mount at or under the root
+    /// would be captured — and, on restore, shadowed — instead of staying a live mount.
+    fn validate_manifest_for_workspace_persistence(
+        &self,
+        manifest: &Manifest,
+    ) -> SandboxResult<()> {
+        if self.options.workspace_persistence != ModalWorkspacePersistence::SnapshotDirectory {
+            return Ok(());
+        }
+        let root = manifest.root().trim_end_matches('/').to_string();
+        for mount_path in ModalCloudBucketMountStrategy::mount_paths(manifest) {
+            let normalized = mount_path.trim_end_matches('/');
+            if normalized == root || normalized.starts_with(&format!("{root}/")) {
+                return Err(SandboxError::new(
+                    ErrorCode::MountConfigInvalid,
+                    "snapshot_directory is not supported when a Modal cloud bucket mount lives \
+                     at or under the workspace root",
+                )
+                .with_context("workspace_root", root)
+                .with_context("mount_path", mount_path)
+                .with_context("workspace_persistence", "snapshot_directory")
+                .with_retryable(false));
+            }
+        }
+        Ok(())
+    }
+
+    /// Attach to a sandbox the caller already owns, instead of creating one.
+    async fn adopt_session(
+        &self,
+        manifest: Manifest,
+        sandbox_id: &str,
+    ) -> SandboxResult<ModalSandboxSession> {
+        let helper = ModalHelper::new(self.options.resolve_helper_command()?);
+        let running = helper
+            .call(json!({"op": "poll", "sandbox_id": sandbox_id}))
+            .await?
+            .get("running")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if !running {
+            return Err(SandboxError::new(
+                ErrorCode::WorkspaceStartError,
+                format!("the Modal sandbox `{sandbox_id}` is not running"),
+            )
+            .with_retryable(false));
+        }
+        Ok(ModalSandboxSession::new(
+            helper,
+            sandbox_id.to_string(),
+            manifest,
+            self.options.clone(),
+        )
+        .with_image_id(self.options.image_id.clone())
+        .with_snapshot(self.snapshot.clone()))
+    }
+
     async fn create_session(
         &self,
         manifest: Manifest,
         image_id: Option<&str>,
     ) -> SandboxResult<ModalSandboxSession> {
+        self.validate_manifest_for_workspace_persistence(&manifest)?;
+        if image_id.is_none()
+            && let Some(sandbox_id) = self
+                .options
+                .sandbox_id
+                .as_deref()
+                .filter(|id| !id.is_empty())
+        {
+            return self.adopt_session(manifest, sandbox_id).await;
+        }
         let helper = ModalHelper::new(self.options.resolve_helper_command()?);
         let response = helper
             .call(self.create_request(&manifest, image_id))
@@ -747,6 +908,149 @@ impl ModalSandboxSession {
             *slot = Some(image_id.clone());
         }
         Ok(image_id)
+    }
+
+    /// Snapshot the workspace root into a Modal image with `Sandbox.snapshot_directory`.
+    ///
+    /// The image captures the whole directory, so the paths a workspace archive excludes —
+    /// ephemeral entries and the staged rclone configuration, which holds a mount credential —
+    /// are moved aside first and put back afterwards, the way Python's
+    /// `_persist_workspace_via_snapshot_directory` does. Without that, a credential would be
+    /// baked into an image that outlives the sandbox.
+    pub async fn snapshot_directory(&self) -> SandboxResult<String> {
+        let root = self.manifest.root().to_string();
+        let excluded = crate::sandbox::session::workspace_archive_excludes(&self.manifest, &root)
+            .into_iter()
+            .map(|relative| relative.trim_start_matches("./").to_string())
+            .filter(|relative| !relative.is_empty())
+            .collect::<Vec<_>>();
+        let backup = (!excluded.is_empty()).then(|| {
+            crate::sandbox::workspace_paths::provider_scratch_path(&format!(
+                "modal-snapshot-directory-ephemeral-{}.tar",
+                self.session_id
+            ))
+        });
+        if let Some(backup) = &backup {
+            self.stash_excluded_paths(&root, &excluded, backup).await?;
+        }
+        let snapshot = self.snapshot_directory_image(&root).await;
+        if let Some(backup) = &backup {
+            // The stash is restored whether or not the snapshot succeeded, so a failure does not
+            // leave the live workspace missing its ephemeral entries.
+            let restored = self.restore_excluded_paths(&root, backup).await;
+            snapshot.as_ref().map_err(Clone::clone)?;
+            restored?;
+        }
+        snapshot
+    }
+
+    /// Archive `excluded` out of `root` into `backup`, then delete them from the workspace.
+    async fn stash_excluded_paths(
+        &self,
+        root: &str,
+        excluded: &[String],
+        backup: &str,
+    ) -> SandboxResult<()> {
+        let quoted = excluded
+            .iter()
+            .map(|relative| crate::sandbox::session::shell_quote(relative))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let backup_quoted = crate::sandbox::session::shell_quote(backup);
+        let root_quoted = crate::sandbox::session::shell_quote(root);
+        // A path that does not exist is skipped rather than failing `tar`, and the archive is
+        // written even when nothing matched so the restore is unconditional.
+        let script = format!(
+            "mkdir -p -- \"$(dirname -- {backup_quoted})\" && cd -- {root_quoted} && \
+             {{ for rel in {quoted}; do if [ -e \"$rel\" ]; then printf '%s\\n' \"$rel\"; fi; \
+             done; }} | tar cf {backup_quoted} -T - 2>/dev/null; \
+             test -f {backup_quoted} && rm -rf -- {quoted}"
+        );
+        let result = self
+            .helper_exec(&["sh".to_string(), "-lc".to_string(), script], "/", None)
+            .await?;
+        if !result.ok() {
+            return Err(SandboxError::new(
+                ErrorCode::SnapshotPersistError,
+                format!(
+                    "failed to set aside the paths a Modal directory snapshot must not capture: {}",
+                    result.stderr_text().trim()
+                ),
+            )
+            .with_context("workspace_root", root));
+        }
+        Ok(())
+    }
+
+    /// Put the stashed paths back and delete the stash.
+    async fn restore_excluded_paths(&self, root: &str, backup: &str) -> SandboxResult<()> {
+        let script = format!(
+            "tar xf {backup} -C {root} && rm -f -- {backup}",
+            backup = crate::sandbox::session::shell_quote(backup),
+            root = crate::sandbox::session::shell_quote(root),
+        );
+        let result = self
+            .helper_exec(&["sh".to_string(), "-lc".to_string(), script], "/", None)
+            .await?;
+        if !result.ok() {
+            return Err(SandboxError::new(
+                ErrorCode::SnapshotPersistError,
+                format!(
+                    "failed to restore the paths set aside for a Modal directory snapshot: {}",
+                    result.stderr_text().trim()
+                ),
+            )
+            .with_context("workspace_root", root));
+        }
+        Ok(())
+    }
+
+    async fn snapshot_directory_image(&self, root: &str) -> SandboxResult<String> {
+        let response = self
+            .helper
+            .call(json!({
+                "op": "snapshot_directory",
+                "sandbox_id": self.sandbox_id(),
+                "path": root,
+                "timeout": self.options.snapshot_filesystem_timeout.as_secs(),
+            }))
+            .await?;
+        response
+            .get("image_id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| {
+                SandboxError::new(
+                    ErrorCode::SnapshotPersistError,
+                    "`snapshot_directory` returned no image id",
+                )
+            })
+    }
+
+    /// Reattach a directory snapshot over the workspace root with `Sandbox.mount_image`.
+    ///
+    /// Unlike a filesystem snapshot, this keeps the running sandbox, so the sandbox id and every
+    /// open PTY survive the restore.
+    async fn mount_snapshot_directory(&self, image_id: &str) -> SandboxResult<()> {
+        self.helper
+            .call(json!({
+                "op": "mount_image",
+                "sandbox_id": self.sandbox_id(),
+                "path": self.manifest.root(),
+                "image_id": image_id,
+                "timeout": self.options.snapshot_filesystem_restore_timeout.as_secs(),
+            }))
+            .await
+            .map_err(|error| {
+                SandboxError::new(
+                    ErrorCode::SnapshotRestoreError,
+                    format!("failed to restore the Modal directory snapshot: {error}"),
+                )
+                .with_context("snapshot_id", image_id)
+                .caused_by(&error)
+            })?;
+        Ok(())
     }
 
     async fn helper_exec(
@@ -1022,7 +1326,7 @@ impl SandboxSession for ModalSandboxSession {
     }
 
     async fn write_file(&self, path: &str, contents: &[u8]) -> SandboxResult<()> {
-        let resolved = self.normalize_path(path)?;
+        let resolved = self.normalize_path_for_write(path)?;
         self.helper
             .call(json!({
                 "op": "write_file",
@@ -1032,6 +1336,55 @@ impl SandboxSession for ModalSandboxSession {
             }))
             .await
             .map(|_| ())
+    }
+
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
+    }
+
+    fn exposed_ports(&self) -> Vec<u16> {
+        self.options.exposed_ports.clone()
+    }
+
+    /// Resolve an exposed port to a reachable endpoint, through Modal's encrypted tunnels.
+    ///
+    /// Mirrors `ModalSandboxSession._resolve_exposed_port`.
+    async fn resolve_exposed_port(&self, port: u16) -> SandboxResult<ExposedPortEndpoint> {
+        assert_exposed_port_configured("modal", port, &self.options.exposed_ports)?;
+        let unavailable = || {
+            exposed_port_unavailable(
+                "modal",
+                port,
+                &self.options.exposed_ports,
+                ExposedPortUnavailable::BackendUnavailable,
+            )
+        };
+        let response = self
+            .helper
+            .call(json!({
+                "op": "tunnels",
+                "sandbox_id": self.sandbox_id(),
+                "timeout": 10,
+            }))
+            .await
+            .map_err(|error| unavailable().caused_by(&error))?;
+        let tunnel = response
+            .get("tunnels")
+            .and_then(Value::as_object)
+            .and_then(|tunnels| tunnels.get(&port.to_string()))
+            .ok_or_else(unavailable)?;
+        let host = tunnel
+            .get("host")
+            .and_then(Value::as_str)
+            .filter(|host| !host.is_empty())
+            .ok_or_else(unavailable)?;
+        let host_port = tunnel
+            .get("port")
+            .and_then(Value::as_u64)
+            .and_then(|port| u16::try_from(port).ok())
+            .ok_or_else(unavailable)?;
+        // A Modal tunnel terminates TLS, which is why its port is 443 in practice.
+        Ok(ExposedPortEndpoint::new(host, host_port, host_port == 443))
     }
 
     fn supports_pty(&self) -> bool {
@@ -1108,17 +1461,33 @@ impl SandboxSession for ModalSandboxSession {
     }
 
     async fn persist_workspace(&self) -> SandboxResult<Vec<u8>> {
-        if self.options.workspace_persistence == ModalWorkspacePersistence::SnapshotFilesystem {
-            let image_id = self.snapshot_filesystem().await?;
-            return Ok(encode_snapshot_filesystem_ref(&image_id));
+        match self.options.workspace_persistence {
+            ModalWorkspacePersistence::SnapshotFilesystem => {
+                let image_id = self.snapshot_filesystem().await?;
+                return Ok(encode_snapshot_filesystem_ref(&image_id));
+            }
+            ModalWorkspacePersistence::SnapshotDirectory => {
+                let image_id = self.snapshot_directory().await?;
+                return Ok(encode_snapshot_directory_ref(&image_id));
+            }
+            ModalWorkspacePersistence::Tar => {}
         }
-        // The tar flow is the trait's own `tar -czf -` over `exec`.
-        default_persist_workspace(self).await
+        // The tar flow is the trait's own `tar -czf -` over `exec`, retried on a transient
+        // transport failure exactly as Python's `@retry_async` wrapper does.
+        retry_async(
+            RetryPolicy::new(),
+            || default_persist_workspace(self),
+            |error, _attempt| is_transient_sandbox_error(error),
+        )
+        .await
     }
 
     async fn hydrate_workspace(&self, archive: &[u8]) -> SandboxResult<()> {
         if let Some(image_id) = decode_snapshot_filesystem_ref(archive) {
             return self.restore_from_image(&image_id).await;
+        }
+        if let Some(image_id) = decode_snapshot_directory_ref(archive) {
+            return self.mount_snapshot_directory(&image_id).await;
         }
         let root = self.manifest.root().to_string();
         // The archive is staged through the helper's own chunked stdin writer: a base64 command
@@ -1235,7 +1604,30 @@ pub fn encode_snapshot_filesystem_ref(image_id: &str) -> Vec<u8> {
 
 /// The Modal image id inside a snapshot envelope, when the payload is one.
 pub fn decode_snapshot_filesystem_ref(payload: &[u8]) -> Option<String> {
-    let body = payload.strip_prefix(SNAPSHOT_FILESYSTEM_MAGIC)?;
+    decode_snapshot_ref(payload, SNAPSHOT_FILESYSTEM_MAGIC)
+}
+
+/// The snapshot envelope a directory snapshot is stored as.
+///
+/// Byte-identical to Python's `_encode_snapshot_directory_ref`, so a reference written by either
+/// port restores through the other.
+pub fn encode_snapshot_directory_ref(image_id: &str) -> Vec<u8> {
+    let body = json!({
+        "snapshot_id": image_id,
+        "workspace_persistence": "snapshot_directory",
+    });
+    let mut payload = SNAPSHOT_DIRECTORY_MAGIC.to_vec();
+    payload.extend_from_slice(serde_json::to_string(&body).unwrap_or_default().as_bytes());
+    payload
+}
+
+/// The Modal image id inside a directory-snapshot envelope, when the payload is one.
+pub fn decode_snapshot_directory_ref(payload: &[u8]) -> Option<String> {
+    decode_snapshot_ref(payload, SNAPSHOT_DIRECTORY_MAGIC)
+}
+
+fn decode_snapshot_ref(payload: &[u8], magic: &[u8]) -> Option<String> {
+    let body = payload.strip_prefix(magic)?;
     let parsed: Value = serde_json::from_slice(body).ok()?;
     parsed
         .get("snapshot_id")

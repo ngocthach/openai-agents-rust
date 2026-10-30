@@ -293,6 +293,15 @@ impl ModalCloudBucketMountStrategy {
             })
             .collect()
     }
+
+    /// The manifest paths every Modal bucket mount is attached at.
+    pub fn mount_paths(manifest: &Manifest) -> Vec<String> {
+        manifest
+            .mount_targets()
+            .into_iter()
+            .filter_map(|(mount, mount_path)| strategy_config(&mount.strategy).map(|_| mount_path))
+            .collect()
+    }
 }
 
 /// The bucket configuration `strategy` carries, when it is a Modal bucket mount.

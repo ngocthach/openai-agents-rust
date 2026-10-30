@@ -54,6 +54,7 @@
 
 pub mod agent;
 pub mod capabilities;
+pub mod dependencies;
 pub mod editor;
 pub mod entries;
 pub mod environment;
@@ -70,6 +71,7 @@ pub mod pty;
 pub mod remote_mount_policy;
 pub mod retry;
 pub mod runtime;
+pub mod runtime_helpers;
 pub mod sandboxes;
 pub mod session;
 pub mod snapshot;
@@ -84,13 +86,15 @@ pub use capabilities::{
     Capabilities, Capability, CapabilityBinding, Compaction, ConfiguredCapability, Filesystem,
     LazySkillSource, LocalDirLazySkillSource, Memory, Shell, Skill, SkillMetadata, Skills,
 };
-pub use editor::SandboxEditor;
+pub use dependencies::{Dependencies, Dependency, DependencyCloser, DependencyFactory};
+pub use editor::{PatchFormat, SandboxEditor, V4aFormat};
 pub use entries::{Entry, EntryKind};
 pub use environment::{EnvEntry, EnvValue, Environment, StrEnvValue};
 pub use errors::{ErrorCode, SandboxError, SandboxOp, SandboxResult};
 pub use events::{
-    CallbackSink, ChainedSink, EventPayloadPolicy, EventPhase, EventSink, Instrumentation,
-    InstrumentedSession, JsonlFileSink, SandboxSessionEvent,
+    CallbackSink, ChainedSink, EventPayloadPolicy, EventPhase, EventSink, HttpProxySink,
+    Instrumentation, InstrumentedSession, JsonlFileSink, SandboxSessionEvent, WorkspaceJsonlSink,
+    current_trace_id,
 };
 pub use manifest::{
     DEFAULT_MANIFEST_ROOT, DEFAULT_MAX_LOCAL_DIR_FILE_CONCURRENCY,
@@ -116,25 +120,36 @@ pub use pty::{
     PtyExecRequest, PtyExecUpdate, PtyManager, PtyWriteRequest, RemotePtyManager, RemotePtyProcess,
 };
 pub use remote_mount_policy::build_remote_mount_policy_instructions;
-pub use retry::{BackoffStrategy, RetryPolicy, retry_async};
+pub use retry::{BackoffStrategy, RetryPolicy, is_transient_sandbox_error, retry_async};
 pub use runtime::{
     PreparedSandboxRun, SandboxRunConfig, SandboxRunOutcome, SandboxRunner, SandboxSessionGuard,
     SandboxStreamedRun,
 };
-pub use session::{ExecRequest, ExecShell, SandboxClient, SandboxSession};
+pub use runtime_helpers::{
+    RESOLVE_WORKSPACE_PATH_HELPER, RuntimeHelperScript, WORKSPACE_FINGERPRINT_HELPER,
+};
+pub use session::{
+    ExecRequest, ExecShell, SandboxClient, SandboxSession, clear_workspace_root_on_resume,
+    compute_and_cache_snapshot_fingerprint, live_workspace_matches_snapshot_on_resume,
+    parse_snapshot_fingerprint_record, read_cached_snapshot_fingerprint,
+    snapshot_fingerprint_cache_path,
+};
 pub use snapshot::{
     LocalSnapshot, NoopSnapshot, RemoteSnapshot, RemoteSnapshotClient, Snapshot, SnapshotSpec,
     cleanup_stale_default_local_snapshots, default_local_snapshot_base_dir,
     register_remote_snapshot_client, remote_snapshot_client, resolve_default_local_snapshot_spec,
     resolve_snapshot,
 };
-pub use state::{SandboxSessionState, manifest_digest};
+pub use state::{SandboxSessionState, SnapshotFingerprint, manifest_digest};
 pub use testing::{
     SandboxCall, SandboxCallResult, SandboxMethod, SandboxStep, ScriptedSandboxSession,
     scripted_sandbox_session,
 };
-pub use types::{ExecResult, FileEntry, Group, Permissions, User, file_mode};
+pub use types::{
+    ExecResult, ExposedPortEndpoint, ExposedPortUnavailable, FileEntry, Group, Permissions, User,
+    exposed_port_unavailable, file_mode,
+};
 pub use workspace_paths::{
-    PROVIDER_SCRATCH_PREFIX, SandboxPathGrant, SandboxWorkspaceScope, is_provider_scratch_path,
-    provider_scratch_path,
+    PROVIDER_SCRATCH_PREFIX, SandboxPathGrant, SandboxWorkspaceScope, WorkspacePathPolicy,
+    is_provider_scratch_path, provider_scratch_path,
 };

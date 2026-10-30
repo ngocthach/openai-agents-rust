@@ -22,6 +22,26 @@ pub struct SandboxEditor {
     session: Arc<dyn SandboxSession>,
     scope: SandboxWorkspaceScope,
     run_as: Option<crate::sandbox::types::User>,
+    patch_format: Arc<dyn PatchFormat>,
+}
+
+/// The diff dialect an [`SandboxEditor`] speaks. Mirrors Python's `PatchFormat` protocol.
+///
+/// `apply_patch` is a wire format, not a filesystem operation: a model trained on a different
+/// diff dialect can be served by swapping this out rather than by re-implementing the editor.
+pub trait PatchFormat: std::fmt::Debug + Send + Sync {
+    /// Apply `diff` to `input` and return the result.
+    fn apply_diff(&self, input: &str, diff: &str, mode: ApplyDiffMode) -> Result<String>;
+}
+
+/// The default dialect, OpenAI's V4A patch format. Mirrors Python's `V4AFormat`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct V4aFormat;
+
+impl PatchFormat for V4aFormat {
+    fn apply_diff(&self, input: &str, diff: &str, mode: ApplyDiffMode) -> Result<String> {
+        apply_diff(input, diff, mode)
+    }
 }
 
 impl SandboxEditor {
@@ -31,7 +51,32 @@ impl SandboxEditor {
             session,
             scope: SandboxWorkspaceScope::root(),
             run_as: None,
+            patch_format: Arc::new(V4aFormat),
         }
+    }
+
+    /// Read diffs in a dialect other than V4A.
+    pub fn with_patch_format(mut self, patch_format: Arc<dyn PatchFormat>) -> Self {
+        self.patch_format = patch_format;
+        self
+    }
+
+    /// Rewrite an operation so its paths are in the workspace policy's canonical form.
+    ///
+    /// Mirrors Python's `normalize_operation`. A caller that wants to inspect, log or dedupe an
+    /// operation before applying it needs the same path the editor will use, not the raw string
+    /// the model produced.
+    pub fn normalize_operation(
+        &self,
+        operation: &ApplyPatchOperation,
+    ) -> Result<ApplyPatchOperation> {
+        let mut normalized = operation.clone();
+        normalized.path = self.resolve(&operation.path)?;
+        normalized.move_to = match &operation.move_to {
+            None => None,
+            Some(destination) => Some(self.resolve(destination)?),
+        };
+        Ok(normalized)
     }
 
     /// Edit files as `run_as` rather than as the session owner.
@@ -99,12 +144,14 @@ impl SandboxEditor {
 impl ApplyPatchEditor for SandboxEditor {
     async fn create_file(&self, operation: &ApplyPatchOperation) -> Result<ApplyPatchResult> {
         let resolved = self.resolve(&operation.path)?;
-        let content = apply_diff(
-            "",
-            operation.diff.as_deref().unwrap_or(""),
-            ApplyDiffMode::Create,
-        )
-        .map_err(invalid_diff)?;
+        let content = self
+            .patch_format
+            .apply_diff(
+                "",
+                operation.diff.as_deref().unwrap_or(""),
+                ApplyDiffMode::Create,
+            )
+            .map_err(invalid_diff)?;
         // `apply_patch` has a separate update mode, so a create against an existing path is a
         // mistake, not an overwrite request. Mirrors Python's `_write_new_text`.
         if self
@@ -133,12 +180,14 @@ impl ApplyPatchEditor for SandboxEditor {
     async fn update_file(&self, operation: &ApplyPatchOperation) -> Result<ApplyPatchResult> {
         let resolved = self.resolve(&operation.path)?;
         let original = self.read_text(&resolved, &operation.path).await?;
-        let updated = apply_diff(
-            &original,
-            operation.diff.as_deref().unwrap_or(""),
-            ApplyDiffMode::Default,
-        )
-        .map_err(invalid_diff)?;
+        let updated = self
+            .patch_format
+            .apply_diff(
+                &original,
+                operation.diff.as_deref().unwrap_or(""),
+                ApplyDiffMode::Default,
+            )
+            .map_err(invalid_diff)?;
         match &operation.move_to {
             None => {
                 self.session

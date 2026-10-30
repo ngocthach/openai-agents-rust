@@ -32,6 +32,14 @@ use serde_json::{Value, json};
 use crate::sandbox::errors::{ErrorCode, SandboxError, SandboxResult};
 use crate::sandbox::manifest::{DEFAULT_MANIFEST_ROOT, Manifest};
 use crate::sandbox::pty::{PtyExecRequest, PtyExecUpdate, PtyWriteRequest};
+use crate::sandbox::retry::{
+    RetryPolicy, is_transient_http_status, is_transient_sandbox_error, retry_async,
+};
+
+use super::super::ports::{
+    ExposedPortEndpoint, ExposedPortUnavailable, assert_exposed_port_configured,
+    exposed_port_unavailable,
+};
 use crate::sandbox::session::{
     ExecRequest, SandboxClient, SandboxSession, restore_session_snapshot,
 };
@@ -624,7 +632,27 @@ impl CloudflareSandboxSession {
         ))
     }
 
+    /// Run one workspace archive request, retrying a transient transport or 5xx failure.
+    ///
+    /// Python decorates `_persist_workspace_via_http` and `_hydrate_workspace_via_http` with
+    /// `@retry_async` (`cloudflare/sandbox.py` L1445, L1488); both reach the worker through this
+    /// one request.
     async fn archive_request(
+        &self,
+        path: &str,
+        query: &[(String, String)],
+        body: Option<Vec<u8>>,
+        code: ErrorCode,
+    ) -> SandboxResult<Vec<u8>> {
+        retry_async(
+            RetryPolicy::new(),
+            || self.archive_request_once(path, query, body.clone(), code),
+            |error, _attempt| is_transient_sandbox_error(error),
+        )
+        .await
+    }
+
+    async fn archive_request_once(
         &self,
         path: &str,
         query: &[(String, String)],
@@ -646,6 +674,8 @@ impl CloudflareSandboxSession {
         }
         let response = builder.send().await.map_err(|error| {
             SandboxError::new(code, format!("cloudflare `{path}` request failed: {error}"))
+                // A connection that never produced a response is worth another attempt.
+                .with_retryable(true)
         })?;
         let status = response.status();
         let payload = response.bytes().await.unwrap_or_default();
@@ -657,7 +687,8 @@ impl CloudflareSandboxSession {
                     status.as_u16(),
                     format_response_body(&payload),
                 ),
-            ));
+            )
+            .with_retryable(is_transient_http_status(status.as_u16())));
         }
         Self::decode_streamed_payload(&payload)
     }
@@ -836,8 +867,102 @@ impl SandboxSession for CloudflareSandboxSession {
         Self::decode_streamed_payload(&body)
     }
 
-    async fn write_file(&self, path: &str, contents: &[u8]) -> SandboxResult<()> {
+    /// Read at most `max_bytes`, bounding what the worker is allowed to send as well.
+    ///
+    /// Mirrors `CloudflareSandboxSession._read_bounded`. The worker answers a file either as raw
+    /// bytes or as an SSE stream whose base64 chunks are several times the size of the file, so
+    /// bounding only the decoded result would still let the sandbox decide how much this process
+    /// buffers. The wire budget is `8 * max_bytes + 65536`, and a body that exceeds it is
+    /// refused with `reason = "bounded_read_wire_limit"` — the convention the core
+    /// [`read_bounded`](SandboxSession::read_bounded) doc names — rather than decoded.
+    async fn read_bounded(&self, path: &str, max_bytes: usize) -> SandboxResult<Vec<u8>> {
+        if max_bytes == 0 {
+            return Err(SandboxError::new(
+                ErrorCode::SandboxConfigInvalid,
+                "read_bounded max_bytes must be positive",
+            ));
+        }
         let resolved = self.normalize_path(path)?;
+        let url = self.file_url(&resolved);
+        let response = self
+            .connection
+            .request(reqwest::Method::GET, &url)
+            .timeout(self.connection.request_timeout)
+            .send()
+            .await
+            .map_err(|error| {
+                SandboxError::new(
+                    ErrorCode::ExecTransportError,
+                    format!("Failed to read `{path}`: {error}"),
+                )
+                .with_retryable(true)
+            })?;
+        let status = response.status();
+        if status.as_u16() == 404 {
+            return Err(SandboxError::new(
+                ErrorCode::WorkspaceReadNotFound,
+                format!("`{resolved}` does not exist in the sandbox workspace"),
+            ));
+        }
+        if !status.is_success() {
+            let body = response.bytes().await.unwrap_or_default();
+            // A 403 is the worker refusing the path, which will never start working.
+            let retryable = status.as_u16() != 403 && is_transient_http_status(status.as_u16());
+            return Err(SandboxError::new(
+                ErrorCode::WorkspaceArchiveReadError,
+                http_error_message(
+                    &format!("GET /file{resolved}"),
+                    status.as_u16(),
+                    format_response_body(&body),
+                ),
+            )
+            .with_context("path", resolved)
+            .with_retryable(retryable));
+        }
+        // One byte over the budget is enough to prove it was exceeded, so the rest of an
+        // oversized body is never pulled off the socket.
+        let wire_limit = max_bytes.saturating_mul(8).saturating_add(65536);
+        let mut body: Vec<u8> = Vec::new();
+        let mut stream = response.bytes_stream();
+        let mut over_budget = false;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|error| {
+                SandboxError::new(
+                    ErrorCode::WorkspaceArchiveReadError,
+                    format!("Failed to read `{path}`: {error}"),
+                )
+                .with_retryable(true)
+            })?;
+            body.extend_from_slice(&chunk);
+            // The budget only applies once the prefix shows this is an SSE body; a raw body is
+            // bounded by `max_bytes` itself.
+            let budget = if body.len() >= 7 && !body.starts_with(b"data: {") {
+                max_bytes
+            } else {
+                wire_limit + 1
+            };
+            if body.len() >= budget {
+                over_budget = body.len() > wire_limit;
+                body.truncate(budget);
+                break;
+            }
+        }
+        if body.starts_with(b"data: {") && over_budget {
+            return Err(SandboxError::new(
+                ErrorCode::WorkspaceArchiveReadError,
+                format!("`{resolved}` exceeds the bounded-read wire limit of {wire_limit} bytes"),
+            )
+            .with_context("reason", "bounded_read_wire_limit")
+            .with_context("path", resolved)
+            .with_retryable(false));
+        }
+        let mut decoded = Self::decode_streamed_payload(&body)?;
+        decoded.truncate(max_bytes);
+        Ok(decoded)
+    }
+
+    async fn write_file(&self, path: &str, contents: &[u8]) -> SandboxResult<()> {
+        let resolved = self.normalize_path_for_write(path)?;
         let url = self.file_url(&resolved);
         let response = self
             .connection
@@ -899,6 +1024,30 @@ impl SandboxSession for CloudflareSandboxSession {
 
     fn as_any(&self) -> Option<&dyn std::any::Any> {
         Some(self)
+    }
+
+    fn exposed_ports(&self) -> Vec<u16> {
+        self.exposed_ports.clone()
+    }
+
+    /// Always refuses: the Cloudflare sandbox worker has no port-resolution endpoint.
+    ///
+    /// Mirrors `CloudflareSandboxSession._resolve_exposed_port`, which raises for every port
+    /// rather than guessing a URL. Declaring a port is still meaningful — the worker opens it
+    /// inside the sandbox — but nothing outside the Worker can address it. The override exists
+    /// only to carry Python's explanatory detail; the refusal itself matches the trait default.
+    async fn resolve_exposed_port(&self, port: u16) -> SandboxResult<ExposedPortEndpoint> {
+        assert_exposed_port_configured("cloudflare", port, &self.exposed_ports)?;
+        Err(exposed_port_unavailable(
+            "cloudflare",
+            port,
+            &self.exposed_ports,
+            ExposedPortUnavailable::BackendUnavailable,
+        )
+        .with_context(
+            "detail",
+            "the Cloudflare sandbox worker exposes no port-resolution endpoint",
+        ))
     }
 
     fn supports_pty(&self) -> bool {

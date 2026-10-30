@@ -42,6 +42,7 @@ use serde_json::{Map, Value, json};
 use crate::sandbox::errors::{ErrorCode, SandboxError, SandboxResult};
 use crate::sandbox::manifest::Manifest;
 use crate::sandbox::pty::{PtyExecRequest, PtyExecUpdate, PtyWriteRequest};
+use crate::sandbox::retry::{RetryPolicy, is_transient_sandbox_error, retry_async};
 use crate::sandbox::session::{
     ExecRequest, SandboxClient, SandboxSession, restore_session_snapshot, shell_quote,
 };
@@ -50,6 +51,9 @@ use crate::sandbox::state::SandboxSessionState;
 use crate::sandbox::types::{ExecResult, FileEntry, Permissions};
 use crate::sandbox::workspace_paths::provider_scratch_path;
 
+use super::super::ports::{
+    ExposedPortEndpoint, ExposedPortUnavailable, endpoint_from_url, exposed_port_unavailable,
+};
 use super::pty::{BlaxelPtySessions, terminal_url};
 
 /// The workspace root Blaxel sandboxes use by default.
@@ -98,7 +102,7 @@ impl Default for BlaxelTimeouts {
 }
 
 /// Settings used when creating a Blaxel-backed session.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlaxelSandboxClientOptions {
     /// The sandbox image, or the Blaxel default when unset.
     pub image: Option<String>,
@@ -130,6 +134,35 @@ pub struct BlaxelSandboxClientOptions {
     pub run_base_url: Option<String>,
     /// Address the sandbox at this URL instead of the one the control plane reports.
     pub force_sandbox_url: Option<String>,
+    /// Whether a preview created for an exposed port is public.
+    pub exposed_port_public: bool,
+    /// How long a private preview's access token stays valid, in seconds.
+    pub exposed_port_url_ttl_secs: u32,
+}
+
+impl Default for BlaxelSandboxClientOptions {
+    fn default() -> Self {
+        BlaxelSandboxClientOptions {
+            image: None,
+            memory: None,
+            region: None,
+            ports: Vec::new(),
+            env_vars: BTreeMap::new(),
+            labels: BTreeMap::new(),
+            ttl: None,
+            name: None,
+            pause_on_exit: false,
+            timeouts: BlaxelTimeouts::default(),
+            api_key: None,
+            workspace: None,
+            api_base_url: None,
+            run_base_url: None,
+            force_sandbox_url: None,
+            // Python's `BlaxelSandboxClientOptions` defaults, not Rust's zero values.
+            exposed_port_public: true,
+            exposed_port_url_ttl_secs: 3600,
+        }
+    }
 }
 
 impl BlaxelSandboxClientOptions {
@@ -293,6 +326,8 @@ pub struct BlaxelConnection {
     workspace: String,
     api_key: Option<String>,
     timeouts: BlaxelTimeouts,
+    exposed_port_public: bool,
+    exposed_port_url_ttl_secs: u32,
 }
 
 impl BlaxelConnection {
@@ -325,6 +360,128 @@ impl BlaxelConnection {
     fn control_request(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
         let url = format!("{}{}", self.api_base_url, path);
         self.request(method, &url)
+    }
+
+    /// Create, or reuse, a preview for `port` and return a reachable endpoint.
+    ///
+    /// Mirrors `BlaxelSandboxSession._resolve_exposed_port`: `previews.create_if_not_exists`
+    /// (`POST /sandboxes/{name}/previews`, falling back to the existing preview on a conflict)
+    /// and, for a private preview, `preview.tokens.create`
+    /// (`POST /sandboxes/{name}/previews/{preview}/tokens`), whose token travels in the URL's
+    /// `bl_preview_token` query.
+    ///
+    /// Blaxel mints a preview for any port on demand, so, as in Python, the port does not have
+    /// to be declared at creation.
+    pub async fn resolve_exposed_port(&self, port: u16) -> SandboxResult<ExposedPortEndpoint> {
+        let unavailable = |detail: &str| {
+            exposed_port_unavailable(
+                "blaxel",
+                port,
+                &[],
+                ExposedPortUnavailable::BackendUnavailable,
+            )
+            .with_context("detail", detail)
+        };
+        let preview_name = format!("port-{port}");
+        // `create_if_not_exists` reads first and creates only on a 404, then falls back to a
+        // second read if the create races another caller to a 409.
+        let preview: Value = match self.read_preview(port, &preview_name).await? {
+            Some(preview) => preview,
+            None => {
+                let created = self
+                    .control_request(
+                        reqwest::Method::POST,
+                        &format!("/sandboxes/{}/previews", self.sandbox_name),
+                    )
+                    .json(&json!({
+                        "metadata": { "name": preview_name },
+                        "spec": { "port": port, "public": self.exposed_port_public },
+                    }))
+                    .timeout(self.timeouts.fast_op)
+                    .send()
+                    .await
+                    .map_err(|_| unavailable("preview_creation_failed"))?;
+                if created.status().is_success() {
+                    created
+                        .json()
+                        .await
+                        .map_err(|_| unavailable("preview_creation_failed"))?
+                } else if created.status() == reqwest::StatusCode::CONFLICT {
+                    self.read_preview(port, &preview_name)
+                        .await?
+                        .ok_or_else(|| unavailable("preview_creation_failed"))?
+                } else {
+                    return Err(unavailable("preview_creation_failed"));
+                }
+            }
+        };
+        let url = preview_url(&preview).ok_or_else(|| unavailable("invalid_preview_url"))?;
+        let mut endpoint =
+            endpoint_from_url(&url).ok_or_else(|| unavailable("url_parse_failed"))?;
+        if !self.exposed_port_public {
+            let expires_at = (chrono::Utc::now()
+                + chrono::Duration::seconds(i64::from(self.exposed_port_url_ttl_secs)))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+            let response = self
+                .control_request(
+                    reqwest::Method::POST,
+                    &format!(
+                        "/sandboxes/{}/previews/{preview_name}/tokens",
+                        self.sandbox_name
+                    ),
+                )
+                .json(&json!({ "spec": { "expiresAt": expires_at } }))
+                .timeout(self.timeouts.fast_op)
+                .send()
+                .await
+                .map_err(|_| unavailable("preview_token_creation_failed"))?;
+            if !response.status().is_success() {
+                return Err(unavailable("preview_token_creation_failed"));
+            }
+            let token: Value = response
+                .json()
+                .await
+                .map_err(|_| unavailable("preview_token_creation_failed"))?;
+            if let Some(value) = token
+                .get("spec")
+                .and_then(|spec| spec.get("token"))
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+            {
+                endpoint = endpoint.with_query(format!("bl_preview_token={value}"));
+            }
+        }
+        Ok(endpoint)
+    }
+
+    /// Read the preview for `port` by name, or `None` when the control plane says it is absent.
+    async fn read_preview(&self, port: u16, preview_name: &str) -> SandboxResult<Option<Value>> {
+        let failed = || {
+            exposed_port_unavailable(
+                "blaxel",
+                port,
+                &[],
+                ExposedPortUnavailable::BackendUnavailable,
+            )
+            .with_context("detail", "preview_lookup_failed")
+            .with_context("preview", preview_name)
+        };
+        let response = self
+            .control_request(
+                reqwest::Method::GET,
+                &format!("/sandboxes/{}/previews/{preview_name}", self.sandbox_name),
+            )
+            .timeout(self.timeouts.fast_op)
+            .send()
+            .await
+            .map_err(|_| failed())?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !response.status().is_success() {
+            return Err(failed());
+        }
+        response.json().await.map(Some).map_err(|_| failed())
     }
 
     /// Attach a Blaxel Drive at `mount_path` (`POST /drives/mount`).
@@ -378,6 +535,33 @@ impl BlaxelConnection {
         }
         Ok(())
     }
+}
+
+/// The URL of a preview, which the SDK reads from `spec.url` and then `status.url`.
+///
+/// Mirrors `_extract_preview_url`, including its fallbacks to a top-level `url`/`endpoint` and
+/// to a nested `preview` object.
+fn preview_url(preview: &Value) -> Option<String> {
+    for nested in ["spec", "status"] {
+        if let Some(url) = preview
+            .get(nested)
+            .and_then(|object| object.get("url"))
+            .and_then(Value::as_str)
+            .filter(|url| !url.is_empty())
+        {
+            return Some(url.to_string());
+        }
+    }
+    for field in ["url", "endpoint"] {
+        if let Some(url) = preview
+            .get(field)
+            .and_then(Value::as_str)
+            .filter(|url| !url.is_empty())
+        {
+            return Some(url.to_string());
+        }
+    }
+    preview.get("preview").and_then(preview_url)
 }
 
 /// Percent-encode a sandbox path for a Blaxel filesystem URL.
@@ -573,6 +757,8 @@ impl BlaxelSandboxClient {
             workspace,
             api_key: self.options.resolve_api_key(),
             timeouts: self.options.timeouts.clone(),
+            exposed_port_public: self.options.exposed_port_public,
+            exposed_port_url_ttl_secs: self.options.exposed_port_url_ttl_secs,
         })
     }
 
@@ -1222,8 +1408,17 @@ impl SandboxSession for BlaxelSandboxSession {
     }
 
     async fn write_file(&self, path: &str, contents: &[u8]) -> SandboxResult<()> {
-        let resolved = self.normalize_path(path)?;
+        let resolved = self.normalize_path_for_write(path)?;
         self.write_internal(&resolved, contents).await
+    }
+
+    /// Resolve an exposed port to a reachable preview endpoint.
+    ///
+    /// Blaxel mints a preview for any port on demand, so, as in Python's
+    /// `_assert_exposed_port_configured` override, the port does not have to be declared at
+    /// creation; the control-plane calls live on [`BlaxelConnection`].
+    async fn resolve_exposed_port(&self, port: u16) -> SandboxResult<ExposedPortEndpoint> {
+        self.connection.resolve_exposed_port(port).await
     }
 
     async fn mkdir(&self, path: &str, parents: bool) -> SandboxResult<()> {
@@ -1293,12 +1488,23 @@ impl SandboxSession for BlaxelSandboxSession {
             root = shell_quote(&root),
             tar = shell_quote(&tar_path),
         );
-        let result = self
-            .exec(
-                ExecRequest::shell(command)
-                    .with_timeout(Some(self.connection.timeouts.workspace_tar)),
-            )
-            .await?;
+        // Python wraps the whole `persist_workspace` in `@retry_async` for a timeout or a
+        // transient status (`blaxel/sandbox.py` L664); the archive command is the part that can
+        // fail that way.
+        let result = retry_async(
+            RetryPolicy::new(),
+            || {
+                self.exec(
+                    ExecRequest::shell(command.clone())
+                        .with_timeout(Some(self.connection.timeouts.workspace_tar)),
+                )
+            },
+            // Python retries a timeout here as well as a transient status.
+            |error, _attempt| {
+                is_transient_sandbox_error(error) || error.code == ErrorCode::ExecTimeout
+            },
+        )
+        .await?;
         if !result.ok() {
             let _ = self.remove_internal(&tar_path, false).await;
             return Err(SandboxError::new(
@@ -1558,6 +1764,8 @@ mod tests {
             workspace: "acme".to_string(),
             api_key: Some("key".to_string()),
             timeouts: BlaxelTimeouts::default(),
+            exposed_port_public: true,
+            exposed_port_url_ttl_secs: 3600,
         });
         BlaxelSandboxSession::new(connection, manifest)
             .with_base_env_vars(BTreeMap::from([("BASE".to_string(), "1".to_string())]))

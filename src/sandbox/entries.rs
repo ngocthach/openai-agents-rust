@@ -246,37 +246,55 @@ impl Entry {
         session: &dyn SandboxSession,
         dest: &str,
     ) -> SandboxResult<MaterializationResult> {
-        Box::pin(self.apply_inner(session, dest.to_string())).await
+        Box::pin(self.apply_inner(session, dest.to_string(), None)).await
+    }
+
+    /// Materialize this entry as `user` rather than as the session owner.
+    ///
+    /// Mirrors the `user=` parameter on Python's `BaseEntry.apply`. A workspace an agent writes
+    /// to as a non-root account needs its files owned by that account from the start, otherwise
+    /// the first command the agent runs cannot touch them. Permissions and group metadata are
+    /// left alone in this mode, exactly as Python does: `chmod`/`chgrp` would run as the session
+    /// owner and could undo the ownership the write just established.
+    pub async fn apply_as(
+        &self,
+        session: &dyn SandboxSession,
+        dest: &str,
+        user: Option<&User>,
+    ) -> SandboxResult<MaterializationResult> {
+        Box::pin(self.apply_inner(session, dest.to_string(), user)).await
     }
 
     async fn apply_inner(
         &self,
         session: &dyn SandboxSession,
         dest: String,
+        user: Option<&User>,
     ) -> SandboxResult<MaterializationResult> {
         let mut written = MaterializationResult::new();
         match &self.kind {
             EntryKind::File { content } => {
-                session.write_file(&dest, content).await?;
+                session.write_file_as(&dest, content, user).await?;
                 written.push(MaterializedFile::new(dest.clone(), content));
             }
             EntryKind::Dir { children } => {
-                session.mkdir(&dest, true).await?;
+                session.mkdir_as(&dest, true, user).await?;
                 for (name, child) in children {
                     let child_dest = join_sandbox_path(&dest, name)?;
-                    written.extend(Box::pin(child.apply_inner(session, child_dest)).await?);
+                    written.extend(Box::pin(child.apply_inner(session, child_dest, user)).await?);
                 }
             }
             EntryKind::LocalFile { src } => {
                 let content = read_host_file(src).await?;
-                session.write_file(&dest, &content).await?;
+                session.write_file_as(&dest, &content, user).await?;
                 written.push(MaterializedFile::new(dest.clone(), &content));
             }
             EntryKind::LocalDir { src } => {
-                session.mkdir(&dest, true).await?;
+                session.mkdir_as(&dest, true, user).await?;
                 if let Some(src) = src {
-                    written
-                        .extend(copy_host_dir(session, src, &dest, self.copy_concurrency).await?);
+                    written.extend(
+                        copy_host_dir(session, src, &dest, self.copy_concurrency, user).await?,
+                    );
                 }
             }
             EntryKind::Mount { mount } => {
@@ -305,7 +323,11 @@ impl Entry {
                 clone_git_repo(session, host, repo, git_ref, subpath.as_deref(), &dest).await?;
             }
         }
-        self.apply_metadata(session, &dest).await?;
+        // Python skips the metadata pass entirely when a user is given: `chmod`/`chgrp` run as
+        // the session owner and would fight the ownership the write just set.
+        if user.is_none() {
+            self.apply_metadata(session, &dest).await?;
+        }
         Ok(written)
     }
 
@@ -343,12 +365,64 @@ fn join_sandbox_path(dir: &str, name: &str) -> SandboxResult<String> {
 }
 
 async fn read_host_file(src: &Path) -> SandboxResult<Vec<u8>> {
-    tokio::fs::read(src).await.map_err(|e| {
+    read_host_file_nofollow(src).await.map_err(|e| {
         SandboxError::new(
             ErrorCode::LocalFileReadError,
             format!("Failed to read host file `{}`: {e}", src.display()),
         )
     })
+}
+
+/// Read a host file without ever following a symlink at its final component.
+///
+/// This is the part of Python's out-of-process `O_DIRECTORY|O_NOFOLLOW` fd-walk worker that
+/// actually protects data: the directory scan already classifies entries without following
+/// links, but between the scan and the read a concurrent process could replace a regular file
+/// with a link to something outside the source tree. Opening with `O_NOFOLLOW` makes that
+/// substitution fail with `ELOOP` instead of copying the target into the sandbox.
+#[cfg(unix)]
+async fn read_host_file_nofollow(src: &Path) -> std::io::Result<Vec<u8>> {
+    use tokio::io::AsyncReadExt as _;
+
+    let mut options = tokio::fs::OpenOptions::new();
+    options.read(true).custom_flags(libc_o_nofollow());
+    let mut file = options.open(src).await?;
+    let mut contents = Vec::new();
+    file.read_to_end(&mut contents).await?;
+    Ok(contents)
+}
+
+#[cfg(not(unix))]
+async fn read_host_file_nofollow(src: &Path) -> std::io::Result<Vec<u8>> {
+    tokio::fs::read(src).await
+}
+
+/// `O_NOFOLLOW`, which is the same value on every platform this crate builds for on unix.
+#[cfg(unix)]
+const fn libc_o_nofollow() -> i32 {
+    #[cfg(target_os = "linux")]
+    {
+        0o400000
+    }
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    {
+        0x0100
+    }
+    #[cfg(any(target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))]
+    {
+        0x0100
+    }
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    )))]
+    {
+        0
+    }
 }
 
 /// Copy a host directory tree into the sandbox, one file at a time.
@@ -357,6 +431,7 @@ async fn copy_host_dir(
     src: &Path,
     dest: &str,
     concurrency: usize,
+    user: Option<&User>,
 ) -> SandboxResult<MaterializationResult> {
     let mut written = MaterializationResult::new();
     // Files are copied in bounded batches: one at a time is slow against a hosted backend where
@@ -393,18 +468,18 @@ async fn copy_host_dir(
                 )
             })?;
             if file_type.is_dir() {
-                session.mkdir(&target, true).await?;
+                session.mkdir_as(&target, true, user).await?;
                 pending.push((entry.path(), target));
             } else if file_type.is_file() {
                 batch.push((entry.path(), target));
                 if batch.len() >= concurrency.max(1) {
-                    written.extend(copy_batch(session, std::mem::take(&mut batch)).await?);
+                    written.extend(copy_batch(session, std::mem::take(&mut batch), user).await?);
                 }
             }
             // Symlinks are skipped: following them would copy host state from outside `src`.
         }
     }
-    written.extend(copy_batch(session, batch).await?);
+    written.extend(copy_batch(session, batch, user).await?);
     Ok(written)
 }
 
@@ -412,13 +487,14 @@ async fn copy_host_dir(
 async fn copy_batch(
     session: &dyn SandboxSession,
     batch: Vec<(PathBuf, String)>,
+    user: Option<&User>,
 ) -> SandboxResult<MaterializationResult> {
     if batch.is_empty() {
         return Ok(MaterializationResult::new());
     }
     let copies = batch.into_iter().map(|(host_path, target)| async move {
         let content = read_host_file(&host_path).await?;
-        session.write_file(&target, &content).await?;
+        session.write_file_as(&target, &content, user).await?;
         Ok::<_, SandboxError>(MaterializedFile::new(target, &content))
     });
     let files = futures::future::try_join_all(copies).await?;

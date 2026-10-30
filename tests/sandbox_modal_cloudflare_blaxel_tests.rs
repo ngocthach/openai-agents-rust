@@ -22,11 +22,12 @@ use openai_agents_sdk::extensions::sandbox::cloudflare::{
     CloudflareSandboxClientOptions,
 };
 use openai_agents_sdk::extensions::sandbox::modal::{
-    ModalCloudBucketMountConfig, ModalCloudBucketMountStrategy, ModalSandboxClient,
-    ModalSandboxClientOptions, ModalWorkspacePersistence, decode_snapshot_filesystem_ref,
+    ModalCloudBucketMountConfig, ModalCloudBucketMountStrategy, ModalImageSelector,
+    ModalSandboxClient, ModalSandboxClientOptions, ModalSandboxSelector, ModalSandboxSession,
+    ModalWorkspacePersistence, decode_snapshot_directory_ref, decode_snapshot_filesystem_ref,
 };
 use openai_agents_sdk::sandbox::entries::Entry;
-use openai_agents_sdk::sandbox::{ErrorCode, ExecRequest, Manifest, SandboxClient};
+use openai_agents_sdk::sandbox::{ErrorCode, ExecRequest, Manifest, SandboxClient, SandboxSession};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -1419,4 +1420,434 @@ async fn modal_bundled_helper_parses_a_command_line_request() {
     );
     assert!(!reported.contains("empty request"), "{reported}");
     assert!(!reported.contains("malformed request"), "{reported}");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Modal selectors, directory snapshots and tunnels; Cloudflare and Blaxel exposed ports
+// ---------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn modal_adopts_a_sandbox_named_by_a_selector() {
+    let fake = FakeModal::new();
+    let client = ModalSandboxClient::new(
+        ModalSandboxClientOptions::new("agents-app")
+            .with_image(ModalImageSelector::from_id("im-existing"))
+            .with_sandbox(ModalSandboxSelector::from_id("sb-existing"))
+            .with_helper_command(fake.command()),
+    );
+    let session = client.create(None).await.expect("create");
+
+    // Adopting replaces `Sandbox.create` entirely; the helper only checks the sandbox is live.
+    assert!(fake.of_op("create").is_empty());
+    assert_eq!(fake.of_op("poll")[0]["sandbox_id"], "sb-existing");
+    let modal = session
+        .as_any()
+        .and_then(|any| any.downcast_ref::<ModalSandboxSession>())
+        .expect("a Modal session");
+    assert_eq!(modal.sandbox_id(), "sb-existing");
+    assert_eq!(modal.image_id().as_deref(), Some("im-existing"));
+}
+
+#[tokio::test]
+async fn modal_image_selectors_pick_the_id_or_the_tag() {
+    let fake = FakeModal::new();
+    ModalSandboxClient::new(
+        ModalSandboxClientOptions::new("agents-app")
+            .with_image_id("im-stale")
+            // A later selector replaces the earlier form rather than stacking with it.
+            .with_image(ModalImageSelector::from_tag("debian:bookworm"))
+            .with_helper_command(fake.command()),
+    )
+    .create(None)
+    .await
+    .expect("create");
+
+    let create = &fake.of_op("create")[0];
+    assert_eq!(create["image_tag"], "debian:bookworm");
+    assert!(create.get("image_id").is_none());
+}
+
+#[tokio::test]
+async fn modal_round_trips_a_directory_snapshot() {
+    let fake = FakeModal::new();
+    let client = ModalSandboxClient::new(
+        ModalSandboxClientOptions::new("agents-app")
+            .with_workspace_persistence(ModalWorkspacePersistence::SnapshotDirectory)
+            .with_helper_command(fake.command()),
+    );
+    let session = client
+        .create(Some(Manifest::new().with_root("/workspace")))
+        .await
+        .expect("create");
+
+    let archive = session.persist_workspace().await.expect("persist");
+    // The image captures the whole directory, so the staged rclone configuration and every
+    // ephemeral entry are moved aside first and put back afterwards.
+    let scripts: Vec<String> = fake
+        .of_op("exec")
+        .into_iter()
+        .filter_map(|request| request["argv"][2].as_str().map(str::to_string))
+        .collect();
+    assert!(
+        scripts.iter().any(|script| script.contains("tar cf")
+            && script.contains(".sandbox-rclone-config")
+            && script.contains("rm -rf")),
+        "{scripts:?}"
+    );
+    assert!(
+        scripts.iter().any(|script| script.contains("tar xf")),
+        "{scripts:?}"
+    );
+    assert_eq!(
+        decode_snapshot_directory_ref(&archive).as_deref(),
+        Some("dir-sb-1")
+    );
+    // The two snapshot kinds have distinct magics, so neither decodes the other's reference.
+    assert!(decode_snapshot_filesystem_ref(&archive).is_none());
+    let snapshot = &fake.of_op("snapshot_directory")[0];
+    assert_eq!(snapshot["path"], "/workspace");
+
+    session.hydrate_workspace(&archive).await.expect("hydrate");
+    let mount = &fake.of_op("mount_image")[0];
+    assert_eq!(mount["path"], "/workspace");
+    assert_eq!(mount["image_id"], "dir-sb-1");
+    // Remounting keeps the running sandbox, unlike a filesystem snapshot restore.
+    assert_eq!(fake.of_op("create").len(), 1);
+}
+
+#[tokio::test]
+async fn modal_refuses_a_directory_snapshot_under_a_bucket_mount() {
+    let fake = FakeModal::new();
+    let client = ModalSandboxClient::new(
+        ModalSandboxClientOptions::new("agents-app")
+            .with_workspace_persistence(ModalWorkspacePersistence::SnapshotDirectory)
+            .with_helper_command(fake.command()),
+    );
+    let manifest = Manifest::new().with_root("/workspace").with_entry(
+        "assets",
+        Entry::mount(ModalCloudBucketMountStrategy::mount(
+            ModalCloudBucketMountConfig::s3("bucket").with_secret_name("aws-creds"),
+        )),
+    );
+    let error = client
+        .create(Some(manifest))
+        .await
+        .expect_err("a bucket under the snapshot root");
+    assert_eq!(error.code, ErrorCode::MountConfigInvalid);
+    assert_eq!(
+        error.context.get("mount_path").map(String::as_str),
+        Some("/workspace/assets")
+    );
+    assert!(fake.of_op("create").is_empty());
+}
+
+#[tokio::test]
+async fn modal_resolves_an_exposed_port_through_a_tunnel() {
+    let fake = FakeModal::new();
+    let session = ModalSandboxClient::new(
+        ModalSandboxClientOptions::new("agents-app")
+            .with_exposed_ports([8080, 9000])
+            .with_helper_command(fake.command()),
+    )
+    .create(None)
+    .await
+    .expect("create");
+    let tls = session.resolve_exposed_port(8080).await.expect("resolve");
+    assert_eq!(tls.host, "tunnel.modal.host");
+    assert_eq!(tls.port, 443);
+    assert!(tls.tls);
+    assert_eq!(tls.url_for("ws").unwrap(), "wss://tunnel.modal.host/");
+
+    let plain = session.resolve_exposed_port(9000).await.expect("resolve");
+    assert_eq!(plain.port, 31000);
+    assert!(!plain.tls);
+
+    let error = session
+        .resolve_exposed_port(7000)
+        .await
+        .expect_err("undeclared");
+    assert_eq!(
+        error.context.get("reason").map(String::as_str),
+        Some("not_configured")
+    );
+}
+
+#[tokio::test]
+async fn cloudflare_reports_that_it_cannot_resolve_an_exposed_port() {
+    let handler: Handler =
+        Arc::new(
+            |request| match (request.method.as_str(), request.path.as_str()) {
+                ("POST", "/v1/sandbox") => MockResponse::json(json!({"id": "sbx-77"})),
+                _ => MockResponse::status(404, json!({"error": "unexpected"})),
+            },
+        );
+    let server = MockServer::start(handler).await;
+    let session = CloudflareSandboxClient::new(
+        CloudflareSandboxClientOptions::new(&server.base_url).with_exposed_ports([8080]),
+    )
+    .create(None)
+    .await
+    .unwrap();
+    // The worker opens the port inside the sandbox but publishes no endpoint for it, so, as in
+    // Python, a declared port still cannot be resolved.
+    let error = session
+        .resolve_exposed_port(8080)
+        .await
+        .expect_err("cloudflare has no endpoint");
+    assert_eq!(
+        error.context.get("reason").map(String::as_str),
+        Some("backend_unavailable")
+    );
+    let undeclared = session
+        .resolve_exposed_port(9090)
+        .await
+        .expect_err("undeclared");
+    assert_eq!(
+        undeclared.context.get("reason").map(String::as_str),
+        Some("not_configured")
+    );
+}
+
+#[tokio::test]
+async fn blaxel_creates_a_preview_and_a_token_for_a_private_port() {
+    let shared: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let url_slot = shared.clone();
+    let handler: Handler = Arc::new(move |request| {
+        let sandbox_url = url_slot.lock().unwrap().clone().unwrap_or_default();
+        match (request.method.as_str(), request.path.as_str()) {
+            ("GET", "/v0/sandboxes/agents-test/previews/port-3000") => {
+                MockResponse::status(404, json!({"error": "not found"}))
+            }
+            ("POST", "/v0/sandboxes/agents-test/previews") => MockResponse::json(json!({
+                "metadata": {"name": "port-3000"},
+                "spec": {"port": 3000, "public": false, "url": "https://preview.blaxel.app"},
+            })),
+            ("POST", "/v0/sandboxes/agents-test/previews/port-3000/tokens") => {
+                MockResponse::json(json!({
+                    "metadata": {"name": "tok-1"},
+                    "spec": {"token": "preview-token", "expiresAt": "2030-01-01T00:00:00Z"},
+                }))
+            }
+            _ => blaxel_handler(sandbox_url)(request),
+        }
+    });
+    let server = MockServer::start(handler).await;
+    *shared.lock().unwrap() = Some(server.base_url.clone());
+
+    let mut options = blaxel_options(&server.base_url);
+    options.exposed_port_public = false;
+    options.exposed_port_url_ttl_secs = 600;
+    let session = BlaxelSandboxClient::new(options)
+        .create(Some(
+            Manifest::new().with_root(DEFAULT_BLAXEL_WORKSPACE_ROOT),
+        ))
+        .await
+        .unwrap();
+    let endpoint = session.resolve_exposed_port(3000).await.expect("resolve");
+    assert_eq!(endpoint.host, "preview.blaxel.app");
+    assert!(endpoint.tls);
+    // A private preview is only reachable with its time-limited token.
+    assert_eq!(endpoint.query, "bl_preview_token=preview-token");
+    assert_eq!(
+        endpoint.url_for("http").unwrap(),
+        "https://preview.blaxel.app/?bl_preview_token=preview-token"
+    );
+
+    let create = server.find("POST", "/v0/sandboxes/agents-test/previews");
+    assert_eq!(
+        create.json(),
+        json!({
+            "metadata": {"name": "port-3000"},
+            "spec": {"port": 3000, "public": false},
+        })
+    );
+    let token = server.find(
+        "POST",
+        "/v0/sandboxes/agents-test/previews/port-3000/tokens",
+    );
+    assert!(
+        token.json()["spec"]["expiresAt"].is_string(),
+        "{}",
+        token.text()
+    );
+}
+
+#[tokio::test]
+async fn blaxel_reuses_an_existing_public_preview() {
+    let shared: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let url_slot = shared.clone();
+    let handler: Handler = Arc::new(move |request| {
+        let sandbox_url = url_slot.lock().unwrap().clone().unwrap_or_default();
+        match (request.method.as_str(), request.path.as_str()) {
+            // `create_if_not_exists` reads first, so an existing preview is never re-created.
+            ("POST", "/v0/sandboxes/agents-test/previews") => {
+                MockResponse::status(409, json!({"error": "already exists"}))
+            }
+            ("GET", "/v0/sandboxes/agents-test/previews/port-3000") => MockResponse::json(json!({
+                "metadata": {"name": "port-3000"},
+                "spec": {"port": 3000, "public": true, "url": "https://public.blaxel.app:8443/"},
+            })),
+            _ => blaxel_handler(sandbox_url)(request),
+        }
+    });
+    let server = MockServer::start(handler).await;
+    *shared.lock().unwrap() = Some(server.base_url.clone());
+
+    let session = BlaxelSandboxClient::new(blaxel_options(&server.base_url))
+        .create(Some(
+            Manifest::new().with_root(DEFAULT_BLAXEL_WORKSPACE_ROOT),
+        ))
+        .await
+        .unwrap();
+    let endpoint = session.resolve_exposed_port(3000).await.expect("resolve");
+    assert_eq!(endpoint.host, "public.blaxel.app");
+    assert_eq!(endpoint.port, 8443);
+    // A public preview mints no token.
+    assert!(endpoint.query.is_empty());
+    assert!(
+        server
+            .requests()
+            .iter()
+            .all(|request| !request.path.ends_with("/tokens"))
+    );
+    // Reading first means an existing preview is never re-created.
+    assert!(
+        server
+            .requests()
+            .iter()
+            .all(|request| request.path != "/v0/sandboxes/agents-test/previews")
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// The core hooks the sandbox-core area added: bounded reads and write grants
+// ---------------------------------------------------------------------------------------------
+
+/// A Cloudflare session against a worker that serves `body` for every file read.
+async fn cloudflare_reading(body: Vec<u8>) -> (MockServer, Arc<dyn SandboxSession>) {
+    let served = Arc::new(body);
+    let handler: Handler =
+        Arc::new(
+            move |request| match (request.method.as_str(), request.path.as_str()) {
+                ("POST", "/v1/sandbox") => MockResponse::json(json!({"id": "sbx-77"})),
+                ("GET", path) if path.starts_with("/v1/sandbox/sbx-77/file/") => {
+                    MockResponse::bytes(served.as_ref().clone())
+                }
+                _ => MockResponse::status(404, json!({"error": "unexpected"})),
+            },
+        );
+    let server = MockServer::start(handler).await;
+    let session =
+        CloudflareSandboxClient::new(CloudflareSandboxClientOptions::new(&server.base_url))
+            .create(None)
+            .await
+            .unwrap();
+    (server, session)
+}
+
+#[tokio::test]
+async fn cloudflare_bounds_a_raw_read_at_max_bytes() {
+    let (_server, session) = cloudflare_reading(vec![b'a'; 4096]).await;
+    let read = session
+        .read_bounded("/workspace/big.log", 64)
+        .await
+        .expect("bounded read");
+    // A raw body is bounded by `max_bytes` itself, not by the wire budget.
+    assert_eq!(read.len(), 64);
+    assert!(read.iter().all(|byte| *byte == b'a'));
+}
+
+#[tokio::test]
+async fn cloudflare_refuses_an_sse_body_over_the_bounded_read_wire_limit() {
+    // The worker's SSE framing base64s every chunk, so the wire form of a file is several times
+    // its size; bounding only the decoded result would let the sandbox decide how much this
+    // process buffers. The budget is `8 * max_bytes + 65536`.
+    let max_bytes = 64usize;
+    let wire_limit = 8 * max_bytes + 65536;
+    let mut body = b"data: {\"type\":\"metadata\",\"isBinary\":false}\n\n".to_vec();
+    while body.len() <= wire_limit {
+        body.extend_from_slice(b"data: {\"type\":\"chunk\",\"data\":\"");
+        body.extend_from_slice(&vec![b'A'; 4096]);
+        body.extend_from_slice(b"\"}\n\n");
+    }
+    let (_server, session) = cloudflare_reading(body).await;
+
+    let error = session
+        .read_bounded("/workspace/big.log", max_bytes)
+        .await
+        .expect_err("the wire limit is enforced");
+    assert_eq!(error.code, ErrorCode::WorkspaceArchiveReadError);
+    assert_eq!(
+        error.context.get("reason").map(String::as_str),
+        Some("bounded_read_wire_limit")
+    );
+    // A refused request is a configuration fact, not something a retry fixes.
+    assert_eq!(error.retryable, Some(false));
+}
+
+#[tokio::test]
+async fn cloudflare_decodes_an_sse_body_inside_the_wire_limit() {
+    let payload = "hello from the worker";
+    let body = format!(
+        "data: {{\"type\":\"metadata\",\"isBinary\":false}}\n\n\
+         data: {{\"type\":\"chunk\",\"data\":\"{payload}\"}}\n\n\
+         data: {{\"type\":\"complete\"}}\n\n"
+    );
+    let (_server, session) = cloudflare_reading(body.into_bytes()).await;
+    let read = session
+        .read_bounded("/workspace/note.txt", 5)
+        .await
+        .expect("bounded read");
+    assert_eq!(read, b"hello");
+}
+
+#[tokio::test]
+async fn modal_and_blaxel_refuse_a_write_through_a_read_only_path_grant() {
+    let grant = openai_agents_sdk::sandbox::workspace_paths::SandboxPathGrant::new("/shared/data")
+        .expect("grant")
+        .read_only(true);
+
+    let fake = FakeModal::new();
+    let modal = ModalSandboxClient::new(
+        ModalSandboxClientOptions::new("agents-app").with_helper_command(fake.command()),
+    )
+    .create(Some(Manifest::new().with_extra_path_grant(grant.clone())))
+    .await
+    .expect("create");
+    let error = modal
+        .write_file("/shared/data/out.txt", b"x")
+        .await
+        .expect_err("a write through a read-only grant");
+    assert_eq!(error.code, ErrorCode::WorkspaceArchiveWriteError);
+    assert_eq!(
+        error.context.get("reason").map(String::as_str),
+        Some("read_only_extra_path_grant")
+    );
+    // The refusal is the SDK's, so the helper is never asked to write.
+    assert!(fake.of_op("write_file").is_empty());
+
+    let shared: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let url_slot = shared.clone();
+    let handler: Handler = Arc::new(move |request| {
+        let sandbox_url = url_slot.lock().unwrap().clone().unwrap_or_default();
+        blaxel_handler(sandbox_url)(request)
+    });
+    let server = MockServer::start(handler).await;
+    *shared.lock().unwrap() = Some(server.base_url.clone());
+    let blaxel = BlaxelSandboxClient::new(blaxel_options(&server.base_url))
+        .create(Some(
+            Manifest::new()
+                .with_root(DEFAULT_BLAXEL_WORKSPACE_ROOT)
+                .with_extra_path_grant(grant),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        blaxel
+            .write_file("/shared/data/out.txt", b"x")
+            .await
+            .expect_err("a write through a read-only grant")
+            .code,
+        ErrorCode::WorkspaceArchiveWriteError
+    );
 }

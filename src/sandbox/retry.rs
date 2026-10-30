@@ -12,6 +12,8 @@
 use std::future::Future;
 use std::time::Duration;
 
+use crate::sandbox::errors::{ErrorCode, SandboxError};
+
 /// How the delay grows between attempts. Mirrors Python's `BackoffStrategy`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum BackoffStrategy {
@@ -136,6 +138,18 @@ impl RetryPolicy {
 /// # Ok(())
 /// # }
 /// ```
+/// Whether an error is worth retrying the same sandbox operation for.
+///
+/// Mirrors the `retry_if` predicates Python attaches to its sandbox call sites: an explicit
+/// `retryable` flag wins, and otherwise only a transport failure counts — a rejected path or a
+/// non-zero command will fail again the same way.
+pub fn is_transient_sandbox_error(error: &SandboxError) -> bool {
+    if let Some(retryable) = error.retryable {
+        return retryable;
+    }
+    matches!(error.code, ErrorCode::ExecTransportError)
+}
+
 pub async fn retry_async<T, E, F, Fut, R>(
     policy: RetryPolicy,
     mut operation: F,

@@ -20,7 +20,20 @@ pub fn transport(what: &str, error: reqwest::Error) -> SandboxError {
     } else {
         ErrorCode::ExecTransportError
     };
-    SandboxError::new(code, format!("Failed to {what}: {error}"))
+    // A request that never reached the provider, or timed out on the way, is the canonical
+    // transient failure: the same request can succeed on the next attempt.
+    SandboxError::new(code, format!("Failed to {what}: {error}")).with_retryable(true)
+}
+
+/// Whether a provider is likely to answer the same request differently on a retry.
+///
+/// A 5xx or a 429 is the provider saying "not now"; every other 4xx is the provider saying the
+/// request itself is wrong, and repeating it only costs quota. Mirrors Python's
+/// `TRANSIENT_HTTP_STATUS_CODES` plus the rate-limit case the providers retry on.
+pub fn status_is_retryable(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || crate::sandbox::retry::is_transient_http_status(status.as_u16())
+        || (status.is_server_error() && !matches!(status, reqwest::StatusCode::NOT_IMPLEMENTED))
 }
 
 /// Map a non-success HTTP response to a sandbox error.
@@ -43,10 +56,14 @@ pub fn http_error(
                 .map(str::to_string)
         })
         .unwrap_or_else(|| body.trim().chars().take(400).collect());
+    // Every exec-driven retry in the provider backends reads this flag, so a 4xx has to say
+    // "no" here or a misconfigured request is sent three times before it fails.
     SandboxError::new(
         code,
         format!("Failed to {what}: HTTP {} {detail}", status.as_u16()),
     )
+    .with_retryable(status_is_retryable(status))
+    .with_context("http_status", status.as_u16().to_string())
 }
 
 /// Decode a JSON body, turning a non-success status into an error.
@@ -65,10 +82,13 @@ pub async fn parse_json<T: serde::de::DeserializeOwned>(
         ));
     }
     serde_json::from_str(&body).map_err(|e| {
+        // A success status with a body the SDK cannot parse is a contract mismatch, not a
+        // hiccup; retrying would decode the same bytes again.
         SandboxError::new(
             ErrorCode::ExecTransportError,
             format!("Failed to {what}: unexpected response body ({e})"),
         )
+        .with_retryable(false)
     })
 }
 
@@ -110,6 +130,28 @@ mod tests {
             r#"{"error":{"message":"not entitled"}}"#,
         );
         assert!(nested.message.contains("HTTP 403 not entitled"), "{nested}");
+    }
+
+    #[test]
+    fn a_client_error_is_not_retryable_but_a_server_error_is() {
+        for (status, retryable) in [
+            (reqwest::StatusCode::BAD_REQUEST, false),
+            (reqwest::StatusCode::UNAUTHORIZED, false),
+            (reqwest::StatusCode::NOT_FOUND, false),
+            (reqwest::StatusCode::TOO_MANY_REQUESTS, true),
+            (reqwest::StatusCode::INTERNAL_SERVER_ERROR, true),
+            (reqwest::StatusCode::NOT_IMPLEMENTED, false),
+            (reqwest::StatusCode::BAD_GATEWAY, true),
+            (reqwest::StatusCode::SERVICE_UNAVAILABLE, true),
+            (reqwest::StatusCode::GATEWAY_TIMEOUT, true),
+        ] {
+            let error = http_error(ErrorCode::ExecTransportError, "do a thing", status, "{}");
+            assert_eq!(error.retryable, Some(retryable), "{status}");
+            assert_eq!(
+                error.context.get("http_status").map(String::as_str),
+                Some(status.as_u16().to_string().as_str()),
+            );
+        }
     }
 
     #[test]

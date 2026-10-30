@@ -301,6 +301,141 @@ fn name_after_fields(line: &str, count: usize) -> Option<String> {
     Some(rest.trim_start().to_string())
 }
 
+/// A reachable host endpoint for a port exposed by a sandbox.
+///
+/// Mirrors `agents.sandbox.types.ExposedPortEndpoint`. A sandbox port is almost never reachable
+/// at the number the workload bound: the provider maps it, usually onto a TLS-terminated name
+/// with a signed query string, so the host side needs all four pieces to build a URL.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExposedPortEndpoint {
+    /// The host name or address the port is reachable at.
+    pub host: String,
+    /// The port on `host`, which is rarely the sandbox-side port.
+    pub port: u16,
+    /// Whether the endpoint terminates TLS.
+    pub tls: bool,
+    /// A query string the provider requires, such as a preview token. Never includes the `?`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub query: String,
+}
+
+impl ExposedPortEndpoint {
+    /// An endpoint with no query string.
+    pub fn new(host: impl Into<String>, port: u16, tls: bool) -> Self {
+        ExposedPortEndpoint {
+            host: host.into(),
+            port,
+            tls,
+            query: String::new(),
+        }
+    }
+
+    /// Attach a query string, with or without a leading `?`.
+    pub fn with_query(mut self, query: impl Into<String>) -> Self {
+        self.query = query.into();
+        self
+    }
+
+    /// The URL for `scheme`, which must be `http` or `ws`.
+    ///
+    /// The default port for the scheme is omitted, matching Python's `url_for`.
+    pub fn url_for(&self, scheme: &str) -> crate::sandbox::errors::SandboxResult<String> {
+        use crate::sandbox::errors::{ErrorCode, SandboxError, SandboxOp};
+
+        let normalized = scheme.to_ascii_lowercase();
+        let prefix = match (normalized.as_str(), self.tls) {
+            ("http", false) => "http",
+            ("http", true) => "https",
+            ("ws", false) => "ws",
+            ("ws", true) => "wss",
+            _ => {
+                return Err(SandboxError::new(
+                    ErrorCode::SandboxConfigInvalid,
+                    "scheme must be either 'http' or 'ws'",
+                )
+                .with_op(SandboxOp::ResolveExposedPort)
+                .with_retryable(false));
+            }
+        };
+        let default_port = if self.tls { 443 } else { 80 };
+        // A bare IPv6 address has to be bracketed before it can carry a port.
+        let host = if self.host.contains(':') && !self.host.starts_with('[') {
+            format!("[{}]", self.host)
+        } else {
+            self.host.clone()
+        };
+        let base = if self.port == default_port {
+            format!("{prefix}://{host}/")
+        } else {
+            format!("{prefix}://{host}:{}/", self.port)
+        };
+        let query = self.query.strip_prefix('?').unwrap_or(&self.query);
+        if query.is_empty() {
+            Ok(base)
+        } else {
+            Ok(format!("{base}?{query}"))
+        }
+    }
+}
+
+/// Why a port could not be resolved. Mirrors Python's `reason` argument.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExposedPortUnavailable {
+    /// The port was never declared on the client options, so the backend never exposed it.
+    NotConfigured,
+    /// The backend could not, or cannot, hand out an endpoint for the port.
+    BackendUnavailable,
+}
+
+impl ExposedPortUnavailable {
+    /// The `reason` string Python puts in the error context.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ExposedPortUnavailable::NotConfigured => "not_configured",
+            ExposedPortUnavailable::BackendUnavailable => "backend_unavailable",
+        }
+    }
+}
+
+/// The error Python raises as `ExposedPortUnavailableError`.
+///
+/// A port that was never declared cannot start working, so that case is explicitly
+/// non-retryable; a backend that is merely not ready yet leaves retryability unset.
+pub fn exposed_port_unavailable(
+    backend: &str,
+    port: u16,
+    exposed_ports: &[u16],
+    reason: ExposedPortUnavailable,
+) -> crate::sandbox::errors::SandboxError {
+    use crate::sandbox::errors::{ErrorCode, SandboxError, SandboxOp};
+
+    let message = match reason {
+        ExposedPortUnavailable::NotConfigured => {
+            format!("port {port} is not configured for host exposure")
+        }
+        ExposedPortUnavailable::BackendUnavailable => {
+            format!("port {port} could not be resolved for host exposure")
+        }
+    };
+    let mut error = SandboxError::new(ErrorCode::ExposedPortUnavailable, message)
+        .with_op(SandboxOp::ResolveExposedPort)
+        .with_context("backend", backend)
+        .with_context("port", port.to_string())
+        .with_context("reason", reason.as_str())
+        .with_context(
+            "exposed_ports",
+            exposed_ports
+                .iter()
+                .map(u16::to_string)
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+    if reason == ExposedPortUnavailable::NotConfigured {
+        error = error.with_retryable(false);
+    }
+    error
+}
+
 #[cfg(test)]
 mod tests {
 

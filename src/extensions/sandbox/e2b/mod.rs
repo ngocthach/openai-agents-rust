@@ -64,6 +64,10 @@ use futures::StreamExt as _;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use super::ports::{
+    ExposedPortEndpoint, ExposedPortUnavailable, assert_exposed_port_configured,
+    endpoint_from_authority, exposed_port_unavailable,
+};
 use crate::sandbox::errors::{ErrorCode, SandboxError, SandboxResult};
 use crate::sandbox::http::{expect_success, http_error, parse_json, transport};
 use crate::sandbox::manifest::Manifest;
@@ -77,6 +81,7 @@ use crate::sandbox::pty::{
     PtyExecRequest, PtyExecUpdate, PtyWriteRequest, RemotePtyManager, RemotePtyProcess,
     resolve_pty_write_yield_time_ms,
 };
+use crate::sandbox::retry::{RetryPolicy, is_transient_sandbox_error, retry_async};
 use crate::sandbox::session::{
     ExecRequest, SandboxClient, SandboxSession, restore_session_snapshot, shell_quote,
     workspace_archive_excludes,
@@ -213,6 +218,11 @@ pub struct E2BSandboxClientOptions {
     pub allow_internet_access: Option<bool>,
     /// Ports the sandbox exposes; a non-empty list enables public traffic.
     pub exposed_ports: Vec<u16>,
+    /// MCP servers E2B starts inside the sandbox, keyed by server name.
+    ///
+    /// Travels verbatim as the `NewSandbox.mcp` object, which the API types as a free-form
+    /// mapping. Mirrors Python's `mcp: dict[str, dict[str, str]]`.
+    pub mcp: BTreeMap<String, BTreeMap<String, String>>,
     /// Operation timeouts.
     pub timeouts: E2BSandboxTimeouts,
     /// Pause instead of killing the sandbox when the session shuts down.
@@ -240,6 +250,7 @@ impl Default for E2BSandboxClientOptions {
             envs: BTreeMap::new(),
             allow_internet_access: None,
             exposed_ports: Vec::new(),
+            mcp: BTreeMap::new(),
             timeouts: E2BSandboxTimeouts::default(),
             pause_on_exit: false,
             on_timeout: E2BTimeoutAction::default(),
@@ -265,6 +276,7 @@ impl std::fmt::Debug for E2BSandboxClientOptions {
             .field("envs", &self.envs.keys().collect::<Vec<_>>())
             .field("allow_internet_access", &self.allow_internet_access)
             .field("exposed_ports", &self.exposed_ports)
+            .field("mcp", &self.mcp.keys().collect::<Vec<_>>())
             .field("timeouts", &self.timeouts)
             .field("pause_on_exit", &self.pause_on_exit)
             .field("on_timeout", &self.on_timeout)
@@ -353,6 +365,26 @@ impl E2BSandboxClientOptions {
     /// Expose a port, which also enables public traffic to the sandbox.
     pub fn with_exposed_port(mut self, port: u16) -> Self {
         self.exposed_ports.push(port);
+        self
+    }
+
+    /// Configure one MCP server the sandbox starts, keyed by name.
+    ///
+    /// Mirrors the `mcp=` argument of Python's `E2BSandboxClientOptions`; the mapping reaches
+    /// the API as `NewSandbox.mcp` unchanged.
+    pub fn with_mcp_server<I, K, V>(mut self, name: impl Into<String>, config: I) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<String>,
+        V: Into<String>,
+    {
+        self.mcp.insert(
+            name.into(),
+            config
+                .into_iter()
+                .map(|(key, value)| (key.into(), value.into()))
+                .collect(),
+        );
         self
     }
 
@@ -530,6 +562,9 @@ impl E2BSandboxClient {
         }
         if !self.options.exposed_ports.is_empty() {
             map.insert("network".into(), json!({ "allowPublicTraffic": true }));
+        }
+        if !self.options.mcp.is_empty() {
+            map.insert("mcp".into(), json!(self.options.mcp));
         }
         if self.options.on_timeout == E2BTimeoutAction::Pause {
             map.insert(
@@ -1409,8 +1444,36 @@ impl SandboxSession for E2BSandboxSession {
     }
 
     async fn write_file(&self, path: &str, contents: &[u8]) -> SandboxResult<()> {
-        let resolved = self.normalize_path(path)?;
+        let resolved = self.normalize_path_for_write(path)?;
         self.upload_at(&resolved, contents).await
+    }
+
+    fn exposed_ports(&self) -> Vec<u16> {
+        self.options.exposed_ports.clone()
+    }
+
+    /// Resolve an exposed port to the host E2B routes it on.
+    ///
+    /// Mirrors `E2BSandboxSession._resolve_exposed_port`, which asks the vendor SDK for
+    /// `get_host(port)`. That call is pure string building — `{port}-{sandbox id}.{domain}` —
+    /// and issues no request, so this port builds the same host rather than adding a round trip.
+    /// A host without an explicit port is reached over TLS on 443, as `_e2b_endpoint_from_host`
+    /// decides.
+    async fn resolve_exposed_port(&self, port: u16) -> SandboxResult<ExposedPortEndpoint> {
+        assert_exposed_port_configured(BACKEND_ID, port, &self.options.exposed_ports)?;
+        let host = format!(
+            "{port}-{sandbox_id}.{domain}",
+            sandbox_id = self.sandbox_id(),
+            domain = self.options.resolved_domain(),
+        );
+        endpoint_from_authority(&host).ok_or_else(|| {
+            exposed_port_unavailable(
+                BACKEND_ID,
+                port,
+                &self.options.exposed_ports,
+                ExposedPortUnavailable::BackendUnavailable,
+            )
+        })
     }
 
     fn supports_pty(&self) -> bool {
@@ -1578,7 +1641,14 @@ impl SandboxSession for E2BSandboxSession {
             let snapshot_id = self.create_native_snapshot().await?;
             return Ok(encode_snapshot_ref(&snapshot_id));
         }
-        self.persist_workspace_tar().await
+        // Python wraps the sandbox-side `tar` command in `@retry_async` on a transient transport
+        // failure (`e2b/sandbox.py` L1340).
+        retry_async(
+            RetryPolicy::new(),
+            || self.persist_workspace_tar(),
+            |error, _attempt| is_transient_sandbox_error(error),
+        )
+        .await
     }
 
     async fn hydrate_workspace(&self, archive: &[u8]) -> SandboxResult<()> {

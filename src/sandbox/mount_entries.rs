@@ -45,7 +45,7 @@ use crate::sandbox::mount_patterns::{
 use crate::sandbox::mounts::{
     ContainerPrivileges, Mount, MountCredentialAuthority, MountPattern, MountPatternConfig,
     MountStrategy, RCLONE_OPTION_READ_ONLY, RCLONE_OPTION_REMOTE_KIND, RCLONE_OPTION_REMOTE_NAME,
-    RCLONE_OPTION_REMOTE_PATH, RcloneMountPattern, docker_volume_mount_args,
+    RCLONE_OPTION_REMOTE_PATH, RcloneMountPattern, docker_volume_mount_args, docker_volume_name,
 };
 use crate::sandbox::session::SandboxSession;
 
@@ -513,6 +513,15 @@ impl MountStrategy for ConfiguredMountStrategy {
     }
 
     fn docker_create_args(&self, mount: &Mount, mount_path: &str) -> Option<Vec<String>> {
+        self.docker_create_args_for_session(mount, mount_path, None)
+    }
+
+    fn docker_create_args_for_session(
+        &self,
+        mount: &Mount,
+        mount_path: &str,
+        session_id: Option<&str>,
+    ) -> Option<Vec<String>> {
         let ConfiguredMountBackend::DockerVolume {
             driver,
             driver_options,
@@ -531,6 +540,7 @@ impl MountStrategy for ConfiguredMountStrategy {
             driver,
             &options,
             mount.read_only,
+            Some(&docker_volume_name(session_id, mount_path)),
         ))
     }
 

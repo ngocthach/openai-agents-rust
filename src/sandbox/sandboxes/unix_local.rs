@@ -25,7 +25,9 @@ use crate::sandbox::session::{
     ExecRequest, SandboxClient, SandboxSession, restore_session_snapshot,
 };
 use crate::sandbox::snapshot::{Snapshot, SnapshotSpec, resolve_snapshot};
-use crate::sandbox::state::{SandboxSessionState, is_sdk_owned_workspace_root};
+use crate::sandbox::state::{
+    SandboxSessionState, SnapshotFingerprint, is_sdk_owned_workspace_root,
+};
 use crate::sandbox::types::ExecResult;
 
 /// Prefix of the temporary workspace directories created for Unix-local sessions.
@@ -109,6 +111,8 @@ impl SandboxClient for UnixLocalSandboxClient {
             ));
         }
         state.verify_manifest(&manifest)?;
+        // The trusted manifest supplies the host paths the persisted state deliberately dropped.
+        let state = state.rebind_path_grants(&manifest)?;
         // The state carries no manifest contents of its own: the workspace root comes from it,
         // but everything that could read host paths comes from the caller's trusted manifest.
         let manifest = manifest.with_root(state.workspace_root.clone());
@@ -117,7 +121,11 @@ impl SandboxClient for UnixLocalSandboxClient {
             .with_snapshot(Some(state.snapshot.clone()))
             .with_identity(state.session_id.clone(), state.snapshot_id.clone())
             .resuming()
-            .with_workspace_root_ready(state.workspace_root_ready);
+            .with_workspace_root_ready(state.workspace_root_ready)
+            .with_snapshot_fingerprint(
+                state.snapshot_fingerprint.clone(),
+                state.snapshot_fingerprint_version.clone(),
+            );
         Ok(Arc::new(session))
     }
 
@@ -189,6 +197,8 @@ pub struct UnixLocalSandboxSession {
     snapshot: Option<SnapshotSpec>,
     snapshot_id: String,
     resuming: bool,
+    /// The workspace fingerprint of the snapshot this session resumes, when it has one.
+    resume_fingerprint: std::sync::Mutex<Option<SnapshotFingerprint>>,
 }
 
 impl UnixLocalSandboxSession {
@@ -222,7 +232,54 @@ impl UnixLocalSandboxSession {
             ptys: PtyManager::new(),
             snapshot: None,
             resuming: false,
+            resume_fingerprint: std::sync::Mutex::new(None),
         })
+    }
+
+    /// Carry the workspace fingerprint a resumed snapshot was taken from.
+    pub fn with_snapshot_fingerprint(
+        self,
+        fingerprint: Option<String>,
+        version: Option<String>,
+    ) -> Self {
+        if let (Some(fingerprint), Some(version)) = (fingerprint, version) {
+            *self.resume_fingerprint.lock().expect("fingerprint lock") =
+                Some(SnapshotFingerprint {
+                    fingerprint,
+                    version,
+                });
+        }
+        self
+    }
+
+    /// Remove the workspace root as each user the manifest declares, then as the session owner.
+    ///
+    /// Mirrors what Python's `DockerRemovalService` achieves, without the privileged worker: the
+    /// trusted manifest already names every account the sandbox ran commands as, so the files
+    /// those accounts own can be unlinked by them directly.
+    async fn remove_workspace_as_manifest_users(&self) -> SandboxResult<()> {
+        let root = self.root.to_string_lossy().to_string();
+        let users: Vec<crate::sandbox::types::User> = self.manifest.users().to_vec();
+        for user in users {
+            let _ = self
+                .exec(
+                    ExecRequest::argv(["rm", "-rf", "--", root.as_str()])
+                        .with_user(Some(user.clone())),
+                )
+                .await;
+        }
+        match tokio::fs::remove_dir_all(&self.root).await {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(SandboxError::new(
+                ErrorCode::WorkspaceStopError,
+                format!(
+                    "Failed to remove workspace `{}` as the session owner or as any manifest \
+                     user: {e}",
+                    self.root.display()
+                ),
+            )),
+        }
     }
 
     /// Store workspace snapshots at `snapshot`.
@@ -290,7 +347,11 @@ impl UnixLocalSandboxSession {
     ///
     /// Writes through a read-only mount are rejected.
     pub async fn host_path_for(&self, path: &str, for_write: bool) -> SandboxResult<PathBuf> {
-        let resolved = self.normalize_path(path)?;
+        let resolved = if for_write {
+            self.normalize_path_for_write(path)?
+        } else {
+            self.normalize_path(path)?
+        };
         let candidate = PathBuf::from(&resolved);
         let real = resolve_existing_prefix(&candidate).await;
         // The root is canonicalized too: a caller-supplied root can contain symlinks (on macOS
@@ -504,6 +565,13 @@ impl SandboxSession for UnixLocalSandboxSession {
             match tokio::fs::remove_dir_all(&self.root).await {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                    // A `run_as` user's commands create files the session owner cannot unlink —
+                    // a `0700` directory made by `sudo -u agent` is enough. This is the case
+                    // Python solves with its privileged removal worker; here the manifest names
+                    // the users, so the workspace can simply be unlinked as each of them.
+                    self.remove_workspace_as_manifest_users().await?;
+                }
                 Err(e) => {
                     return Err(SandboxError::new(
                         ErrorCode::WorkspaceStopError,
@@ -657,10 +725,28 @@ impl SandboxSession for UnixLocalSandboxSession {
         .with_workspace_root_owned(self.owned_root)
         .with_workspace_root_ready(self.materialized.load(Ordering::SeqCst))
         .with_snapshot(self.snapshot.clone().unwrap_or_default())
+        .with_snapshot_fingerprint(self.resume_snapshot_fingerprint())
     }
 
     fn snapshot(&self) -> Arc<dyn Snapshot> {
         resolve_snapshot(self.snapshot.as_ref(), &self.snapshot_id)
+    }
+
+    fn resume_snapshot_fingerprint(&self) -> Option<SnapshotFingerprint> {
+        // A workspace that was never fully materialized is not the one the fingerprint
+        // describes, so the fast path must not consider it. Mirrors Python's
+        // `_can_reuse_preserved_workspace_on_resume`.
+        if !self.materialized.load(Ordering::SeqCst) {
+            return None;
+        }
+        self.resume_fingerprint
+            .lock()
+            .expect("fingerprint lock")
+            .clone()
+    }
+
+    fn record_snapshot_fingerprint(&self, record: Option<SnapshotFingerprint>) {
+        *self.resume_fingerprint.lock().expect("fingerprint lock") = record;
     }
 
     async fn hydrate_workspace(&self, archive: &[u8]) -> SandboxResult<()> {

@@ -258,6 +258,14 @@ impl<C: Send + Sync + 'static> SandboxAgent<C> {
         for capability in &self.capabilities {
             manifest = capability.process_manifest(manifest);
         }
+        // Mirrors Python's `_manifest_with_run_as_user`. The account the agent's commands run as
+        // has to exist before the first command runs, and `provision_accounts` only creates the
+        // accounts the manifest declares.
+        if let Some(run_as) = &self.run_as
+            && !manifest.users().iter().any(|user| user.name == run_as.name)
+        {
+            manifest = manifest.with_user(run_as.clone());
+        }
         manifest
     }
 
@@ -313,6 +321,41 @@ impl<C: Send + Sync + 'static> SandboxAgent<C> {
         &self,
         binding: &CapabilityBinding,
     ) -> Result<PreparedSandboxGraph<C>> {
+        self.prepare_graph_with_bindings(binding, &HashMap::new())
+            .await
+    }
+
+    /// One agent of this agent's sandbox handoff graph, by name.
+    pub fn graph_agent(&self, name: &str) -> Option<Arc<SandboxAgent<C>>> {
+        let root = Arc::new(self.clone());
+        let mut nodes: HashMap<String, GraphNode<C>> = HashMap::new();
+        let mut order: Vec<String> = Vec::new();
+        collect_graph(&root, &mut nodes, &mut order).ok()?;
+        nodes.remove(name).map(|node| node.agent)
+    }
+
+    /// The names of every agent in this agent's sandbox handoff graph, in post order.
+    ///
+    /// A caller that wants one session per agent needs the names before it can create the
+    /// sessions, which is why this is separate from preparation.
+    pub fn graph_agent_names(&self) -> Result<Vec<String>> {
+        let root = Arc::new(self.clone());
+        let mut nodes: HashMap<String, GraphNode<C>> = HashMap::new();
+        let mut order: Vec<String> = Vec::new();
+        collect_graph(&root, &mut nodes, &mut order)?;
+        Ok(order)
+    }
+
+    /// Prepare the graph, binding each named agent to its own session.
+    ///
+    /// Mirrors Python's per-agent sandbox sessions (`SandboxRuntimeSessionManager.acquire_agent`
+    /// / `ensure_session`). An agent with no entry in `by_name` falls back to `binding`, so the
+    /// default one-session-per-graph behaviour is `by_name` being empty.
+    pub async fn prepare_graph_with_bindings(
+        &self,
+        binding: &CapabilityBinding,
+        by_name: &HashMap<String, CapabilityBinding>,
+    ) -> Result<PreparedSandboxGraph<C>> {
         let root = Arc::new(self.clone());
         let mut nodes: HashMap<String, GraphNode<C>> = HashMap::new();
         let mut order: Vec<String> = Vec::new();
@@ -365,7 +408,11 @@ impl<C: Send + Sync + 'static> SandboxAgent<C> {
                     .and_then(|n| n.agent.agent.handoff_description.clone());
                 handoffs.push(describe_handoff(handoff, target, described.as_deref()));
             }
-            let node_binding = binding.clone().with_run_as(node.agent.run_as.clone());
+            let node_binding = by_name
+                .get(name)
+                .unwrap_or(binding)
+                .clone()
+                .with_run_as(node.agent.run_as.clone());
             let agent = Arc::new(
                 node.agent
                     .prepare_with_handoffs(&node_binding, handoffs)

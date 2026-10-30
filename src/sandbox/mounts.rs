@@ -20,6 +20,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use sha2::{Digest, Sha256};
 
 use crate::sandbox::errors::{ErrorCode, SandboxError, SandboxResult};
 use crate::sandbox::session::{ExecRequest, ExecShell, SandboxSession, shell_quote};
@@ -264,6 +265,21 @@ pub trait MountStrategy: Send + Sync + fmt::Debug {
     fn docker_create_args(&self, mount: &Mount, mount_path: &str) -> Option<Vec<String>> {
         let _ = (mount, mount_path);
         None
+    }
+
+    /// Like [`docker_create_args`](Self::docker_create_args), with the creating session's id.
+    ///
+    /// A strategy backed by a Docker **volume** names it after the session and the mount path, so
+    /// two sessions sharing a manifest never share storage. Everything else ignores `session_id`,
+    /// which is why the default delegates.
+    fn docker_create_args_for_session(
+        &self,
+        mount: &Mount,
+        mount_path: &str,
+        session_id: Option<&str>,
+    ) -> Option<Vec<String>> {
+        let _ = session_id;
+        self.docker_create_args(mount, mount_path)
     }
 
     /// The host path this mount exposes, when the SDK may use it directly.
@@ -637,11 +653,21 @@ impl MountStrategy for DockerVolumeMountStrategy {
     }
 
     fn docker_create_args(&self, mount: &Mount, mount_path: &str) -> Option<Vec<String>> {
+        self.docker_create_args_for_session(mount, mount_path, None)
+    }
+
+    fn docker_create_args_for_session(
+        &self,
+        mount: &Mount,
+        mount_path: &str,
+        session_id: Option<&str>,
+    ) -> Option<Vec<String>> {
         Some(docker_volume_mount_args(
             mount_path,
             &self.driver,
             &self.driver_options,
             mount.read_only,
+            Some(&docker_volume_name(session_id, mount_path)),
         ))
     }
 
@@ -702,17 +728,58 @@ fn docker_mount_field(field: &str) -> String {
 }
 
 /// The `docker create` arguments that attach a named volume at `mount_path`.
+/// The Docker volume name a session uses for the mount at `mount_path`.
+///
+/// Mirrors Python's `_docker_volume_name`. The readable path suffix keeps `docker volume ls`
+/// legible, and the path hash keeps distinct targets such as `/workspace/a_b` and `/workspace/a/b`
+/// from aliasing after the slash substitution.
+pub fn docker_volume_name(session_id: Option<&str>, mount_path: &str) -> String {
+    let session_prefix = match session_id {
+        Some(id) if !id.is_empty() => format!("{id}_"),
+        _ => String::new(),
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(mount_path.as_bytes());
+    let digest = hasher.finalize();
+    let path_hash: String = digest
+        .iter()
+        .take(6)
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let sanitized: String = mount_path
+        .trim_matches('/')
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let sanitized = if sanitized.is_empty() {
+        "workspace"
+    } else {
+        sanitized.as_str()
+    };
+    format!("sandbox_{session_prefix}{path_hash}_{sanitized}")
+}
+
 pub(crate) fn docker_volume_mount_args(
     mount_path: &str,
     driver: &str,
     driver_options: &BTreeMap<String, String>,
     read_only: bool,
+    volume_name: Option<&str>,
 ) -> Vec<String> {
-    let mut fields = vec![
-        "type=volume".to_string(),
+    let mut fields = vec!["type=volume".to_string()];
+    if let Some(name) = volume_name {
+        fields.push(format!("src={name}"));
+    }
+    fields.extend([
         format!("dst={mount_path}"),
         format!("volume-driver={driver}"),
-    ];
+    ]);
     fields.extend(
         driver_options
             .iter()
@@ -902,13 +969,37 @@ mod tests {
         let volume = Mount::new(Arc::new(
             DockerVolumeMountStrategy::new("s3").with_driver_option("bucket", "b"),
         ));
+        // Without a session id the volume name still carries the mount path hash, so two
+        // targets that collapse to the same sanitized suffix stay distinct volumes.
         assert_eq!(
             volume.strategy.docker_create_args(&volume, "/workspace/v"),
             Some(vec![
                 "--mount".to_string(),
-                "type=volume,dst=/workspace/v,volume-driver=s3,volume-opt=bucket=b,readonly"
-                    .to_string()
+                format!(
+                    "type=volume,src={},dst=/workspace/v,volume-driver=s3,volume-opt=bucket=b,\
+                     readonly",
+                    docker_volume_name(None, "/workspace/v")
+                )
             ])
+        );
+        assert_eq!(
+            volume
+                .strategy
+                .docker_create_args_for_session(&volume, "/workspace/v", Some("abc")),
+            Some(vec![
+                "--mount".to_string(),
+                format!(
+                    "type=volume,src=sandbox_abc_{},dst=/workspace/v,volume-driver=s3,\
+                     volume-opt=bucket=b,readonly",
+                    docker_volume_name(None, "/workspace/v").trim_start_matches("sandbox_")
+                )
+            ])
+        );
+        // `/workspace/a_b` and `/workspace/a/b` sanitize to the same suffix, so only the hash
+        // keeps them apart.
+        assert_ne!(
+            docker_volume_name(Some("s"), "/workspace/a_b"),
+            docker_volume_name(Some("s"), "/workspace/a/b")
         );
     }
 

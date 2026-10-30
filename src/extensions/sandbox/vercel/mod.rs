@@ -54,11 +54,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use base64::Engine as _;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::sandbox::errors::{ErrorCode, SandboxError, SandboxResult};
 use crate::sandbox::manifest::{DEFAULT_MANIFEST_ROOT, Manifest};
+use crate::sandbox::retry::{RetryPolicy, is_transient_sandbox_error, retry_async};
 use crate::sandbox::session::{
     ExecRequest, SandboxClient, SandboxSession, restore_session_snapshot, shell_quote,
     workspace_archive_excludes,
@@ -69,6 +71,10 @@ use crate::sandbox::types::{ExecResult, User};
 use crate::sandbox::workspace_paths::provider_scratch_path;
 
 use super::e2b::adopt_recorded_root;
+use super::ports::{
+    ExposedPortEndpoint, ExposedPortUnavailable, assert_exposed_port_configured, endpoint_from_url,
+    exposed_port_unavailable,
+};
 use crate::sandbox::http::{expect_success, http_error, parse_json, transport};
 
 pub mod mounts;
@@ -79,6 +85,8 @@ use self::tar_gz::TarGzBuilder;
 
 /// The backend identifier reported by this client and its sessions.
 pub const BACKEND_ID: &str = "vercel";
+/// The strategy type [`VercelCloudBucketMountStrategy`] reports.
+const VERCEL_S3_MOUNT_STRATEGY: &str = "vercel_cloud_bucket";
 /// Environment variable holding a Vercel OIDC token, preferred over the personal token.
 pub const VERCEL_OIDC_TOKEN_ENV: &str = "VERCEL_OIDC_TOKEN";
 /// Environment variable holding a Vercel personal access token.
@@ -251,10 +259,16 @@ pub enum NetworkPolicy {
 
 impl NetworkPolicy {
     /// The JSON body the API expects.
+    ///
+    /// `POST /v3/sandboxes` types `networkPolicy` as a `oneOf` of two objects: the mode form
+    /// (`{mode, allowedDomains, allowedCIDRs, deniedCIDRs, injectionRules}`) and the rule form
+    /// (`{allow, subnets}`, where `allow` is an array or an object). `allow-all` and `deny-all`
+    /// are the mode form, which is what the provider SDK sends for its `allow_all()`/`deny_all()`
+    /// constructors; a custom policy is the rule form.
     fn to_api(&self) -> Value {
         let (allow, allow_subnets, deny_subnets) = match self {
-            NetworkPolicy::AllowAll => return json!({ "allow": "all" }),
-            NetworkPolicy::DenyAll => return json!({ "allow": [] }),
+            NetworkPolicy::AllowAll => return json!({ "mode": "allow-all" }),
+            NetworkPolicy::DenyAll => return json!({ "mode": "deny-all" }),
             NetworkPolicy::Custom {
                 allow,
                 allow_subnets,
@@ -505,11 +519,40 @@ impl VercelSandboxClientOptions {
         self.project_id
             .clone()
             .or_else(|| env_var(VERCEL_PROJECT_ID_ENV))
+            .or_else(|| oidc_claim(VERCEL_OIDC_PROJECT_CLAIM))
     }
 
     fn resolved_team_id(&self) -> Option<String> {
-        self.team_id.clone().or_else(|| env_var(VERCEL_TEAM_ID_ENV))
+        self.team_id
+            .clone()
+            .or_else(|| env_var(VERCEL_TEAM_ID_ENV))
+            .or_else(|| oidc_claim(VERCEL_OIDC_TEAM_CLAIM))
     }
+}
+
+/// The `project_id` claim of a Vercel OIDC token.
+const VERCEL_OIDC_PROJECT_CLAIM: &str = "project_id";
+/// The claim naming the owning team of a Vercel OIDC token.
+const VERCEL_OIDC_TEAM_CLAIM: &str = "owner_id";
+
+/// Read one claim out of the OIDC token in the environment.
+///
+/// Mirrors `vercel.oidc.credentials.get_credentials`, which falls back to the token's own
+/// `project_id` and `owner_id` claims when the environment names neither: a deployment that
+/// carries only `VERCEL_OIDC_TOKEN` still knows which project and team it belongs to. The
+/// payload is read, never verified — the API is what validates the token.
+fn oidc_claim(claim: &str) -> Option<String> {
+    let token = env_var(VERCEL_OIDC_TOKEN_ENV)?;
+    let payload = token.split('.').nth(1)?;
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .ok()?;
+    let claims: Value = serde_json::from_slice(&decoded).ok()?;
+    claims
+        .get(claim)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
 }
 
 /// The error raised when no usable Vercel token is configured.
@@ -533,6 +576,16 @@ fn env_var(name: &str) -> Option<String> {
 struct SandboxAndSession {
     sandbox: SandboxRecord,
     session: SessionRecord,
+    /// The public route the API assigned to each exposed port.
+    #[serde(default)]
+    routes: Vec<RouteRecord>,
+}
+
+/// One public route of a sandbox, as `POST /v3/sandboxes` reports it.
+#[derive(Debug, Clone, Deserialize)]
+struct RouteRecord {
+    port: u16,
+    url: String,
 }
 
 /// The sandbox half of a create response.
@@ -635,17 +688,28 @@ impl VercelSandboxClient {
         if let Some(expiration) = self.options.snapshot_expiration_ms {
             map.insert("snapshotExpiration".into(), json!(expiration));
         }
-        let response = self
-            .request(
-                self.http
-                    .post(format!("{}/v3/sandboxes", self.options.api_base())),
-                token,
-            )
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| transport("create a Vercel sandbox", e))?;
-        parse_json(response, "create a Vercel sandbox").await
+        // Python wraps `AsyncSandbox.create` in `@retry_async` for a transient create failure
+        // (`vercel/sandbox.py` L150). `parse_json` classifies the status, so a 400 or a 402
+        // fails once instead of three times.
+        let what = "create a Vercel sandbox";
+        retry_async(
+            RetryPolicy::new(),
+            || async {
+                let response = self
+                    .request(
+                        self.http
+                            .post(format!("{}/v3/sandboxes", self.options.api_base())),
+                        token,
+                    )
+                    .json(&body)
+                    .send()
+                    .await
+                    .map_err(|e| transport(what, e))?;
+                parse_json(response, what).await
+            },
+            |error: &SandboxError, _attempt| is_transient_sandbox_error(error),
+        )
+        .await
     }
 
     /// Attach the bearer token and the team scope to a request.
@@ -730,6 +794,8 @@ impl SandboxClient for VercelSandboxClient {
         #[derive(Deserialize)]
         struct SessionOnly {
             session: SessionRecord,
+            #[serde(default)]
+            routes: Vec<RouteRecord>,
         }
         let reattached = match existing {
             Some(response) => parse_json::<SessionOnly>(response, "load a Vercel session")
@@ -741,6 +807,7 @@ impl SandboxClient for VercelSandboxClient {
                         name: sandbox_name.clone(),
                     },
                     session: loaded.session,
+                    routes: loaded.routes,
                 }),
             None => None,
         };
@@ -823,6 +890,8 @@ pub struct VercelSandboxSession {
     active_s3_mounts: std::sync::Mutex<BTreeSet<String>>,
     /// The mount paths detached so a native snapshot could be taken.
     detached_s3_mounts: std::sync::Mutex<BTreeSet<String>>,
+    /// Whether the fixed S3 mount topology has already been applied once.
+    s3_mounts_started: AtomicBool,
 }
 
 /// The mutable provider identity: a snapshot restore replaces both halves.
@@ -830,6 +899,8 @@ pub struct VercelSandboxSession {
 struct RemoteHandle {
     sandbox_name: String,
     session_id: String,
+    /// The public URL of each exposed port, keyed by the sandbox-side port.
+    routes: BTreeMap<u16, String>,
 }
 
 // The bearer token must never appear in a log line.
@@ -864,6 +935,11 @@ impl VercelSandboxSession {
             remote: std::sync::RwLock::new(RemoteHandle {
                 sandbox_name: created.sandbox.name,
                 session_id: created.session.id,
+                routes: created
+                    .routes
+                    .into_iter()
+                    .map(|route| (route.port, route.url))
+                    .collect(),
             }),
             manifest,
             snapshot_id: session_key.clone(),
@@ -875,6 +951,7 @@ impl VercelSandboxSession {
             s3_mounts_startable: AtomicBool::new(false),
             active_s3_mounts: std::sync::Mutex::new(BTreeSet::new()),
             detached_s3_mounts: std::sync::Mutex::new(BTreeSet::new()),
+            s3_mounts_started: AtomicBool::new(false),
         }
     }
 
@@ -908,6 +985,14 @@ impl VercelSandboxSession {
                  sandbox creation"
             ),
         ))
+    }
+
+    /// Whether the manifest carries any Vercel S3 mount. Mirrors `_vercel_s3_mounts`.
+    fn has_s3_mounts(&self) -> bool {
+        self.manifest
+            .mount_targets()
+            .iter()
+            .any(|(mount, _)| mount.strategy.strategy_type() == VERCEL_S3_MOUNT_STRATEGY)
     }
 
     /// Whether this session attached a mount at `mount_path`.
@@ -1205,17 +1290,26 @@ impl VercelSandboxSession {
     }
 
     /// Upload a gzipped tar archive, extracting it under `extract_dir`.
+    ///
+    /// Retried on a transient transport failure, as Python's `_write_files_with_retry` is.
     async fn write_archive(&self, extract_dir: &str, archive: Vec<u8>) -> SandboxResult<()> {
         let what = "write files to the Vercel sandbox";
-        let response = self
-            .request(self.http.post(self.session_url("/fs/write")))
-            .header("Content-Type", "application/gzip")
-            .header("x-cwd", extract_dir)
-            .body(archive)
-            .send()
-            .await
-            .map_err(|e| transport(what, e))?;
-        expect_success(response, what, ErrorCode::WorkspaceWriteTypeError).await
+        retry_async(
+            RetryPolicy::new(),
+            || async {
+                let response = self
+                    .request(self.http.post(self.session_url("/fs/write")))
+                    .header("Content-Type", "application/gzip")
+                    .header("x-cwd", extract_dir)
+                    .body(archive.clone())
+                    .send()
+                    .await
+                    .map_err(|e| transport(what, e))?;
+                expect_success(response, what, ErrorCode::WorkspaceWriteTypeError).await
+            },
+            |error, _attempt| is_transient_sandbox_error(error),
+        )
+        .await
     }
 
     /// Take a native Vercel snapshot of the session.
@@ -1267,6 +1361,12 @@ impl VercelSandboxSession {
             let previous = handle.session_id.clone();
             handle.sandbox_name = created.sandbox.name;
             handle.session_id = created.session.id;
+            // The replacement sandbox gets its own public routes.
+            handle.routes = created
+                .routes
+                .into_iter()
+                .map(|route| (route.port, route.url))
+                .collect();
             previous
         };
         // Stop the session the snapshot replaces so the project does not leak sandboxes.
@@ -1329,6 +1429,19 @@ impl SandboxSession for VercelSandboxSession {
     }
 
     async fn start(&self) -> SandboxResult<()> {
+        // Vercel fixes the S3 mount topology when the sandbox is created, so a second `start`
+        // on a mounted session would re-present credentials to a sandbox that has already run
+        // model-controlled code. Mirrors Python's `_s3_mounts_started` guard.
+        let has_s3_mounts = self.has_s3_mounts();
+        if has_s3_mounts && self.s3_mounts_started.load(Ordering::SeqCst) {
+            return Err(SandboxError::new(
+                ErrorCode::MountConfigInvalid,
+                "Vercel S3 mount topology is fixed when the sandbox is created; starting the \
+                 same mounted session again is not supported",
+            )
+            .with_context("backend", BACKEND_ID)
+            .with_retryable(false));
+        }
         let root = self.manifest.root().to_string();
         let prepared = self
             .run_command(
@@ -1367,6 +1480,14 @@ impl SandboxSession for VercelSandboxSession {
             self.manifest.clone().apply(self).await.map(|_| ())
         };
         self.s3_mounts_startable.store(false, Ordering::SeqCst);
+        // Python closes the window on success, and on failure only once a mount actually
+        // attached: a start that failed before any credential reached the sandbox is safe to
+        // retry, and must not leave the session permanently unstartable.
+        if has_s3_mounts
+            && (result.is_ok() || !self.active_s3_mounts.lock().expect("poisoned").is_empty())
+        {
+            self.s3_mounts_started.store(true, Ordering::SeqCst);
+        }
         result.inspect_err(|_| {
             self.started.store(false, Ordering::SeqCst);
         })?;
@@ -1408,8 +1529,36 @@ impl SandboxSession for VercelSandboxSession {
         self.download_at(&resolved).await
     }
 
+    fn exposed_ports(&self) -> Vec<u16> {
+        self.options.exposed_ports.clone()
+    }
+
+    /// Resolve an exposed port to its public Vercel route.
+    ///
+    /// Mirrors `VercelSandboxSession._resolve_exposed_port`, whose `sandbox.domain(port)` reads
+    /// the route the API assigned when the sandbox was created. The REST create and session
+    /// responses carry those routes, so this needs no extra round trip.
+    async fn resolve_exposed_port(&self, port: u16) -> SandboxResult<ExposedPortEndpoint> {
+        assert_exposed_port_configured(BACKEND_ID, port, &self.options.exposed_ports)?;
+        let url = self
+            .remote
+            .read()
+            .expect("poisoned")
+            .routes
+            .get(&port)
+            .cloned();
+        url.as_deref().and_then(endpoint_from_url).ok_or_else(|| {
+            exposed_port_unavailable(
+                BACKEND_ID,
+                port,
+                &self.options.exposed_ports,
+                ExposedPortUnavailable::BackendUnavailable,
+            )
+        })
+    }
+
     async fn write_file(&self, path: &str, contents: &[u8]) -> SandboxResult<()> {
-        let resolved = self.normalize_path(path)?;
+        let resolved = self.normalize_path_for_write(path)?;
         // `fs/write` only accepts a gzipped tar whose entry names are relative to `x-cwd`.
         let relative = resolved.trim_start_matches('/');
         let mut archive = TarGzBuilder::new();
@@ -1648,8 +1797,14 @@ mod tests {
 
     #[test]
     fn serializes_network_policies() {
-        assert_eq!(NetworkPolicy::AllowAll.to_api(), json!({ "allow": "all" }));
-        assert_eq!(NetworkPolicy::DenyAll.to_api(), json!({ "allow": [] }));
+        assert_eq!(
+            NetworkPolicy::AllowAll.to_api(),
+            json!({ "mode": "allow-all" })
+        );
+        assert_eq!(
+            NetworkPolicy::DenyAll.to_api(),
+            json!({ "mode": "deny-all" })
+        );
         let custom = NetworkPolicy::Custom {
             allow: vec!["example.com".into()],
             allow_subnets: vec!["10.0.0.0/8".into()],

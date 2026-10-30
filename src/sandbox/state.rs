@@ -45,6 +45,24 @@ pub const OWNED_WORKSPACE_PREFIX: &str = "openai-agents-sandbox-";
 /// Version of the session-state payload format.
 pub const SESSION_STATE_SCHEMA_VERSION: &str = "openai-agents-sandbox-state-v1";
 
+/// The current workspace fingerprint algorithm. Mirrors `SNAPSHOT_FINGERPRINT_VERSION`.
+pub const SNAPSHOT_FINGERPRINT_VERSION: &str = "workspace_tar_sha256_v2";
+
+/// The previous algorithm, recomputed as-is when comparing an older record.
+pub const SNAPSHOT_FINGERPRINT_VERSION_V1: &str = "workspace_tar_sha256_v1";
+
+/// A workspace fingerprint and the algorithm that produced it.
+///
+/// Mirrors the `{"fingerprint": ..., "version": ...}` record Python's workspace fingerprint
+/// helper prints.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SnapshotFingerprint {
+    /// The hash of the workspace archive combined with the manifest digest.
+    pub fingerprint: String,
+    /// The algorithm identifier, such as `workspace_tar_sha256_v2`.
+    pub version: String,
+}
+
 /// The credential-free description of a live sandbox session, for the caller to persist.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SandboxSessionState {
@@ -107,6 +125,28 @@ pub struct SandboxSessionState {
     /// Mirrors Python's `mount_authority_rebound`.
     #[serde(default)]
     pub mount_authority_rebound: bool,
+    /// The grant paths whose `host_path` was dropped when this state was written.
+    ///
+    /// Mirrors Python's `REDACTED_HOST_PATH_GRANT_PATHS_KEY`. The paths themselves are inside
+    /// the sandbox, so recording them leaks nothing about the host; the host side is exactly
+    /// what [`rebind_path_grants`](Self::rebind_path_grants) makes the caller supply again.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub redacted_host_path_grant_paths: Vec<String>,
+    /// The fingerprint of the workspace the snapshot was taken from.
+    ///
+    /// Mirrors Python's `snapshot_fingerprint`: a resume whose live workspace still hashes to
+    /// this value can skip restoring the archive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_fingerprint: Option<String>,
+    /// The algorithm that produced [`snapshot_fingerprint`](Self::snapshot_fingerprint).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_fingerprint_version: Option<String>,
+    /// Backend-specific identity the backend needs to reattach, such as Docker's labels.
+    ///
+    /// Mirrors the extra fields Python's `SandboxSessionState` subclasses add. It never holds a
+    /// credential: everything a mount needs comes from the trusted manifest at resume time.
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub provider_metadata: serde_json::Map<String, serde_json::Value>,
 }
 
 impl SandboxSessionState {
@@ -139,7 +179,139 @@ impl SandboxSessionState {
                 mount.strategy.credential_authority() != MountCredentialAuthority::None
             }),
             mount_authority_rebound: false,
+            redacted_host_path_grant_paths: manifest
+                .extra_path_grants()
+                .iter()
+                .filter(|grant| grant.host_path.is_some())
+                .map(|grant| grant.path.clone())
+                .collect(),
+            snapshot_fingerprint: None,
+            snapshot_fingerprint_version: None,
+            provider_metadata: serde_json::Map::new(),
         }
+    }
+
+    /// Record the workspace fingerprint the snapshot was taken from.
+    pub fn with_snapshot_fingerprint(mut self, record: Option<SnapshotFingerprint>) -> Self {
+        match record {
+            None => {
+                self.snapshot_fingerprint = None;
+                self.snapshot_fingerprint_version = None;
+            }
+            Some(record) => {
+                self.snapshot_fingerprint = Some(record.fingerprint);
+                self.snapshot_fingerprint_version = Some(record.version);
+            }
+        }
+        self
+    }
+
+    /// Attach a backend-specific value under `key`.
+    pub fn with_provider_metadata(
+        mut self,
+        key: impl Into<String>,
+        value: serde_json::Value,
+    ) -> Self {
+        self.provider_metadata.insert(key.into(), value);
+        self
+    }
+
+    /// Read a backend-specific value.
+    pub fn provider_metadata(&self, key: &str) -> Option<&serde_json::Value> {
+        self.provider_metadata.get(key)
+    }
+
+    /// Rebind the persisted grants and mount authority to the current trusted manifest.
+    ///
+    /// Mirrors Python's `rebind_persisted_path_grants` + `rebind_persisted_mount_authority`. A
+    /// persisted state never carries a host path or a mount credential, so every grant the live
+    /// manifest had must be supplied again by application code or the resume is refused:
+    /// otherwise a hand-edited state could widen what the sandbox reaches.
+    pub fn rebind_path_grants(&self, trusted: &Manifest) -> SandboxResult<Self> {
+        if !self.path_grants_require_rebind {
+            let mut rebound = self.clone();
+            if rebound.mount_authority_redacted {
+                rebound.mount_authority_redacted = false;
+                rebound.mount_authority_rebound = true;
+            }
+            return Ok(rebound);
+        }
+        let available: std::collections::BTreeSet<&str> = trusted
+            .extra_path_grants()
+            .iter()
+            .filter(|grant| grant.host_path.is_some())
+            .map(|grant| grant.path.as_str())
+            .collect();
+        let missing: Vec<&str> = self
+            .redacted_host_path_grant_paths
+            .iter()
+            .map(String::as_str)
+            .filter(|path| !available.contains(path))
+            .collect();
+        if !missing.is_empty() {
+            return Err(SandboxError::new(
+                ErrorCode::SessionStateInvalid,
+                format!(
+                    "sandbox session state requires current trusted host_path values for these \
+                     path grants: {}",
+                    missing.join(", ")
+                ),
+            ));
+        }
+        let mut rebound = self.clone();
+        rebound.path_grants_require_rebind = false;
+        rebound.redacted_host_path_grant_paths.clear();
+        if rebound.mount_authority_redacted {
+            // `verify_manifest` already proved the trusted manifest has the same mount topology,
+            // so its strategies are the authority the state dropped.
+            rebound.mount_authority_redacted = false;
+            rebound.mount_authority_rebound = true;
+        }
+        Ok(rebound)
+    }
+
+    /// Refuse a resume that still needs the caller to supply grants or mount authority.
+    ///
+    /// Mirrors Python's `assert_path_grants_rebound`.
+    pub fn assert_path_grants_rebound(&self) -> SandboxResult<()> {
+        if self.mount_authority_redacted && !self.mount_authority_rebound {
+            return Err(SandboxError::new(
+                ErrorCode::SessionStateInvalid,
+                "sandbox session state with cloud mount credentials cannot be resumed on its \
+                 own; resume through SandboxRunner with the current trusted manifest",
+            ));
+        }
+        if self.path_grants_require_rebind {
+            return Err(SandboxError::new(
+                ErrorCode::SessionStateInvalid,
+                "sandbox session state path grants must be rebound from a current trusted \
+                 manifest before resume; resume through SandboxRunner with \
+                 SandboxRunConfig::manifest",
+            ));
+        }
+        Ok(())
+    }
+
+    /// The state as it is safe to persist.
+    ///
+    /// Mirrors Python's `_sanitize_persisted_provider_identity`: once the live manifest held
+    /// mount credentials, the backend resource those credentials attached storage to must not be
+    /// reattachable from the state alone, so the provider identity is dropped and the session id
+    /// is replaced by one derived from it. The derived id is stable, so two writes of the same
+    /// state still name the same snapshot.
+    pub fn sanitized_for_persistence(&self) -> Self {
+        if !self.mount_authority_redacted || self.mount_authority_rebound {
+            return self.clone();
+        }
+        let mut sanitized = self.clone();
+        sanitized.provider_id = None;
+        sanitized.session_id = uuid::Uuid::new_v5(
+            &uuid::Uuid::NAMESPACE_URL,
+            format!("openai-agents:mount-authority-redacted:{}", self.session_id).as_bytes(),
+        )
+        .to_string();
+        sanitized.workspace_root_ready = false;
+        sanitized
     }
 
     /// Record that the workspace was fully materialized.
@@ -179,8 +351,11 @@ impl SandboxSessionState {
     }
 
     /// Serialize to a JSON string the caller can persist.
+    ///
+    /// The provider identity is sanitized first, so a state whose live manifest held mount
+    /// credentials never persists a reattachable backend resource.
     pub fn to_json_string(&self) -> SandboxResult<String> {
-        serde_json::to_string(self).map_err(|e| {
+        serde_json::to_string(&self.sanitized_for_persistence()).map_err(|e| {
             SandboxError::new(
                 ErrorCode::SessionStateInvalid,
                 format!("Failed to serialize sandbox session state: {e}"),

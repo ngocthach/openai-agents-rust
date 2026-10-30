@@ -17,12 +17,13 @@ use openai_agents_sdk::extensions::sandbox::e2b::{
     WorkspacePersistence,
 };
 use openai_agents_sdk::extensions::sandbox::vercel::{
-    VercelCloudBucketMountStrategy, VercelSandboxClient, VercelSandboxClientOptions,
+    NetworkPolicy, VercelCloudBucketMountStrategy, VercelSandboxClient, VercelSandboxClientOptions,
     WorkspacePersistence as VercelWorkspacePersistence,
 };
 use openai_agents_sdk::sandbox::entries::Entry;
 use openai_agents_sdk::sandbox::mounts::MountStrategy;
 use openai_agents_sdk::sandbox::pty::{PtyExecRequest, PtyWriteRequest};
+use openai_agents_sdk::sandbox::workspace_paths::SandboxPathGrant;
 use openai_agents_sdk::sandbox::{
     ErrorCode, ExecRequest, Manifest, SandboxClient, SandboxSessionState,
 };
@@ -2888,4 +2889,415 @@ async fn vercel_detaches_and_restores_a_mount_around_a_snapshot() {
         .expect_err("a late mount");
     assert_eq!(error.code, ErrorCode::MountConfigInvalid);
     server.stop();
+}
+
+// ---------------------------------------------------------------------------------------------
+// Exposed ports, the E2B MCP option and the Vercel network policy wire shape
+// ---------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn e2b_sends_the_mcp_configuration_and_resolves_an_exposed_port() {
+    let server =
+        MockServer::start(
+            |request| match (request.method.as_str(), request.path.as_str()) {
+                ("POST", "/v2/sandboxes") => MockResponse::json(serde_json::json!({
+                    "sandboxID": "sbx-e2b",
+                    "envdAccessToken": "envd-token",
+                })),
+                _ => MockResponse::error(404, "unexpected"),
+            },
+        )
+        .await;
+
+    let client = E2BSandboxClient::with_options(
+        E2BSandboxClientOptions::new()
+            .with_api_key("e2b_test")
+            .with_base_url(&server.base_url)
+            .with_domain("e2b.test")
+            .with_exposed_port(3000)
+            .with_mcp_server("github", [("url", "https://mcp.example/github")]),
+    );
+    let session = client.create(None).await.expect("create");
+
+    // The MCP mapping travels verbatim as `NewSandbox.mcp`.
+    let create = server.find("POST", "/v2/sandboxes");
+    assert_eq!(
+        create.json()["mcp"],
+        serde_json::json!({ "github": { "url": "https://mcp.example/github" } })
+    );
+
+    // `get_host` is client-side string building, so resolving issues no request.
+    let endpoint = session.resolve_exposed_port(3000).await.expect("resolve");
+    assert_eq!(endpoint.host, "3000-sbx-e2b.e2b.test");
+    assert!(endpoint.tls);
+    assert_eq!(endpoint.port, 443);
+    assert_eq!(
+        endpoint.url_for("http").unwrap(),
+        "https://3000-sbx-e2b.e2b.test/"
+    );
+
+    // A port the client never declared is refused before any provider call.
+    let error = session
+        .resolve_exposed_port(8080)
+        .await
+        .expect_err("undeclared");
+    assert_eq!(
+        error.context.get("reason").map(String::as_str),
+        Some("not_configured")
+    );
+    server.stop();
+}
+
+#[tokio::test]
+async fn daytona_resolves_an_exposed_port_through_a_signed_preview_url() {
+    let base = Arc::new(Mutex::new(String::new()));
+    let handler_base = base.clone();
+    let server = MockServer::start(move |request| {
+        let base_url = handler_base.lock().expect("poisoned").clone();
+        match (request.method.as_str(), request.path.as_str()) {
+            ("POST", "/sandbox") | ("GET", "/sandbox/sbx-daytona") => {
+                MockResponse::json(daytona_sandbox(&base_url))
+            }
+            ("GET", "/sandbox/sbx-daytona/ports/3000/signed-preview-url") => {
+                MockResponse::json(serde_json::json!({
+                    "url": "https://3000-sbx-daytona.proxy.daytona.works/?token=abc",
+                    "token": "abc",
+                }))
+            }
+            _ => MockResponse::error(404, "unexpected"),
+        }
+    })
+    .await;
+    *base.lock().expect("poisoned") = server.base_url.clone();
+
+    let session = DaytonaSandboxClient::with_options(
+        DaytonaSandboxClientOptions::new()
+            .with_api_key("dt_test")
+            .with_api_url(&server.base_url)
+            .with_exposed_port(3000)
+            .with_exposed_port_url_ttl_secs(120),
+    )
+    .create(None)
+    .await
+    .expect("create");
+    let endpoint = session.resolve_exposed_port(3000).await.expect("resolve");
+    assert_eq!(endpoint.host, "3000-sbx-daytona.proxy.daytona.works");
+    assert!(endpoint.tls);
+    // The signature is part of the URL, so it has to survive into the endpoint.
+    assert_eq!(endpoint.query, "token=abc");
+    assert_eq!(
+        endpoint.url_for("http").unwrap(),
+        "https://3000-sbx-daytona.proxy.daytona.works/?token=abc"
+    );
+
+    let preview = server.find("GET", "/sandbox/sbx-daytona/ports/3000/signed-preview-url");
+    assert!(
+        preview.query.contains("expiresInSeconds=120"),
+        "{}",
+        preview.query
+    );
+    server.stop();
+}
+
+#[tokio::test]
+async fn vercel_resolves_an_exposed_port_from_the_create_routes() {
+    let server = MockServer::start(|request| match (request.method.as_str(), request.path.as_str())
+    {
+        ("POST", "/v3/sandboxes") => {
+            let mut body = vercel_sandbox_and_session("running");
+            body["routes"] = serde_json::json!([
+                { "port": 3000, "subdomain": "agents-test-3000", "url": "https://agents-test-3000.vercel.run" },
+            ]);
+            MockResponse::json(body)
+        }
+        ("GET", "/v2/sandboxes/sessions/sess-1") => {
+            let mut body = vercel_sandbox_and_session("running");
+            MockResponse::json(serde_json::json!({ "session": body["session"].take() }))
+        }
+        ("POST", "/v2/sandboxes/sessions/sess-1/fs/mkdir") => {
+            MockResponse::json(serde_json::json!({}))
+        }
+        _ => MockResponse::error(404, "unexpected"),
+    })
+    .await;
+
+    let session = VercelSandboxClient::with_options(
+        VercelSandboxClientOptions::new()
+            .with_token("vercel_test")
+            .with_base_url(&server.base_url)
+            .with_status_poll_interval(Duration::from_millis(1))
+            .with_exposed_port(3000)
+            .with_exposed_port(8080),
+    )
+    .create(None)
+    .await
+    .expect("create");
+    let endpoint = session.resolve_exposed_port(3000).await.expect("resolve");
+    assert_eq!(endpoint.host, "agents-test-3000.vercel.run");
+    assert_eq!(endpoint.port, 443);
+    assert!(endpoint.tls);
+
+    // A declared port the API published no route for is a backend failure, not a
+    // configuration error.
+    let error = session
+        .resolve_exposed_port(8080)
+        .await
+        .expect_err("no route");
+    assert_eq!(
+        error.context.get("reason").map(String::as_str),
+        Some("backend_unavailable")
+    );
+    // A port the client never declared is refused before the routes are consulted.
+    let undeclared = session
+        .resolve_exposed_port(9090)
+        .await
+        .expect_err("undeclared");
+    assert_eq!(
+        undeclared.context.get("reason").map(String::as_str),
+        Some("not_configured")
+    );
+    server.stop();
+}
+
+#[tokio::test]
+async fn vercel_sends_the_mode_form_for_allow_all_and_deny_all() {
+    for (policy, expected) in [
+        (NetworkPolicy::AllowAll, "allow-all"),
+        (NetworkPolicy::DenyAll, "deny-all"),
+    ] {
+        let server =
+            MockServer::start(
+                |request| match (request.method.as_str(), request.path.as_str()) {
+                    ("POST", "/v3/sandboxes") => {
+                        MockResponse::json(vercel_sandbox_and_session("running"))
+                    }
+                    ("GET", "/v2/sandboxes/sessions/sess-1") => {
+                        let mut body = vercel_sandbox_and_session("running");
+                        MockResponse::json(serde_json::json!({ "session": body["session"].take() }))
+                    }
+                    _ => MockResponse::error(404, "unexpected"),
+                },
+            )
+            .await;
+
+        VercelSandboxClient::with_options(
+            VercelSandboxClientOptions::new()
+                .with_token("vercel_test")
+                .with_base_url(&server.base_url)
+                .with_status_poll_interval(Duration::from_millis(1))
+                .with_network_policy(policy),
+        )
+        .create(None)
+        .await
+        .expect("create");
+
+        // `POST /v3/sandboxes` types `networkPolicy` as a `oneOf`; `allow: "all"` matches
+        // neither branch, while the mode form is the first one.
+        let create = server.find("POST", "/v3/sandboxes");
+        assert_eq!(
+            create.json()["networkPolicy"],
+            serde_json::json!({ "mode": expected })
+        );
+        server.stop();
+    }
+}
+
+#[tokio::test]
+async fn vercel_refuses_to_start_a_mounted_session_twice() {
+    let server = MockServer::start(|request| {
+        vercel_mount_handler(request).unwrap_or_else(|| MockResponse::error(404, "unexpected"))
+    })
+    .await;
+
+    let strategy = VercelCloudBucketMountStrategy::new("my-bucket")
+        .with_region("us-east-1")
+        .with_credentials("AKIAEXAMPLE", "s3cr3t");
+    let session = vercel_mount_client(&server)
+        .create(Some(vercel_mount_manifest(strategy, false)))
+        .await
+        .expect("create");
+    session.start().await.expect("start");
+
+    // The mount topology is fixed at creation, so a second start would re-present the
+    // credential to a sandbox that has already run model-controlled code.
+    let error = session.start().await.expect_err("a second start");
+    assert_eq!(error.code, ErrorCode::MountConfigInvalid);
+    assert!(
+        error.message.contains("starting the same mounted session"),
+        "{}",
+        error.message
+    );
+    server.stop();
+}
+
+#[tokio::test]
+async fn vercel_lets_a_mounted_session_start_again_after_an_early_failure() {
+    // The first `mkdir` fails, so `start` gives up before any mount attaches and no credential
+    // reached the sandbox. That start must be retryable, not leave the session unusable.
+    let failed_once = Arc::new(Mutex::new(false));
+    let seen = failed_once.clone();
+    let server = MockServer::start(move |request| {
+        if request.path == "/v2/sandboxes/sessions/sess-1/cmd"
+            && vercel_command_argv(request).first().map(String::as_str) == Some("/usr/bin/mkdir")
+        {
+            let mut seen = seen.lock().expect("poisoned");
+            if !*seen {
+                *seen = true;
+                return MockResponse::error(503, "the runtime is restarting");
+            }
+        }
+        vercel_mount_handler(request).unwrap_or_else(|| MockResponse::error(404, "unexpected"))
+    })
+    .await;
+
+    let strategy = VercelCloudBucketMountStrategy::new("my-bucket")
+        .with_region("us-east-1")
+        .with_credentials("AKIAEXAMPLE", "s3cr3t");
+    let session = vercel_mount_client(&server)
+        .create(Some(vercel_mount_manifest(strategy, false)))
+        .await
+        .expect("create");
+
+    session.start().await.expect_err("the first start fails");
+    // No mount attached, so the gate is still open.
+    session.start().await.expect("the retry starts the session");
+    assert_eq!(vercel_commands(&server, "/usr/bin/mount-s3").len(), 1);
+
+    // Once a mount did attach, a further start is refused.
+    let error = session.start().await.expect_err("a third start");
+    assert_eq!(error.code, ErrorCode::MountConfigInvalid);
+    server.stop();
+}
+
+// ---------------------------------------------------------------------------------------------
+// The core hooks the sandbox-core area added: write grants and exposed ports through the trait
+// ---------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn providers_refuse_a_write_through_a_read_only_path_grant() {
+    // `write_file` is implemented per backend, so the read-only grant check has to be requested
+    // by each of them. These three share one assertion because the rule is the SDK's, not the
+    // provider's: a grant marked read-only must refuse a write the backend would otherwise
+    // happily perform.
+    let grant = SandboxPathGrant::new("/shared/dataset")
+        .expect("grant")
+        .read_only(true);
+    let manifest = Manifest::new().with_extra_path_grant(grant);
+
+    let e2b_server =
+        MockServer::start(
+            |request| match (request.method.as_str(), request.path.as_str()) {
+                ("POST", "/v2/sandboxes") => MockResponse::json(serde_json::json!({
+                    "sandboxID": "sbx-e2b",
+                    "envdAccessToken": "t",
+                })),
+                _ => MockResponse::error(404, "unexpected"),
+            },
+        )
+        .await;
+    let e2b = e2b_client(&e2b_server.base_url)
+        .create(Some(manifest.clone()))
+        .await
+        .expect("create");
+    let error = e2b
+        .write_file("/shared/dataset/out.txt", b"x")
+        .await
+        .expect_err("a write through a read-only grant");
+    assert_eq!(error.code, ErrorCode::WorkspaceArchiveWriteError);
+    assert_eq!(
+        error.context.get("reason").map(String::as_str),
+        Some("read_only_extra_path_grant")
+    );
+    // A read through the same grant is still allowed.
+    assert!(
+        e2b.normalize_path("/shared/dataset/out.txt").is_ok(),
+        "the grant still permits reads"
+    );
+    e2b_server.stop();
+
+    let vercel_server = MockServer::start(|request| {
+        vercel_mount_handler(request).unwrap_or_else(|| MockResponse::error(404, "unexpected"))
+    })
+    .await;
+    let vercel = vercel_mount_client(&vercel_server)
+        .create(Some(manifest.clone()))
+        .await
+        .expect("create");
+    assert_eq!(
+        vercel
+            .write_file("/shared/dataset/out.txt", b"x")
+            .await
+            .expect_err("a write through a read-only grant")
+            .code,
+        ErrorCode::WorkspaceArchiveWriteError
+    );
+    vercel_server.stop();
+
+    let base = Arc::new(Mutex::new(String::new()));
+    let handler_base = base.clone();
+    let daytona_server = MockServer::start(move |request| {
+        let base_url = handler_base.lock().expect("poisoned").clone();
+        match (request.method.as_str(), request.path.as_str()) {
+            ("POST", "/sandbox") | ("GET", "/sandbox/sbx-daytona") => {
+                MockResponse::json(daytona_sandbox(&base_url))
+            }
+            _ => MockResponse::error(404, "unexpected"),
+        }
+    })
+    .await;
+    *base.lock().expect("poisoned") = daytona_server.base_url.clone();
+    let daytona = DaytonaSandboxClient::with_options(
+        DaytonaSandboxClientOptions::new()
+            .with_api_key("dt_test")
+            .with_api_url(&daytona_server.base_url),
+    )
+    .create(Some(manifest))
+    .await
+    .expect("create");
+    assert_eq!(
+        daytona
+            .write_file("/shared/dataset/out.txt", b"x")
+            .await
+            .expect_err("a write through a read-only grant")
+            .code,
+        ErrorCode::WorkspaceArchiveWriteError
+    );
+    daytona_server.stop();
+}
+
+#[tokio::test]
+async fn vercel_fails_a_create_once_on_a_permanent_status() {
+    // `http.rs` now classifies the status, so a 402 is not retried three times while a 503 is.
+    for (status, expected_attempts) in [(402u16, 1usize), (503u16, 3usize)] {
+        let server = MockServer::start(move |request| {
+            match (request.method.as_str(), request.path.as_str()) {
+                ("POST", "/v3/sandboxes") => MockResponse::error(status, "nope"),
+                _ => MockResponse::error(404, "unexpected"),
+            }
+        })
+        .await;
+        let error = VercelSandboxClient::with_options(
+            VercelSandboxClientOptions::new()
+                .with_token("vercel_test")
+                .with_base_url(&server.base_url)
+                .with_status_poll_interval(Duration::from_millis(1)),
+        )
+        .create(None)
+        .await
+        .expect_err("create fails");
+        assert_eq!(
+            error.context.get("http_status").map(String::as_str),
+            Some(status.to_string().as_str())
+        );
+        assert_eq!(
+            server
+                .requests()
+                .iter()
+                .filter(|request| request.path == "/v3/sandboxes")
+                .count(),
+            expected_attempts,
+            "status {status}"
+        );
+        server.stop();
+    }
 }
