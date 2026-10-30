@@ -1,5 +1,6 @@
 //! Sandbox errors and their stable error codes. Mirrors `agents.sandbox.errors`.
 
+use std::collections::BTreeMap;
 use std::fmt;
 
 use crate::error::AgentsError;
@@ -10,6 +11,8 @@ use crate::sandbox::types::ExecResult;
 pub enum ErrorCode {
     /// A manifest path was absolute, empty or escaped the workspace root.
     InvalidManifestPath,
+    /// A workspace archive used a compression scheme the backend cannot read.
+    InvalidCompressionScheme,
     /// A command exited with a non-zero status.
     ExecNonZero,
     /// A command exceeded its timeout.
@@ -40,6 +43,10 @@ pub enum ErrorCode {
     ApplyPatchDecodeError,
     /// A workspace read targeted a missing path.
     WorkspaceReadNotFound,
+    /// Reading a workspace archive failed.
+    WorkspaceArchiveReadError,
+    /// Writing a workspace archive failed.
+    WorkspaceArchiveWriteError,
     /// A workspace write failed because the target has the wrong type.
     WorkspaceWriteTypeError,
     /// Starting the sandbox workspace failed.
@@ -52,12 +59,16 @@ pub enum ErrorCode {
     LocalFileReadError,
     /// A host directory referenced by a manifest entry could not be read.
     LocalDirReadError,
+    /// Checksumming a host file while materializing it failed.
+    LocalChecksumError,
     /// `git` is not available inside the sandbox image.
     GitMissingInImage,
     /// Cloning a git repository failed.
     GitCloneError,
     /// The requested git subpath does not exist in the clone.
     GitSubpathError,
+    /// Copying a cloned git tree into the workspace failed.
+    GitCopyError,
     /// The skills capability is misconfigured.
     SkillsConfigInvalid,
     /// The sandbox configuration is invalid.
@@ -75,6 +86,7 @@ impl ErrorCode {
     pub fn as_str(self) -> &'static str {
         match self {
             ErrorCode::InvalidManifestPath => "invalid_manifest_path",
+            ErrorCode::InvalidCompressionScheme => "invalid_compression_scheme",
             ErrorCode::ExecNonZero => "exec_nonzero",
             ErrorCode::ExecTimeout => "exec_timeout",
             ErrorCode::ExecTransportError => "exec_transport_error",
@@ -90,15 +102,19 @@ impl ErrorCode {
             ErrorCode::ApplyPatchFileNotFound => "apply_patch_file_not_found",
             ErrorCode::ApplyPatchDecodeError => "apply_patch_decode_error",
             ErrorCode::WorkspaceReadNotFound => "workspace_read_not_found",
+            ErrorCode::WorkspaceArchiveReadError => "workspace_archive_read_error",
+            ErrorCode::WorkspaceArchiveWriteError => "workspace_archive_write_error",
             ErrorCode::WorkspaceWriteTypeError => "workspace_write_type_error",
             ErrorCode::WorkspaceStartError => "workspace_start_error",
             ErrorCode::WorkspaceStopError => "workspace_stop_error",
             ErrorCode::WorkspaceRootNotFound => "workspace_root_not_found",
             ErrorCode::LocalFileReadError => "local_file_read_error",
             ErrorCode::LocalDirReadError => "local_dir_read_error",
+            ErrorCode::LocalChecksumError => "local_checksum_error",
             ErrorCode::GitMissingInImage => "git_missing_in_image",
             ErrorCode::GitCloneError => "git_clone_error",
             ErrorCode::GitSubpathError => "git_subpath_error",
+            ErrorCode::GitCopyError => "git_copy_error",
             ErrorCode::SkillsConfigInvalid => "skills_config_invalid",
             ErrorCode::SandboxConfigInvalid => "sandbox_config_invalid",
             ErrorCode::SnapshotPersistError => "snapshot_persist_error",
@@ -114,6 +130,70 @@ impl fmt::Display for ErrorCode {
     }
 }
 
+/// The sandbox operation an error came from. Mirrors Python's `OpName`.
+///
+/// Carrying the operation lets a caller tell a failed `write` from a failed `exec` without
+/// parsing the message, which matters when the same error code can come from either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SandboxOp {
+    /// Starting the workspace.
+    Start,
+    /// Stopping the workspace.
+    Stop,
+    /// Running a command.
+    Exec,
+    /// Reading a workspace file.
+    Read,
+    /// Writing a workspace file.
+    Write,
+    /// Tearing the sandbox down.
+    Shutdown,
+    /// Checking whether the sandbox is running.
+    Running,
+    /// Capturing the workspace into an archive.
+    PersistWorkspace,
+    /// Restoring the workspace from an archive.
+    HydrateWorkspace,
+    /// Resolving an exposed port to a reachable endpoint.
+    ResolveExposedPort,
+    /// Materializing a manifest entry.
+    Materialize,
+    /// Persisting a snapshot.
+    SnapshotPersist,
+    /// Restoring a snapshot.
+    SnapshotRestore,
+    /// Applying a patch.
+    ApplyPatch,
+}
+
+impl SandboxOp {
+    /// The wire name of the operation.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SandboxOp::Start => "start",
+            SandboxOp::Stop => "stop",
+            SandboxOp::Exec => "exec",
+            SandboxOp::Read => "read",
+            SandboxOp::Write => "write",
+            SandboxOp::Shutdown => "shutdown",
+            SandboxOp::Running => "running",
+            SandboxOp::PersistWorkspace => "persist_workspace",
+            SandboxOp::HydrateWorkspace => "hydrate_workspace",
+            SandboxOp::ResolveExposedPort => "resolve_exposed_port",
+            SandboxOp::Materialize => "materialize",
+            SandboxOp::SnapshotPersist => "snapshot_persist",
+            SandboxOp::SnapshotRestore => "snapshot_restore",
+            SandboxOp::ApplyPatch => "apply_patch",
+        }
+    }
+}
+
+impl fmt::Display for SandboxOp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// An error raised by a sandbox session, client or manifest entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SandboxError {
@@ -123,6 +203,15 @@ pub struct SandboxError {
     pub message: String,
     /// The exit code of the failed command, when the error came from `exec`.
     pub exit_code: Option<i32>,
+    /// The operation that failed, when the raising code names one.
+    pub op: Option<SandboxOp>,
+    /// Structured metadata for debugging. Never holds a credential.
+    pub context: BTreeMap<String, String>,
+    /// Whether retrying the same operation is expected to succeed.
+    ///
+    /// `None` means the SDK cannot safely classify the error, which is not the same as "no":
+    /// a caller that retries on `None` is guessing.
+    pub retryable: Option<bool>,
 }
 
 impl SandboxError {
@@ -132,7 +221,41 @@ impl SandboxError {
             code,
             message: message.into(),
             exit_code: None,
+            op: None,
+            context: BTreeMap::new(),
+            retryable: None,
         }
+    }
+
+    /// Name the operation that failed.
+    pub fn with_op(mut self, op: SandboxOp) -> Self {
+        self.op = Some(op);
+        self
+    }
+
+    /// Attach one piece of debugging metadata.
+    ///
+    /// The value reaches logs and error messages, so it must never be a credential.
+    pub fn with_context(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.context.insert(key.into(), value.into());
+        self
+    }
+
+    /// Record whether retrying the same operation is expected to succeed.
+    pub fn with_retryable(mut self, retryable: bool) -> Self {
+        self.retryable = Some(retryable);
+        self
+    }
+
+    /// Inherit the retry classification of the error that caused this one.
+    ///
+    /// Mirrors Python's `__post_init__`: an unclassified error wrapping a transient one is
+    /// itself transient, and wrapping it must not quietly lose that.
+    pub fn caused_by(mut self, cause: &SandboxError) -> Self {
+        if self.retryable.is_none() {
+            self.retryable = cause.retryable;
+        }
+        self
     }
 
     /// Build an [`ErrorCode::ExecNonZero`] error from a failed command.
@@ -152,6 +275,10 @@ impl SandboxError {
                 detail.trim()
             ),
             exit_code: Some(result.exit_code),
+            op: Some(SandboxOp::Exec),
+            context: BTreeMap::new(),
+            // A command that ran and failed will fail the same way again.
+            retryable: Some(false),
         }
     }
 
@@ -213,6 +340,33 @@ mod tests {
             let err: AgentsError = SandboxError::new(code, "boom").into();
             assert_eq!(err.sandbox_code(), Some(code.as_str()));
         }
+    }
+
+    #[test]
+    fn inherits_the_retry_classification_of_a_cause() {
+        let transient =
+            SandboxError::new(ErrorCode::ExecTransportError, "reset").with_retryable(true);
+        let wrapped =
+            SandboxError::new(ErrorCode::WorkspaceStartError, "failed").caused_by(&transient);
+        assert_eq!(wrapped.retryable, Some(true));
+
+        // An explicit classification wins over the cause's.
+        let pinned = SandboxError::new(ErrorCode::WorkspaceStartError, "failed")
+            .with_retryable(false)
+            .caused_by(&transient);
+        assert_eq!(pinned.retryable, Some(false));
+    }
+
+    #[test]
+    fn carries_the_operation_and_its_context() {
+        let error = SandboxError::new(ErrorCode::WorkspaceArchiveWriteError, "no space")
+            .with_op(SandboxOp::PersistWorkspace)
+            .with_context("root", "/workspace");
+        assert_eq!(error.op.map(SandboxOp::as_str), Some("persist_workspace"));
+        assert_eq!(
+            error.context.get("root").map(String::as_str),
+            Some("/workspace")
+        );
     }
 
     #[test]

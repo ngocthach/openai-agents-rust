@@ -189,6 +189,11 @@ pub enum SnapshotSpec {
         /// The directory holding the snapshot files.
         base_path: PathBuf,
     },
+    /// Store snapshot files through a [`RemoteSnapshotClient`] registered under `client_key`.
+    Remote {
+        /// The key the client was registered under.
+        client_key: String,
+    },
 }
 
 impl SnapshotSpec {
@@ -199,6 +204,127 @@ impl SnapshotSpec {
             SnapshotSpec::Local { base_path } => {
                 Arc::new(LocalSnapshot::new(snapshot_id, base_path.clone()))
             }
+            SnapshotSpec::Remote { client_key } => {
+                Arc::new(RemoteSnapshot::new(snapshot_id, client_key.clone()))
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Remote snapshots
+// ---------------------------------------------------------------------------------------------
+
+/// Somewhere a workspace archive can be stored that is not this machine. Mirrors the client a
+/// Python `RemoteSnapshot` resolves out of its session dependencies.
+///
+/// Implement this for object storage, a provider's own snapshot API, or anything else that
+/// survives the process. It is what makes a paused run resumable from a different machine.
+#[async_trait]
+pub trait RemoteSnapshotClient: Send + Sync + fmt::Debug {
+    /// Store `data` under `snapshot_id`.
+    async fn upload(&self, snapshot_id: &str, data: &[u8]) -> SandboxResult<()>;
+
+    /// Fetch what was stored under `snapshot_id`.
+    async fn download(&self, snapshot_id: &str) -> SandboxResult<Vec<u8>>;
+
+    /// Whether anything is stored under `snapshot_id`.
+    async fn exists(&self, snapshot_id: &str) -> SandboxResult<bool>;
+}
+
+/// The process-wide registry of remote snapshot clients.
+///
+/// [`SandboxSessionState`](crate::sandbox::SandboxSessionState) has to survive being written to
+/// disk and read back in another process, so it can only carry a *name* for the storage, never
+/// the client object. The application registers the client under that name at start-up and a
+/// resumed state finds it again. Nothing here is a credential: the client holds those.
+static REMOTE_SNAPSHOT_CLIENTS: std::sync::LazyLock<
+    std::sync::RwLock<std::collections::BTreeMap<String, Arc<dyn RemoteSnapshotClient>>>,
+> = std::sync::LazyLock::new(|| std::sync::RwLock::new(std::collections::BTreeMap::new()));
+
+/// Register `client` under `client_key`, replacing any client already registered under it.
+///
+/// Call this before creating or resuming a session whose snapshot spec names `client_key`.
+pub fn register_remote_snapshot_client(
+    client_key: impl Into<String>,
+    client: Arc<dyn RemoteSnapshotClient>,
+) {
+    if let Ok(mut clients) = REMOTE_SNAPSHOT_CLIENTS.write() {
+        clients.insert(client_key.into(), client);
+    }
+}
+
+/// The client registered under `client_key`, when there is one.
+pub fn remote_snapshot_client(client_key: &str) -> Option<Arc<dyn RemoteSnapshotClient>> {
+    REMOTE_SNAPSHOT_CLIENTS
+        .read()
+        .ok()
+        .and_then(|clients| clients.get(client_key).cloned())
+}
+
+/// A workspace snapshot stored through a [`RemoteSnapshotClient`]. Mirrors Python's
+/// `RemoteSnapshot`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteSnapshot {
+    /// The snapshot id.
+    pub id: String,
+    /// The key the storage client is registered under.
+    pub client_key: String,
+}
+
+impl RemoteSnapshot {
+    /// A snapshot stored through the client registered under `client_key`.
+    pub fn new(id: impl Into<String>, client_key: impl Into<String>) -> Self {
+        RemoteSnapshot {
+            id: id.into(),
+            client_key: client_key.into(),
+        }
+    }
+
+    /// The registered client, or an error naming what is missing.
+    fn client(&self, code: ErrorCode) -> SandboxResult<Arc<dyn RemoteSnapshotClient>> {
+        remote_snapshot_client(&self.client_key).ok_or_else(|| {
+            SandboxError::new(
+                code,
+                format!(
+                    "no remote snapshot client is registered under `{}`; register one before \
+                     creating or resuming this session",
+                    self.client_key
+                ),
+            )
+            .with_context("client_key", self.client_key.clone())
+        })
+    }
+}
+
+#[async_trait]
+impl Snapshot for RemoteSnapshot {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn snapshot_type(&self) -> &str {
+        "remote"
+    }
+
+    async fn persist(&self, data: &[u8]) -> SandboxResult<()> {
+        self.client(ErrorCode::SnapshotPersistError)?
+            .upload(&self.id, data)
+            .await
+    }
+
+    async fn restore(&self) -> SandboxResult<Vec<u8>> {
+        self.client(ErrorCode::SnapshotRestoreError)?
+            .download(&self.id)
+            .await
+    }
+
+    async fn restorable(&self) -> SandboxResult<bool> {
+        // A missing client means nothing is restorable, not that the run should fail: a resume
+        // that cannot find its archive falls back to materializing the manifest.
+        match remote_snapshot_client(&self.client_key) {
+            Some(client) => client.exists(&self.id).await,
+            None => Ok(false),
         }
     }
 }
@@ -277,6 +403,80 @@ pub async fn cleanup_stale_default_local_snapshots(base_path: &Path, max_age: Du
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Debug, Default)]
+    struct MemoryClient {
+        stored: std::sync::Mutex<std::collections::BTreeMap<String, Vec<u8>>>,
+    }
+
+    #[async_trait]
+    impl RemoteSnapshotClient for MemoryClient {
+        async fn upload(&self, snapshot_id: &str, data: &[u8]) -> SandboxResult<()> {
+            self.stored
+                .lock()
+                .unwrap()
+                .insert(snapshot_id.to_string(), data.to_vec());
+            Ok(())
+        }
+
+        async fn download(&self, snapshot_id: &str) -> SandboxResult<Vec<u8>> {
+            self.stored
+                .lock()
+                .unwrap()
+                .get(snapshot_id)
+                .cloned()
+                .ok_or_else(|| SandboxError::new(ErrorCode::SnapshotNotRestorable, "no archive"))
+        }
+
+        async fn exists(&self, snapshot_id: &str) -> SandboxResult<bool> {
+            Ok(self.stored.lock().unwrap().contains_key(snapshot_id))
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_snapshots_round_trip_through_their_client() {
+        register_remote_snapshot_client("test-store", Arc::new(MemoryClient::default()));
+        let spec = SnapshotSpec::Remote {
+            client_key: "test-store".to_string(),
+        };
+        let snapshot = spec.build("session-1");
+        assert_eq!(snapshot.snapshot_type(), "remote");
+        assert!(!snapshot.restorable().await.unwrap());
+        snapshot.persist(b"archive").await.unwrap();
+        assert!(snapshot.restorable().await.unwrap());
+        assert_eq!(snapshot.restore().await.unwrap(), b"archive");
+    }
+
+    #[tokio::test]
+    async fn an_unregistered_client_is_reported_not_guessed() {
+        let snapshot = SnapshotSpec::Remote {
+            client_key: "never-registered".to_string(),
+        }
+        .build("session-2");
+        // Nothing can be restored, which a resume handles by materializing the manifest.
+        assert!(!snapshot.restorable().await.unwrap());
+        // Persisting, which would silently lose the workspace, says exactly what is missing.
+        let error = snapshot.persist(b"archive").await.unwrap_err();
+        assert_eq!(error.code, ErrorCode::SnapshotPersistError);
+        assert!(
+            error.message.contains("never-registered"),
+            "{}",
+            error.message
+        );
+    }
+
+    #[test]
+    fn a_remote_spec_survives_serialization() {
+        let spec = SnapshotSpec::Remote {
+            client_key: "store".to_string(),
+        };
+        let json = serde_json::to_string(&spec).unwrap();
+        assert_eq!(
+            serde_json::from_str::<SnapshotSpec>(&json).unwrap(),
+            spec,
+            "{json}"
+        );
+    }
 
     #[tokio::test]
     async fn local_snapshots_round_trip() {

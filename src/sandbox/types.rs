@@ -115,6 +115,22 @@ impl Permissions {
         ((self.owner & 0o7) << 6) | ((self.group & 0o7) << 3) | (self.other & 0o7)
     }
 
+    /// Permissions from a numeric mode, as `stat` reports it.
+    ///
+    /// Mirrors Python's `Permissions.from_mode`: the three triplets come from the low nine bits
+    /// and the directory flag from `S_IFDIR`, so a mode read back from the sandbox round-trips
+    /// through [`to_mode`](Self::to_mode).
+    pub fn from_mode(mode: u32) -> Self {
+        /// `stat.S_IFDIR`.
+        const S_IFDIR: u32 = 0o040000;
+        Permissions {
+            owner: (mode >> 6) & 0o7,
+            group: (mode >> 3) & 0o7,
+            other: mode & 0o7,
+            directory: mode & S_IFDIR != 0,
+        }
+    }
+
     /// The mode as a four-digit octal string, as `chmod` expects it.
     pub fn octal_string(self) -> String {
         format!("{:04o}", self.to_mode())
@@ -287,6 +303,17 @@ fn name_after_fields(line: &str, count: usize) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn round_trips_a_numeric_mode() {
+        let permissions = Permissions::new(7, 5, 4);
+        assert_eq!(Permissions::from_mode(permissions.to_mode()), permissions);
+        let directory = Permissions::new(7, 0, 0).as_directory(true);
+        assert_eq!(
+            Permissions::from_mode(directory.to_mode() | 0o040000),
+            directory
+        );
+    }
     use super::*;
 
     #[test]

@@ -67,6 +67,7 @@ use serde_json::{Value, json};
 use crate::sandbox::errors::{ErrorCode, SandboxError, SandboxResult};
 use crate::sandbox::http::{expect_success, http_error, parse_json, transport};
 use crate::sandbox::manifest::Manifest;
+use crate::sandbox::mount_entries::{BuiltinMountPattern, ConfiguredMount};
 use crate::sandbox::mounts::{
     InContainerMountStrategy, Mount, MountCredentialAuthority, MountPatternConfig, MountStrategy,
     RCLONE_OPTION_READ_ONLY, RCLONE_OPTION_REMOTE_NAME, RCLONE_OPTION_REMOTE_PATH, RcloneMountMode,
@@ -1659,7 +1660,15 @@ pub struct E2BCloudBucketMountStrategy {
     /// The rclone pattern that attaches the bucket.
     pub pattern: RcloneMountPattern,
     /// The secret-bearing rclone configuration and the remote selection options.
+    ///
+    /// Ignored when [`spec`](Self::spec) is set, which derives the configuration per session.
     pub config: MountPatternConfig,
+    /// The storage this strategy attaches, when it was built from a configured mount.
+    ///
+    /// A configured mount knows how to render its own rclone section, so the configuration is
+    /// built on each activation against the session it is attached to instead of being pinned
+    /// when the strategy is declared.
+    pub spec: Option<Arc<dyn ConfiguredMount>>,
     /// Whether a missing `rclone` (or `fuse3`) may be installed into the sandbox.
     pub install_tools: bool,
 }
@@ -1673,11 +1682,25 @@ impl E2BCloudBucketMountStrategy {
     ) -> Self {
         E2BCloudBucketMountStrategy {
             pattern: RcloneMountPattern::new(),
+            spec: None,
             install_tools: true,
             config: MountPatternConfig::new()
                 .with_config_text(config_text)
                 .with_option(RCLONE_OPTION_REMOTE_NAME, remote_name)
                 .with_option(RCLONE_OPTION_REMOTE_PATH, remote_path),
+        }
+    }
+
+    /// A strategy attaching one of the built-in remote storage mounts.
+    ///
+    /// The mount renders its own rclone remote on every activation, so the credentials never
+    /// have to be rendered by the caller and the remote name is derived from the live session.
+    pub fn for_mount(spec: impl ConfiguredMount + 'static) -> Self {
+        E2BCloudBucketMountStrategy {
+            pattern: RcloneMountPattern::new(),
+            spec: Some(Arc::new(spec)),
+            install_tools: true,
+            config: MountPatternConfig::new(),
         }
     }
 
@@ -1699,13 +1722,30 @@ impl E2BCloudBucketMountStrategy {
     }
 
     /// The delegate used for one activation, with the mount's read-only flag applied.
-    fn delegate(&self, mount: &Mount) -> InContainerMountStrategy {
-        let mut config = self.config.clone();
-        config.options.insert(
-            RCLONE_OPTION_READ_ONLY.to_string(),
-            mount.read_only.to_string(),
-        );
-        InContainerMountStrategy::new(Arc::new(self.fuse_pattern()), config)
+    fn delegate(
+        &self,
+        mount: &Mount,
+        session: &dyn SandboxSession,
+        include_credentials: bool,
+    ) -> SandboxResult<InContainerMountStrategy> {
+        let pattern = self.fuse_pattern();
+        let config = match &self.spec {
+            Some(spec) => spec.build_in_container_config(
+                session.id(),
+                &BuiltinMountPattern::Rclone(pattern.clone()),
+                mount.read_only,
+                include_credentials,
+            )?,
+            None => {
+                let mut config = self.config.clone();
+                config.options.insert(
+                    RCLONE_OPTION_READ_ONLY.to_string(),
+                    mount.read_only.to_string(),
+                );
+                config
+            }
+        };
+        Ok(InContainerMountStrategy::new(Arc::new(pattern), config))
     }
 
     /// The pattern with the flags this provider's images need.
@@ -1739,11 +1779,31 @@ impl MountStrategy for E2BCloudBucketMountStrategy {
     }
 
     fn credential_authority(&self) -> MountCredentialAuthority {
-        if self.config.has_config_text() {
+        if let Some(spec) = &self.spec {
+            return spec.credential_authority("rclone", self.pattern.config_file_path.is_some());
+        }
+        if self.config.has_credentials() {
             MountCredentialAuthority::MountScoped
         } else {
             MountCredentialAuthority::None
         }
+    }
+
+    fn validate(&self, _mount: &Mount) -> SandboxResult<()> {
+        let Some(spec) = &self.spec else {
+            return Ok(());
+        };
+        spec.validate()?;
+        if !spec.supported_in_container_patterns().contains(&"rclone") {
+            return Err(SandboxError::new(
+                ErrorCode::MountConfigInvalid,
+                format!(
+                    "`{}` cannot be attached with the `rclone` mount pattern",
+                    spec.mount_type()
+                ),
+            ));
+        }
+        Ok(())
     }
 
     fn supports_native_snapshot_detach(&self) -> bool {
@@ -1759,7 +1819,7 @@ impl MountStrategy for E2BCloudBucketMountStrategy {
         assert_e2b_session(session)?;
         session.authorize_mount_activation(mount, mount_path)?;
         self.preflight(session).await?;
-        self.delegate(mount)
+        self.delegate(mount, session, true)?
             .activate(mount, session, mount_path)
             .await
     }
@@ -1771,7 +1831,7 @@ impl MountStrategy for E2BCloudBucketMountStrategy {
         mount_path: &str,
     ) -> SandboxResult<()> {
         assert_e2b_session(session)?;
-        self.delegate(mount)
+        self.delegate(mount, session, false)?
             .deactivate(mount, session, mount_path)
             .await
     }
@@ -1785,7 +1845,7 @@ impl MountStrategy for E2BCloudBucketMountStrategy {
         assert_e2b_session(session)?;
         session.authorize_mount_activation(mount, mount_path)?;
         self.preflight(session).await?;
-        self.delegate(mount)
+        self.delegate(mount, session, true)?
             .activate(mount, session, mount_path)
             .await
     }

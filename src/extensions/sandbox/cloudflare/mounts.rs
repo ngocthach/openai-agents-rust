@@ -10,6 +10,7 @@ use async_trait::async_trait;
 use serde_json::{Map, Value, json};
 
 use crate::sandbox::errors::{ErrorCode, SandboxError, SandboxResult};
+use crate::sandbox::mount_entries::{ConfiguredMount, GCS_S3_ENDPOINT, GcsMount, R2Mount, S3Mount};
 use crate::sandbox::mounts::{Mount, MountStrategy};
 use crate::sandbox::session::SandboxSession;
 
@@ -288,6 +289,134 @@ impl MountStrategy for CloudflareBucketMountStrategy {
     ) -> SandboxResult<()> {
         let connection = self.connection(session, mount_path)?;
         connection.unmount_bucket(mount_path).await
+    }
+}
+
+// -------------------------------------------------------------------------------------------
+// Configured mount translation
+// -------------------------------------------------------------------------------------------
+
+impl CloudflareBucketMountConfig {
+    /// The Cloudflare bucket configuration for one of the built-in remote storage mounts.
+    ///
+    /// Mirrors Python's `_build_cloudflare_bucket_mount_config`: the worker speaks the S3 API
+    /// itself, so an [`S3Mount`], an [`R2Mount`] or an HMAC-authenticated [`GcsMount`] all become
+    /// one bucket request, and anything the worker cannot reach is rejected before the sandbox is
+    /// created.
+    pub fn from_configured_mount(mount: &dyn ConfiguredMount) -> SandboxResult<Self> {
+        mount.validate()?;
+        let any = mount.as_any();
+
+        if let Some(s3) = any.downcast_ref::<S3Mount>() {
+            let credentials =
+                credential_pair(s3.access_key_id.as_deref(), s3.secret_access_key.as_deref())?;
+            if s3.session_token.is_some() {
+                return Err(SandboxError::new(
+                    ErrorCode::MountConfigInvalid,
+                    "cloudflare bucket mounts do not support s3 session_token credentials",
+                ));
+            }
+            let endpoint = s3.endpoint_url.clone().unwrap_or_else(|| match &s3.region {
+                Some(region) => format!("https://s3.{region}.amazonaws.com"),
+                None => "https://s3.amazonaws.com".to_string(),
+            });
+            return Ok(CloudflareBucketMountConfig {
+                bucket_name: s3.bucket.clone(),
+                bucket_endpoint_url: endpoint,
+                provider: CloudflareBucketProvider::S3,
+                key_prefix: normalize_key_prefix(s3.prefix.as_deref()),
+                credentials,
+                read_only: true,
+            });
+        }
+
+        if let Some(r2) = any.downcast_ref::<R2Mount>() {
+            return Ok(CloudflareBucketMountConfig {
+                bucket_name: r2.bucket.clone(),
+                bucket_endpoint_url: r2.endpoint(),
+                provider: CloudflareBucketProvider::R2,
+                key_prefix: None,
+                credentials: credential_pair(
+                    r2.access_key_id.as_deref(),
+                    r2.secret_access_key.as_deref(),
+                )?,
+                read_only: true,
+            });
+        }
+
+        if let Some(gcs) = any.downcast_ref::<GcsMount>() {
+            if !gcs.uses_s3_compatible_api() {
+                return Err(SandboxError::new(
+                    ErrorCode::MountConfigInvalid,
+                    "gcs cloudflare bucket mounts require an access id and a secret access key",
+                ));
+            }
+            return Ok(CloudflareBucketMountConfig {
+                bucket_name: gcs.bucket.clone(),
+                bucket_endpoint_url: gcs
+                    .endpoint_url
+                    .clone()
+                    .unwrap_or_else(|| GCS_S3_ENDPOINT.to_string()),
+                provider: CloudflareBucketProvider::Gcs,
+                key_prefix: normalize_key_prefix(gcs.prefix.as_deref()),
+                credentials: credential_pair(
+                    gcs.access_id.as_deref(),
+                    gcs.secret_access_key.as_deref(),
+                )?,
+                read_only: true,
+            });
+        }
+
+        Err(SandboxError::new(
+            ErrorCode::MountConfigInvalid,
+            format!(
+                "cloudflare bucket mounts do not support `{}`",
+                mount.mount_type()
+            ),
+        ))
+    }
+}
+
+impl CloudflareBucketMountStrategy {
+    /// A strategy attaching one of the built-in remote storage mounts.
+    ///
+    /// The returned configuration is read-only, because these backends take `read_only` from the
+    /// configuration rather than from the [`Mount`]: chain `with_read_only(false)` to allow
+    /// writes. Defaulting the other way would silently widen a mount.
+    pub fn for_mount(mount: &dyn ConfiguredMount) -> SandboxResult<Self> {
+        Ok(CloudflareBucketMountStrategy::new(
+            CloudflareBucketMountConfig::from_configured_mount(mount)?,
+        ))
+    }
+}
+
+/// The access key pair, rejecting a half-supplied one.
+fn credential_pair(
+    access_key_id: Option<&str>,
+    secret_access_key: Option<&str>,
+) -> SandboxResult<Option<(String, String)>> {
+    match (access_key_id, secret_access_key) {
+        (Some(access_key_id), Some(secret_access_key)) => Ok(Some((
+            access_key_id.to_string(),
+            secret_access_key.to_string(),
+        ))),
+        (None, None) => Ok(None),
+        _ => Err(SandboxError::new(
+            ErrorCode::MountConfigInvalid,
+            "cloudflare bucket mounts require both an access key id and a secret access key when \
+             either is given",
+        )),
+    }
+}
+
+/// Normalize an object prefix to the `/prefix/` shape the worker expects.
+fn normalize_key_prefix(prefix: Option<&str>) -> Option<String> {
+    let prefix = prefix?;
+    let trimmed = prefix.trim_matches('/');
+    if trimmed.is_empty() {
+        Some("/".to_string())
+    } else {
+        Some(format!("/{trimmed}/"))
     }
 }
 

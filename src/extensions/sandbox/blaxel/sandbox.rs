@@ -1696,7 +1696,9 @@ mod tests {
         );
         assert_eq!(
             session.tar_exclude_args(),
-            "--exclude ./.sandbox-rclone-config --exclude ./cache"
+            "--exclude ./.sandbox-blobfuse-cache --exclude ./.sandbox-blobfuse-config \
+             --exclude ./.sandbox-mountpoint-env --exclude ./.sandbox-rclone-config \
+             --exclude ./cache"
         );
     }
 }

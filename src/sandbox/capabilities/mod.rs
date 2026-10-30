@@ -134,6 +134,132 @@ where
     }
 }
 
+/// Replaces or wraps the tools a capability exposes. Mirrors Python's
+/// `FilesystemToolConfigurator` / `configure_tools`.
+///
+/// The bundled capabilities expose a fixed set of tools, which is right until an application
+/// needs one of them renamed, narrowed, wrapped in an approval, or dropped. Rewriting the
+/// capability to change one tool loses every other thing it does, so this wraps it instead: the
+/// manifest changes, the instructions and the sampling parameters all still come from the
+/// capability, and only the tool list passes through the configurator.
+///
+/// ```no_run
+/// use std::sync::Arc;
+///
+/// use openai_agents_sdk::sandbox::capabilities::{ConfiguredCapability, Shell};
+///
+/// // Expose the shell capability with every tool whose name starts with `exec_` removed.
+/// let narrowed = ConfiguredCapability::<()>::new(Arc::new(Shell::new()), |tools| {
+///     tools
+///         .into_iter()
+///         .filter(|tool| !tool.name().starts_with("exec_"))
+///         .collect()
+/// });
+/// let _capability: Arc<dyn openai_agents_sdk::sandbox::capabilities::Capability<()>> =
+///     Arc::new(narrowed);
+/// ```
+pub struct ConfiguredCapability<C>
+where
+    C: Send + Sync + 'static,
+{
+    inner: Arc<dyn Capability<C>>,
+    configure: ToolConfigurator<C>,
+}
+
+/// Rewrites the tool list a capability produces.
+pub type ToolConfigurator<C> = Arc<dyn Fn(Vec<Tool<C>>) -> Vec<Tool<C>> + Send + Sync>;
+
+impl<C> ConfiguredCapability<C>
+where
+    C: Send + Sync + 'static,
+{
+    /// Wrap `inner`, passing its tools through `configure`.
+    pub fn new<F>(inner: Arc<dyn Capability<C>>, configure: F) -> Self
+    where
+        F: Fn(Vec<Tool<C>>) -> Vec<Tool<C>> + Send + Sync + 'static,
+    {
+        ConfiguredCapability {
+            inner,
+            configure: Arc::new(configure),
+        }
+    }
+
+    /// The capability being wrapped.
+    pub fn inner(&self) -> &Arc<dyn Capability<C>> {
+        &self.inner
+    }
+}
+
+// Hand-written because `C` need not be `Clone` or `Debug` for the capability to be either.
+impl<C> Clone for ConfiguredCapability<C>
+where
+    C: Send + Sync + 'static,
+{
+    fn clone(&self) -> Self {
+        ConfiguredCapability {
+            inner: self.inner.clone(),
+            configure: self.configure.clone(),
+        }
+    }
+}
+
+impl<C> fmt::Debug for ConfiguredCapability<C>
+where
+    C: Send + Sync + 'static,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ConfiguredCapability")
+            .field("inner", &self.inner)
+            .finish_non_exhaustive()
+    }
+}
+
+#[async_trait]
+impl<C> Capability<C> for ConfiguredCapability<C>
+where
+    C: Send + Sync + 'static,
+{
+    fn capability_type(&self) -> &str {
+        self.inner.capability_type()
+    }
+
+    fn required_capability_types(&self) -> Vec<&'static str> {
+        self.inner.required_capability_types()
+    }
+
+    fn process_manifest(&self, manifest: Manifest) -> Manifest {
+        self.inner.process_manifest(manifest)
+    }
+
+    fn tools(&self, binding: &CapabilityBinding) -> Result<Vec<Tool<C>>> {
+        Ok((self.configure)(self.inner.tools(binding)?))
+    }
+
+    async fn instructions(&self, manifest: &Manifest) -> Result<Option<String>> {
+        self.inner.instructions(manifest).await
+    }
+
+    async fn bound_instructions(
+        &self,
+        binding: &CapabilityBinding,
+        manifest: &Manifest,
+    ) -> Result<Option<String>> {
+        self.inner.bound_instructions(binding, manifest).await
+    }
+
+    fn as_memory(&self) -> Option<&Memory> {
+        self.inner.as_memory()
+    }
+
+    fn sampling_params(&self, sampling_params: &Map<String, Value>) -> Map<String, Value> {
+        self.inner.sampling_params(sampling_params)
+    }
+
+    fn process_context(&self, context: Vec<InputItem>) -> Vec<InputItem> {
+        self.inner.process_context(context)
+    }
+}
+
 /// The capability sets the SDK ships.
 #[derive(Debug, Clone, Copy)]
 pub struct Capabilities;

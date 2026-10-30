@@ -116,7 +116,8 @@ impl SandboxClient for UnixLocalSandboxClient {
             .with_inherit_host_environment(self.inherit_host_environment)
             .with_snapshot(Some(state.snapshot.clone()))
             .with_identity(state.session_id.clone(), state.snapshot_id.clone())
-            .resuming();
+            .resuming()
+            .with_workspace_root_ready(state.workspace_root_ready);
         Ok(Arc::new(session))
     }
 
@@ -176,6 +177,13 @@ pub struct UnixLocalSandboxSession {
     root: PathBuf,
     owned_root: bool,
     inherit_host_environment: bool,
+    host_environment_allowlist: Option<Vec<String>>,
+    /// The manifest's start-up environment lookups, performed once when the session starts.
+    resolved_environment: std::sync::OnceLock<std::collections::BTreeMap<String, String>>,
+    /// Whether the manifest finished materializing, so a resume can trust the workspace.
+    materialized: AtomicBool,
+    /// Keeps concurrent work out of the workspace while a snapshot detaches its mounts.
+    mount_transition: crate::sandbox::mounts::MountTransition,
     running: AtomicBool,
     ptys: PtyManager,
     snapshot: Option<SnapshotSpec>,
@@ -206,6 +214,10 @@ impl UnixLocalSandboxSession {
             root,
             owned_root,
             inherit_host_environment: true,
+            host_environment_allowlist: None,
+            resolved_environment: std::sync::OnceLock::new(),
+            materialized: AtomicBool::new(false),
+            mount_transition: crate::sandbox::mounts::MountTransition::new(),
             running: AtomicBool::new(false),
             ptys: PtyManager::new(),
             snapshot: None,
@@ -233,9 +245,33 @@ impl UnixLocalSandboxSession {
         self
     }
 
+    /// Whether the workspace this session resumes was fully materialized before the pause.
+    ///
+    /// A run interrupted mid-materialization leaves a workspace that has files in it but is not
+    /// the one the manifest describes, so resuming it has to re-apply the manifest rather than
+    /// trust what survived.
+    pub fn with_workspace_root_ready(self, ready: bool) -> Self {
+        self.materialized.store(ready, Ordering::SeqCst);
+        self
+    }
+
     /// Whether sandbox commands inherit the host process environment.
     pub fn with_inherit_host_environment(mut self, inherit: bool) -> Self {
         self.inherit_host_environment = inherit;
+        self
+    }
+
+    /// Replace the host variables a non-inheriting session passes through.
+    ///
+    /// Mirrors Python's `host_environment_allowlist`; `None` uses
+    /// [`HOST_ENVIRONMENT_ALLOWLIST`]. It has no effect while the session inherits the host
+    /// environment, which already passes everything.
+    pub fn with_host_environment_allowlist<I, S>(mut self, allowlist: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.host_environment_allowlist = Some(allowlist.into_iter().map(Into::into).collect());
         self
     }
 
@@ -293,14 +329,74 @@ impl UnixLocalSandboxSession {
         }
     }
 
+    /// The environment a sandbox command starts with.
+    ///
+    /// Mirrors Python's `_exec_environment`: the host variables the session is allowed to pass
+    /// through, then the manifest's own environment, then `HOME` pinned to the workspace root so
+    /// a tool writing to `~` writes inside the sandbox.
     fn exec_env(&self) -> Vec<(String, String)> {
-        self.manifest()
-            .environment()
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect()
+        let mut env: Vec<(String, String)> = Vec::new();
+        if !self.inherit_host_environment {
+            for key in self.host_environment_allowlist() {
+                if let Ok(value) = std::env::var(key) {
+                    env.push((key.to_string(), value));
+                }
+            }
+        }
+        match self.resolved_environment.get() {
+            // Once the session has started this already includes the manifest's literals.
+            Some(resolved) => {
+                env.extend(resolved.iter().map(|(k, v)| (k.clone(), v.clone())));
+            }
+            None => env.extend(
+                self.manifest()
+                    .environment()
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone())),
+            ),
+        }
+        env.push(("HOME".to_string(), self.root.to_string_lossy().into_owned()));
+        env
+    }
+
+    /// The host variables this session passes through when it does not inherit the environment.
+    fn host_environment_allowlist(&self) -> Vec<&str> {
+        match &self.host_environment_allowlist {
+            Some(allowlist) => allowlist.iter().map(String::as_str).collect(),
+            None => HOST_ENVIRONMENT_ALLOWLIST.to_vec(),
+        }
     }
 }
+
+/// Host environment variables a non-inheriting Unix-local session still passes through.
+///
+/// Mirrors Python's `_HOST_ENVIRONMENT_ALLOWLIST`. Clearing the environment entirely breaks
+/// things the sandbox has no way to rediscover: without `SSL_CERT_FILE` and friends a command
+/// cannot verify TLS at all, and without the locale variables tools misread non-ASCII output.
+/// `HOME` is not here because the session sets it to the workspace root, as Python does, which
+/// keeps the agent out of the real home directory.
+pub const HOST_ENVIRONMENT_ALLOWLIST: &[&str] = &[
+    "PATH",
+    "LANG",
+    "LC_ALL",
+    "LC_COLLATE",
+    "LC_CTYPE",
+    "LC_MESSAGES",
+    "LC_MONETARY",
+    "LC_NUMERIC",
+    "LC_TIME",
+    "TZ",
+    "TERM",
+    "TMPDIR",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "REQUESTS_CA_BUNDLE",
+    "NODE_EXTRA_CA_CERTS",
+    "UV_PYTHON",
+    "NO_COLOR",
+    "FORCE_COLOR",
+    "CI",
+];
 
 /// Canonicalize the deepest existing ancestor of `path` and re-attach the missing tail.
 ///
@@ -353,6 +449,11 @@ impl SandboxSession for UnixLocalSandboxSession {
             )
         })?;
         self.running.store(true, Ordering::SeqCst);
+        // Start-up environment lookups run once, before any command can observe the environment.
+        if !self.manifest().resolved_environment().is_empty() {
+            let resolved = self.manifest().resolve_environment().await?;
+            let _ = self.resolved_environment.set(resolved);
+        }
         let result = if self.resuming {
             match restore_session_snapshot(self).await {
                 Ok(true) => Ok(()),
@@ -362,7 +463,8 @@ impl SandboxSession for UnixLocalSandboxSession {
                 // backend) materialize the whole manifest instead of handing the model an
                 // empty workspace.
                 Ok(false) => {
-                    let preserved = self.workspace_has_content().await;
+                    let preserved = self.materialized.load(Ordering::SeqCst)
+                        && self.workspace_has_content().await;
                     let manifest = self.manifest.clone();
                     if preserved {
                         manifest.apply_ephemeral(self).await.map(|_| ())
@@ -378,6 +480,9 @@ impl SandboxSession for UnixLocalSandboxSession {
         result.inspect_err(|_| {
             self.running.store(false, Ordering::SeqCst);
         })?;
+        // Only now is the workspace what the manifest says it is; a resume before this point
+        // would find a half-materialized tree that looks populated.
+        self.materialized.store(true, Ordering::SeqCst);
         Ok(())
     }
 
@@ -412,6 +517,14 @@ impl SandboxSession for UnixLocalSandboxSession {
 
     async fn running(&self) -> SandboxResult<bool> {
         Ok(self.running.load(Ordering::SeqCst))
+    }
+
+    fn resolves_environment(&self) -> bool {
+        true
+    }
+
+    fn mount_transition(&self) -> Option<&crate::sandbox::mounts::MountTransition> {
+        Some(&self.mount_transition)
     }
 
     fn supports_pty(&self) -> bool {
@@ -468,13 +581,14 @@ impl SandboxSession for UnixLocalSandboxSession {
             .kill_on_drop(true);
         if !self.inherit_host_environment {
             command.env_clear();
-            for key in ["PATH", "HOME", "LANG", "TERM"] {
-                if let Ok(value) = std::env::var(key) {
-                    command.env(key, value);
-                }
-            }
         }
-        for (key, value) in request.resolved_env(self.manifest().environment()) {
+        // `exec_env` already folds in the manifest's literals and its start-up lookups, in that
+        // order, so re-applying the literals here would let one override a looked-up value of
+        // the same name. Only the request's own variables are applied on top.
+        for (key, value) in self.exec_env() {
+            command.env(key, value);
+        }
+        for (key, value) in &request.env {
             command.env(key, value);
         }
         let run = command.output();
@@ -541,6 +655,7 @@ impl SandboxSession for UnixLocalSandboxSession {
             &self.manifest,
         )
         .with_workspace_root_owned(self.owned_root)
+        .with_workspace_root_ready(self.materialized.load(Ordering::SeqCst))
         .with_snapshot(self.snapshot.clone().unwrap_or_default())
     }
 
@@ -594,6 +709,9 @@ pub(crate) async fn extract_tar_gz(root: &Path, archive: &[u8]) -> SandboxResult
             format!("Failed to wait for `tar`: {e}"),
         )
     })?;
+    // The rebase runs whether or not `tar` succeeded: a partial restore still holds links that
+    // have to follow the workspace to its new root.
+    rebase_absolute_symlinks(root).await;
     if !output.status.success() {
         return Err(SandboxError::new(
             ErrorCode::SnapshotRestoreError,
@@ -606,10 +724,162 @@ pub(crate) async fn extract_tar_gz(root: &Path, archive: &[u8]) -> SandboxResult
     Ok(())
 }
 
+/// Rewrite absolute symlink targets that point inside the workspace as link-relative ones.
+///
+/// Mirrors Python's `_rebase_symlink_target`. A snapshot can be restored under a different root
+/// than the one it was taken at — a new temporary directory, a different container — and an
+/// absolute link recorded as `<old root>/lib/thing` then points at a path that no longer exists.
+/// Rewriting it relative to the link's own directory makes it follow the workspace wherever it
+/// lands.
+///
+/// Targets outside the workspace are left exactly as they are, as Python leaves them: a
+/// workspace legitimately contains links out, such as a virtualenv's
+/// `bin/python -> /usr/bin/python3`, and deleting or rewriting those would break the very tools
+/// the agent restored the workspace to use. Containment is enforced where a path is *used*
+/// rather than here — `host_path_for` canonicalizes both the candidate and the root before every
+/// file operation, and `tar` itself refuses to extract through a symlink.
+async fn rebase_absolute_symlinks(root: &Path) {
+    let Ok(canonical_root) = tokio::fs::canonicalize(root).await else {
+        return;
+    };
+    let mut pending = vec![canonical_root.clone()];
+    while let Some(directory) = pending.pop() {
+        let Ok(mut read_dir) = tokio::fs::read_dir(&directory).await else {
+            continue;
+        };
+        while let Ok(Some(entry)) = read_dir.next_entry().await {
+            let path = entry.path();
+            let Ok(file_type) = entry.file_type().await else {
+                continue;
+            };
+            if file_type.is_dir() {
+                pending.push(path);
+                continue;
+            }
+            if !file_type.is_symlink() {
+                continue;
+            }
+            let Ok(target) = tokio::fs::read_link(&path).await else {
+                continue;
+            };
+            let Some(rebased) = rebase_symlink_target(&canonical_root, &path, &target) else {
+                continue;
+            };
+            // Replacing a link is two steps; if the second fails the link is gone, so the
+            // original is put back rather than left missing.
+            if tokio::fs::remove_file(&path).await.is_ok()
+                && let Err(error) = tokio::fs::symlink(&rebased, &path).await
+            {
+                log::warn!(
+                    "failed to rebase the symlink `{}` onto the restored workspace: {error}",
+                    path.display()
+                );
+                let _ = tokio::fs::symlink(&target, &path).await;
+            }
+        }
+    }
+}
+
+/// The link-relative form of `target`, when it is absolute and points inside `root`.
+///
+/// Returns `None` when there is nothing to do: a relative target already follows the workspace,
+/// and an absolute one pointing outside it is the caller's own reference to the host.
+fn rebase_symlink_target(root: &Path, link: &Path, target: &Path) -> Option<PathBuf> {
+    if !target.is_absolute() {
+        return None;
+    }
+    let rest = target.strip_prefix(root).ok()?;
+    // Climb out of the link's own directory, then descend the part after the root. The
+    // components after the root are kept verbatim: `..` following a symlink component is
+    // resolved by the kernel against that link's target, so normalizing here would change
+    // where the link points.
+    let depth = link
+        .parent()
+        .and_then(|parent| parent.strip_prefix(root).ok())
+        .map(|relative| relative.components().count())
+        .unwrap_or(0);
+    let mut rebased = PathBuf::new();
+    for _ in 0..depth {
+        rebased.push("..");
+    }
+    rebased.push(rest);
+    if rebased.as_os_str().is_empty() {
+        rebased.push(".");
+    }
+    Some(rebased)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::sandbox::entries::Entry;
+
+    #[tokio::test]
+    async fn a_restored_workspace_keeps_its_links_and_follows_its_new_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("workspace");
+        tokio::fs::create_dir_all(root.join("bin")).await.unwrap();
+        tokio::fs::create_dir_all(root.join("lib")).await.unwrap();
+        tokio::fs::write(root.join("lib/real.so"), b"ok")
+            .await
+            .unwrap();
+        let canonical_root = tokio::fs::canonicalize(&root).await.unwrap();
+
+        // An absolute link into the workspace: this is the one that breaks when a snapshot is
+        // restored under a different root, so it is rewritten to follow the workspace.
+        std::os::unix::fs::symlink(canonical_root.join("lib/real.so"), root.join("bin/inside"))
+            .unwrap();
+        // A link out of the workspace, as a virtualenv interpreter is. The agent restored the
+        // workspace to use it, so it stays exactly as it was.
+        std::os::unix::fs::symlink("/usr/bin/env", root.join("bin/python")).unwrap();
+        // A relative link already follows the workspace.
+        std::os::unix::fs::symlink("../lib/real.so", root.join("bin/relative")).unwrap();
+
+        rebase_absolute_symlinks(&root).await;
+
+        assert_eq!(
+            tokio::fs::read_link(root.join("bin/inside")).await.unwrap(),
+            PathBuf::from("../lib/real.so")
+        );
+        assert_eq!(
+            tokio::fs::read_link(root.join("bin/python")).await.unwrap(),
+            PathBuf::from("/usr/bin/env")
+        );
+        assert_eq!(
+            tokio::fs::read_link(root.join("bin/relative"))
+                .await
+                .unwrap(),
+            PathBuf::from("../lib/real.so")
+        );
+        // The rewritten link still resolves to the same file.
+        assert_eq!(
+            tokio::fs::read(root.join("bin/inside")).await.unwrap(),
+            b"ok"
+        );
+    }
+
+    #[test]
+    fn only_absolute_in_workspace_targets_are_rebased() {
+        let root = Path::new("/w");
+        assert_eq!(
+            rebase_symlink_target(root, Path::new("/w/bin/x"), Path::new("/w/lib/y")),
+            Some(PathBuf::from("../lib/y"))
+        );
+        // At the root there is nothing to climb out of.
+        assert_eq!(
+            rebase_symlink_target(root, Path::new("/w/x"), Path::new("/w/lib/y")),
+            Some(PathBuf::from("lib/y"))
+        );
+        // Outside the workspace, and already relative: left alone.
+        assert_eq!(
+            rebase_symlink_target(root, Path::new("/w/bin/x"), Path::new("/usr/bin/env")),
+            None
+        );
+        assert_eq!(
+            rebase_symlink_target(root, Path::new("/w/bin/x"), Path::new("../lib/y")),
+            None
+        );
+    }
 
     #[tokio::test]
     async fn starts_materializes_and_execs() {

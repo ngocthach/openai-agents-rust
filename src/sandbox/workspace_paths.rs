@@ -167,6 +167,124 @@ pub fn normalize_sandbox_cwd(cwd: &str) -> SandboxResult<String> {
     Ok(normalized)
 }
 
+/// Access to an absolute path outside the sandbox workspace. Mirrors Python's
+/// `SandboxPathGrant`.
+///
+/// The workspace root is the only place a sandbox can reach by default. A grant widens that
+/// deliberately and visibly — a shared cache, a read-only dataset — and carries its own
+/// `read_only` flag so widening access does not have to mean granting writes. `host_path` names
+/// the native directory behind it when the backend has to bind-mount or copy from the host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SandboxPathGrant {
+    /// The POSIX path visible inside the sandbox.
+    pub path: String,
+    /// Whether the sandbox may only read through the grant.
+    pub read_only: bool,
+    /// Why the grant exists, for the people reading the manifest.
+    pub description: Option<String>,
+    /// The native host directory backing the grant, when one is needed.
+    pub host_path: Option<String>,
+}
+
+impl SandboxPathGrant {
+    /// A writable grant for an absolute sandbox path.
+    ///
+    /// Returns [`ErrorCode::InvalidManifestPath`] for a relative path, a Windows path, or the
+    /// filesystem root: granting `/` would hand the sandbox the whole machine, which is never
+    /// what a grant is for.
+    pub fn new(path: impl AsRef<str>) -> SandboxResult<Self> {
+        let path = validate_grant_path("path", path.as_ref())?;
+        Ok(SandboxPathGrant {
+            path,
+            read_only: false,
+            description: None,
+            host_path: None,
+        })
+    }
+
+    /// Only allow reads through the grant.
+    pub fn read_only(mut self, read_only: bool) -> Self {
+        self.read_only = read_only;
+        self
+    }
+
+    /// Explain why the grant exists.
+    pub fn with_description(mut self, description: impl Into<String>) -> Self {
+        self.description = Some(description.into());
+        self
+    }
+
+    /// Back the grant with a native host directory.
+    pub fn with_host_path(mut self, host_path: impl AsRef<str>) -> SandboxResult<Self> {
+        self.host_path = Some(validate_grant_path("host_path", host_path.as_ref())?);
+        Ok(self)
+    }
+
+    /// The host directory this grant reads from, which is `path` when none was set.
+    pub fn host_source(&self) -> &str {
+        self.host_path.as_deref().unwrap_or(&self.path)
+    }
+}
+
+/// Validate one absolute path on a [`SandboxPathGrant`].
+fn validate_grant_path(field: &str, value: &str) -> SandboxResult<String> {
+    let invalid = |message: String| SandboxError::new(ErrorCode::InvalidManifestPath, message);
+    if value.starts_with("\\\\") || value.starts_with("//") {
+        return Err(invalid(format!(
+            "sandbox path grant {field} does not support UNC or device paths"
+        )));
+    }
+    if is_windows_absolute(value) {
+        return Err(invalid(format!(
+            "sandbox path grant {field} must be POSIX absolute"
+        )));
+    }
+    if value.split(['/', '\\']).any(|part| part == "..") {
+        return Err(invalid(format!(
+            "sandbox path grant {field} must not contain parent segments"
+        )));
+    }
+    if !value.starts_with('/') {
+        return Err(invalid(format!(
+            "sandbox path grant {field} must be an absolute path"
+        )));
+    }
+    let normalized = normalize_segments(value);
+    if normalized == "/" || normalized.is_empty() {
+        return Err(invalid(format!(
+            "sandbox path grant {field} must not be the filesystem root"
+        )));
+    }
+    Ok(normalized)
+}
+
+/// Express `path` relative to `start`, both workspace-relative POSIX paths.
+///
+/// Mirrors `posixpath.relpath`: shared leading segments are dropped and each remaining segment
+/// of `start` becomes a `..`.
+fn relative_to(path: &str, start: &str) -> String {
+    let path_parts: Vec<&str> = path
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
+        .collect();
+    let start_parts: Vec<&str> = start
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
+        .collect();
+    let shared = path_parts
+        .iter()
+        .zip(start_parts.iter())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let mut parts: Vec<&str> = vec![".."; start_parts.len() - shared];
+    parts.extend(&path_parts[shared..]);
+    if parts.is_empty() {
+        ".".to_string()
+    } else {
+        parts.join("/")
+    }
+}
+
 /// The immutable model-facing relative-path base for one sandbox run.
 ///
 /// The scope only changes how relative paths are anchored; it does not confine the run. The
@@ -200,6 +318,80 @@ impl SandboxWorkspaceScope {
         self.cwd.as_deref()
     }
 
+    /// Render a workspace-root-relative path the way the model should see it.
+    ///
+    /// Mirrors Python's `model_path`. Without a run `cwd` the path is already in the model's
+    /// terms; with one, a tool result that says `src/app.py` while the model is working in
+    /// `src/` would send it looking in `src/src/`, so the path is re-expressed relative to the
+    /// working directory instead.
+    pub fn model_path(&self, workspace_relative_path: &str) -> SandboxResult<String> {
+        let posix = to_posix(workspace_relative_path);
+        if posix.starts_with('/') || is_windows_absolute(&posix) {
+            return Err(SandboxError::new(
+                ErrorCode::InvalidManifestPath,
+                "a workspace-relative display path must not be absolute",
+            ));
+        }
+        let normalized = normalize_segments(&posix);
+        let Some(cwd) = &self.cwd else {
+            return Ok(normalized);
+        };
+        Ok(relative_to(&normalized, cwd))
+    }
+
+    /// Render a path to a session-owned workspace resource for the model's instructions.
+    ///
+    /// Mirrors Python's `model_resource_path`. Without a run `cwd` the workspace-relative form
+    /// is kept; with one the path becomes absolute, because a resource named relative to the
+    /// workspace root stops resolving as soon as a shell command changes directory.
+    pub fn model_resource_path(
+        &self,
+        workspace_root: &str,
+        workspace_relative_path: &str,
+    ) -> SandboxResult<String> {
+        let invalid =
+            |message: &str| SandboxError::new(ErrorCode::InvalidManifestPath, message.to_string());
+        if workspace_relative_path.contains('\\') {
+            return Err(invalid(
+                "session resource paths must use POSIX path separators",
+            ));
+        }
+        if workspace_relative_path.starts_with('/') {
+            return Err(invalid("session resource paths must be workspace-relative"));
+        }
+        let normalized = normalize_segments(workspace_relative_path);
+        if normalized.split('/').any(|part| part == "..") {
+            return Err(invalid("session resource paths must be workspace-relative"));
+        }
+        if normalized.is_empty() || normalized == "." {
+            return Err(invalid("session resource paths must be non-empty"));
+        }
+        let Some(_) = &self.cwd else {
+            return Ok(normalized);
+        };
+        let root = to_posix(workspace_root);
+        if !root.starts_with('/') {
+            return Err(invalid("sandbox workspace root must be POSIX absolute"));
+        }
+        Ok(format!("{}/{normalized}", root.trim_end_matches('/')))
+    }
+
+    /// Render a tool-result path, keeping the shape the model used in its request.
+    ///
+    /// Mirrors Python's `display_path`: a model that asked with an absolute path gets an
+    /// absolute answer, so the result is recognisably about the path it named.
+    pub fn display_path(
+        &self,
+        original_path: &str,
+        workspace_relative_path: &str,
+    ) -> SandboxResult<String> {
+        let original = to_posix(original_path);
+        if self.cwd.is_none() || original.starts_with('/') || is_windows_absolute(&original) {
+            return Ok(normalize_segments(&to_posix(workspace_relative_path)));
+        }
+        self.model_path(workspace_relative_path)
+    }
+
     /// Anchor a model-provided path: relative paths resolve from `cwd`, absolute paths pass
     /// through for the session to validate against the workspace root.
     pub fn anchor(&self, path: &str) -> String {
@@ -223,6 +415,95 @@ impl SandboxWorkspaceScope {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_path_grant_refuses_to_widen_access_to_everything() {
+        let grant = SandboxPathGrant::new("/srv/data/")
+            .unwrap()
+            .read_only(true)
+            .with_description("shared corpus");
+        assert_eq!(grant.path, "/srv/data");
+        assert!(grant.read_only);
+        assert_eq!(grant.host_source(), "/srv/data");
+
+        for refused in [
+            "/",
+            "relative/path",
+            "/srv/../etc",
+            "//server/share",
+            "C:\\data",
+        ] {
+            assert!(
+                SandboxPathGrant::new(refused).is_err(),
+                "accepted `{refused}`"
+            );
+        }
+    }
+
+    #[test]
+    fn a_host_path_backs_the_grant() {
+        let grant = SandboxPathGrant::new("/mnt/data")
+            .unwrap()
+            .with_host_path("/var/lib/corpus")
+            .unwrap();
+        assert_eq!(grant.host_source(), "/var/lib/corpus");
+        assert!(
+            SandboxPathGrant::new("/mnt/data")
+                .unwrap()
+                .with_host_path("relative")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn renders_paths_relative_to_the_run_cwd() {
+        let scope = SandboxWorkspaceScope::from_cwd(Some("src")).unwrap();
+        assert_eq!(scope.model_path("src/app.py").unwrap(), "app.py");
+        assert_eq!(scope.model_path("README.md").unwrap(), "../README.md");
+        assert_eq!(scope.model_path("src").unwrap(), ".");
+
+        // Without a cwd the workspace-relative form is already the model's view.
+        let root = SandboxWorkspaceScope::root();
+        assert_eq!(root.model_path("src/app.py").unwrap(), "src/app.py");
+        assert!(root.model_path("/abs").is_err());
+    }
+
+    #[test]
+    fn keeps_session_resources_addressable_under_a_cwd() {
+        let scope = SandboxWorkspaceScope::from_cwd(Some("src")).unwrap();
+        assert_eq!(
+            scope
+                .model_resource_path("/workspace", "skills/list.md")
+                .unwrap(),
+            "/workspace/skills/list.md"
+        );
+        let root = SandboxWorkspaceScope::root();
+        assert_eq!(
+            root.model_resource_path("/workspace", "skills/list.md")
+                .unwrap(),
+            "skills/list.md"
+        );
+        assert!(root.model_resource_path("/workspace", "../escape").is_err());
+        assert!(root.model_resource_path("/workspace", "").is_err());
+        assert!(root.model_resource_path("/workspace", "/abs").is_err());
+    }
+
+    #[test]
+    fn a_tool_result_keeps_the_shape_the_model_asked_with() {
+        let scope = SandboxWorkspaceScope::from_cwd(Some("src")).unwrap();
+        // The model asked relatively, so it gets a cwd-relative answer.
+        assert_eq!(
+            scope.display_path("app.py", "src/app.py").unwrap(),
+            "app.py"
+        );
+        // It asked absolutely, so the answer stays workspace-relative as before.
+        assert_eq!(
+            scope
+                .display_path("/workspace/src/app.py", "src/app.py")
+                .unwrap(),
+            "src/app.py"
+        );
+    }
 
     #[test]
     fn resolves_relative_paths() {

@@ -21,6 +21,7 @@ use crate::sandbox::workspace_paths::SandboxWorkspaceScope;
 pub struct SandboxEditor {
     session: Arc<dyn SandboxSession>,
     scope: SandboxWorkspaceScope,
+    run_as: Option<crate::sandbox::types::User>,
 }
 
 impl SandboxEditor {
@@ -29,7 +30,17 @@ impl SandboxEditor {
         SandboxEditor {
             session,
             scope: SandboxWorkspaceScope::root(),
+            run_as: None,
         }
+    }
+
+    /// Edit files as `run_as` rather than as the session owner.
+    ///
+    /// A patch applied as the session owner can leave a file the agent's own commands cannot
+    /// then write, so the editor uses the same user the capability runs commands as.
+    pub fn with_run_as(mut self, run_as: Option<crate::sandbox::types::User>) -> Self {
+        self.run_as = run_as;
+        self
     }
 
     /// Anchor relative paths at the run's working directory.
@@ -46,18 +57,27 @@ impl SandboxEditor {
     /// Resolve a model-provided path to an absolute sandbox path.
     pub fn resolve(&self, path: &str) -> Result<String> {
         let anchored = self.scope.anchor(path);
-        self.session.normalize_path(&anchored).map_err(|e| {
+        let resolved = self.session.normalize_path(&anchored).map_err(|e| {
             AgentsError::from(SandboxError::new(
                 ErrorCode::ApplyPatchInvalidPath,
                 e.message,
             ))
-        })
+        })?;
+        // A read-only grant widens what the sandbox can *read*; every `apply_patch` operation is
+        // a write, so one aimed into such a grant is refused before anything is touched.
+        if self.session.manifest().path_grant_is_read_only(&resolved) {
+            return Err(AgentsError::from(SandboxError::new(
+                ErrorCode::ApplyPatchInvalidPath,
+                format!("`{path}` is inside a read-only path grant"),
+            )));
+        }
+        Ok(resolved)
     }
 
     async fn read_text(&self, resolved: &str, path: &str) -> Result<String> {
         let bytes = self
             .session
-            .read_file(resolved)
+            .read_file_as(resolved, self.run_as.as_ref())
             .await
             .map_err(|e| match e.code {
                 ErrorCode::WorkspaceReadNotFound => AgentsError::from(SandboxError::new(
@@ -85,8 +105,24 @@ impl ApplyPatchEditor for SandboxEditor {
             ApplyDiffMode::Create,
         )
         .map_err(invalid_diff)?;
+        // `apply_patch` has a separate update mode, so a create against an existing path is a
+        // mistake, not an overwrite request. Mirrors Python's `_write_new_text`.
+        if self
+            .session
+            .read_file_as(&resolved, self.run_as.as_ref())
+            .await
+            .is_ok()
+        {
+            return Err(AgentsError::from(SandboxError::new(
+                ErrorCode::ApplyPatchInvalidPath,
+                format!(
+                    "apply_patch cannot create `{}` because it already exists",
+                    operation.path
+                ),
+            )));
+        }
         self.session
-            .write_file(&resolved, content.as_bytes())
+            .write_file_as(&resolved, content.as_bytes(), self.run_as.as_ref())
             .await?;
         Ok(ApplyPatchResult::completed(format!(
             "Created {}",
@@ -106,7 +142,7 @@ impl ApplyPatchEditor for SandboxEditor {
         match &operation.move_to {
             None => {
                 self.session
-                    .write_file(&resolved, updated.as_bytes())
+                    .write_file_as(&resolved, updated.as_bytes(), self.run_as.as_ref())
                     .await?;
                 Ok(ApplyPatchResult::completed(format!(
                     "Updated {}",
@@ -116,10 +152,12 @@ impl ApplyPatchEditor for SandboxEditor {
             Some(destination) => {
                 let move_target = self.resolve(destination)?;
                 self.session
-                    .write_file(&move_target, updated.as_bytes())
+                    .write_file_as(&move_target, updated.as_bytes(), self.run_as.as_ref())
                     .await?;
                 if move_target != resolved {
-                    self.session.rm(&resolved, false).await?;
+                    self.session
+                        .rm_as(&resolved, false, self.run_as.as_ref())
+                        .await?;
                 }
                 Ok(ApplyPatchResult::completed(format!(
                     "Updated {} and moved it to {destination}",
@@ -135,7 +173,7 @@ impl ApplyPatchEditor for SandboxEditor {
         // not there is a model error worth reporting. Binary files must stay deletable, so this
         // reads bytes rather than going through `read_text`.
         self.session
-            .read_file(&resolved)
+            .read_file_as(&resolved, self.run_as.as_ref())
             .await
             .map_err(|e| match e.code {
                 ErrorCode::WorkspaceReadNotFound => AgentsError::from(SandboxError::new(
@@ -147,7 +185,9 @@ impl ApplyPatchEditor for SandboxEditor {
                 )),
                 _ => AgentsError::from(e),
             })?;
-        self.session.rm(&resolved, false).await?;
+        self.session
+            .rm_as(&resolved, false, self.run_as.as_ref())
+            .await?;
         Ok(ApplyPatchResult::completed(format!(
             "Deleted {}",
             operation.path

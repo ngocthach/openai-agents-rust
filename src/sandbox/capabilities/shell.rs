@@ -98,6 +98,9 @@ impl<C: Send + Sync + 'static> Capability<C> for Shell {
             let run_as = run_as.clone();
             let cwd = cwd.clone();
             async move {
+                // A snapshot detaches the workspace's mounts; a command that ran now would read
+                // empty directories where mounted storage should be.
+                session.ensure_mounts_settled()?;
                 let action = &request.data.action;
                 let timeout = action.timeout_ms.map(Duration::from_millis);
                 let mut output = Vec::with_capacity(action.commands.len());

@@ -358,7 +358,11 @@ async fn cloudflare_runs_a_full_session_against_the_worker_protocol() {
     let archive = session.persist_workspace().await.unwrap();
     assert_eq!(archive, b"tar-bytes");
     // Ephemeral entries and mounts are runtime state, so they are excluded from the archive.
-    assert_eq!(server.find("POST", "/persist").query, "excludes=.sandbox-rclone-config%2Ccache");
+    assert_eq!(
+        server.find("POST", "/persist").query,
+        "excludes=.sandbox-blobfuse-cache%2C.sandbox-blobfuse-config%2C.sandbox-mountpoint-env%2C\
+         .sandbox-rclone-config%2Ccache"
+    );
 
     session.hydrate_workspace(b"restored").await.unwrap();
     assert_eq!(server.find("POST", "/hydrate").text(), "restored");
@@ -739,8 +743,9 @@ async fn blaxel_persists_and_hydrates_through_a_tar_file() {
     let tar = server.find("POST", "/process");
     assert_eq!(
         tar.json()["command"],
-        "sh -lc 'tar --exclude ./.sandbox-rclone-config --exclude ./cache -C /workspace -cf \
-         /tmp/openai-agents-sandbox-blaxel-persist-agents-test.tar .'"
+        "sh -lc 'tar --exclude ./.sandbox-blobfuse-cache --exclude ./.sandbox-blobfuse-config \
+         --exclude ./.sandbox-mountpoint-env --exclude ./.sandbox-rclone-config --exclude ./cache \
+         -C /workspace -cf /tmp/openai-agents-sandbox-blaxel-persist-agents-test.tar .'"
     );
     // The archive is pulled back out of the sandbox and the scratch file removed.
     assert!(
@@ -1046,7 +1051,13 @@ async fn modal_persists_a_tar_archive_by_default() {
     let tar = fake.of_op("exec").pop().unwrap();
     assert_eq!(
         tar["argv"],
-        json!(["sh", "-lc", "tar -czf - -C /workspace --exclude ./cache --exclude ./.sandbox-rclone-config ."])
+        json!([
+            "sh",
+            "-lc",
+            "tar -czf - -C /workspace --exclude ./cache --exclude ./.sandbox-rclone-config \
+             --exclude ./.sandbox-blobfuse-config --exclude ./.sandbox-blobfuse-cache \
+             --exclude ./.sandbox-mountpoint-env ."
+        ])
     );
 
     session.hydrate_workspace(b"payload").await.unwrap();

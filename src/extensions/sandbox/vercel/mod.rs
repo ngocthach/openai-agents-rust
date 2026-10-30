@@ -56,6 +56,7 @@ use serde_json::{Value, json};
 
 use crate::sandbox::errors::{ErrorCode, SandboxError, SandboxResult};
 use crate::sandbox::manifest::{DEFAULT_MANIFEST_ROOT, Manifest};
+use crate::sandbox::mount_entries::{ConfiguredMount, S3Mount};
 use crate::sandbox::mounts::{Mount, MountCredentialAuthority, MountStrategy};
 use crate::sandbox::session::{
     ExecRequest, SandboxClient, SandboxSession, restore_session_snapshot, shell_quote,
@@ -1432,6 +1433,33 @@ impl VercelCloudBucketMountStrategy {
     pub fn with_session_token(mut self, session_token: impl Into<String>) -> Self {
         self.session_token = Some(session_token.into());
         self
+    }
+
+    /// A strategy attaching one of the built-in remote storage mounts.
+    ///
+    /// Mirrors Python's `_validate_s3_mount`: Vercel's runtime images mount buckets with
+    /// `mount-s3`, so only an [`S3Mount`] fits. The mount's own `read_only` flag still governs
+    /// the mount command, so it is not copied here.
+    pub fn for_mount(mount: &dyn ConfiguredMount) -> SandboxResult<Self> {
+        mount.validate()?;
+        let Some(s3) = mount.as_any().downcast_ref::<S3Mount>() else {
+            return Err(SandboxError::new(
+                ErrorCode::MountConfigInvalid,
+                format!(
+                    "vercel cloud bucket mounts only support `s3_mount`, not `{}`",
+                    mount.mount_type()
+                ),
+            ));
+        };
+        Ok(VercelCloudBucketMountStrategy {
+            bucket: s3.bucket.clone(),
+            prefix: s3.prefix.clone(),
+            region: s3.region.clone(),
+            endpoint_url: s3.endpoint_url.clone(),
+            access_key_id: s3.access_key_id.clone(),
+            secret_access_key: s3.secret_access_key.clone(),
+            session_token: s3.session_token.clone(),
+        })
     }
 
     /// Whether this mount hands credentials to the sandbox.

@@ -10,7 +10,7 @@ use async_trait::async_trait;
 
 use crate::sandbox::errors::{ErrorCode, SandboxError, SandboxResult};
 use crate::sandbox::manifest::Manifest;
-use crate::sandbox::mounts::Mount;
+use crate::sandbox::mounts::{Mount, MountTransition};
 use crate::sandbox::pty::{PtyExecRequest, PtyExecUpdate, PtyWriteRequest};
 use crate::sandbox::snapshot::{Snapshot, resolve_snapshot};
 use crate::sandbox::state::SandboxSessionState;
@@ -240,9 +240,219 @@ pub trait SandboxSession: Send + Sync + fmt::Debug {
     /// Write a file to the workspace, creating parent directories.
     async fn write_file(&self, path: &str, contents: &[u8]) -> SandboxResult<()>;
 
+    /// Read a file as `user`.
+    ///
+    /// A sandbox agent that runs its commands as an unprivileged user should read files as that
+    /// user too: reading as the session owner can succeed where the agent's own shell commands
+    /// would fail, which hides a permission problem until the model trips over it. The default
+    /// runs `cat` through [`exec`](Self::exec), which already applies the `sudo` wrapper, so
+    /// every backend gets this without implementing it.
+    async fn read_file_as(&self, path: &str, user: Option<&User>) -> SandboxResult<Vec<u8>> {
+        let Some(user) = user else {
+            return self.read_file(path).await;
+        };
+        let path = self.normalize_path(path)?;
+        let result = self
+            .exec(ExecRequest::argv(["cat", "--", path.as_str()]).with_user(Some(user.clone())))
+            .await?;
+        if !result.ok() {
+            return Err(SandboxError::new(
+                ErrorCode::WorkspaceReadNotFound,
+                format!(
+                    "`{}` could not read `{path}` as `{}`: {}",
+                    self.backend_id(),
+                    user.name,
+                    result.stderr_text().trim()
+                ),
+            ));
+        }
+        Ok(result.stdout)
+    }
+
+    /// Write a file as `user`, so the file ends up owned by them.
+    ///
+    /// The contents travel base64-encoded, so arbitrary binary content and shell metacharacters
+    /// are safe. They are also written in chunks: a single argument is capped at 128 KiB on
+    /// Linux, so one big `printf` would fail with `E2BIG` on any file over about 96 KB. The
+    /// chunks land in a sibling temporary file that is moved into place, so a failed write never
+    /// leaves a half-written file where the old one was.
+    async fn write_file_as(
+        &self,
+        path: &str,
+        contents: &[u8],
+        user: Option<&User>,
+    ) -> SandboxResult<()> {
+        /// Bytes of base64 per command, comfortably inside the single-argument limit.
+        const CHUNK_BYTES: usize = 48 * 1024;
+
+        let Some(user) = user else {
+            return self.write_file(path, contents).await;
+        };
+        let path = self.normalize_path(path)?;
+        let encoded = {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD.encode(contents)
+        };
+        let staging = format!("{path}.openai-agents-write");
+        let quoted_path = shell_quote(&path);
+        let quoted_staging = shell_quote(&staging);
+
+        let run = async |command: String| -> SandboxResult<ExecResult> {
+            self.exec(
+                ExecRequest::argv(["sh", "-lc", command.as_str()])
+                    .with_shell(ExecShell::None)
+                    .with_user(Some(user.clone())),
+            )
+            .await
+        };
+        let failed = |action: &str, result: &ExecResult| {
+            SandboxError::new(
+                ErrorCode::WorkspaceWriteTypeError,
+                format!(
+                    "`{}` could not {action} `{path}` as `{}`: {}",
+                    self.backend_id(),
+                    user.name,
+                    result.stderr_text().trim()
+                ),
+            )
+        };
+
+        // `write_file` creates parent directories, so the run-as form has to as well.
+        let prepared = run(format!(
+            "mkdir -p -- \"$(dirname {quoted_path})\" && : > {quoted_staging}"
+        ))
+        .await?;
+        if !prepared.ok() {
+            return Err(failed("prepare", &prepared));
+        }
+
+        let chunks: Vec<&str> = if encoded.is_empty() {
+            Vec::new()
+        } else {
+            encoded
+                .as_bytes()
+                .chunks(CHUNK_BYTES)
+                .map(|chunk| {
+                    // base64 is ASCII, so every chunk is a valid string.
+                    std::str::from_utf8(chunk).unwrap_or_default()
+                })
+                .collect()
+        };
+        for chunk in chunks {
+            let appended = run(format!(
+                "printf %s {} | base64 -d >> {quoted_staging}",
+                shell_quote(chunk)
+            ))
+            .await?;
+            if !appended.ok() {
+                let _ = run(format!("rm -f -- {quoted_staging}")).await;
+                return Err(failed("write", &appended));
+            }
+        }
+
+        let moved = run(format!("mv -- {quoted_staging} {quoted_path}")).await?;
+        if !moved.ok() {
+            let _ = run(format!("rm -f -- {quoted_staging}")).await;
+            return Err(failed("write", &moved));
+        }
+        Ok(())
+    }
+
+    /// Create a directory as `user`, so it ends up owned by them.
+    async fn mkdir_as(&self, path: &str, parents: bool, user: Option<&User>) -> SandboxResult<()> {
+        let Some(user) = user else {
+            return self.mkdir(path, parents).await;
+        };
+        let path = self.normalize_path(path)?;
+        let mut argv = vec!["mkdir".to_string()];
+        if parents {
+            argv.push("-p".to_string());
+        }
+        argv.extend(["--".to_string(), path.clone()]);
+        let result = self
+            .exec(ExecRequest::argv(argv.clone()).with_user(Some(user.clone())))
+            .await?;
+        if !result.ok() {
+            return Err(SandboxError::exec_nonzero(&argv, &result));
+        }
+        Ok(())
+    }
+
+    /// Remove a path as `user`.
+    async fn rm_as(&self, path: &str, recursive: bool, user: Option<&User>) -> SandboxResult<()> {
+        let Some(user) = user else {
+            return self.rm(path, recursive).await;
+        };
+        let path = self.normalize_path(path)?;
+        let mut argv = vec!["rm".to_string()];
+        if recursive {
+            argv.push("-r".to_string());
+        }
+        argv.extend(["-f".to_string(), "--".to_string(), path.clone()]);
+        let result = self
+            .exec(ExecRequest::argv(argv.clone()).with_user(Some(user.clone())))
+            .await?;
+        if !result.ok() {
+            return Err(SandboxError::exec_nonzero(&argv, &result));
+        }
+        Ok(())
+    }
+
+    /// Move a path as `user`.
+    async fn mv_as(
+        &self,
+        source: &str,
+        destination: &str,
+        user: Option<&User>,
+    ) -> SandboxResult<()> {
+        let Some(user) = user else {
+            return self.mv(source, destination).await;
+        };
+        let source = self.normalize_path(source)?;
+        let destination = self.normalize_path(destination)?;
+        let argv = vec!["mv".to_string(), "--".to_string(), source, destination];
+        let result = self
+            .exec(ExecRequest::argv(argv.clone()).with_user(Some(user.clone())))
+            .await?;
+        if !result.ok() {
+            return Err(SandboxError::exec_nonzero(&argv, &result));
+        }
+        Ok(())
+    }
+
     /// Whether the session can run commands in a PTY (`exec_command` / `write_stdin`).
     fn supports_pty(&self) -> bool {
         false
+    }
+
+    /// Whether this backend performs the manifest's start-up environment lookups.
+    ///
+    /// A backend that returns `false` would silently drop a variable declared with
+    /// [`Manifest::with_env_entry`](crate::sandbox::Manifest::with_env_entry), leaving the
+    /// sandbox without a secret the caller believes it has. Materialization refuses instead, so
+    /// the gap is visible at start-up rather than as a confusing failure inside the sandbox.
+    fn resolves_environment(&self) -> bool {
+        false
+    }
+
+    /// The session's mount-transition tracker, when the backend has one.
+    ///
+    /// A backend that can snapshot a workspace with mounts attached returns one so concurrent
+    /// work can be refused while the mounts are detached. Backends without it never detach
+    /// mounts behind a running command.
+    fn mount_transition(&self) -> Option<&MountTransition> {
+        None
+    }
+
+    /// Fail when this session's mounts are mid-snapshot.
+    ///
+    /// Model-facing tools call this before touching the workspace: during a snapshot a mounted
+    /// bucket is an empty directory, and a command that reads it reports the emptiness as fact.
+    fn ensure_mounts_settled(&self) -> SandboxResult<()> {
+        match self.mount_transition() {
+            Some(transition) => transition.ensure_settled(),
+            None => Ok(()),
+        }
     }
 
     /// Whether the container runtime attaches mounts before the session starts, so that
@@ -294,7 +504,16 @@ pub trait SandboxSession: Send + Sync + fmt::Debug {
 
     /// Normalize a model-provided path to an absolute sandbox path inside the workspace root.
     fn normalize_path(&self, path: &str) -> SandboxResult<String> {
-        resolve_workspace_path(self.workspace_root(), path)
+        match resolve_workspace_path(self.workspace_root(), path) {
+            Ok(resolved) => Ok(resolved),
+            // A manifest can grant access to absolute paths outside the workspace. The grant is
+            // trusted application configuration, so a path under one is allowed through; a path
+            // under no grant is still refused.
+            Err(error) => match granted_path(self.manifest(), path) {
+                Some(granted) => Ok(granted),
+                None => Err(error),
+            },
+        }
     }
 
     /// Resolve a path the SDK itself placed, which may sit outside the workspace root.
@@ -422,6 +641,24 @@ pub trait SandboxSession: Send + Sync + fmt::Debug {
     }
 }
 
+/// Resolve `path` against the manifest's extra path grants.
+///
+/// Returns the normalized path when it falls under a grant. A read-only grant still resolves:
+/// the grant's `read_only` flag is enforced where the write happens, not here, so an attempt to
+/// write reports a permission problem instead of looking like a path that does not exist.
+fn granted_path(manifest: &Manifest, path: &str) -> Option<String> {
+    let posix = crate::sandbox::workspace_paths::to_posix(path);
+    if !posix.starts_with('/') {
+        return None;
+    }
+    let normalized = crate::sandbox::workspace_paths::normalize_segments(&posix);
+    manifest
+        .extra_path_grants()
+        .iter()
+        .any(|grant| crate::sandbox::workspace_paths::is_within(&grant.path, &normalized))
+        .then_some(normalized)
+}
+
 /// The `tar --exclude` patterns every workspace archive applies.
 ///
 /// Two kinds of path must never reach an archive:
@@ -429,10 +666,12 @@ pub trait SandboxSession: Send + Sync + fmt::Debug {
 /// - The manifest's ephemeral entries. Mounts and the like are runtime-attached state, never
 ///   durable workspace content; archiving them would copy whole mounted buckets into the
 ///   snapshot.
-/// - The staging directory a mount writes its credentials to
-///   ([`RCLONE_CONFIG_DIR`](crate::sandbox::mounts::RCLONE_CONFIG_DIR)). It lives inside the
-///   workspace because the session's file API cannot write outside it, so the archive has to
-///   leave it out explicitly.
+/// - The staging directories a mount writes its credentials and cache to
+///   ([`RCLONE_CONFIG_DIR`](crate::sandbox::mounts::RCLONE_CONFIG_DIR) and
+///   [`MOUNT_SCRATCH_DIRS`](crate::sandbox::mount_patterns::MOUNT_SCRATCH_DIRS)). They live
+///   inside the workspace because the session's file API cannot write outside it, so the archive
+///   has to leave them out explicitly. One of them is a blob cache that can reach tens of
+///   gigabytes.
 ///
 /// A backend that overrides [`persist_workspace`](SandboxSession::persist_workspace) — every
 /// hosted one does, because their command output is text — calls this for the same exclusions.
@@ -449,6 +688,11 @@ pub fn workspace_archive_excludes(manifest: &Manifest, root: &str) -> Vec<String
         })
         .collect();
     excludes.push(format!("./{}", crate::sandbox::mounts::RCLONE_CONFIG_DIR));
+    excludes.extend(
+        crate::sandbox::mount_patterns::MOUNT_SCRATCH_DIRS
+            .iter()
+            .map(|directory| format!("./{directory}")),
+    );
     excludes
 }
 
@@ -468,6 +712,12 @@ pub async fn persist_session_snapshot(session: &dyn SandboxSession) -> SandboxRe
         .into_iter()
         .filter(|(mount, _)| !mount.strategy.supports_native_snapshot_detach())
         .collect();
+    // While these are detached the workspace is not what the manifest describes, so other tasks
+    // are kept out of it until they are back. The guard is released even if the archive fails.
+    let _transition = match session.mount_transition() {
+        Some(transition) if !detached.is_empty() => Some(transition.begin()?),
+        _ => None,
+    };
     for (mount, path) in &detached {
         mount
             .strategy

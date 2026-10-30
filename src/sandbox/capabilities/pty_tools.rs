@@ -148,6 +148,9 @@ pub fn exec_command_tool<C: Send + Sync + 'static>(
             let run_as = run_as.clone();
             let scope = scope.clone();
             async move {
+                // A snapshot detaches the workspace's mounts; a process started now would see
+                // empty directories where mounted storage should be.
+                session.ensure_mounts_settled()?;
                 let started = std::time::Instant::now();
                 let workdir = match args.workdir.as_deref().map(str::trim) {
                     None | Some("") => scope.cwd().map(str::to_string),
@@ -203,6 +206,7 @@ pub fn write_stdin_tool<C: Send + Sync + 'static>(
         move |_ctx, args: WriteStdinArgs| {
             let session = session.clone();
             async move {
+                session.ensure_mounts_settled()?;
                 let started = std::time::Instant::now();
                 let request = PtyWriteRequest::new(args.session_id, args.chars)
                     .with_yield_time_ms(args.yield_time_ms)

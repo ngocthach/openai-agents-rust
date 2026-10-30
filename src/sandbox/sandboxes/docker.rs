@@ -15,6 +15,7 @@ use tokio::sync::Mutex;
 
 use crate::sandbox::errors::{ErrorCode, SandboxError, SandboxResult};
 use crate::sandbox::manifest::Manifest;
+use crate::sandbox::mounts::ContainerPrivileges;
 use crate::sandbox::pty::{PtyExecRequest, PtyExecUpdate, PtyManager, PtySpawn, PtyWriteRequest};
 use crate::sandbox::session::{
     ExecRequest, SandboxClient, SandboxSession, restore_session_snapshot, shell_quote,
@@ -126,11 +127,29 @@ impl DockerSandboxClient {
         }
         // Bind and volume mounts are attached by the container runtime, before the session
         // starts, so they are resolved from the manifest here rather than during materialization.
+        let mut privileges = ContainerPrivileges::None;
         for (mount, mount_path) in manifest.mount_targets() {
             mount.validate()?;
+            privileges = privileges.max(mount.strategy.container_privileges());
             if let Some(args) = mount.strategy.docker_create_args(mount, &mount_path) {
                 argv.extend(args);
             }
+        }
+        // A capability or a device cannot be added to a running container, so an in-container
+        // FUSE or `mount(2)` helper has to be provided for here or it can never work.
+        argv.extend(container_privilege_args(privileges));
+        // A manifest grant with a host path is a bind mount: the sandbox cannot reach a host
+        // directory the runtime did not attach.
+        for grant in manifest.extra_path_grants() {
+            if grant.host_path.is_none() {
+                continue;
+            }
+            let mut spec = format!("{}:{}", grant.host_source(), grant.path);
+            if grant.read_only {
+                spec.push_str(":ro");
+            }
+            argv.push("-v".to_string());
+            argv.push(spec);
         }
         argv.extend(self.options.extra_create_args.iter().cloned());
         argv.push(self.options.image.clone());
@@ -230,7 +249,8 @@ impl SandboxClient for DockerSandboxClient {
                 DockerSandboxSession::new(container_id, manifest)
                     .with_snapshot(Some(state.snapshot.clone()))
                     .with_snapshot_id(state.snapshot_id.clone())
-                    .resuming(),
+                    .resuming()
+                    .with_workspace_root_ready(state.workspace_root_ready),
             ));
         }
         // The original container is gone: create a replacement and hydrate it from the snapshot.
@@ -254,6 +274,16 @@ pub struct DockerSandboxSession {
     container_id: String,
     manifest: Manifest,
     started: AtomicBool,
+    /// Whether the manifest finished materializing, so a resume can trust the workspace.
+    materialized: AtomicBool,
+    /// Keeps concurrent work out of the workspace while a snapshot detaches its mounts.
+    mount_transition: crate::sandbox::mounts::MountTransition,
+    /// Host file holding the manifest's start-up environment lookups, written `0600`.
+    ///
+    /// Docker passes environment variables to `docker exec` as `-e KEY=VALUE`, which the host's
+    /// process table shows to every local user. A value fetched from a secret store must not go
+    /// that way, so it travels through `--env-file` instead.
+    resolved_env_file: std::sync::OnceLock<std::path::PathBuf>,
     removed: Mutex<bool>,
     ptys: PtyManager,
     snapshot: Option<SnapshotSpec>,
@@ -270,6 +300,9 @@ impl DockerSandboxSession {
             container_id,
             manifest,
             started: AtomicBool::new(false),
+            materialized: AtomicBool::new(false),
+            mount_transition: crate::sandbox::mounts::MountTransition::new(),
+            resolved_env_file: std::sync::OnceLock::new(),
             removed: Mutex::new(false),
             ptys: PtyManager::new(),
             snapshot: None,
@@ -295,6 +328,15 @@ impl DockerSandboxSession {
         self
     }
 
+    /// Whether the workspace this session resumes was fully materialized before the pause.
+    ///
+    /// A run interrupted mid-materialization leaves a workspace that has files in it but is not
+    /// the one the manifest describes, so resuming it has to re-apply the manifest.
+    pub fn with_workspace_root_ready(self, ready: bool) -> Self {
+        self.materialized.store(ready, Ordering::SeqCst);
+        self
+    }
+
     /// The container backing the workspace.
     pub fn container_id(&self) -> &str {
         &self.container_id
@@ -312,6 +354,7 @@ impl DockerSandboxSession {
         };
         argv.push("-w".to_string());
         argv.push(workdir);
+        argv.extend(self.resolved_environment_args());
         for (key, value) in request.resolved_env(self.manifest.environment()) {
             argv.push("-e".to_string());
             argv.push(format!("{key}={value}"));
@@ -319,6 +362,114 @@ impl DockerSandboxSession {
         argv.push(self.container_id.clone());
         argv.extend(request.resolved_argv());
         Ok(argv)
+    }
+
+    /// Perform the manifest's start-up environment lookups into an owner-only host file.
+    ///
+    /// Docker reads `--env-file` itself, so the values never appear in an argument vector.
+    async fn write_resolved_environment_file(&self) -> SandboxResult<()> {
+        if self.manifest.resolved_environment().is_empty() {
+            return Ok(());
+        }
+        // `stop()` then `start()` reuses the session. Writing a second file would leave the
+        // first one behind, because `OnceLock::set` would quietly refuse the new path and
+        // teardown only knows about the one it holds.
+        if self.resolved_env_file.get().is_some() {
+            return Ok(());
+        }
+        let resolved = self.manifest.resolved_environment().resolve().await?;
+        let mut body = String::new();
+        for (key, value) in &resolved {
+            // `--env-file` is line-oriented, so a value with a newline cannot be expressed and
+            // would silently become a different variable.
+            if value.contains(['\n', '\r']) {
+                return Err(SandboxError::new(
+                    ErrorCode::SandboxConfigInvalid,
+                    format!("the environment value for `{key}` must not contain a line break"),
+                ));
+            }
+            body.push_str(&format!("{key}={value}\n"));
+        }
+        // The name is unpredictable and the file is created `0600` in one step. Creating it
+        // world-readable and tightening it afterwards leaves a window in a shared directory, and
+        // a predictable name invites a planted symlink for the write to follow.
+        let path = std::env::temp_dir().join(format!(
+            "openai-agents-sandbox-env-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let mut options = tokio::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let staged = async {
+            use tokio::io::AsyncWriteExt as _;
+            let mut file = options.open(&path).await?;
+            file.write_all(body.as_bytes()).await?;
+            file.flush().await
+        };
+        staged.await.map_err(|error| {
+            SandboxError::new(
+                ErrorCode::WorkspaceStartError,
+                format!("Failed to stage the sandbox environment file: {error}"),
+            )
+        })?;
+        let _ = self.resolved_env_file.set(path);
+        Ok(())
+    }
+
+    /// The `docker exec` argument vector that starts one interactive process.
+    ///
+    /// The host-side `docker exec` is only a proxy: killing it leaves the process inside the
+    /// container running, so the command records its pid for teardown to kill.
+    fn pty_argv(&self, request: &PtyExecRequest, workdir: &str, pid_path: &str) -> Vec<String> {
+        let inner = format!(
+            "echo $$ > {pid}; exec {argv}",
+            pid = shell_quote(pid_path),
+            argv = request
+                .resolved_argv()
+                .iter()
+                .map(|a| shell_quote(a))
+                .collect::<Vec<_>>()
+                .join(" "),
+        );
+        let mut argv = vec!["docker".to_string(), "exec".to_string(), "-i".to_string()];
+        if request.tty {
+            argv.push("-t".to_string());
+        }
+        argv.push("-w".to_string());
+        argv.push(workdir.to_string());
+        // An interactive process gets the same environment a command does, including the
+        // start-up lookups; without this a secret would be present for `shell` and missing for
+        // `exec_command`, which is the silent gap `resolves_environment` exists to prevent.
+        argv.extend(self.resolved_environment_args());
+        for (key, value) in self.manifest.environment() {
+            argv.push("-e".to_string());
+            argv.push(format!("{key}={value}"));
+        }
+        argv.push(self.container_id.clone());
+        argv.extend(["sh".to_string(), "-c".to_string(), inner]);
+        argv
+    }
+
+    /// The `docker exec` arguments that supply the manifest's start-up environment lookups.
+    ///
+    /// They go through `--env-file`, which `docker` reads itself, rather than `-e KEY=VALUE`,
+    /// which the host's process table shows to every local user.
+    fn resolved_environment_args(&self) -> Vec<String> {
+        match self.resolved_env_file.get() {
+            Some(path) => vec![
+                "--env-file".to_string(),
+                path.to_string_lossy().into_owned(),
+            ],
+            None => Vec::new(),
+        }
+    }
+
+    /// Remove the staged environment file, if one was written.
+    async fn remove_resolved_environment_file(&self) {
+        if let Some(path) = self.resolved_env_file.get() {
+            let _ = tokio::fs::remove_file(path).await;
+        }
     }
 
     /// Whether the container workspace still holds anything.
@@ -375,6 +526,7 @@ impl SandboxSession for DockerSandboxSession {
             ));
         }
         self.started.store(true, Ordering::SeqCst);
+        self.write_resolved_environment_file().await?;
         let result = if self.resuming {
             match restore_session_snapshot(self).await {
                 Ok(true) => Ok(()),
@@ -384,7 +536,8 @@ impl SandboxSession for DockerSandboxSession {
                 // backend) materialize the whole manifest instead of handing the model an
                 // empty workspace.
                 Ok(false) => {
-                    let preserved = self.workspace_has_content().await;
+                    let preserved = self.materialized.load(Ordering::SeqCst)
+                        && self.workspace_has_content().await;
                     let manifest = self.manifest.clone();
                     if preserved {
                         manifest.apply_ephemeral(self).await.map(|_| ())
@@ -400,6 +553,9 @@ impl SandboxSession for DockerSandboxSession {
         result.inspect_err(|_| {
             self.started.store(false, Ordering::SeqCst);
         })?;
+        // Only now is the workspace what the manifest says it is; a resume before this point
+        // would find a half-materialized tree that looks populated.
+        self.materialized.store(true, Ordering::SeqCst);
         Ok(())
     }
 
@@ -432,6 +588,8 @@ impl SandboxSession for DockerSandboxSession {
 
     async fn shutdown(&self) -> SandboxResult<()> {
         self.terminate_pty_sessions().await;
+        // The staged secrets must not outlive the container that used them.
+        self.remove_resolved_environment_file().await;
         // In-container mounts have to be released while the container is still alive. Bind and
         // volume mounts are detached by the runtime when the container goes away.
         if let Err(error) = self.manifest.unmount_all(self).await {
@@ -465,6 +623,14 @@ impl SandboxSession for DockerSandboxSession {
         Ok(())
     }
 
+    fn resolves_environment(&self) -> bool {
+        true
+    }
+
+    fn mount_transition(&self) -> Option<&crate::sandbox::mounts::MountTransition> {
+        Some(&self.mount_transition)
+    }
+
     fn supports_pty(&self) -> bool {
         true
     }
@@ -481,6 +647,7 @@ impl SandboxSession for DockerSandboxSession {
             &self.manifest,
         )
         .with_provider_id(Some(self.container_id.clone()))
+        .with_workspace_root_ready(self.materialized.load(Ordering::SeqCst))
         .with_snapshot(self.snapshot.clone().unwrap_or_default())
     }
 
@@ -500,28 +667,7 @@ impl SandboxSession for DockerSandboxSession {
             "/tmp/openai-agents-sandbox-pty-{}.pid",
             uuid::Uuid::new_v4().simple()
         );
-        let inner = format!(
-            "echo $$ > {pid}; exec {argv}",
-            pid = shell_quote(&pid_path),
-            argv = request
-                .resolved_argv()
-                .iter()
-                .map(|a| shell_quote(a))
-                .collect::<Vec<_>>()
-                .join(" "),
-        );
-        let mut argv = vec!["docker".to_string(), "exec".to_string(), "-i".to_string()];
-        if request.tty {
-            argv.push("-t".to_string());
-        }
-        argv.push("-w".to_string());
-        argv.push(workdir);
-        for (key, value) in self.manifest.environment() {
-            argv.push("-e".to_string());
-            argv.push(format!("{key}={value}"));
-        }
-        argv.push(self.container_id.clone());
-        argv.extend(["sh".to_string(), "-c".to_string(), inner]);
+        let argv = self.pty_argv(&request, &workdir, &pid_path);
 
         let spawn = PtySpawn {
             argv,
@@ -698,6 +844,127 @@ async fn run_docker(argv: &[String], stdin: Option<&[u8]>) -> SandboxResult<Exec
         stderr: output.stderr,
         exit_code: output.status.code().unwrap_or(-1),
     })
+}
+
+/// The `docker create` arguments that grant `privileges`.
+///
+/// Mirrors Python's `_manifest_requires_fuse` / `_manifest_requires_sys_admin` branches.
+/// `apparmor:unconfined` goes with `CAP_SYS_ADMIN` because the default AppArmor profile denies
+/// `mount(2)` even to a capable process.
+fn container_privilege_args(privileges: ContainerPrivileges) -> Vec<String> {
+    let mut argv: Vec<String> = Vec::new();
+    match privileges {
+        ContainerPrivileges::None => return argv,
+        ContainerPrivileges::FuseDevice => {
+            argv.extend(["--device".to_string(), "/dev/fuse".to_string()]);
+        }
+        ContainerPrivileges::SysAdmin => {}
+    }
+    argv.extend([
+        "--cap-add".to_string(),
+        "SYS_ADMIN".to_string(),
+        "--security-opt".to_string(),
+        "apparmor:unconfined".to_string(),
+    ]);
+    argv
+}
+
+#[cfg(test)]
+mod privilege_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_looked_up_secret_reaches_both_exec_paths_without_the_process_table() {
+        use crate::sandbox::environment::EnvEntry;
+
+        let session = DockerSandboxSession::new(
+            "container-under-test".to_string(),
+            Manifest::new()
+                .with_root("/workspace")
+                .with_env("PLAIN", "visible")
+                .with_env_entry("TOKEN", EnvEntry::literal("SUPERSECRET")),
+        );
+        session.write_resolved_environment_file().await.unwrap();
+
+        let path = session
+            .resolved_env_file
+            .get()
+            .expect("a looked-up environment is staged in a file")
+            .clone();
+        // The file is owner-only, and its name is not derived from the container id.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = tokio::fs::metadata(&path)
+                .await
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600, "{mode:o}");
+        }
+        assert!(
+            !path.to_string_lossy().contains("container-under-test"),
+            "{}",
+            path.display()
+        );
+        let body = tokio::fs::read_to_string(&path).await.unwrap();
+        assert!(body.contains("TOKEN=SUPERSECRET"), "{body}");
+
+        // Both the command path and the interactive path read it through `--env-file`, and
+        // neither puts the value in an argument the host's process table would show.
+        let command_argv = session
+            .exec_argv(&ExecRequest::argv(["echo", "hi"]))
+            .unwrap();
+        let pty_argv = session.pty_argv(&PtyExecRequest::new("sh"), "/workspace", "/tmp/pid");
+        for argv in [command_argv, pty_argv] {
+            let joined = argv.join(" ");
+            assert!(joined.contains("--env-file"), "{joined}");
+            assert!(!joined.contains("SUPERSECRET"), "{joined}");
+            // A plain manifest value is not a secret and still travels as `-e`.
+            assert!(joined.contains("PLAIN=visible"), "{joined}");
+        }
+
+        session.remove_resolved_environment_file().await;
+        assert!(tokio::fs::metadata(&path).await.is_err());
+    }
+
+    #[test]
+    fn grants_only_what_a_mount_needs() {
+        assert!(container_privilege_args(ContainerPrivileges::None).is_empty());
+        assert_eq!(
+            container_privilege_args(ContainerPrivileges::SysAdmin),
+            vec![
+                "--cap-add",
+                "SYS_ADMIN",
+                "--security-opt",
+                "apparmor:unconfined"
+            ]
+        );
+        assert_eq!(
+            container_privilege_args(ContainerPrivileges::FuseDevice),
+            vec![
+                "--device",
+                "/dev/fuse",
+                "--cap-add",
+                "SYS_ADMIN",
+                "--security-opt",
+                "apparmor:unconfined"
+            ]
+        );
+    }
+
+    #[test]
+    fn the_strongest_requirement_wins() {
+        // `max` over the enum is what `create_session` folds the manifest's mounts with.
+        assert_eq!(
+            ContainerPrivileges::SysAdmin.max(ContainerPrivileges::FuseDevice),
+            ContainerPrivileges::FuseDevice
+        );
+        assert_eq!(
+            ContainerPrivileges::None.max(ContainerPrivileges::SysAdmin),
+            ContainerPrivileges::SysAdmin
+        );
+    }
 }
 
 #[cfg(test)]

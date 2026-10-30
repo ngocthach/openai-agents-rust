@@ -54,11 +54,14 @@ impl MountCredentialAuthority {
 
 /// Runtime configuration a [`MountPattern`] needs to attach storage.
 ///
-/// `config_text` holds the secret-bearing configuration written into the sandbox. Its contents
-/// never appear in `Debug` output, error messages or serialized session state.
+/// `config_text` holds the secret-bearing configuration written into the sandbox, and `secrets`
+/// holds individual credential values a pattern passes through an environment file instead of a
+/// configuration file. Neither ever appears in `Debug` output, error messages or serialized
+/// session state.
 #[derive(Clone, Default)]
 pub struct MountPatternConfig {
     config_text: Option<String>,
+    secrets: BTreeMap<String, String>,
     /// Non-secret options the pattern passes to its mount command.
     pub options: BTreeMap<String, String>,
 }
@@ -86,15 +89,46 @@ impl MountPatternConfig {
         self.config_text.as_deref()
     }
 
-    /// Whether this configuration carries a secret.
+    /// Whether this configuration carries configuration text.
     pub fn has_config_text(&self) -> bool {
         self.config_text.is_some()
     }
 
-    /// A copy without the secret payload, for teardown paths that must not reproduce it.
+    /// Attach an individual credential value under `key`.
+    ///
+    /// A pattern that hands credentials to its mount tool through the process environment reads
+    /// them from here instead of [`config_text`](Self::config_text), so the non-secret
+    /// [`options`](Self::options) stay printable.
+    pub fn with_secret(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.secrets.insert(key.into(), value.into());
+        self
+    }
+
+    /// One credential value, when the pattern was given it.
+    pub fn secret(&self, key: &str) -> Option<&str> {
+        self.secrets.get(key).map(String::as_str)
+    }
+
+    /// The credential keys this configuration carries, in sorted order.
+    pub fn secret_keys(&self) -> impl Iterator<Item = &str> {
+        self.secrets.keys().map(String::as_str)
+    }
+
+    /// Every credential value this configuration carries, for redacting command output.
+    pub fn secret_values(&self) -> impl Iterator<Item = &str> {
+        self.secrets.values().map(String::as_str)
+    }
+
+    /// Whether this configuration carries any credential, as text or as individual values.
+    pub fn has_credentials(&self) -> bool {
+        self.config_text.is_some() || !self.secrets.is_empty()
+    }
+
+    /// A copy without any credential, for teardown paths that must not reproduce one.
     pub fn without_config_text(&self) -> Self {
         MountPatternConfig {
             config_text: None,
+            secrets: BTreeMap::new(),
             options: self.options.clone(),
         }
     }
@@ -107,9 +141,33 @@ impl fmt::Debug for MountPatternConfig {
                 "config_text",
                 &self.config_text.as_ref().map(|_| "<redacted>"),
             )
+            .field(
+                "secrets",
+                &self
+                    .secrets
+                    .keys()
+                    .map(|key| (key.as_str(), "<redacted>"))
+                    .collect::<BTreeMap<_, _>>(),
+            )
             .field("options", &self.options)
             .finish()
     }
+}
+
+/// The kernel privileges a container runtime has to grant before a mount can work.
+///
+/// A FUSE filesystem needs `/dev/fuse` and `CAP_SYS_ADMIN`; `mount(2)`-based helpers such as
+/// `rclone serve nfs` or the S3 Files mount helper need `CAP_SYS_ADMIN` alone. A backend that
+/// creates the container has to ask for these up front, because they cannot be added later.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub enum ContainerPrivileges {
+    /// Nothing beyond the runtime's defaults.
+    #[default]
+    None,
+    /// `CAP_SYS_ADMIN`, for a helper that calls `mount(2)` directly.
+    SysAdmin,
+    /// `CAP_SYS_ADMIN` and the `/dev/fuse` device, for a FUSE filesystem.
+    FuseDevice,
 }
 
 /// A command pattern that attaches external storage from inside the sandbox.
@@ -123,6 +181,11 @@ pub trait MountPattern: Send + Sync + fmt::Debug {
     /// Whether applying this pattern writes a credential inside the sandbox.
     fn exposes_credentials(&self) -> bool {
         true
+    }
+
+    /// The kernel privileges the container runtime must grant for this pattern to work.
+    fn container_privileges(&self) -> ContainerPrivileges {
+        ContainerPrivileges::None
     }
 
     /// Attach the storage at `mount_path`.
@@ -186,6 +249,14 @@ pub trait MountStrategy: Send + Sync + fmt::Debug {
         true
     }
 
+    /// The kernel privileges the container runtime must grant for this mount to work.
+    ///
+    /// A backend that creates the container reads this before it starts, because a capability
+    /// or a device cannot be added to a running container.
+    fn container_privileges(&self) -> ContainerPrivileges {
+        ContainerPrivileges::None
+    }
+
     /// Arguments the Docker backend adds to `docker create` for this mount.
     ///
     /// A strategy that returns `Some` is attached by the container runtime before the session
@@ -235,6 +306,107 @@ pub trait MountStrategy: Send + Sync + fmt::Debug {
         mount_path: &str,
     ) -> SandboxResult<()> {
         self.activate(mount, session, mount_path).await
+    }
+}
+
+/// Tracks which task is detaching or re-attaching a session's mounts. Mirrors the
+/// `_MOUNT_TRANSITION_OWNER` context variable in Python's `mount_lifecycle`.
+///
+/// Capturing a snapshot detaches every mount that cannot be snapshotted in place, archives the
+/// workspace, and attaches them again. For that window the workspace is not what the manifest
+/// says it is: a mounted bucket is an empty directory. A command that runs in that window reads
+/// the wrong thing and reports it as fact, which is worse than an error, so the session refuses
+/// instead — except for the task doing the transition, whose own `exec` calls are how the mounts
+/// are detached in the first place.
+#[derive(Debug, Default)]
+pub struct MountTransition {
+    /// `Some` while a transition is in progress; the inner value is the owning task's id,
+    /// which is absent when the transition was started outside a task.
+    owner: std::sync::Mutex<Option<Option<tokio::task::Id>>>,
+}
+
+impl MountTransition {
+    /// A transition tracker with no transition in progress.
+    pub fn new() -> Self {
+        MountTransition::default()
+    }
+
+    /// Claim the transition for the current task.
+    ///
+    /// Fails when another task already holds it: two overlapping snapshots would each detach the
+    /// mounts the other is relying on.
+    pub fn begin(&self) -> SandboxResult<MountTransitionGuard<'_>> {
+        let current = tokio::task::try_id();
+        let mut owner = self.owner.lock().map_err(|_| {
+            SandboxError::new(
+                ErrorCode::MountFailed,
+                "the mount transition state was left poisoned by a panicking task",
+            )
+        })?;
+        match *owner {
+            Some(existing) if existing != current => Err(SandboxError::new(
+                ErrorCode::MountFailed,
+                "another task is already detaching or re-attaching this session's mounts",
+            )),
+            _ => {
+                *owner = Some(current);
+                Ok(MountTransitionGuard { transition: self })
+            }
+        }
+    }
+
+    /// Whether a transition is in progress.
+    pub fn in_progress(&self) -> bool {
+        self.owner
+            .lock()
+            .map(|owner| owner.is_some())
+            .unwrap_or(true)
+    }
+
+    /// Whether the calling task is the one doing the transition.
+    pub fn current_task_owns(&self) -> bool {
+        let current = tokio::task::try_id();
+        self.owner
+            .lock()
+            .map(|owner| match *owner {
+                Some(existing) => existing == current,
+                None => false,
+            })
+            .unwrap_or(false)
+    }
+
+    /// Fail when the mounts are mid-transition and the caller is not the one moving them.
+    pub fn ensure_settled(&self) -> SandboxResult<()> {
+        if !self.in_progress() || self.current_task_owns() {
+            return Ok(());
+        }
+        Err(SandboxError::new(
+            ErrorCode::MountFailed,
+            "the sandbox workspace is mid-snapshot: its mounts are detached, so this operation \
+             would read or write the wrong filesystem",
+        ))
+    }
+
+    /// Release the transition.
+    fn end(&self) {
+        if let Ok(mut owner) = self.owner.lock() {
+            *owner = None;
+        }
+    }
+}
+
+/// Holds a [`MountTransition`] for as long as the transition lasts.
+///
+/// Releasing on drop matters: a snapshot that fails part way through must not leave the session
+/// permanently refusing every command.
+#[derive(Debug)]
+pub struct MountTransitionGuard<'a> {
+    transition: &'a MountTransition,
+}
+
+impl Drop for MountTransitionGuard<'_> {
+    fn drop(&mut self) {
+        self.transition.end();
     }
 }
 
@@ -465,14 +637,12 @@ impl MountStrategy for DockerVolumeMountStrategy {
     }
 
     fn docker_create_args(&self, mount: &Mount, mount_path: &str) -> Option<Vec<String>> {
-        let mut spec = format!("type=volume,dst={mount_path},volume-driver={}", self.driver);
-        for (key, value) in &self.driver_options {
-            spec.push_str(&format!(",volume-opt={key}={value}"));
-        }
-        if mount.read_only {
-            spec.push_str(",readonly");
-        }
-        Some(vec!["--mount".to_string(), spec])
+        Some(docker_volume_mount_args(
+            mount_path,
+            &self.driver,
+            &self.driver_options,
+            mount.read_only,
+        ))
     }
 
     async fn activate(
@@ -518,6 +688,47 @@ impl MountStrategy for DockerVolumeMountStrategy {
     }
 }
 
+/// One `--mount` field, quoted so Docker's CSV parser keeps it whole.
+///
+/// `docker create --mount` splits its value with a CSV reader, so a driver option carrying a
+/// comma — a GCS service-account key, an endpoint list — would otherwise be read as several
+/// fields and silently change, or invent, a mount setting.
+fn docker_mount_field(field: &str) -> String {
+    if field.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", field.replace('"', "\"\""))
+    } else {
+        field.to_string()
+    }
+}
+
+/// The `docker create` arguments that attach a named volume at `mount_path`.
+pub(crate) fn docker_volume_mount_args(
+    mount_path: &str,
+    driver: &str,
+    driver_options: &BTreeMap<String, String>,
+    read_only: bool,
+) -> Vec<String> {
+    let mut fields = vec![
+        "type=volume".to_string(),
+        format!("dst={mount_path}"),
+        format!("volume-driver={driver}"),
+    ];
+    fields.extend(
+        driver_options
+            .iter()
+            .map(|(key, value)| format!("volume-opt={key}={value}")),
+    );
+    if read_only {
+        fields.push("readonly".to_string());
+    }
+    let spec = fields
+        .iter()
+        .map(|field| docker_mount_field(field))
+        .collect::<Vec<_>>()
+        .join(",");
+    vec!["--mount".to_string(), spec]
+}
+
 // ---------------------------------------------------------------------------------------------
 // In-container mounts
 // ---------------------------------------------------------------------------------------------
@@ -548,7 +759,7 @@ impl MountStrategy for InContainerMountStrategy {
     }
 
     fn credential_authority(&self) -> MountCredentialAuthority {
-        if self.pattern.exposes_credentials() && self.config.has_config_text() {
+        if self.pattern.exposes_credentials() && self.config.has_credentials() {
             MountCredentialAuthority::MountScoped
         } else {
             MountCredentialAuthority::None
@@ -557,6 +768,10 @@ impl MountStrategy for InContainerMountStrategy {
 
     fn supports_native_snapshot_detach(&self) -> bool {
         false
+    }
+
+    fn container_privileges(&self) -> ContainerPrivileges {
+        self.pattern.container_privileges()
     }
 
     async fn activate(
@@ -584,6 +799,41 @@ impl MountStrategy for InContainerMountStrategy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_mount_transition_keeps_other_tasks_out_of_the_workspace() {
+        let transition = std::sync::Arc::new(MountTransition::new());
+        assert!(transition.ensure_settled().is_ok());
+
+        let guard = transition.begin().unwrap();
+        // The task doing the transition still needs to run the detach commands.
+        assert!(transition.current_task_owns());
+        assert!(transition.ensure_settled().is_ok());
+
+        // Any other task is refused rather than shown a half-detached workspace.
+        let other = transition.clone();
+        let refused = tokio::spawn(async move { other.ensure_settled() })
+            .await
+            .unwrap();
+        assert!(refused.is_err());
+
+        // A second transition from another task cannot start.
+        let other = transition.clone();
+        let claimed = tokio::spawn(async move { other.begin().map(|_| ()) })
+            .await
+            .unwrap();
+        assert!(claimed.is_err());
+
+        drop(guard);
+        assert!(!transition.in_progress());
+        let other = transition.clone();
+        assert!(
+            tokio::spawn(async move { other.ensure_settled() })
+                .await
+                .unwrap()
+                .is_ok()
+        );
+    }
 
     #[test]
     fn redacts_configuration_text() {
@@ -1057,6 +1307,15 @@ impl MountPattern for RcloneMountPattern {
 
     fn exposes_credentials(&self) -> bool {
         true
+    }
+
+    fn container_privileges(&self) -> ContainerPrivileges {
+        match self.mode {
+            RcloneMountMode::Fuse => ContainerPrivileges::FuseDevice,
+            // `rclone serve nfs` needs no FUSE device, but the client side still calls
+            // `mount(2)`.
+            RcloneMountMode::Nfs => ContainerPrivileges::SysAdmin,
+        }
     }
 
     async fn apply(

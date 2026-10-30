@@ -16,6 +16,7 @@ use async_trait::async_trait;
 use serde_json::{Map, Value};
 
 use crate::sandbox::errors::{ErrorCode, SandboxError, SandboxResult};
+use crate::sandbox::mount_entries::{ConfiguredMount, GCS_S3_ENDPOINT, GcsMount, R2Mount, S3Mount};
 use crate::sandbox::mounts::{Mount, MountCredentialAuthority, MountStrategy};
 use crate::sandbox::session::{ExecRequest, SandboxSession, shell_quote};
 
@@ -680,6 +681,105 @@ async fn run_shell(
                 .with_timeout(Some(std::time::Duration::from_secs(timeout_secs))),
         )
         .await
+}
+
+// -------------------------------------------------------------------------------------------
+// Configured mount translation
+// -------------------------------------------------------------------------------------------
+
+impl BlaxelCloudBucketMountConfig {
+    /// The Blaxel bucket configuration for one of the built-in remote storage mounts.
+    ///
+    /// Mirrors Python's `_build_mount_config`: `s3fs` covers S3, R2 and HMAC-authenticated GCS,
+    /// and only a GCS mount without HMAC credentials falls through to `gcsfuse`.
+    pub fn from_configured_mount(mount: &dyn ConfiguredMount) -> SandboxResult<Self> {
+        mount.validate()?;
+        let any = mount.as_any();
+
+        if let Some(s3) = any.downcast_ref::<S3Mount>() {
+            return Ok(BlaxelCloudBucketMountConfig {
+                provider: BlaxelBucketProvider::S3,
+                bucket: s3.bucket.clone(),
+                read_only: true,
+                access_key_id: s3.access_key_id.clone(),
+                secret_access_key: s3.secret_access_key.clone(),
+                session_token: s3.session_token.clone(),
+                region: s3.region.clone(),
+                endpoint_url: s3.endpoint_url.clone(),
+                prefix: s3.prefix.clone(),
+                service_account_key: None,
+            });
+        }
+
+        if let Some(r2) = any.downcast_ref::<R2Mount>() {
+            return Ok(BlaxelCloudBucketMountConfig {
+                provider: BlaxelBucketProvider::R2,
+                bucket: r2.bucket.clone(),
+                read_only: true,
+                access_key_id: r2.access_key_id.clone(),
+                secret_access_key: r2.secret_access_key.clone(),
+                session_token: None,
+                region: None,
+                endpoint_url: Some(r2.endpoint()),
+                prefix: None,
+                service_account_key: None,
+            });
+        }
+
+        if let Some(gcs) = any.downcast_ref::<GcsMount>() {
+            if gcs.uses_s3_compatible_api() {
+                return Ok(BlaxelCloudBucketMountConfig {
+                    provider: BlaxelBucketProvider::S3,
+                    bucket: gcs.bucket.clone(),
+                    read_only: true,
+                    access_key_id: gcs.access_id.clone(),
+                    secret_access_key: gcs.secret_access_key.clone(),
+                    session_token: None,
+                    region: gcs.region.clone(),
+                    endpoint_url: Some(
+                        gcs.endpoint_url
+                            .clone()
+                            .unwrap_or_else(|| GCS_S3_ENDPOINT.to_string()),
+                    ),
+                    prefix: gcs.prefix.clone(),
+                    service_account_key: None,
+                });
+            }
+            return Ok(BlaxelCloudBucketMountConfig {
+                provider: BlaxelBucketProvider::Gcs,
+                bucket: gcs.bucket.clone(),
+                read_only: true,
+                access_key_id: None,
+                secret_access_key: None,
+                session_token: None,
+                region: None,
+                endpoint_url: None,
+                prefix: gcs.prefix.clone(),
+                service_account_key: gcs.service_account_credentials.clone(),
+            });
+        }
+
+        Err(SandboxError::new(
+            ErrorCode::MountConfigInvalid,
+            format!(
+                "blaxel cloud bucket mounts do not support `{}`",
+                mount.mount_type()
+            ),
+        ))
+    }
+}
+
+impl BlaxelCloudBucketMountStrategy {
+    /// A strategy attaching one of the built-in remote storage mounts.
+    ///
+    /// The returned configuration is read-only, because these backends take `read_only` from the
+    /// configuration rather than from the [`Mount`]: chain `with_read_only(false)` to allow
+    /// writes. Defaulting the other way would silently widen a mount.
+    pub fn for_mount(mount: &dyn ConfiguredMount) -> SandboxResult<Self> {
+        Ok(BlaxelCloudBucketMountStrategy::new(
+            BlaxelCloudBucketMountConfig::from_configured_mount(mount)?,
+        ))
+    }
 }
 
 #[cfg(test)]

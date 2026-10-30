@@ -33,6 +33,10 @@
 //! - [`Mount`]s with a [`MountStrategy`] trait cloud providers can implement, plus the built-in
 //!   [`BindMountStrategy`], [`DockerVolumeMountStrategy`] and [`InContainerMountStrategy`], the
 //!   credential-exposure policy, and the remote mount instruction block.
+//! - The remote storage mounts [`S3Mount`], [`S3FilesMount`], [`GcsMount`], [`AzureBlobMount`],
+//!   [`R2Mount`] and [`BoxMount`], attached by [`ConfiguredMountStrategy`] through the
+//!   [`RcloneMountPattern`], [`MountpointMountPattern`], [`FuseMountPattern`] and
+//!   [`S3FilesMountPattern`] mount tools.
 //! - PTY sessions (`exec_command` / `write_stdin`), backed by `portable-pty` on both backends.
 //! - Workspace [`Snapshot`]s and [`SandboxSessionState`], so a run that pauses on approvals can
 //!   be resumed against the same workspace.
@@ -46,60 +50,91 @@
 //! - The cloud provider backends in `agents.extensions.sandbox` (Blaxel, Cloudflare, Daytona,
 //!   E2B, Modal, Vercel). Implement [`SandboxClient`] and [`SandboxSession`] to add one, and
 //!   [`MountPattern`] for their storage mounts.
-//! - The concrete remote storage mounts (S3, S3 Files, GCS, Azure Blob, R2, Box) and their FUSE,
-//!   `mount-s3` and `rclone` patterns, which belong with those providers.
 //! - Exposed ports, archive extraction limits and the runtime helper scripts.
 
 pub mod agent;
 pub mod capabilities;
 pub mod editor;
 pub mod entries;
+pub mod environment;
 pub mod errors;
+pub mod events;
 pub mod http;
 pub mod manifest;
+pub mod materialization;
 pub mod memory;
+pub mod mount_entries;
+pub mod mount_patterns;
 pub mod mounts;
 pub mod pty;
 pub mod remote_mount_policy;
+pub mod retry;
 pub mod runtime;
 pub mod sandboxes;
 pub mod session;
 pub mod snapshot;
 pub mod state;
+pub mod testing;
 pub mod types;
 pub mod util;
 pub mod workspace_paths;
 
 pub use agent::{DEFAULT_SANDBOX_INSTRUCTIONS, PreparedSandboxGraph, SandboxAgent};
 pub use capabilities::{
-    Capabilities, Capability, CapabilityBinding, Compaction, Filesystem, LazySkillSource,
-    LocalDirLazySkillSource, Memory, Shell, Skill, SkillMetadata, Skills,
+    Capabilities, Capability, CapabilityBinding, Compaction, ConfiguredCapability, Filesystem,
+    LazySkillSource, LocalDirLazySkillSource, Memory, Shell, Skill, SkillMetadata, Skills,
 };
 pub use editor::SandboxEditor;
 pub use entries::{Entry, EntryKind};
-pub use errors::{ErrorCode, SandboxError, SandboxResult};
-pub use manifest::{DEFAULT_MANIFEST_ROOT, DEFAULT_REMOTE_MOUNT_COMMAND_ALLOWLIST, Manifest};
+pub use environment::{EnvEntry, EnvValue, Environment, StrEnvValue};
+pub use errors::{ErrorCode, SandboxError, SandboxOp, SandboxResult};
+pub use events::{
+    CallbackSink, ChainedSink, EventPayloadPolicy, EventPhase, EventSink, Instrumentation,
+    InstrumentedSession, JsonlFileSink, SandboxSessionEvent,
+};
+pub use manifest::{
+    DEFAULT_MANIFEST_ROOT, DEFAULT_MAX_LOCAL_DIR_FILE_CONCURRENCY,
+    DEFAULT_MAX_MANIFEST_ENTRY_CONCURRENCY, DEFAULT_REMOTE_MOUNT_COMMAND_ALLOWLIST, Manifest,
+    SandboxConcurrencyLimits,
+};
+pub use materialization::{MaterializationResult, MaterializedFile, sha256_file, sha256_hex};
 pub use memory::{MemoryGenerateConfig, MemoryLayoutConfig, MemoryReadConfig};
+pub use mount_entries::{
+    AzureBlobMount, BoxMount, BoxSubType, BuiltinMountPattern, ConfiguredMount,
+    ConfiguredMountBackend, ConfiguredMountStrategy, GcsMount, R2Mount, S3FilesMount, S3Mount,
+};
+pub use mount_patterns::{
+    BlobfuseCacheType, FuseMountPattern, MountpointMountPattern, MountpointOptions,
+    S3FilesMountPattern, S3FilesOptions,
+};
 pub use mounts::{
-    BindMountStrategy, DockerVolumeMountStrategy, HostPathGrant, InContainerMountStrategy, Mount,
-    MountCredentialAuthority, MountPattern, MountPatternConfig, MountStrategy, RCLONE_CONFIG_DIR,
-    RcloneMountMode, RcloneMountPattern,
+    BindMountStrategy, ContainerPrivileges, DockerVolumeMountStrategy, HostPathGrant,
+    InContainerMountStrategy, Mount, MountCredentialAuthority, MountPattern, MountPatternConfig,
+    MountStrategy, MountTransition, RCLONE_CONFIG_DIR, RcloneMountMode, RcloneMountPattern,
 };
 pub use pty::{
     PtyExecRequest, PtyExecUpdate, PtyManager, PtyWriteRequest, RemotePtyManager, RemotePtyProcess,
 };
 pub use remote_mount_policy::build_remote_mount_policy_instructions;
+pub use retry::{BackoffStrategy, RetryPolicy, retry_async};
 pub use runtime::{
     PreparedSandboxRun, SandboxRunConfig, SandboxRunOutcome, SandboxRunner, SandboxSessionGuard,
     SandboxStreamedRun,
 };
 pub use session::{ExecRequest, ExecShell, SandboxClient, SandboxSession};
 pub use snapshot::{
-    LocalSnapshot, NoopSnapshot, Snapshot, SnapshotSpec, cleanup_stale_default_local_snapshots,
-    default_local_snapshot_base_dir, resolve_default_local_snapshot_spec, resolve_snapshot,
+    LocalSnapshot, NoopSnapshot, RemoteSnapshot, RemoteSnapshotClient, Snapshot, SnapshotSpec,
+    cleanup_stale_default_local_snapshots, default_local_snapshot_base_dir,
+    register_remote_snapshot_client, remote_snapshot_client, resolve_default_local_snapshot_spec,
+    resolve_snapshot,
 };
 pub use state::{SandboxSessionState, manifest_digest};
+pub use testing::{
+    SandboxCall, SandboxCallResult, SandboxMethod, SandboxStep, ScriptedSandboxSession,
+    scripted_sandbox_session,
+};
 pub use types::{ExecResult, FileEntry, Group, Permissions, User, file_mode};
 pub use workspace_paths::{
-    PROVIDER_SCRATCH_PREFIX, SandboxWorkspaceScope, is_provider_scratch_path, provider_scratch_path,
+    PROVIDER_SCRATCH_PREFIX, SandboxPathGrant, SandboxWorkspaceScope, is_provider_scratch_path,
+    provider_scratch_path,
 };

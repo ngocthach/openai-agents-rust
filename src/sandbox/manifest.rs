@@ -4,11 +4,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::sandbox::entries::{Entry, EntryKind};
+use crate::sandbox::environment::{EnvEntry, Environment};
 use crate::sandbox::errors::{ErrorCode, SandboxError, SandboxResult};
+use crate::sandbox::materialization::MaterializationResult;
 use crate::sandbox::mounts::{HostPathGrant, Mount, MountCredentialAuthority};
 use crate::sandbox::session::{ExecRequest, SandboxSession};
 use crate::sandbox::types::{Group, User};
 use crate::sandbox::workspace_paths::resolve_workspace_path;
+use crate::sandbox::workspace_paths::{SandboxPathGrant, to_posix as to_posix_path};
 
 /// Commands the model may run on remote mounts by default. Mirrors
 /// `DEFAULT_REMOTE_MOUNT_COMMAND_ALLOWLIST`.
@@ -27,6 +30,74 @@ pub const MAX_MANIFEST_DESCRIPTION_CHARS: usize = 5000;
 /// Depth of the rendered workspace layout.
 const MANIFEST_DESCRIPTION_DEPTH: usize = 3;
 
+/// The default number of manifest entries materialized at once.
+pub const DEFAULT_MAX_MANIFEST_ENTRY_CONCURRENCY: usize = 4;
+
+/// The default number of files copied at once for one `local_dir` entry.
+pub const DEFAULT_MAX_LOCAL_DIR_FILE_CONCURRENCY: usize = 4;
+
+/// How much materialization work runs at once. Mirrors Python's `SandboxConcurrencyLimits`.
+///
+/// Copying a large directory one file at a time is slow over a hosted backend, where each file
+/// is a round trip; copying all of them at once exhausts file handles and connections. These
+/// bound the middle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SandboxConcurrencyLimits {
+    /// Manifest entries materialized at once; `None` disables the limit.
+    pub manifest_entries: Option<usize>,
+    /// Files copied at once for one `local_dir` entry; `None` disables the limit.
+    pub local_dir_files: Option<usize>,
+}
+
+impl Default for SandboxConcurrencyLimits {
+    fn default() -> Self {
+        SandboxConcurrencyLimits {
+            manifest_entries: Some(DEFAULT_MAX_MANIFEST_ENTRY_CONCURRENCY),
+            local_dir_files: Some(DEFAULT_MAX_LOCAL_DIR_FILE_CONCURRENCY),
+        }
+    }
+}
+
+impl SandboxConcurrencyLimits {
+    /// The SDK defaults.
+    pub fn new() -> Self {
+        SandboxConcurrencyLimits::default()
+    }
+
+    /// Copy at most `files` files at once for one `local_dir` entry.
+    pub fn with_local_dir_files(mut self, files: Option<usize>) -> Self {
+        self.local_dir_files = files;
+        self
+    }
+
+    /// Materialize at most `entries` manifest entries at once.
+    pub fn with_manifest_entries(mut self, entries: Option<usize>) -> Self {
+        self.manifest_entries = entries;
+        self
+    }
+
+    /// Reject a limit that would stop work happening at all.
+    pub fn validate(&self) -> SandboxResult<()> {
+        for (name, value) in [
+            ("manifest_entries", self.manifest_entries),
+            ("local_dir_files", self.local_dir_files),
+        ] {
+            if value == Some(0) {
+                return Err(SandboxError::new(
+                    ErrorCode::SandboxConfigInvalid,
+                    format!("concurrency_limits.{name} must be at least 1"),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// The effective file-copy width, with `None` meaning "no limit".
+    pub fn local_dir_file_width(&self) -> usize {
+        self.local_dir_files.unwrap_or(usize::MAX).max(1)
+    }
+}
+
 /// The files, directories, mounts and accounts a fresh sandbox session starts from.
 #[derive(Debug, Clone)]
 pub struct Manifest {
@@ -34,6 +105,9 @@ pub struct Manifest {
     root: String,
     entries: BTreeMap<String, Entry>,
     environment: BTreeMap<String, String>,
+    resolved_environment: Environment,
+    concurrency_limits: SandboxConcurrencyLimits,
+    extra_path_grants: Vec<SandboxPathGrant>,
     users: Vec<User>,
     groups: Vec<Group>,
     remote_mount_command_allowlist: Vec<String>,
@@ -48,6 +122,9 @@ impl Default for Manifest {
             root: DEFAULT_MANIFEST_ROOT.to_string(),
             entries: BTreeMap::new(),
             environment: BTreeMap::new(),
+            resolved_environment: Environment::new(),
+            concurrency_limits: SandboxConcurrencyLimits::new(),
+            extra_path_grants: Vec::new(),
             users: Vec::new(),
             groups: Vec::new(),
             remote_mount_command_allowlist: DEFAULT_REMOTE_MOUNT_COMMAND_ALLOWLIST
@@ -111,6 +188,60 @@ impl Manifest {
     /// Add or replace a top-level entry.
     pub fn with_entry(mut self, path: impl Into<String>, entry: Entry) -> Self {
         self.entries.insert(path.into(), entry);
+        self
+    }
+
+    /// Variables whose values are fetched when the session starts.
+    pub fn resolved_environment(&self) -> &Environment {
+        &self.resolved_environment
+    }
+
+    /// Export a variable whose value is fetched when the session starts.
+    ///
+    /// Use this for a value that should not be written into the manifest, such as a secret read
+    /// from a credential store. See [`EnvValue`].
+    pub fn with_env_entry(mut self, key: impl Into<String>, entry: EnvEntry) -> Self {
+        self.resolved_environment = self.resolved_environment.with_entry(key, entry);
+        self
+    }
+
+    /// Every environment variable the sandbox exports, with the start-up lookups performed.
+    ///
+    /// A looked-up value wins over a literal of the same name, because the lookup is the more
+    /// specific statement of intent.
+    pub async fn resolve_environment(&self) -> SandboxResult<BTreeMap<String, String>> {
+        let mut environment = self.environment.clone();
+        environment.extend(self.resolved_environment.resolve().await?);
+        Ok(environment)
+    }
+
+    /// How much materialization work this manifest runs at once.
+    pub fn concurrency_limits(&self) -> SandboxConcurrencyLimits {
+        self.concurrency_limits
+    }
+
+    /// Bound how much materialization work runs at once.
+    pub fn with_concurrency_limits(
+        mut self,
+        limits: SandboxConcurrencyLimits,
+    ) -> SandboxResult<Self> {
+        limits.validate()?;
+        self.concurrency_limits = limits;
+        Ok(self)
+    }
+
+    /// The extra absolute paths this manifest grants the sandbox outside its workspace.
+    pub fn extra_path_grants(&self) -> &[SandboxPathGrant] {
+        &self.extra_path_grants
+    }
+
+    /// Grant the sandbox access to an absolute path outside its workspace.
+    ///
+    /// This is trusted application configuration, like the credential-exposure
+    /// acknowledgements: it widens what the sandbox can reach, so it is never taken from
+    /// untrusted manifest input.
+    pub fn with_extra_path_grant(mut self, grant: SandboxPathGrant) -> Self {
+        self.extra_path_grants.push(grant);
         self
     }
 
@@ -220,12 +351,31 @@ impl Manifest {
         mounts
     }
 
-    /// Host paths the SDK may use directly because a mount exposes them.
+    /// Host paths the SDK may use directly.
+    ///
+    /// These come from two places: a mount that exposes a host directory, and an
+    /// [`extra_path_grant`](Self::with_extra_path_grant) the application declared. Both widen
+    /// what the SDK may touch outside the workspace, and both carry their own `read_only` flag,
+    /// so the backends enforce one rule rather than two.
     pub fn host_path_grants(&self) -> Vec<HostPathGrant> {
-        self.mount_targets()
+        let mut grants: Vec<HostPathGrant> = self
+            .mount_targets()
             .into_iter()
             .filter_map(|(mount, _)| mount.strategy.host_path_grant(mount))
-            .collect()
+            .collect();
+        grants.extend(self.extra_path_grants.iter().map(|grant| HostPathGrant {
+            path: std::path::PathBuf::from(grant.host_source()),
+            read_only: grant.read_only,
+        }));
+        grants
+    }
+
+    /// Whether `path` falls under a read-only grant, which refuses writes through it.
+    pub fn path_grant_is_read_only(&self, path: &str) -> bool {
+        let normalized = crate::sandbox::workspace_paths::normalize_segments(&to_posix_path(path));
+        self.extra_path_grants.iter().any(|grant| {
+            grant.read_only && crate::sandbox::workspace_paths::is_within(&grant.path, &normalized)
+        })
     }
 
     /// Absolute workspace paths that snapshots must exclude and resume must re-apply.
@@ -237,6 +387,62 @@ impl Manifest {
             .map(|(dest, _)| dest)
             .collect();
         paths.extend(self.mount_targets().into_iter().map(|(_, path)| path));
+        paths.sort_unstable();
+        paths.dedup();
+        paths
+    }
+
+    /// The workspace-relative paths of the entries marked ephemeral.
+    ///
+    /// Mirrors Python's `ephemeral_entry_paths`. These are the manifest keys, not resolved
+    /// paths, which is the form a caller comparing two manifests works in.
+    pub fn ephemeral_entry_paths(&self) -> Vec<String> {
+        let mut paths: Vec<String> = self
+            .entries
+            .iter()
+            .filter(|(_, entry)| entry.ephemeral)
+            .map(|(path, _)| path.clone())
+            .collect();
+        paths.sort_unstable();
+        paths.dedup();
+        paths
+    }
+
+    /// The mounts declared by ephemeral entries, with the paths they attach at.
+    pub fn ephemeral_mount_targets(&self) -> Vec<(&Mount, String)> {
+        let mut mounts: Vec<(&Mount, String)> = Vec::new();
+        for (dest, entry) in self.iter_entries() {
+            if !entry.ephemeral {
+                continue;
+            }
+            let Some(mount) = entry.as_mount() else {
+                continue;
+            };
+            let Ok(path) = mount.resolve_mount_path(&self.root, &dest) else {
+                continue;
+            };
+            mounts.push((mount, path));
+        }
+        mounts.sort_by_key(|(_, path)| std::cmp::Reverse(path.matches('/').count()));
+        mounts
+    }
+
+    /// The workspace-relative paths a persistence pass has to skip.
+    ///
+    /// Mirrors Python's `ephemeral_persistence_paths`: the ephemeral entries plus wherever their
+    /// mounts actually landed, which can differ from the entry's own path when a mount sets an
+    /// explicit `mount_path`.
+    pub fn ephemeral_persistence_paths(&self) -> Vec<String> {
+        let root = self.root.trim_end_matches('/');
+        let mut paths = self.ephemeral_entry_paths();
+        for (_, path) in self.ephemeral_mount_targets() {
+            if let Some(relative) = path.strip_prefix(root) {
+                let relative = relative.trim_start_matches('/');
+                if !relative.is_empty() {
+                    paths.push(relative.to_string());
+                }
+            }
+        }
         paths.sort_unstable();
         paths.dedup();
         paths
@@ -288,7 +494,10 @@ impl Manifest {
     ///
     /// Accounts are provisioned first (best effort, as in Python: a sandbox without `useradd`
     /// simply keeps running), then the workspace root, then every entry.
-    pub async fn apply(&self, session: &dyn SandboxSession) -> SandboxResult<Vec<String>> {
+    pub async fn apply(
+        &self,
+        session: &dyn SandboxSession,
+    ) -> SandboxResult<MaterializationResult> {
         self.apply_entries(session, false).await
     }
 
@@ -296,7 +505,7 @@ impl Manifest {
     pub async fn apply_ephemeral(
         &self,
         session: &dyn SandboxSession,
-    ) -> SandboxResult<Vec<String>> {
+    ) -> SandboxResult<MaterializationResult> {
         self.apply_entries(session, true).await
     }
 
@@ -304,13 +513,24 @@ impl Manifest {
         &self,
         session: &dyn SandboxSession,
         only_ephemeral: bool,
-    ) -> SandboxResult<Vec<String>> {
+    ) -> SandboxResult<MaterializationResult> {
         let validated = self.validated_entries()?;
+        if !self.resolved_environment.is_empty() && !session.resolves_environment() {
+            return Err(SandboxError::new(
+                ErrorCode::SandboxConfigInvalid,
+                format!(
+                    "the `{}` sandbox backend does not perform start-up environment lookups, so \
+                     the variables declared with `with_env_entry` would be missing inside the \
+                     sandbox",
+                    session.backend_id()
+                ),
+            ));
+        }
         session.mkdir(&self.root, true).await?;
         if !only_ephemeral {
             self.provision_accounts(session).await;
         }
-        let mut written = Vec::new();
+        let mut written = MaterializationResult::new();
         for (_, dest, entry) in validated {
             if only_ephemeral && !entry.ephemeral {
                 continue;
@@ -322,6 +542,11 @@ impl Manifest {
                     session.mkdir(&parent, true).await?;
                 }
             }
+            // The manifest owns the limits, so an entry built before they were set still
+            // honours them.
+            let entry = entry
+                .clone()
+                .with_copy_concurrency(self.concurrency_limits.local_dir_file_width());
             written.extend(entry.apply(session, &dest).await?);
         }
         Ok(written)
@@ -441,6 +666,100 @@ fn parent_path(path: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn copies_a_local_directory_under_its_concurrency_limit() {
+        use crate::sandbox::sandboxes::unix_local::UnixLocalSandboxClient;
+        use crate::sandbox::session::SandboxClient;
+
+        let host = tempfile::tempdir().unwrap();
+        for index in 0..9 {
+            tokio::fs::write(
+                host.path().join(format!("f{index}.txt")),
+                format!("{index}"),
+            )
+            .await
+            .unwrap();
+        }
+
+        let manifest = Manifest::new()
+            .with_entry("data", Entry::local_dir(host.path()))
+            .with_concurrency_limits(SandboxConcurrencyLimits::new().with_local_dir_files(Some(2)))
+            .unwrap();
+        let client = UnixLocalSandboxClient::new();
+        let session = client.create(Some(manifest)).await.unwrap();
+        session.start().await.unwrap();
+
+        // Every file arrives, with the checksum of what was written.
+        let listing = session.ls("data").await.unwrap();
+        assert_eq!(listing.len(), 9, "{listing:?}");
+        client.delete(session).await.unwrap();
+    }
+
+    #[test]
+    fn rejects_a_concurrency_limit_that_stops_work() {
+        assert!(
+            SandboxConcurrencyLimits::new()
+                .with_local_dir_files(Some(0))
+                .validate()
+                .is_err()
+        );
+        assert!(
+            SandboxConcurrencyLimits::new()
+                .with_manifest_entries(Some(0))
+                .validate()
+                .is_err()
+        );
+        // `None` disables the limit rather than meaning zero.
+        assert!(
+            SandboxConcurrencyLimits::new()
+                .with_local_dir_files(None)
+                .validate()
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn separates_ephemeral_entries_from_their_mount_targets() {
+        use crate::sandbox::mounts::BindMountStrategy;
+
+        let manifest = Manifest::new()
+            .with_root("/workspace")
+            .with_entry("cache", Entry::dir().with_ephemeral(true))
+            .with_entry("keep", Entry::dir())
+            .with_entry(
+                "bucket",
+                Entry::mount(BindMountStrategy::mount("/host/data").with_mount_path("mnt/data")),
+            );
+
+        assert_eq!(manifest.ephemeral_entry_paths(), vec!["bucket", "cache"]);
+        // The mount landed somewhere other than its entry path, so persistence has to skip both.
+        let persistence = manifest.ephemeral_persistence_paths();
+        assert!(
+            persistence.contains(&"cache".to_string()),
+            "{persistence:?}"
+        );
+        assert!(
+            persistence.contains(&"mnt/data".to_string()),
+            "{persistence:?}"
+        );
+        assert!(
+            !persistence.contains(&"keep".to_string()),
+            "{persistence:?}"
+        );
+        assert_eq!(manifest.ephemeral_mount_targets().len(), 1);
+    }
+
+    #[test]
+    fn records_extra_path_grants() {
+        let manifest = Manifest::new().with_extra_path_grant(
+            SandboxPathGrant::new("/srv/corpus")
+                .unwrap()
+                .read_only(true),
+        );
+        assert_eq!(manifest.extra_path_grants().len(), 1);
+        assert!(manifest.extra_path_grants()[0].read_only);
+    }
 
     #[test]
     fn renders_the_workspace_layout() {

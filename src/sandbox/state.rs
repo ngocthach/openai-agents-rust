@@ -31,7 +31,13 @@ use sha2::{Digest, Sha256};
 use crate::sandbox::entries::EntryKind;
 use crate::sandbox::errors::{ErrorCode, SandboxError, SandboxResult};
 use crate::sandbox::manifest::Manifest;
+use crate::sandbox::mounts::MountCredentialAuthority;
 use crate::sandbox::snapshot::SnapshotSpec;
+
+/// The serde default for fields that older states did not carry.
+fn default_true() -> bool {
+    true
+}
 
 /// Prefix of the temporary workspace directories the SDK creates and may delete.
 pub const OWNED_WORKSPACE_PREFIX: &str = "openai-agents-sandbox-";
@@ -73,6 +79,34 @@ pub struct SandboxSessionState {
     /// memory artifact instead of two.
     #[serde(default)]
     pub rollout_id: Option<String>,
+    /// Whether the workspace was fully materialized before the session was suspended.
+    ///
+    /// A run that was interrupted while the manifest was still being applied leaves a workspace
+    /// that looks populated but is not, so a resume re-applies the manifest instead of trusting
+    /// what is there.
+    ///
+    /// A state written before this field existed defaults to `true`, which keeps the behaviour
+    /// those states were written under: defaulting to `false` would make a resume re-apply the
+    /// manifest over the edits the first half of the run had already made.
+    #[serde(default = "default_true")]
+    pub workspace_root_ready: bool,
+    /// Whether the host path grants have to be re-supplied by the caller on resume.
+    ///
+    /// Grants widen what the SDK may touch outside the workspace, so they are never carried in
+    /// persisted state. Mirrors Python's `path_grants_require_rebind`.
+    #[serde(default)]
+    pub path_grants_require_rebind: bool,
+    /// Whether mount credential authority was stripped when this state was written.
+    ///
+    /// Mirrors Python's `mount_authority_redacted`: it records that the live manifest held
+    /// credential-bearing mounts, without recording the credentials.
+    #[serde(default)]
+    pub mount_authority_redacted: bool,
+    /// Whether the caller has re-supplied that authority on the trusted manifest.
+    ///
+    /// Mirrors Python's `mount_authority_rebound`.
+    #[serde(default)]
+    pub mount_authority_rebound: bool,
 }
 
 impl SandboxSessionState {
@@ -96,7 +130,28 @@ impl SandboxSessionState {
             manifest_digest: manifest_digest(manifest),
             exposed_ports: Vec::new(),
             rollout_id: None,
+            workspace_root_ready: false,
+            // The live manifest is the only place a grant or a credential may live, so a
+            // resumed state always needs the caller to supply them again.
+            path_grants_require_rebind: !manifest.host_path_grants().is_empty()
+                || !manifest.extra_path_grants().is_empty(),
+            mount_authority_redacted: manifest.mount_targets().iter().any(|(mount, _)| {
+                mount.strategy.credential_authority() != MountCredentialAuthority::None
+            }),
+            mount_authority_rebound: false,
         }
+    }
+
+    /// Record that the workspace was fully materialized.
+    pub fn with_workspace_root_ready(mut self, ready: bool) -> Self {
+        self.workspace_root_ready = ready;
+        self
+    }
+
+    /// Record that the caller has re-supplied the mount authority on the trusted manifest.
+    pub fn with_mount_authority_rebound(mut self, rebound: bool) -> Self {
+        self.mount_authority_rebound = rebound;
+        self
     }
 
     /// Mark the workspace root as created by the SDK.

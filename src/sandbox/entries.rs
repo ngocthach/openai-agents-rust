@@ -5,6 +5,8 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use crate::sandbox::errors::{ErrorCode, SandboxError, SandboxResult};
+use crate::sandbox::manifest::DEFAULT_MAX_LOCAL_DIR_FILE_CONCURRENCY;
+use crate::sandbox::materialization::{MaterializationResult, MaterializedFile};
 use crate::sandbox::mounts::Mount;
 use crate::sandbox::session::{ExecRequest, SandboxSession, shell_quote};
 use crate::sandbox::types::{Group, Permissions, User, file_mode};
@@ -74,6 +76,8 @@ pub struct Entry {
     /// Whether the entry is runtime-attached state that snapshots must exclude and resume must
     /// re-apply. Mounts are always ephemeral.
     pub ephemeral: bool,
+    /// How many files a `local_dir` entry copies at once.
+    pub copy_concurrency: usize,
 }
 
 impl Entry {
@@ -96,6 +100,7 @@ impl Entry {
             },
             group: None,
             ephemeral,
+            copy_concurrency: DEFAULT_MAX_LOCAL_DIR_FILE_CONCURRENCY,
         }
     }
 
@@ -105,6 +110,14 @@ impl Entry {
     }
 
     /// Mark the entry as runtime-attached state excluded from snapshots.
+    /// Copy at most `concurrency` files at once when materializing a `local_dir` entry.
+    ///
+    /// Mirrors `SandboxConcurrencyLimits::local_dir_files`.
+    pub fn with_copy_concurrency(mut self, concurrency: usize) -> Self {
+        self.copy_concurrency = concurrency.max(1);
+        self
+    }
+
     pub fn with_ephemeral(mut self, ephemeral: bool) -> Self {
         self.ephemeral = ephemeral;
         self
@@ -226,12 +239,13 @@ impl Entry {
 
     /// Materialize this entry at the absolute sandbox path `dest`.
     ///
-    /// Returns the absolute sandbox paths of the files that were written.
+    /// Returns every file that was written, with the SHA-256 of its contents, so a caller can
+    /// tell whether the workspace holds the inputs it expected.
     pub async fn apply(
         &self,
         session: &dyn SandboxSession,
         dest: &str,
-    ) -> SandboxResult<Vec<String>> {
+    ) -> SandboxResult<MaterializationResult> {
         Box::pin(self.apply_inner(session, dest.to_string())).await
     }
 
@@ -239,12 +253,12 @@ impl Entry {
         &self,
         session: &dyn SandboxSession,
         dest: String,
-    ) -> SandboxResult<Vec<String>> {
-        let mut written = Vec::new();
+    ) -> SandboxResult<MaterializationResult> {
+        let mut written = MaterializationResult::new();
         match &self.kind {
             EntryKind::File { content } => {
                 session.write_file(&dest, content).await?;
-                written.push(dest.clone());
+                written.push(MaterializedFile::new(dest.clone(), content));
             }
             EntryKind::Dir { children } => {
                 session.mkdir(&dest, true).await?;
@@ -256,12 +270,13 @@ impl Entry {
             EntryKind::LocalFile { src } => {
                 let content = read_host_file(src).await?;
                 session.write_file(&dest, &content).await?;
-                written.push(dest.clone());
+                written.push(MaterializedFile::new(dest.clone(), &content));
             }
             EntryKind::LocalDir { src } => {
                 session.mkdir(&dest, true).await?;
                 if let Some(src) = src {
-                    written.extend(copy_host_dir(session, src, &dest).await?);
+                    written
+                        .extend(copy_host_dir(session, src, &dest, self.copy_concurrency).await?);
                 }
             }
             EntryKind::Mount { mount } => {
@@ -284,8 +299,10 @@ impl Entry {
                 git_ref,
                 subpath,
             } => {
+                // A clone writes a whole tree, not one file, and the caller already identifies
+                // its contents by the ref they asked for, so nothing is recorded here rather
+                // than a file record with an empty checksum.
                 clone_git_repo(session, host, repo, git_ref, subpath.as_deref(), &dest).await?;
-                written.push(dest.clone());
             }
         }
         self.apply_metadata(session, &dest).await?;
@@ -339,8 +356,12 @@ async fn copy_host_dir(
     session: &dyn SandboxSession,
     src: &Path,
     dest: &str,
-) -> SandboxResult<Vec<String>> {
-    let mut written = Vec::new();
+    concurrency: usize,
+) -> SandboxResult<MaterializationResult> {
+    let mut written = MaterializationResult::new();
+    // Files are copied in bounded batches: one at a time is slow against a hosted backend where
+    // each write is a round trip, and all at once exhausts its connections.
+    let mut batch: Vec<(PathBuf, String)> = Vec::new();
     let mut pending = vec![(src.to_path_buf(), dest.to_string())];
     while let Some((host_dir, sandbox_dir)) = pending.pop() {
         let mut read_dir = tokio::fs::read_dir(&host_dir).await.map_err(|e| {
@@ -375,14 +396,33 @@ async fn copy_host_dir(
                 session.mkdir(&target, true).await?;
                 pending.push((entry.path(), target));
             } else if file_type.is_file() {
-                let content = read_host_file(&entry.path()).await?;
-                session.write_file(&target, &content).await?;
-                written.push(target);
+                batch.push((entry.path(), target));
+                if batch.len() >= concurrency.max(1) {
+                    written.extend(copy_batch(session, std::mem::take(&mut batch)).await?);
+                }
             }
             // Symlinks are skipped: following them would copy host state from outside `src`.
         }
     }
+    written.extend(copy_batch(session, batch).await?);
     Ok(written)
+}
+
+/// Copy one batch of files concurrently, preserving the order they were discovered in.
+async fn copy_batch(
+    session: &dyn SandboxSession,
+    batch: Vec<(PathBuf, String)>,
+) -> SandboxResult<MaterializationResult> {
+    if batch.is_empty() {
+        return Ok(MaterializationResult::new());
+    }
+    let copies = batch.into_iter().map(|(host_path, target)| async move {
+        let content = read_host_file(&host_path).await?;
+        session.write_file(&target, &content).await?;
+        Ok::<_, SandboxError>(MaterializedFile::new(target, &content))
+    });
+    let files = futures::future::try_join_all(copies).await?;
+    Ok(MaterializationResult::from_iter(files))
 }
 
 /// Clone a git repository inside the sandbox with the `git` CLI.
@@ -408,15 +448,49 @@ async fn clone_git_repo(
         None => dest.to_string(),
         Some(_) => format!("{}.gitclone", dest.trim_end_matches('/')),
     };
-    let script = format!(
-        "set -e\nrm -rf {target}\nmkdir -p {target}\ncd {target}\ngit init -q .\n\
-         git remote add origin {url}\ngit fetch --depth 1 origin {git_ref}\n\
-         git checkout -q FETCH_HEAD",
-        target = shell_quote(&clone_target),
-        url = shell_quote(&url),
-        git_ref = shell_quote(git_ref),
-    );
-    let result = session.exec(ExecRequest::shell(script)).await?;
+
+    // A commit sha and a branch name need different commands: `clone --branch` does not accept a
+    // sha, and fetching a sha fails on a server that does not allow it. Mirrors Python's
+    // `_looks_like_commit_ref` fallback, which tries the fetch first for a sha and falls back to
+    // a named clone, so a tag that happens to be all hex still resolves.
+    let mut result = if looks_like_commit_ref(git_ref) {
+        let fetched = session
+            .exec(ExecRequest::shell(fetch_commit_script(
+                &clone_target,
+                &url,
+                git_ref,
+            )))
+            .await?;
+        if fetched.ok() {
+            fetched
+        } else {
+            session
+                .exec(ExecRequest::shell(clone_named_ref_script(
+                    &clone_target,
+                    &url,
+                    git_ref,
+                )))
+                .await?
+        }
+    } else {
+        session
+            .exec(ExecRequest::shell(clone_named_ref_script(
+                &clone_target,
+                &url,
+                git_ref,
+            )))
+            .await?
+    };
+    if !result.ok() && !looks_like_commit_ref(git_ref) {
+        // A named ref that is not a branch or tag may still be reachable by sha.
+        result = session
+            .exec(ExecRequest::shell(fetch_commit_script(
+                &clone_target,
+                &url,
+                git_ref,
+            )))
+            .await?;
+    }
     if !result.ok() {
         return Err(SandboxError::new(
             ErrorCode::GitCloneError,
@@ -424,7 +498,9 @@ async fn clone_git_repo(
                 "Failed to clone `{url}` at `{git_ref}`: {}",
                 result.stderr_text().trim()
             ),
-        ));
+        )
+        .with_op(crate::sandbox::errors::SandboxOp::Materialize)
+        .with_context("repo", repo.to_string()));
     }
     if let Some(subpath) = subpath {
         let source = join_sandbox_path(&clone_target, subpath)?;
@@ -436,16 +512,57 @@ async fn clone_git_repo(
         );
         let result = session.exec(ExecRequest::shell(script)).await?;
         if !result.ok() {
+            // Tell "the subpath is not in this tree" apart from "the copy failed": the first is
+            // the caller's manifest to fix, the second is the sandbox's filesystem.
+            let present = session
+                .exec(ExecRequest::shell(format!(
+                    "test -d {}",
+                    shell_quote(&source)
+                )))
+                .await?;
+            let code = if present.ok() {
+                ErrorCode::GitCopyError
+            } else {
+                ErrorCode::GitSubpathError
+            };
             return Err(SandboxError::new(
-                ErrorCode::GitSubpathError,
+                code,
                 format!(
-                    "Subpath `{subpath}` is not present in `{url}` at `{git_ref}`: {}",
+                    "Subpath `{subpath}` could not be materialized from `{url}` at `{git_ref}`: {}",
                     result.stderr_text().trim()
                 ),
-            ));
+            )
+            .with_op(crate::sandbox::errors::SandboxOp::Materialize));
         }
     }
     Ok(())
+}
+
+/// Whether `git_ref` looks like a commit sha. Mirrors Python's `_COMMIT_REF_RE`.
+fn looks_like_commit_ref(git_ref: &str) -> bool {
+    (7..=40).contains(&git_ref.len()) && git_ref.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// The script that fetches one commit into a fresh repository.
+fn fetch_commit_script(target: &str, url: &str, git_ref: &str) -> String {
+    format!(
+        "set -e\nrm -rf {target}\nmkdir -p {target}\ncd {target}\ngit init -q .\n\
+         git remote add origin {url}\ngit fetch --depth 1 --no-tags origin {git_ref}\n\
+         git checkout -q --detach FETCH_HEAD",
+        target = shell_quote(target),
+        url = shell_quote(url),
+        git_ref = shell_quote(git_ref),
+    )
+}
+
+/// The script that clones one branch or tag.
+fn clone_named_ref_script(target: &str, url: &str, git_ref: &str) -> String {
+    format!(
+        "set -e\nrm -rf {target}\ngit clone --depth 1 --no-tags --branch {git_ref} {url} {target}",
+        target = shell_quote(target),
+        url = shell_quote(url),
+        git_ref = shell_quote(git_ref),
+    )
 }
 
 /// Manifest users and groups provisioned before entries are materialized.
@@ -460,6 +577,26 @@ pub struct Accounts {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tells_a_commit_sha_from_a_branch_name() {
+        assert!(looks_like_commit_ref("0123abc"));
+        assert!(looks_like_commit_ref(&"a".repeat(40)));
+        // Too short, too long, or not hex: treated as a named ref.
+        assert!(!looks_like_commit_ref("abc"));
+        assert!(!looks_like_commit_ref(&"a".repeat(41)));
+        assert!(!looks_like_commit_ref("main"));
+        assert!(!looks_like_commit_ref("release/1.0"));
+    }
+
+    #[test]
+    fn builds_both_git_acquisition_scripts() {
+        let named = clone_named_ref_script("/tmp/t", "https://h/r.git", "main");
+        assert!(named.contains("git clone --depth 1 --no-tags --branch main"));
+        let fetched = fetch_commit_script("/tmp/t", "https://h/r.git", "deadbeef");
+        assert!(fetched.contains("git fetch --depth 1 --no-tags origin deadbeef"));
+        assert!(fetched.contains("checkout -q --detach FETCH_HEAD"));
+    }
 
     #[test]
     fn marks_mounts_ephemeral() {

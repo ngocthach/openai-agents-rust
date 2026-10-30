@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
 use openai_agents_sdk::AgentModel;
+use openai_agents_sdk::extensions::sandbox::cloudflare::CloudflareBucketMountConfig;
 use openai_agents_sdk::items::{OutputItem, RunItemKind};
 use openai_agents_sdk::sandbox::capabilities::{
     Capability, CapabilityBinding, Compaction, Filesystem, LocalDirLazySkillSource, Memory, Shell,
@@ -14,6 +15,10 @@ use openai_agents_sdk::sandbox::capabilities::{
 };
 use openai_agents_sdk::sandbox::entries::Entry;
 use openai_agents_sdk::sandbox::memory::{MemoryGenerateConfig, MemoryReadConfig};
+use openai_agents_sdk::sandbox::mount_entries::{
+    AzureBlobMount, BoxMount, ConfiguredMountStrategy, GcsMount, R2Mount, S3Mount,
+};
+use openai_agents_sdk::sandbox::mounts::Mount;
 use openai_agents_sdk::sandbox::mounts::{
     BindMountStrategy, MountCredentialAuthority, MountPattern, MountPatternConfig, MountStrategy,
 };
@@ -286,7 +291,11 @@ async fn runs_a_sandbox_agent_end_to_end() {
                 Entry::dir()
                     .with_description("staged repository")
                     .with_child("task.md", Entry::text_file("alpha\nbeta\n"))
-                    .with_child("logo.png", Entry::file(vec![0x89, 0x50, 0x4e, 0x47])),
+                    .with_child(
+                        "logo.png",
+                        // The real PNG signature: `view_image` identifies an image by its bytes.
+                        Entry::file(vec![0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+                    ),
             ),
         );
 
@@ -320,7 +329,7 @@ async fn runs_a_sandbox_agent_end_to_end() {
     assert!(
         outputs[2]
             .to_string()
-            .contains("data:image/png;base64,iVBORw==")
+            .contains("data:image/png;base64,iVBORw0KGgo=")
     );
 
     // The sandbox prompt, the agent instructions and the workspace layout all reach the model.
@@ -846,7 +855,7 @@ async fn sandbox_handoff_targets_get_their_own_capability_tools() {
 
     model.add_turn(vec![item(json!({
         "type": "function_call", "call_id": "c_handoff",
-        "name": "transfer_to_Reviewer", "arguments": "{}"
+        "name": "transfer_to_reviewer", "arguments": "{}"
     }))]);
     model.add_turn(vec![shell_call("c_shell", &["cat f.txt"])]);
     model.add_turn(vec![assistant_message("reviewed")]);
@@ -1621,7 +1630,7 @@ async fn resumes_a_run_that_paused_inside_a_handoff_destination() {
 
     model.add_turn(vec![item(json!({
         "type": "function_call", "call_id": "c_handoff",
-        "name": "transfer_to_Reviewer", "arguments": "{}"
+        "name": "transfer_to_reviewer", "arguments": "{}"
     }))]);
     model.add_turn(vec![shell_call("c_review", &["cat f.txt"])]);
 
@@ -1692,9 +1701,9 @@ async fn supports_cyclic_sandbox_handoff_graphs() {
 
     // Engineer -> Reviewer -> Engineer -> Reviewer, then do some work.
     for (call, tool) in [
-        ("c1", "transfer_to_Reviewer"),
-        ("c2", "transfer_to_Engineer"),
-        ("c3", "transfer_to_Reviewer"),
+        ("c1", "transfer_to_reviewer"),
+        ("c2", "transfer_to_engineer"),
+        ("c3", "transfer_to_reviewer"),
     ] {
         model.add_turn(vec![item(json!({
             "type": "function_call", "call_id": call, "name": tool, "arguments": "{}"
@@ -1822,4 +1831,911 @@ async fn a_streamed_run_that_fails_still_releases_the_sandbox() {
         "an abandoned-after-error stream must still tear the workspace down"
     );
     assert!(run.sandbox_state().is_none());
+}
+
+// ---------------------------------------------------------------------------------------------
+// Remote storage mounts
+// ---------------------------------------------------------------------------------------------
+
+/// A session that records what a mount pattern does instead of running it.
+///
+/// Mount tools cannot be installed in a test, so the probe for one succeeds, every other command
+/// is recorded and reports success, and the workspace is an in-memory map. That is enough to
+/// assert the two things that matter for a credential-bearing mount: what reaches the argument
+/// vector, and what reaches the filesystem.
+#[derive(Debug)]
+struct RecordingSession {
+    manifest: Manifest,
+    commands: std::sync::Mutex<Vec<Vec<String>>>,
+    files: std::sync::Mutex<std::collections::BTreeMap<String, Vec<u8>>>,
+    directories: std::sync::Mutex<Vec<String>>,
+}
+
+impl RecordingSession {
+    fn new() -> Self {
+        RecordingSession {
+            manifest: Manifest::new()
+                .with_root("/workspace")
+                .with_in_container_mount_broad_credential_exposure_acknowledged([
+                    "/workspace/bucket",
+                    "/workspace/blob",
+                    "/workspace/box",
+                ]),
+            commands: std::sync::Mutex::new(Vec::new()),
+            files: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+            directories: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn commands(&self) -> Vec<Vec<String>> {
+        self.commands.lock().unwrap().clone()
+    }
+
+    /// The first recorded command containing `needle` in any argument.
+    fn command_with(&self, needle: &str) -> Vec<String> {
+        self.commands()
+            .into_iter()
+            .find(|argv| argv.iter().any(|arg| arg.contains(needle)))
+            .unwrap_or_else(|| panic!("no recorded command contains `{needle}`"))
+    }
+
+    fn file(&self, path: &str) -> Option<String> {
+        self.files
+            .lock()
+            .unwrap()
+            .get(path)
+            .map(|raw| String::from_utf8_lossy(raw).into_owned())
+    }
+
+    fn file_paths(&self) -> Vec<String> {
+        self.files.lock().unwrap().keys().cloned().collect()
+    }
+}
+
+#[async_trait]
+impl SandboxSession for RecordingSession {
+    fn id(&self) -> &str {
+        "sess"
+    }
+
+    fn manifest(&self) -> &Manifest {
+        &self.manifest
+    }
+
+    fn backend_id(&self) -> &str {
+        "recording"
+    }
+
+    async fn start(&self) -> Result<(), openai_agents_sdk::sandbox::SandboxError> {
+        Ok(())
+    }
+
+    async fn stop(&self) -> Result<(), openai_agents_sdk::sandbox::SandboxError> {
+        Ok(())
+    }
+
+    async fn shutdown(&self) -> Result<(), openai_agents_sdk::sandbox::SandboxError> {
+        Ok(())
+    }
+
+    async fn running(&self) -> Result<bool, openai_agents_sdk::sandbox::SandboxError> {
+        Ok(true)
+    }
+
+    async fn exec(
+        &self,
+        request: ExecRequest,
+    ) -> Result<
+        openai_agents_sdk::sandbox::types::ExecResult,
+        openai_agents_sdk::sandbox::SandboxError,
+    > {
+        let argv = request.resolved_argv();
+        self.commands.lock().unwrap().push(argv.clone());
+        Ok(openai_agents_sdk::sandbox::types::ExecResult {
+            exit_code: 0,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        })
+    }
+
+    async fn read_file(
+        &self,
+        path: &str,
+    ) -> Result<Vec<u8>, openai_agents_sdk::sandbox::SandboxError> {
+        self.files
+            .lock()
+            .unwrap()
+            .get(path)
+            .cloned()
+            .ok_or_else(|| {
+                openai_agents_sdk::sandbox::SandboxError::new(
+                    ErrorCode::WorkspaceReadNotFound,
+                    format!("no file at `{path}`"),
+                )
+            })
+    }
+
+    async fn write_file(
+        &self,
+        path: &str,
+        contents: &[u8],
+    ) -> Result<(), openai_agents_sdk::sandbox::SandboxError> {
+        self.files
+            .lock()
+            .unwrap()
+            .insert(path.to_string(), contents.to_vec());
+        Ok(())
+    }
+
+    async fn mkdir(
+        &self,
+        path: &str,
+        _parents: bool,
+    ) -> Result<(), openai_agents_sdk::sandbox::SandboxError> {
+        self.directories.lock().unwrap().push(path.to_string());
+        Ok(())
+    }
+
+    async fn rm(
+        &self,
+        path: &str,
+        _recursive: bool,
+    ) -> Result<(), openai_agents_sdk::sandbox::SandboxError> {
+        self.files.lock().unwrap().remove(path);
+        Ok(())
+    }
+
+    async fn hydrate_workspace(
+        &self,
+        _archive: &[u8],
+    ) -> Result<(), openai_agents_sdk::sandbox::SandboxError> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn an_s3_mount_keeps_its_credentials_out_of_the_mount_command() {
+    let session = RecordingSession::new();
+    let strategy = ConfiguredMountStrategy::mountpoint(
+        S3Mount::new("my-bucket")
+            .with_credentials("AKIAEXAMPLE", "SUPERSECRET")
+            .with_session_token("TOKENSECRET")
+            .with_region("us-east-1"),
+    );
+    let mount = Mount::new(Arc::new(strategy.clone()));
+
+    strategy
+        .activate(&mount, &session, "/workspace/bucket")
+        .await
+        .unwrap();
+
+    let mount_command = session.command_with("exec mount-s3");
+    let joined = mount_command.join(" ");
+    assert!(!joined.contains("SUPERSECRET"), "{joined}");
+    assert!(!joined.contains("TOKENSECRET"), "{joined}");
+    assert!(!joined.contains("AKIAEXAMPLE"), "{joined}");
+    assert!(joined.contains("--read-only"), "{joined}");
+    assert!(joined.contains("--region us-east-1"), "{joined}");
+    assert!(joined.contains("my-bucket"), "{joined}");
+
+    // The credentials are sourced from an owner-only file instead.
+    let env_path = session
+        .file_paths()
+        .into_iter()
+        .find(|path| path.ends_with(".env"))
+        .expect("an environment file was staged");
+    assert!(
+        env_path.starts_with("/workspace/.sandbox-mountpoint-env/"),
+        "{env_path}"
+    );
+    let env = session.file(&env_path).unwrap();
+    assert!(
+        env.contains("export AWS_ACCESS_KEY_ID=AKIAEXAMPLE"),
+        "{env}"
+    );
+    assert!(
+        env.contains("export AWS_SECRET_ACCESS_KEY=SUPERSECRET"),
+        "{env}"
+    );
+    assert!(
+        env.contains("export AWS_SESSION_TOKEN=TOKENSECRET"),
+        "{env}"
+    );
+    assert!(joined.contains(&env_path), "{joined}");
+
+    let chmod = session.command_with("0600");
+    assert_eq!(chmod, vec!["chmod", "0600", "--", env_path.as_str()]);
+
+    // Teardown unmounts and removes the staged credential.
+    strategy
+        .deactivate(&mount, &session, "/workspace/bucket")
+        .await
+        .unwrap();
+    assert!(session.file(&env_path).is_none());
+}
+
+#[tokio::test]
+async fn an_azure_mount_stages_an_owner_only_blobfuse_configuration() {
+    let session = RecordingSession::new();
+    let strategy = ConfiguredMountStrategy::blobfuse(
+        AzureBlobMount::new("acct", "data").with_account_key("SUPERSECRET"),
+    );
+    let mount = Mount::new(Arc::new(strategy.clone())).with_read_only(false);
+
+    strategy
+        .activate(&mount, &session, "/workspace/blob")
+        .await
+        .unwrap();
+
+    let command = session.command_with("--config-file");
+    assert!(!command.join(" ").contains("SUPERSECRET"));
+    assert!(!command.iter().any(|arg| arg == "--read-only"));
+
+    let config_path = session
+        .file_paths()
+        .into_iter()
+        .find(|path| path.ends_with(".yaml"))
+        .expect("a blobfuse configuration was staged");
+    assert!(config_path.starts_with("/workspace/.sandbox-blobfuse-config/"));
+    assert!(config_path.ends_with("/acct_data.yaml"), "{config_path}");
+    let yaml = session.file(&config_path).unwrap();
+    assert!(yaml.contains("  auth-type: key"));
+    assert!(yaml.contains("  account-key: SUPERSECRET"));
+    assert!(yaml.contains("  path: /workspace/.sandbox-blobfuse-cache/"));
+    assert_eq!(
+        session.command_with("0600"),
+        vec!["chmod", "0600", "--", config_path.as_str()]
+    );
+}
+
+#[tokio::test]
+async fn an_rclone_backed_box_mount_writes_one_remote_section() {
+    let session = RecordingSession::new();
+    let strategy = ConfiguredMountStrategy::rclone(
+        BoxMount::new()
+            .with_path("/Team/Docs")
+            .with_token("TOKENSECRET"),
+    );
+    let mount = Mount::new(Arc::new(strategy.clone()));
+
+    strategy
+        .activate(&mount, &session, "/workspace/box")
+        .await
+        .unwrap();
+
+    let config_path = session
+        .file_paths()
+        .into_iter()
+        .find(|path| path.ends_with(".conf"))
+        .expect("an rclone configuration was staged");
+    assert!(config_path.starts_with("/workspace/.sandbox-rclone-config/"));
+    let text = session.file(&config_path).unwrap();
+    assert!(
+        text.starts_with("[sandbox_box_sess]\ntype = box\n"),
+        "{text}"
+    );
+    assert!(text.contains("token = TOKENSECRET"));
+
+    let mount_command = session.command_with("rclone mount");
+    assert!(!mount_command.join(" ").contains("TOKENSECRET"));
+    assert!(
+        mount_command
+            .join(" ")
+            .contains("sandbox_box_sess:Team/Docs")
+    );
+}
+
+#[test]
+fn the_credential_authority_of_a_mount_follows_the_tool_attaching_it() {
+    let public = ConfiguredMountStrategy::rclone(S3Mount::new("open-data"));
+    assert_eq!(
+        public.credential_authority(),
+        MountCredentialAuthority::None
+    );
+
+    let keyed = ConfiguredMountStrategy::rclone(S3Mount::new("b").with_credentials("A", "B"));
+    assert_eq!(
+        keyed.credential_authority(),
+        MountCredentialAuthority::MountScoped
+    );
+
+    // `blobfuse2` discovers the ambient managed identity whether or not the mount names one, so
+    // it always needs a broad acknowledgement.
+    for azure in [
+        AzureBlobMount::new("acct", "data").with_identity_client_id("CID"),
+        AzureBlobMount::new("acct", "data"),
+    ] {
+        assert_eq!(
+            ConfiguredMountStrategy::blobfuse(azure).credential_authority(),
+            MountCredentialAuthority::Broad
+        );
+    }
+
+    // A Docker volume hands the credential to the runtime on the host, not into the sandbox.
+    let volume = ConfiguredMountStrategy::docker_volume(
+        S3Mount::new("b").with_credentials("A", "B"),
+        "rclone",
+    );
+    assert_eq!(
+        volume.credential_authority(),
+        MountCredentialAuthority::None
+    );
+}
+
+#[test]
+fn workspace_archives_exclude_every_mount_scratch_directory() {
+    let manifest = Manifest::new().with_root("/workspace");
+    let excludes =
+        openai_agents_sdk::sandbox::session::workspace_archive_excludes(&manifest, "/workspace");
+    for directory in [
+        "./.sandbox-rclone-config",
+        "./.sandbox-blobfuse-config",
+        "./.sandbox-blobfuse-cache",
+        "./.sandbox-mountpoint-env",
+    ] {
+        assert!(
+            excludes.iter().any(|exclude| exclude == directory),
+            "{directory} is archived: {excludes:?}"
+        );
+    }
+}
+
+#[test]
+fn a_cloudflare_bucket_mount_is_built_from_a_configured_mount() {
+    let config = CloudflareBucketMountConfig::from_configured_mount(
+        &R2Mount::new("bucket", "acct").with_credentials("ID", "SECRET"),
+    )
+    .unwrap();
+    assert_eq!(config.bucket_name, "bucket");
+    assert_eq!(
+        config.bucket_endpoint_url,
+        "https://acct.r2.cloudflarestorage.com"
+    );
+
+    // Cloudflare's worker cannot use a native Google Cloud Storage credential.
+    let error = CloudflareBucketMountConfig::from_configured_mount(
+        &GcsMount::new("bucket").with_service_account_credentials("{}"),
+    )
+    .unwrap_err();
+    assert_eq!(error.code, ErrorCode::MountConfigInvalid);
+}
+
+#[tokio::test]
+async fn a_configured_mount_cannot_activate_at_an_unacknowledged_path() {
+    let mount = ConfiguredMountStrategy::rclone(
+        S3Mount::new("my-bucket").with_credentials("AKIAEXAMPLE", "SUPERSECRET"),
+    )
+    .mount();
+
+    let client = UnixLocalSandboxClient::new();
+    let refused = client
+        .create(Some(
+            Manifest::new().with_entry("bucket", Entry::mount(mount.clone())),
+        ))
+        .await
+        .unwrap();
+    let error = refused.start().await.unwrap_err();
+    assert_eq!(error.code, ErrorCode::MountConfigInvalid);
+    assert!(!format!("{error:?}").contains("SUPERSECRET"));
+    refused.shutdown().await.unwrap();
+
+    // With the acknowledgement the mount gets as far as looking for `rclone`, which this machine
+    // does not have inside the workspace: the gate runs before the tool probe, not after it.
+    let probe = client.create(None).await.unwrap();
+    let root = probe.workspace_root().to_string();
+    client.delete(probe).await.unwrap();
+    let acknowledged = client
+        .create(Some(
+            Manifest::new()
+                .with_root(root.clone())
+                .with_entry("bucket", Entry::mount(mount))
+                .with_in_container_mount_credential_exposure_acknowledged([format!(
+                    "{root}/bucket"
+                )]),
+        ))
+        .await
+        .unwrap();
+    let error = acknowledged.start().await.unwrap_err();
+    assert_eq!(error.code, ErrorCode::MountMissingTool);
+    acknowledged.shutdown().await.unwrap();
+}
+
+#[test]
+fn a_rejected_driver_option_is_reported_as_itself() {
+    let mount = ConfiguredMountStrategy::docker_volume(
+        S3Mount::new("bucket").with_prefix("data\nendpoint = evil"),
+        "rclone",
+    )
+    .mount();
+    let error = mount.validate().unwrap_err();
+    assert_eq!(error.code, ErrorCode::MountConfigInvalid);
+    assert!(error.message.contains("line break"), "{}", error.message);
+}
+
+#[test]
+fn a_box_mount_needs_a_non_interactive_authentication_source() {
+    let interactive = ConfiguredMountStrategy::rclone(BoxMount::new().with_path("/Team")).mount();
+    let error = interactive.validate().unwrap_err();
+    assert_eq!(error.code, ErrorCode::MountConfigInvalid);
+
+    ConfiguredMountStrategy::rclone(BoxMount::new().with_token("{\"access_token\": \"x\"}"))
+        .mount()
+        .validate()
+        .unwrap();
+}
+
+#[test]
+fn a_half_supplied_credential_pair_is_rejected() {
+    let mount = ConfiguredMountStrategy::rclone(S3Mount {
+        bucket: "b".to_string(),
+        secret_access_key: Some("SECRET".to_string()),
+        s3_provider: "AWS".to_string(),
+        ..Default::default()
+    })
+    .mount();
+    assert_eq!(
+        mount.validate().unwrap_err().code,
+        ErrorCode::MountConfigInvalid
+    );
+}
+
+#[test]
+fn a_pretty_printed_service_account_key_is_accepted() {
+    let key = "{\n  \"type\": \"service_account\",\n  \"project_id\": \"p\"\n}";
+    let strategy = ConfiguredMountStrategy::rclone(
+        GcsMount::new("bucket").with_service_account_credentials(key),
+    );
+    let config = strategy
+        .spec
+        .build_in_container_config("sess", strategy.pattern().unwrap(), true, true)
+        .unwrap();
+    let text = config.config_text().unwrap();
+    let line = text
+        .lines()
+        .find(|line| line.starts_with("service_account_credentials = "))
+        .unwrap_or_else(|| panic!("no credential line in {text}"));
+    assert!(line.contains("\"type\":\"service_account\""), "{line}");
+    assert!(line.contains("\"project_id\":\"p\""), "{line}");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Parity follow-ups
+// ---------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn apply_patch_refuses_to_create_over_an_existing_file() {
+    use openai_agents_sdk::editor::{ApplyPatchEditor, ApplyPatchOperation};
+    use openai_agents_sdk::sandbox::editor::SandboxEditor;
+
+    let client = UnixLocalSandboxClient::new();
+    let session = client
+        .create(Some(
+            Manifest::new().with_entry("notes.md", Entry::text_file("original\n")),
+        ))
+        .await
+        .unwrap();
+    session.start().await.unwrap();
+
+    let editor = SandboxEditor::new(session.clone());
+    let error = editor
+        .create_file(&ApplyPatchOperation {
+            op_type: openai_agents_sdk::editor::ApplyPatchOperationType::CreateFile,
+            path: "notes.md".to_string(),
+            diff: Some("+replacement\n".to_string()),
+            move_to: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("already exists"), "{error}");
+
+    // The original content survived.
+    let kept = session.read_file("notes.md").await.unwrap();
+    assert_eq!(String::from_utf8_lossy(&kept), "original\n");
+    client.delete(session).await.unwrap();
+}
+
+#[tokio::test]
+async fn view_image_refuses_oversized_and_non_image_files() {
+    let model = setup();
+    model.add_turn(vec![view_image_call("c1", "notes.txt")]);
+    model.add_turn(vec![assistant_message("done")]);
+
+    let agent = SandboxAgent::<()>::new("Viewer")
+        .with_model_instance(model.clone())
+        .with_capability(Arc::new(Filesystem::new()))
+        .with_default_manifest(
+            Manifest::new().with_entry("notes.txt", Entry::text_file("not an image")),
+        );
+    let config = SandboxRunConfig::with_client(Arc::new(UnixLocalSandboxClient::new()));
+    let result = SandboxRunner::run(&agent, "look", &config).await.unwrap();
+
+    let refusal = result
+        .new_items
+        .iter()
+        .filter_map(|item| match &item.kind {
+            RunItemKind::ToolCallOutput { output, .. } => Some(output.to_string()),
+            _ => None,
+        })
+        .next()
+        .expect("the tool produced an output");
+    assert!(
+        refusal.contains("is not a supported image file"),
+        "{refusal}"
+    );
+}
+
+#[tokio::test]
+async fn file_operations_can_run_as_the_sandbox_user() {
+    use openai_agents_sdk::sandbox::testing::{
+        SandboxCallResult, SandboxMethod, SandboxStep, scripted_sandbox_session,
+    };
+    use openai_agents_sdk::sandbox::types::{ExecResult, User};
+
+    // Reading as a user goes through `exec`, which applies the `sudo` wrapper.
+    let session = scripted_sandbox_session([SandboxStep::new(SandboxMethod::Exec)
+        .matching(|call| {
+            call.has_argument("sudo") && call.has_argument("agent") && call.has_argument("cat")
+        })
+        .returning_exec(ExecResult {
+            exit_code: 0,
+            stdout: b"contents".to_vec(),
+            stderr: Vec::new(),
+        })]);
+    let user = User::new("agent");
+    let bytes = session
+        .read_file_as("/workspace/a.txt", Some(&user))
+        .await
+        .unwrap();
+    assert_eq!(bytes, b"contents");
+    session.assert_complete();
+
+    // Writing as a user prepares the parent, streams base64 chunks into a staging file, and
+    // moves it into place, so binary content is safe and no argument hits the 128 KiB limit.
+    let ok = || {
+        SandboxCallResult::Exec(ExecResult {
+            exit_code: 0,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        })
+    };
+    let payload = vec![0xffu8; 1024 * 1024];
+    let steps = std::iter::once(
+        SandboxStep::new(SandboxMethod::Exec)
+            .matching(|call| call.arguments.join(" ").contains("mkdir -p"))
+            .returning(ok()),
+    )
+    .chain((0..29).map(move |_| {
+        SandboxStep::new(SandboxMethod::Exec)
+            .matching(|call| call.arguments.join(" ").contains("base64 -d >>"))
+            .returning(ok())
+    }))
+    .chain(std::iter::once(
+        SandboxStep::new(SandboxMethod::Exec)
+            .matching(|call| call.arguments.join(" ").contains("mv --"))
+            .returning(ok()),
+    ));
+    let session = scripted_sandbox_session(steps);
+    session
+        .write_file_as("/workspace/nested/a.bin", &payload, Some(&user))
+        .await
+        .unwrap();
+    for call in session.calls() {
+        for argument in &call.arguments {
+            assert!(
+                argument.len() <= 100_000,
+                "an argument of {} bytes would exceed the kernel limit",
+                argument.len()
+            );
+        }
+    }
+    session.assert_complete();
+
+    // Without a user the plain session method is used instead.
+    let session = scripted_sandbox_session([
+        SandboxStep::new(SandboxMethod::ReadFile).returning_bytes(b"plain".to_vec())
+    ]);
+    assert_eq!(
+        session
+            .read_file_as("/workspace/a.txt", None)
+            .await
+            .unwrap(),
+        b"plain"
+    );
+}
+
+#[tokio::test]
+async fn a_scripted_session_drives_a_whole_run() {
+    use openai_agents_sdk::sandbox::testing::{
+        SandboxMethod, SandboxStep, scripted_sandbox_session,
+    };
+    use openai_agents_sdk::sandbox::types::ExecResult;
+
+    let model = setup();
+    model.add_turn(vec![shell_call("c1", &["echo", "hi"])]);
+    model.add_turn(vec![assistant_message("done")]);
+
+    let session = Arc::new(scripted_sandbox_session([SandboxStep::new(
+        SandboxMethod::Exec,
+    )
+    .matching(|call| call.has_argument("echo"))
+    .returning_exec(ExecResult {
+        exit_code: 0,
+        stdout: b"hi\n".to_vec(),
+        stderr: Vec::new(),
+    })]));
+
+    let agent = SandboxAgent::<()>::new("Scripted")
+        .with_model_instance(model.clone())
+        .with_capability(Arc::new(Shell::new()));
+    let config = SandboxRunConfig::with_session(session.clone());
+    let result = SandboxRunner::run(&agent, "run it", &config).await.unwrap();
+    assert_eq!(result.final_output_text().as_deref(), Some("done"));
+    session.assert_complete();
+}
+
+#[tokio::test]
+async fn a_capability_can_have_its_tools_reconfigured() {
+    use openai_agents_sdk::sandbox::capabilities::{
+        Capability, CapabilityBinding, ConfiguredCapability,
+    };
+
+    let client = UnixLocalSandboxClient::new();
+    let session = client.create(None).await.unwrap();
+    session.start().await.unwrap();
+    let binding = CapabilityBinding::new(session.clone());
+
+    let shell = Shell::new();
+    let bundled = Capability::<()>::tools(&shell, &binding).unwrap();
+    assert!(!bundled.is_empty());
+
+    // Rename every tool the capability exposes, keeping everything else it does.
+    let renamed = ConfiguredCapability::<()>::new(Arc::new(Shell::new()), |tools| {
+        tools
+            .into_iter()
+            .filter(|tool| tool.name() != "shell")
+            .collect()
+    });
+    let configured = Capability::<()>::tools(&renamed, &binding).unwrap();
+    assert_eq!(configured.len(), bundled.len() - 1);
+    assert!(configured.iter().all(|tool| tool.name() != "shell"));
+    // The wrapper still reports the capability it wraps.
+    assert_eq!(
+        Capability::<()>::capability_type(&renamed),
+        Capability::<()>::capability_type(&shell)
+    );
+
+    client.delete(session).await.unwrap();
+}
+
+#[tokio::test]
+async fn an_instrumented_session_records_what_the_agent_did() {
+    use openai_agents_sdk::sandbox::events::{
+        CallbackSink, EventPhase, InstrumentedSession, SandboxSessionEvent,
+    };
+
+    let recorded: Arc<std::sync::Mutex<Vec<SandboxSessionEvent>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = {
+        let recorded = recorded.clone();
+        Arc::new(CallbackSink::new(move |event| {
+            recorded.lock().unwrap().push(event.clone())
+        }))
+    };
+
+    let model = setup();
+    model.add_turn(vec![shell_call("c1", &["echo secret-output"])]);
+    model.add_turn(vec![assistant_message("done")]);
+
+    let client = UnixLocalSandboxClient::new();
+    let session = client.create(None).await.unwrap();
+    let audited = Arc::new(InstrumentedSession::new(session, sink));
+    audited.start().await.unwrap();
+
+    let agent = SandboxAgent::<()>::new("Audited")
+        .with_model_instance(model.clone())
+        .with_capability(Arc::new(Shell::new()));
+    let config = SandboxRunConfig::with_session(audited.clone());
+    SandboxRunner::run(&agent, "run it", &config).await.unwrap();
+
+    let events = recorded.lock().unwrap().clone();
+    let exec_start = events
+        .iter()
+        .find(|event| event.op == "exec" && event.phase == EventPhase::Start)
+        .expect("the command was recorded");
+    assert!(
+        exec_start
+            .data
+            .iter()
+            .any(|(_, v)| v.contains("echo secret-output")),
+        "{:?}",
+        exec_start.data
+    );
+    // Every start has a matching finish under the same span.
+    let finish = events
+        .iter()
+        .find(|event| event.phase == EventPhase::Finish && event.span_id == exec_start.span_id)
+        .expect("the command's outcome was recorded");
+    assert_eq!(finish.ok, Some(true));
+    // Command output is the agent's data and is withheld by default.
+    assert_eq!(finish.stdout, None);
+}
+
+#[tokio::test]
+async fn an_archive_cannot_write_through_a_symlink() {
+    let work = tempfile::tempdir().unwrap();
+    let outside = work.path().join("outside");
+    tokio::fs::create_dir_all(&outside).await.unwrap();
+    let dir1 = work.path().join("dir1");
+    let dir2 = work.path().join("dir2/link");
+    tokio::fs::create_dir_all(&dir1).await.unwrap();
+    tokio::fs::create_dir_all(&dir2).await.unwrap();
+    std::os::unix::fs::symlink(&outside, dir1.join("link")).unwrap();
+    tokio::fs::write(dir2.join("file"), b"payload")
+        .await
+        .unwrap();
+
+    // An archive holding `link -> <outside>` followed by a real `link/file`.
+    let archive_path = work.path().join("a.tar");
+    for args in [
+        vec![
+            "-cf",
+            archive_path.to_str().unwrap(),
+            "-C",
+            dir1.to_str().unwrap(),
+            "link",
+        ],
+        vec![
+            "-rf",
+            archive_path.to_str().unwrap(),
+            "-C",
+            work.path().join("dir2").to_str().unwrap(),
+            "link/file",
+        ],
+    ] {
+        let status = tokio::process::Command::new("tar")
+            .args(&args)
+            .status()
+            .await
+            .unwrap();
+        assert!(status.success(), "failed to build the probe archive");
+    }
+    let gzipped = tokio::process::Command::new("gzip")
+        .arg("-f")
+        .arg(&archive_path)
+        .status()
+        .await
+        .unwrap();
+    assert!(gzipped.success());
+    let archive = tokio::fs::read(work.path().join("a.tar.gz")).await.unwrap();
+
+    let root = work.path().join("extract");
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    let client = UnixLocalSandboxClient::new();
+    let session = client
+        .create(Some(
+            Manifest::new().with_root(root.to_string_lossy().into_owned()),
+        ))
+        .await
+        .unwrap();
+    session.start().await.unwrap();
+    // `tar` itself refuses to write through the link, so the extraction fails loudly.
+    let result = session.hydrate_workspace(&archive).await;
+    assert!(
+        result.is_err(),
+        "extracting through a symlink must not succeed"
+    );
+    // Nothing was written outside the workspace.
+    assert!(!outside.join("file").exists());
+    // The link itself is left exactly as the archive recorded it, the way Python leaves an
+    // absolute target outside the workspace: containment is enforced where a path is used, not
+    // by deleting links a restored workspace legitimately needs.
+    assert_eq!(
+        tokio::fs::read_link(root.join("link")).await.unwrap(),
+        outside
+    );
+    client.delete(session).await.unwrap();
+}
+
+#[tokio::test]
+async fn an_extra_path_grant_widens_reads_but_not_writes() {
+    use openai_agents_sdk::editor::{
+        ApplyPatchEditor, ApplyPatchOperation, ApplyPatchOperationType,
+    };
+    use openai_agents_sdk::sandbox::editor::SandboxEditor;
+    use openai_agents_sdk::sandbox::workspace_paths::SandboxPathGrant;
+
+    let corpus = tempfile::tempdir().unwrap();
+    tokio::fs::write(corpus.path().join("data.txt"), b"shared\n")
+        .await
+        .unwrap();
+    let corpus_path = tokio::fs::canonicalize(corpus.path()).await.unwrap();
+    let grant = SandboxPathGrant::new(corpus_path.to_str().unwrap())
+        .unwrap()
+        .read_only(true);
+
+    let client = UnixLocalSandboxClient::new();
+    let session = client
+        .create(Some(Manifest::new().with_extra_path_grant(grant)))
+        .await
+        .unwrap();
+    session.start().await.unwrap();
+
+    // The sandbox can read through the grant, which the workspace root alone would refuse.
+    let data = session
+        .read_file(corpus_path.join("data.txt").to_str().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&data), "shared\n");
+
+    // A model-facing edit aimed into it is refused: the grant is read-only.
+    let editor = SandboxEditor::new(session.clone());
+    let error = editor
+        .create_file(&ApplyPatchOperation {
+            op_type: ApplyPatchOperationType::CreateFile,
+            path: corpus_path.join("new.txt").to_string_lossy().into_owned(),
+            diff: Some("+written\n".to_string()),
+            move_to: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("read-only"), "{error}");
+    assert!(!corpus.path().join("new.txt").exists());
+
+    client.delete(session).await.unwrap();
+}
+
+#[tokio::test]
+async fn an_audit_log_records_sizes_and_times_but_never_file_contents() {
+    use openai_agents_sdk::sandbox::events::{
+        CallbackSink, InstrumentedSession, SandboxSessionEvent,
+    };
+    use openai_agents_sdk::sandbox::types::User;
+
+    let recorded: Arc<std::sync::Mutex<Vec<SandboxSessionEvent>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = {
+        let recorded = recorded.clone();
+        Arc::new(CallbackSink::new(move |event| {
+            recorded.lock().unwrap().push(event.clone())
+        }))
+    };
+
+    let client = UnixLocalSandboxClient::new();
+    let session = client.create(None).await.unwrap();
+    let audited = InstrumentedSession::new(session.clone(), sink);
+    audited.start().await.unwrap();
+    audited
+        .write_file("secrets.txt", b"SUPERSECRET-CONTENTS")
+        .await
+        .unwrap();
+    // The run-as form must not fall back to the recorded `exec`, which would log the payload.
+    let _ = audited
+        .write_file_as(
+            "as-user.txt",
+            b"SUPERSECRET-CONTENTS",
+            Some(&User::new("nobody")),
+        )
+        .await;
+
+    let events = recorded.lock().unwrap().clone();
+    let serialized = events
+        .iter()
+        .map(|event| event.to_json_line().unwrap())
+        .collect::<String>();
+    assert!(
+        !serialized.contains("SUPERSECRET-CONTENTS"),
+        "file contents must never reach the audit log: {serialized}"
+    );
+    // base64 of the contents must not be there either.
+    assert!(!serialized.contains("U1VQRVJTRUNSRVQ"), "{serialized}");
+    // Sizes and timestamps are recorded.
+    assert!(events.iter().any(|event| {
+        event
+            .data
+            .iter()
+            .any(|(key, value)| key == "bytes" && value == "20")
+    }));
+    assert!(events.iter().all(|event| event.ts > 0));
+
+    client.delete(session).await.unwrap();
 }

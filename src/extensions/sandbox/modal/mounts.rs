@@ -14,6 +14,7 @@ use serde_json::{Map, Value};
 
 use crate::sandbox::errors::{ErrorCode, SandboxError, SandboxResult};
 use crate::sandbox::manifest::Manifest;
+use crate::sandbox::mount_entries::{ConfiguredMount, GcsMount, R2Mount, S3Mount};
 use crate::sandbox::mounts::{Mount, MountStrategy};
 use crate::sandbox::session::SandboxSession;
 
@@ -360,6 +361,84 @@ impl MountStrategy for ModalCloudBucketMountStrategy {
     ) -> SandboxResult<()> {
         // The bucket is released with the sandbox itself.
         Ok(())
+    }
+}
+
+// -------------------------------------------------------------------------------------------
+// Configured mount translation
+// -------------------------------------------------------------------------------------------
+
+impl ModalCloudBucketMountConfig {
+    /// The Modal bucket configuration for one of the built-in remote storage mounts.
+    ///
+    /// Mirrors Python's `_build_modal_cloud_bucket_mount_config`. Modal injects the credentials
+    /// as a secret, so a mount that carries its own credentials cannot also name an existing
+    /// Modal secret; [`with_secret_name`](Self::with_secret_name) is for credential-free mounts.
+    pub fn from_configured_mount(mount: &dyn ConfiguredMount) -> SandboxResult<Self> {
+        mount.validate()?;
+        let any = mount.as_any();
+
+        if let Some(s3) = any.downcast_ref::<S3Mount>() {
+            let mut config = ModalCloudBucketMountConfig::s3(s3.bucket.clone());
+            config.bucket_endpoint_url = s3.endpoint_url.clone();
+            config.key_prefix = s3.prefix.clone();
+            if let (Some(access_key_id), Some(secret_access_key)) =
+                (&s3.access_key_id, &s3.secret_access_key)
+            {
+                config = config.with_aws_credentials(access_key_id, secret_access_key);
+                if let Some(session_token) = &s3.session_token {
+                    config = config.with_aws_session_token(session_token);
+                }
+            }
+            return Ok(config);
+        }
+
+        if let Some(r2) = any.downcast_ref::<R2Mount>() {
+            let mut config = ModalCloudBucketMountConfig::s3(r2.bucket.clone());
+            config.bucket_endpoint_url = Some(r2.endpoint());
+            if let (Some(access_key_id), Some(secret_access_key)) =
+                (&r2.access_key_id, &r2.secret_access_key)
+            {
+                config = config.with_aws_credentials(access_key_id, secret_access_key);
+            }
+            return Ok(config);
+        }
+
+        if let Some(gcs) = any.downcast_ref::<GcsMount>() {
+            let mut config = ModalCloudBucketMountConfig::gcs(gcs.bucket.clone());
+            if let Some(endpoint_url) = &gcs.endpoint_url {
+                config.bucket_endpoint_url = Some(endpoint_url.clone());
+            }
+            config.key_prefix = gcs.prefix.clone();
+            if gcs.uses_s3_compatible_api() {
+                config = config.with_google_credentials(
+                    gcs.access_id.clone().unwrap_or_default(),
+                    gcs.secret_access_key.clone().unwrap_or_default(),
+                );
+            }
+            return Ok(config);
+        }
+
+        Err(SandboxError::new(
+            ErrorCode::MountConfigInvalid,
+            format!(
+                "modal cloud bucket mounts do not support `{}`",
+                mount.mount_type()
+            ),
+        ))
+    }
+}
+
+impl ModalCloudBucketMountStrategy {
+    /// A strategy attaching one of the built-in remote storage mounts.
+    ///
+    /// The returned configuration is read-only, because these backends take `read_only` from the
+    /// configuration rather than from the [`Mount`]: chain `with_read_only(false)` to allow
+    /// writes. Defaulting the other way would silently widen a mount.
+    pub fn for_mount(mount: &dyn ConfiguredMount) -> SandboxResult<Self> {
+        Ok(ModalCloudBucketMountStrategy::new(
+            ModalCloudBucketMountConfig::from_configured_mount(mount)?,
+        ))
     }
 }
 
