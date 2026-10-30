@@ -46,6 +46,9 @@ pub struct ReasoningContentReplayContext {
 pub type ShouldReplayReasoningContent =
     Arc<dyn Fn(&ReasoningContentReplayContext) -> bool + Send + Sync>;
 
+/// Rewrites the converted chat messages just before they are sent.
+pub type ChatMessageTransform = Arc<dyn Fn(Vec<Value>) -> Vec<Value> + Send + Sync>;
+
 /// Default replay rule: only for DeepSeek models, and only reasoning that came from DeepSeek
 /// (or predates provider tracking).
 pub fn default_should_replay_reasoning_content(ctx: &ReasoningContentReplayContext) -> bool {
@@ -59,6 +62,9 @@ pub fn default_should_replay_reasoning_content(ctx: &ReasoningContentReplayConte
         || !other_data
 }
 
+/// Replaces a tool output that Chat Completions cannot represent.
+pub const OMITTED_TOOL_OUTPUT_PLACEHOLDER: &str = "[tool output omitted]";
+
 /// Options for converting Responses input items to Chat Completions messages.
 #[derive(Clone, Default)]
 pub struct ChatConversionOptions {
@@ -68,6 +74,11 @@ pub struct ChatConversionOptions {
     pub base_url: Option<String>,
     /// Custom reasoning replay rule.
     pub should_replay_reasoning_content: Option<ShouldReplayReasoningContent>,
+    /// Keep every content part of a multimodal tool output instead of reducing it to text.
+    /// Providers reached through the adapters in [`crate::extensions::models`] accept this.
+    pub preserve_tool_output_all_content: bool,
+    /// Reject what Chat Completions cannot represent instead of warning and degrading.
+    pub strict_feature_validation: bool,
 }
 
 impl std::fmt::Debug for ChatConversionOptions {
@@ -85,6 +96,11 @@ pub struct OpenAIChatCompletionsModel {
     model: String,
     client: OpenAIClient,
     should_replay_reasoning_content: Option<ShouldReplayReasoningContent>,
+    strict_feature_validation: bool,
+    preserve_tool_output_all_content: bool,
+    message_transform: Option<ChatMessageTransform>,
+    /// Each unsupported-feature warning is emitted once per model, as in Python.
+    warned_unsupported: Arc<[std::sync::atomic::AtomicBool; 2]>,
 }
 
 impl std::fmt::Debug for OpenAIChatCompletionsModel {
@@ -103,7 +119,37 @@ impl OpenAIChatCompletionsModel {
             model: model.into(),
             client,
             should_replay_reasoning_content: None,
+            strict_feature_validation: false,
+            preserve_tool_output_all_content: false,
+            message_transform: None,
+            warned_unsupported: Arc::new([
+                std::sync::atomic::AtomicBool::new(false),
+                std::sync::atomic::AtomicBool::new(false),
+            ]),
         }
+    }
+
+    /// Keep every content part of a multimodal tool output instead of reducing it to text.
+    pub fn with_preserve_tool_output_all_content(mut self, preserve: bool) -> Self {
+        self.preserve_tool_output_all_content = preserve;
+        self
+    }
+
+    /// Rewrite the converted chat messages just before they are sent. Used by the adapters in
+    /// [`crate::extensions::models`] to satisfy provider-specific message ordering rules.
+    pub fn with_message_transform<F>(mut self, f: F) -> Self
+    where
+        F: Fn(Vec<Value>) -> Vec<Value> + Send + Sync + 'static,
+    {
+        self.message_transform = Some(Arc::new(f));
+        self
+    }
+
+    /// Reject Responses-only features (`previous_response_id`, `conversation_id`, `prompt`)
+    /// instead of warning and ignoring them.
+    pub fn with_strict_feature_validation(mut self, strict: bool) -> Self {
+        self.strict_feature_validation = strict;
+        self
     }
 
     /// Decide which reasoning items are replayed to the provider as `reasoning_content`.
@@ -120,18 +166,76 @@ impl OpenAIChatCompletionsModel {
         &self.model
     }
 
+    /// Warn about, or reject, Responses-only features a Chat Completions model cannot honour.
+    fn validate_responses_only_features(&self, req: &ModelRequest) -> Result<()> {
+        if req.prompt.is_some() {
+            let message = "Reusable prompts are only supported by the Responses API. \
+                 OpenAIChatCompletionsModel does not support `prompt`; use a Responses model \
+                 instead.";
+            if self.strict_feature_validation {
+                return Err(AgentsError::user(message));
+            }
+            if !self.warned_unsupported[0].swap(true, std::sync::atomic::Ordering::Relaxed) {
+                log::warn!(
+                    target: crate::logger::LOG_TARGET,
+                    "{message} Ignoring `prompt`; enable strict feature validation to raise an \
+                     error instead."
+                );
+            }
+        }
+        let mut unsupported = Vec::new();
+        if req.previous_response_id.is_some() {
+            unsupported.push("previous_response_id");
+        }
+        if req.conversation_id.is_some() {
+            unsupported.push("conversation_id");
+        }
+        if !unsupported.is_empty() {
+            let message = format!(
+                "OpenAIChatCompletionsModel does not support server-managed conversation state \
+                 ({}). Chat Completions requires callers to pass the full conversation history; \
+                 use a Responses API model for previous_response_id or a conversation-capable \
+                 model for conversation_id.",
+                unsupported.join(", ")
+            );
+            if self.strict_feature_validation {
+                return Err(AgentsError::user(message));
+            }
+            if !self.warned_unsupported[1].swap(true, std::sync::atomic::Ordering::Relaxed) {
+                log::warn!(
+                    target: crate::logger::LOG_TARGET,
+                    "{message} Ignoring unsupported server-managed conversation state; enable \
+                     strict feature validation to raise an error instead."
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Build the JSON request body.
     pub fn build_request_body(&self, req: &ModelRequest, stream: bool) -> Result<Value> {
+        self.validate_responses_only_features(req)?;
         let s = &req.model_settings;
-        let messages = items_to_messages_with(
+        let mut messages = items_to_messages_with(
             &req.input,
             req.system_instructions.as_deref(),
             &ChatConversionOptions {
                 model: Some(self.model.clone()),
                 base_url: Some(self.client.base_url().to_string()),
                 should_replay_reasoning_content: self.should_replay_reasoning_content.clone(),
+                preserve_tool_output_all_content: self.preserve_tool_output_all_content,
+                strict_feature_validation: self.strict_feature_validation,
             },
         )?;
+        if let Some(transform) = &self.message_transform {
+            // The system message is inserted first, so the transform sees it too, as in Python
+            // where it runs before the system message is prepended only for tool ordering.
+            let system = (req.system_instructions.is_some()).then(|| messages.remove(0));
+            messages = transform(messages);
+            if let Some(system) = system {
+                messages.insert(0, system);
+            }
+        }
         let mut tools: Vec<Value> = Vec::new();
         for t in &req.tools {
             match t {
@@ -177,12 +281,15 @@ impl OpenAIChatCompletionsModel {
         let has_tools = !tools.is_empty();
         if has_tools {
             body.insert("tools".into(), Value::Array(tools));
-            if let Some(tc) = &s.tool_choice {
-                body.insert("tool_choice".into(), convert_chat_tool_choice(tc));
-            }
+            // Chat Completions rejects parallel_tool_calls unless tools are present.
             if let Some(p) = s.parallel_tool_calls {
                 body.insert("parallel_tool_calls".into(), Value::Bool(p));
             }
+        }
+        // `tool_choice` is sent whenever it is set, so `tool_choice: "none"` without tools
+        // still reaches the provider, as in the Python SDK.
+        if let Some(tc) = &s.tool_choice {
+            body.insert("tool_choice".into(), convert_chat_tool_choice(tc));
         }
         if let Some(schema) = &req.output_schema
             && !schema.is_plain_text()
@@ -251,6 +358,30 @@ impl OpenAIChatCompletionsModel {
             }
         }
         if let Some(extra) = &s.extra_args {
+            let duplicates: Vec<&str> = {
+                let mut keys: Vec<&str> = extra
+                    .keys()
+                    .filter(|k| body.contains_key(k.as_str()))
+                    .map(String::as_str)
+                    .collect();
+                keys.sort_unstable();
+                keys
+            };
+            if !duplicates.is_empty() {
+                let keys = duplicates
+                    .iter()
+                    .map(|k| format!("'{k}'"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let plural = if duplicates.len() == 1 {
+                    "argument"
+                } else {
+                    "arguments"
+                };
+                return Err(AgentsError::user(format!(
+                    "chat.completions.create() got multiple values for keyword {plural} {keys}"
+                )));
+            }
             for (k, v) in extra {
                 body.insert(k.clone(), v.clone());
             }
@@ -272,7 +403,11 @@ impl OpenAIChatCompletionsModel {
                 None
             },
             Some(self.model.clone()),
-            Some(req.model_settings.to_traceable_value()),
+            Some(super::trace::model_config_for_trace(
+                &req.model_settings,
+                req.tracing,
+                Some(self.client.base_url()),
+            )),
             req.tracing.is_disabled(),
         );
         span.start();
@@ -337,6 +472,105 @@ fn convert_user_part(part: &Value) -> Result<Value> {
             "Unknown content part for Chat Completions: {part}"
         ))),
     }
+}
+
+/// Convert Chat Completions `url_citation` annotations into Responses output-text annotations.
+///
+/// A provider that reports an incomplete citation is skipped rather than failing the turn.
+pub fn convert_url_citations(raw: Option<&Value>) -> Vec<Value> {
+    let Some(Value::Array(items)) = raw else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for annotation in items {
+        if annotation.get("type").and_then(Value::as_str) != Some("url_citation") {
+            continue;
+        }
+        let Some(citation) = annotation.get("url_citation") else {
+            continue;
+        };
+        let (Some(start), Some(end), Some(url)) = (
+            citation.get("start_index").and_then(Value::as_u64),
+            citation.get("end_index").and_then(Value::as_u64),
+            citation.get("url").and_then(Value::as_str),
+        ) else {
+            crate::logger::log_model_action_debug("Skipping malformed url citation", annotation);
+            continue;
+        };
+        out.push(json!({
+            "type": "url_citation",
+            "start_index": start,
+            "end_index": end,
+            "url": url,
+            "title": citation.get("title").and_then(Value::as_str).unwrap_or_default(),
+        }));
+    }
+    out
+}
+
+fn chat_token_logprobs(logprobs: Option<&Value>) -> &[Value] {
+    logprobs
+        .and_then(|l| l.get("content"))
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+}
+
+/// Convert Chat Completions token logprobs into the Responses `output_text` logprob shape.
+pub fn convert_logprobs_for_output_text(logprobs: Option<&Value>) -> Option<Value> {
+    let tokens = chat_token_logprobs(logprobs);
+    if tokens.is_empty() {
+        return None;
+    }
+    let bytes = |v: &Value| v.get("bytes").cloned().unwrap_or_else(|| json!([]));
+    Some(Value::Array(
+        tokens
+            .iter()
+            .map(|t| {
+                json!({
+                    "token": t.get("token").cloned().unwrap_or_default(),
+                    "logprob": t.get("logprob").cloned().unwrap_or_else(|| json!(0.0)),
+                    "bytes": bytes(t),
+                    "top_logprobs": t.get("top_logprobs").and_then(Value::as_array)
+                        .map(|tops| tops.iter().map(|top| json!({
+                            "token": top.get("token").cloned().unwrap_or_default(),
+                            "logprob": top.get("logprob").cloned().unwrap_or_else(|| json!(0.0)),
+                            "bytes": bytes(top),
+                        })).collect::<Vec<_>>())
+                        .unwrap_or_default(),
+                })
+            })
+            .collect(),
+    ))
+}
+
+/// Convert Chat Completions token logprobs into the `response.output_text.delta` logprob shape.
+pub fn convert_logprobs_for_text_delta(logprobs: Option<&Value>) -> Vec<Value> {
+    chat_token_logprobs(logprobs)
+        .iter()
+        .map(|t| {
+            let tops = t
+                .get("top_logprobs")
+                .and_then(Value::as_array)
+                .map(|tops| {
+                    tops.iter()
+                        .map(|top| {
+                            json!({
+                                "token": top.get("token").cloned().unwrap_or_default(),
+                                "logprob": top.get("logprob").cloned()
+                                    .unwrap_or_else(|| json!(0.0)),
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            json!({
+                "token": t.get("token").cloned().unwrap_or_default(),
+                "logprob": t.get("logprob").cloned().unwrap_or_else(|| json!(0.0)),
+                "top_logprobs": if tops.is_empty() { Value::Null } else { json!(tops) },
+            })
+        })
+        .collect()
 }
 
 fn text_of(content: &Value) -> String {
@@ -532,15 +766,49 @@ pub fn items_to_messages_with(
                 flush(&mut result, &mut current);
                 pending_reasoning_content = None;
                 pending_reasoning = None;
+                let Some(call_id) = v.get("call_id").filter(|c| !c.is_null()).cloned() else {
+                    return Err(AgentsError::user(
+                        "Unpaired function outputs are supported by Responses but cannot be \
+                         converted to Chat Completions tool messages. Use a Responses model to \
+                         preserve this input.",
+                    ));
+                };
                 let output = v.get("output").cloned().unwrap_or(Value::Null);
                 let content = match &output {
                     Value::String(s) => Value::String(s.clone()),
-                    Value::Array(_) => Value::String(text_of(&output)),
+                    Value::Array(parts) => {
+                        let converted: Vec<Value> =
+                            parts.iter().map(convert_user_part).collect::<Result<_>>()?;
+                        if options.preserve_tool_output_all_content {
+                            Value::Array(converted)
+                        } else {
+                            let text_only: Vec<Value> = converted
+                                .into_iter()
+                                .filter(|p| p.get("type").and_then(Value::as_str) == Some("text"))
+                                .collect();
+                            if text_only.is_empty() {
+                                let message = "Chat Completions tool outputs cannot be empty or \
+                                     contain only non-text content unless \
+                                     preserve_tool_output_all_content is set.";
+                                if options.strict_feature_validation {
+                                    return Err(AgentsError::user(message));
+                                }
+                                log::warn!(
+                                    target: crate::logger::LOG_TARGET,
+                                    "{message} Replacing the tool output with a placeholder; \
+                                     enable strict feature validation to raise an error instead."
+                                );
+                                Value::String(OMITTED_TOOL_OUTPUT_PLACEHOLDER.to_string())
+                            } else {
+                                Value::Array(text_only)
+                            }
+                        }
+                    }
                     other => Value::String(other.to_string()),
                 };
                 result.push(json!({
                     "role": "tool",
-                    "tool_call_id": v.get("call_id").cloned().unwrap_or(Value::Null),
+                    "tool_call_id": call_id,
                     "content": content,
                 }));
             }
@@ -607,8 +875,8 @@ pub(crate) fn parse_chat_completion(
         if !text.is_empty() {
             content.push(MessageContent::OutputText {
                 text: text.to_string(),
-                annotations: Vec::new(),
-                logprobs: None,
+                annotations: convert_url_citations(message.get("annotations")),
+                logprobs: convert_logprobs_for_output_text(choice.get("logprobs")),
             });
         }
         if !refusal.is_empty() {
@@ -675,6 +943,10 @@ struct StreamState {
     inner: BoxStream<'static, Result<Value>>,
     pending: VecDeque<Result<Value>>,
     text: String,
+    /// Accumulated url-citation annotations on the assistant text part.
+    annotations: Vec<Value>,
+    /// Accumulated Responses-shaped logprobs on the assistant text part.
+    logprobs: Vec<Value>,
     refusal: String,
     message_started: bool,
     tool_calls: BTreeMap<u64, (String, String, String)>,
@@ -806,20 +1078,32 @@ impl StreamState {
         {
             self.close_summary_part();
         }
+        let choice_logprobs = chunk.pointer("/choices/0/logprobs").cloned();
         if let Some(t) = delta.get("content").and_then(Value::as_str)
             && !t.is_empty()
         {
             self.start_message();
             self.text.push_str(t);
             let index = self.message_index();
+            let delta_logprobs = convert_logprobs_for_text_delta(choice_logprobs.as_ref());
+            if let Some(Value::Array(output_logprobs)) =
+                convert_logprobs_for_output_text(choice_logprobs.as_ref())
+            {
+                self.logprobs.extend(output_logprobs);
+            }
             self.pending.push_back(Ok(json!({
                 "type": "response.output_text.delta",
                 "item_id": FAKE_RESPONSES_ID,
                 "output_index": index,
                 "content_index": 0,
                 "delta": t,
-                "logprobs": [],
+                "logprobs": delta_logprobs,
             })));
+        }
+        // Citations can arrive on the delta carrying the cited text or on a later one.
+        if self.message_started {
+            self.annotations
+                .extend(convert_url_citations(delta.get("annotations")));
         }
         if let Some(r) = delta.get("refusal").and_then(Value::as_str)
             && !r.is_empty()
@@ -839,10 +1123,18 @@ impl StreamState {
             for c in calls {
                 let idx = c.get("index").and_then(Value::as_u64).unwrap_or(0);
                 let entry = self.tool_calls.entry(idx).or_default();
-                if let Some(id) = c.get("id").and_then(Value::as_str) {
+                // The id and the name are assigned, never appended: a provider that repeats
+                // them on every chunk must not produce a duplicated `call_id` or `name`.
+                if let Some(id) = c.get("id").and_then(Value::as_str)
+                    && !id.is_empty()
+                {
+                    entry.0.clear();
                     entry.0.push_str(id);
                 }
-                if let Some(n) = c.pointer("/function/name").and_then(Value::as_str) {
+                if let Some(n) = c.pointer("/function/name").and_then(Value::as_str)
+                    && !n.is_empty()
+                {
+                    entry.1.clear();
                     entry.1.push_str(n);
                 }
                 if let Some(a) = c.pointer("/function/arguments").and_then(Value::as_str) {
@@ -877,16 +1169,21 @@ impl StreamState {
         if self.message_started {
             let mut content = Vec::new();
             if !self.text.is_empty() {
-                content.push(json!({"type": "output_text", "text": self.text, "annotations": []}));
+                let mut part = json!({"type": "output_text", "text": self.text,
+                    "annotations": self.annotations});
+                if !self.logprobs.is_empty() {
+                    part["logprobs"] = json!(self.logprobs);
+                }
+                content.push(part.clone());
                 self.pending.push_back(Ok(json!({
                     "type": "response.output_text.done",
                     "item_id": FAKE_RESPONSES_ID, "output_index": mi, "content_index": 0,
-                    "text": self.text,
+                    "text": self.text, "logprobs": self.logprobs,
                 })));
                 self.pending.push_back(Ok(json!({
                     "type": "response.content_part.done",
                     "item_id": FAKE_RESPONSES_ID, "output_index": mi, "content_index": 0,
-                    "part": {"type": "output_text", "text": self.text, "annotations": []},
+                    "part": part,
                 })));
             }
             if !self.refusal.is_empty() {
@@ -960,6 +1257,10 @@ impl StreamState {
 
 #[async_trait]
 impl Model for OpenAIChatCompletionsModel {
+    fn supports_default_prompt_cache_key(&self) -> bool {
+        self.client.is_openai_api()
+    }
+
     async fn get_response(&self, request: ModelRequest) -> Result<ModelResponse> {
         let body = self.build_request_body(&request, false)?;
         let span = self.start_span(&request, &body);
@@ -980,12 +1281,18 @@ impl Model for OpenAIChatCompletionsModel {
             )
         }
         .await;
+        let include_data = request.tracing.include_data();
         match &result {
-            Ok(r) => finish_generation_span(&span, r, request.tracing.include_data()),
-            Err(e) => span.set_error(
-                "Error getting response",
-                Some(json!({"error": e.to_string()})),
-            ),
+            Ok(r) => finish_generation_span(&span, r, include_data),
+            Err(e) => {
+                crate::tracing::record_model_error_on_span(
+                    &span,
+                    "Error getting response",
+                    e,
+                    include_data,
+                );
+                crate::logger::log_model_action_error("Error getting response", e);
+            }
         }
         span.finish();
         result
@@ -1006,10 +1313,13 @@ impl Model for OpenAIChatCompletionsModel {
         {
             Ok(s) => s,
             Err(e) => {
-                span.set_error(
+                crate::tracing::record_model_error_on_span(
+                    &span,
                     "Error streaming response",
-                    Some(json!({"error": e.to_string()})),
+                    &e,
+                    request.tracing.include_data(),
                 );
+                crate::logger::log_model_action_error("Error streaming response", &e);
                 span.finish();
                 return Err(e);
             }
@@ -1018,6 +1328,8 @@ impl Model for OpenAIChatCompletionsModel {
             inner,
             pending: VecDeque::new(),
             text: String::new(),
+            annotations: Vec::new(),
+            logprobs: Vec::new(),
             refusal: String::new(),
             message_started: false,
             tool_calls: BTreeMap::new(),
@@ -1044,10 +1356,13 @@ impl Model for OpenAIChatCompletionsModel {
                     Some(Ok(chunk)) => st.handle_chunk(&chunk),
                     Some(Err(e)) => {
                         st.finished = true;
-                        st.span.set_error(
+                        crate::tracing::record_model_error_on_span(
+                            &st.span,
                             "Error streaming response",
-                            Some(json!({"error": e.to_string()})),
+                            &e,
+                            st.include_data,
                         );
+                        crate::logger::log_model_action_error("Error streaming response", &e);
                         st.span.finish();
                         return Some((Err(e), st));
                     }
@@ -1125,6 +1440,8 @@ mod tests {
             inner: futures::stream::iter(chunks).boxed(),
             pending: VecDeque::new(),
             text: String::new(),
+            annotations: Vec::new(),
+            logprobs: Vec::new(),
             refusal: String::new(),
             message_started: false,
             tool_calls: BTreeMap::new(),
@@ -1166,6 +1483,8 @@ mod tests {
             inner: futures::stream::iter(chunks).boxed(),
             pending: VecDeque::new(),
             text: String::new(),
+            annotations: Vec::new(),
+            logprobs: Vec::new(),
             refusal: String::new(),
             message_started: false,
             tool_calls: BTreeMap::new(),
@@ -1226,6 +1545,141 @@ mod tests {
         assert_eq!(msgs[1]["tool_calls"][0]["id"], "c1");
         let msgs = items_to_messages_with(&items, None, &opts("gpt-4o")).unwrap();
         assert!(msgs[1].get("reasoning_content").is_none());
+    }
+
+    fn stream_state(model: &str, chunks: Vec<Result<Value>>) -> StreamState {
+        StreamState {
+            inner: futures::stream::iter(chunks).boxed(),
+            pending: VecDeque::new(),
+            text: String::new(),
+            annotations: Vec::new(),
+            logprobs: Vec::new(),
+            refusal: String::new(),
+            message_started: false,
+            tool_calls: BTreeMap::new(),
+            reasoning: None,
+            usage: None,
+            finished: false,
+            model: model.into(),
+            span: crate::tracing::create_span(
+                SpanData::Custom {
+                    name: "t".into(),
+                    data: Value::Null,
+                },
+                None,
+                true,
+            ),
+            include_data: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn assigns_repeated_tool_call_id_and_name() {
+        // Some providers repeat the id and the name on every chunk; they must be assigned,
+        // not appended.
+        let chunks = vec![
+            Ok(
+                json!({"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "call_1", "function": {"name": "f", "arguments": "{\"x\""}}]}}]}),
+            ),
+            Ok(
+                json!({"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "call_1", "function": {"name": "f", "arguments": ":1}"}}]}}]}),
+            ),
+            Ok(
+                json!({"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "", "function": {"name": "", "arguments": ""}}]}}]}),
+            ),
+        ];
+        let mut st = stream_state("m", chunks);
+        while let Some(Ok(c)) = st.inner.next().await {
+            st.handle_chunk(&c);
+        }
+        st.finish();
+        let events: Vec<Value> = st.pending.into_iter().map(|e| e.unwrap()).collect();
+        let out = &events.last().unwrap()["response"]["output"];
+        assert_eq!(out[0]["call_id"], "call_1");
+        assert_eq!(out[0]["name"], "f");
+        assert_eq!(out[0]["arguments"], "{\"x\":1}");
+    }
+
+    #[tokio::test]
+    async fn streams_logprobs_and_url_citations() {
+        let chunks = vec![
+            Ok(
+                json!({"choices": [{"delta": {"content": "hi"}, "logprobs": {"content": [
+                    {"token": "hi", "logprob": -0.5, "bytes": [104, 105],
+                     "top_logprobs": [{"token": "hi", "logprob": -0.5, "bytes": [104, 105]}]}
+                ]}}]}),
+            ),
+            Ok(json!({"choices": [{"delta": {"annotations": [
+                {"type": "url_citation", "url_citation": {"start_index": 0, "end_index": 2,
+                 "url": "https://example.com", "title": "Example"}}
+            ]}}]})),
+        ];
+        let mut st = stream_state("m", chunks);
+        while let Some(Ok(c)) = st.inner.next().await {
+            st.handle_chunk(&c);
+        }
+        st.finish();
+        let events: Vec<Value> = st.pending.into_iter().map(|e| e.unwrap()).collect();
+        let delta = events
+            .iter()
+            .find(|e| e["type"] == "response.output_text.delta")
+            .unwrap();
+        assert_eq!(delta["logprobs"][0]["token"], "hi");
+        assert!(delta["logprobs"][0].get("bytes").is_none());
+        let part = &events.last().unwrap()["response"]["output"][0]["content"][0];
+        assert_eq!(part["annotations"][0]["url"], "https://example.com");
+        assert_eq!(part["logprobs"][0]["bytes"][0], 104);
+    }
+
+    #[test]
+    fn parses_annotations_and_logprobs() {
+        let v = json!({"choices": [{"message": {"content": "hi", "annotations": [
+            {"type": "url_citation", "url_citation": {"start_index": 0, "end_index": 2,
+             "url": "https://example.com", "title": "Example"}},
+            {"type": "url_citation", "url_citation": {"url": "https://broken"}}
+        ]}, "logprobs": {"content": [{"token": "hi", "logprob": -0.1, "bytes": [104, 105],
+            "top_logprobs": []}]}}]});
+        let r = parse_chat_completion(&v, None, false).unwrap();
+        let item = r.output[0].to_value();
+        assert_eq!(
+            item["content"][0]["annotations"].as_array().unwrap().len(),
+            1
+        );
+        assert_eq!(item["content"][0]["annotations"][0]["title"], "Example");
+        assert_eq!(item["content"][0]["logprobs"][0]["token"], "hi");
+    }
+
+    #[test]
+    fn sends_tool_choice_without_tools_and_rejects_duplicate_extra_args() {
+        use crate::model_settings::ModelSettings;
+        let model = OpenAIChatCompletionsModel::new("gpt-4o", OpenAIClient::new("k"));
+        let req = ModelRequest {
+            model_settings: ModelSettings::default().with_tool_choice("none"),
+            ..Default::default()
+        };
+        let body = model.build_request_body(&req, false).unwrap();
+        assert_eq!(body["tool_choice"], "none");
+        assert!(body.get("tools").is_none());
+
+        let req = ModelRequest {
+            model_settings: ModelSettings {
+                extra_args: Some(
+                    [("model".to_string(), json!("other"))]
+                        .into_iter()
+                        .collect(),
+                ),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let err = model
+            .build_request_body(&req, false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("multiple values for keyword argument 'model'"),
+            "{err}"
+        );
     }
 
     #[test]

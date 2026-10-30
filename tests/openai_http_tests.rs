@@ -4,6 +4,7 @@
 use std::sync::{Arc, Mutex};
 
 use futures::StreamExt;
+use openai_agents_sdk::models::interface::Model;
 use openai_agents_sdk::tool::FunctionTool;
 use openai_agents_sdk::{
     Agent, OpenAIChatCompletionsModel, OpenAIClient, OpenAIResponsesModel, RunOptions, Runner,
@@ -265,5 +266,40 @@ async fn api_errors_are_reported() {
             assert_eq!(message, "Invalid API key");
         }
         other => panic!("unexpected {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn responses_stream_terminal_events_become_errors() {
+    openai_agents_sdk::set_tracing_disabled(true);
+    for (events, expected) in [
+        (
+            vec![json!({"type": "response.error", "code": "server_error", "message": "boom"})],
+            "Responses stream ended with terminal event `response.error`. \
+             code=server_error; message=boom.",
+        ),
+        (
+            vec![json!({"type": "response.incomplete", "response": {
+                "id": "resp_1", "status": "incomplete",
+                "incomplete_details": {"reason": "max_output_tokens"}}})],
+            "Responses stream ended with terminal event `response.incomplete`. \
+             status=incomplete; incomplete_details={\"reason\":\"max_output_tokens\"}.",
+        ),
+    ] {
+        let (base, _) = mock_server(vec![Reply::Sse(events)]).await;
+        let client = OpenAIClient::new("sk-test").with_base_url(base);
+        let model = OpenAIResponsesModel::new("gpt-4.1", client);
+        let mut stream = model
+            .stream_response(Default::default())
+            .await
+            .expect("stream opened");
+        let err = loop {
+            match stream.next().await {
+                Some(Ok(_)) => continue,
+                Some(Err(e)) => break e,
+                None => panic!("stream ended without an error"),
+            }
+        };
+        assert_eq!(err.to_string(), expected);
     }
 }

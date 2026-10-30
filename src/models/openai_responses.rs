@@ -12,8 +12,10 @@ use super::openai_client::OpenAIClient;
 use crate::error::{AgentsError, Result};
 use crate::items::{InputItem, ModelResponse, OutputItem};
 use crate::model_settings::ToolChoice;
-use crate::tracing::{Span, SpanData, response_span};
+use crate::tracing::{Span, SpanData, record_model_error_on_span, response_span};
 use crate::usage::Usage;
+
+use super::response_terminal::{is_terminal_failure_event, terminal_failure_error};
 
 /// A model that calls `POST /responses`.
 #[derive(Debug, Clone)]
@@ -424,6 +426,10 @@ impl Drop for SpanGuard {
 
 #[async_trait]
 impl Model for OpenAIResponsesModel {
+    fn supports_default_prompt_cache_key(&self) -> bool {
+        self.client.is_openai_api()
+    }
+
     async fn get_response(&self, request: ModelRequest) -> Result<ModelResponse> {
         let body = self.build_request_body(&request, false)?;
         let span = response_span(request.tracing.is_disabled());
@@ -445,12 +451,13 @@ impl Model for OpenAIResponsesModel {
             )
         }
         .await;
+        let include_data = request.tracing.include_data();
         match &result {
             Ok(resp) => finish_response_span(&span, resp, true),
-            Err(e) => span.set_error(
-                "Error getting response",
-                Some(json!({"error": e.to_string()})),
-            ),
+            Err(e) => {
+                record_model_error_on_span(&span, "Error getting response", e, include_data);
+                crate::logger::log_model_action_error("Error getting response", e);
+            }
         }
         span.finish();
         result
@@ -460,6 +467,7 @@ impl Model for OpenAIResponsesModel {
         let body = self.build_request_body(&request, true)?;
         let span = response_span(request.tracing.is_disabled());
         span.start();
+        let include_data = request.tracing.include_data();
         let (stream, _request_id) = match self
             .client
             .post_sse(
@@ -472,10 +480,8 @@ impl Model for OpenAIResponsesModel {
         {
             Ok(s) => s,
             Err(e) => {
-                span.set_error(
-                    "Error streaming response",
-                    Some(json!({"error": e.to_string()})),
-                );
+                record_model_error_on_span(&span, "Error streaming response", &e, include_data);
+                crate::logger::log_model_action_error("Error streaming response", &e);
                 span.finish();
                 return Err(e);
             }
@@ -489,34 +495,29 @@ impl Model for OpenAIResponsesModel {
                         .get("type")
                         .and_then(Value::as_str)
                         .unwrap_or_default();
-                    match ty {
-                        "response.completed" => {
-                            if let Some(r) = event.get("response")
-                                && let Ok(parsed) = parse_response(r, None, false)
-                            {
-                                finish_response_span(span, &parsed, true);
-                            }
-                            Ok(event)
+                    if ty == "response.completed" {
+                        if let Some(r) = event.get("response")
+                            && let Ok(parsed) = parse_response(r, None, false)
+                        {
+                            finish_response_span(span, &parsed, true);
                         }
-                        "response.failed" | "response.incomplete" => {
-                            let r = event.get("response").cloned().unwrap_or(Value::Null);
-                            let err = parse_response(&r, None, false).err().unwrap_or_else(|| {
-                                AgentsError::model_behavior(format!("Stream ended with {ty}"))
-                            });
-                            span.set_error(
-                                "Error streaming response",
-                                Some(json!({"error": err.to_string()})),
-                            );
-                            Err(err)
-                        }
-                        _ => Ok(event),
+                        return Ok(event);
                     }
+                    if is_terminal_failure_event(ty) {
+                        let err = terminal_failure_error(ty, &event);
+                        record_model_error_on_span(
+                            span,
+                            "Error streaming response",
+                            &err,
+                            include_data,
+                        );
+                        return Err(err);
+                    }
+                    Ok(event)
                 }
                 Err(e) => {
-                    span.set_error(
-                        "Error streaming response",
-                        Some(json!({"error": e.to_string()})),
-                    );
+                    record_model_error_on_span(span, "Error streaming response", &e, include_data);
+                    crate::logger::log_model_action_error("Error streaming response", &e);
                     Err(e)
                 }
             }
@@ -554,6 +555,7 @@ mod tests {
             namespace: ns.map(str::to_string),
             namespace_description: ns.map(|_| "ns desc".to_string()),
             allowed_callers: None,
+            output_json_schema: None,
         })
     }
 

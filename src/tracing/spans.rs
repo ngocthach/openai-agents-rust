@@ -235,6 +235,21 @@ impl Span {
         self.0.tracing_api_key.as_deref()
     }
 
+    /// When the span was started (ISO-8601), if it has been.
+    pub fn started_at(&self) -> Option<String> {
+        self.0
+            .state
+            .lock()
+            .expect("span poisoned")
+            .started_at
+            .clone()
+    }
+
+    /// When the span was finished (ISO-8601), if it has been.
+    pub fn ended_at(&self) -> Option<String> {
+        self.0.state.lock().expect("span poisoned").ended_at.clone()
+    }
+
     /// A copy of the span data.
     pub fn data(&self) -> SpanData {
         self.0.state.lock().expect("span poisoned").data.clone()

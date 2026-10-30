@@ -32,6 +32,101 @@ use crate::models::openai_chatcompletions::{
 };
 use crate::models::openai_client::OpenAIClient;
 use crate::models::openai_responses::OpenAIResponsesModel;
+use serde_json::Value;
+
+/// Providers that require every tool result to immediately follow its tool call.
+const STRICT_TOOL_ORDERING_MODELS: &[&str] = &["anthropic", "claude", "gemini"];
+
+/// Whether `model` names a provider that rejects tool results without a preceding tool call.
+pub fn requires_strict_tool_ordering(model: &str) -> bool {
+    let model = model.to_lowercase();
+    STRICT_TOOL_ORDERING_MODELS
+        .iter()
+        .any(|m| model.contains(m))
+}
+
+/// Reorder chat messages so every `tool_calls` assistant message is immediately followed by its
+/// tool result. Port of `LitellmModel._fix_tool_message_ordering`.
+///
+/// An assistant message carrying several tool calls is split into one message per call; only the
+/// first split keeps the shared assistant text and reasoning, so signed thinking blocks (which
+/// Anthropic rejects when duplicated) appear once.
+pub fn fix_tool_message_ordering(messages: Vec<Value>) -> Vec<Value> {
+    use std::collections::{HashMap, HashSet};
+
+    // tool call id -> (original index, the single-call assistant message)
+    let mut tool_call_messages: HashMap<String, (usize, Value)> = HashMap::new();
+    // tool call id -> (original index, the tool result message)
+    let mut tool_results: HashMap<String, (usize, Value)> = HashMap::new();
+    for (i, message) in messages.iter().enumerate() {
+        match message.get("role").and_then(Value::as_str) {
+            Some("assistant") => {
+                let Some(calls) = message.get("tool_calls").and_then(Value::as_array) else {
+                    continue;
+                };
+                for (split, call) in calls.iter().enumerate() {
+                    let Some(id) = call.get("id").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    let mut single = message.clone();
+                    single["tool_calls"] = Value::Array(vec![call.clone()]);
+                    if split > 0
+                        && let Some(obj) = single.as_object_mut()
+                    {
+                        for shared in ["content", "thinking_blocks", "reasoning_content"] {
+                            obj.remove(shared);
+                        }
+                    }
+                    tool_call_messages.insert(id.to_string(), (i, single));
+                }
+            }
+            Some("tool") => {
+                if let Some(id) = message.get("tool_call_id").and_then(Value::as_str) {
+                    tool_results.insert(id.to_string(), (i, message.clone()));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let paired: HashSet<usize> = tool_call_messages
+        .keys()
+        .filter_map(|id| tool_results.get(id).map(|(idx, _)| *idx))
+        .collect();
+
+    let mut fixed: Vec<Value> = Vec::with_capacity(messages.len());
+    for (i, message) in messages.iter().enumerate() {
+        match message.get("role").and_then(Value::as_str) {
+            Some("assistant")
+                if message
+                    .get("tool_calls")
+                    .and_then(Value::as_array)
+                    .is_some_and(|c| !c.is_empty()) =>
+            {
+                for call in message["tool_calls"].as_array().expect("checked") {
+                    let Some(id) = call.get("id").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    let Some((_, call_msg)) = tool_call_messages.get(id) else {
+                        continue;
+                    };
+                    fixed.push(call_msg.clone());
+                    if let Some((_, result)) = tool_results.get(id) {
+                        fixed.push(result.clone());
+                    }
+                }
+            }
+            Some("tool") => {
+                // Paired results were emitted next to their call above.
+                if !paired.contains(&i) {
+                    fixed.push(message.clone());
+                }
+            }
+            _ => fixed.push(message.clone()),
+        }
+    }
+    fixed
+}
 
 /// An OpenAI-compatible provider endpoint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -333,9 +428,17 @@ impl LitellmModel {
     ) -> Result<Self> {
         let model = model.into();
         let r = resolve(&model, base_url, api_key)?;
+        // Python passes preserve_tool_output_all_content=True because LiteLLM then translates
+        // the content parts into each provider's native shape. This adapter posts straight to
+        // the provider's OpenAI-compatible endpoint with nothing in between, and those
+        // endpoints are not guaranteed to accept array content on a `role: tool` message, so
+        // the conservative text-only reduction is kept.
         let mut chat = OpenAIChatCompletionsModel::new(r.model, r.client);
         if let Some(f) = should_replay_reasoning_content {
             chat = chat.with_should_replay_reasoning_content(move |c| f(c));
+        }
+        if requires_strict_tool_ordering(&model) {
+            chat = chat.with_message_transform(fix_tool_message_ordering);
         }
         Ok(LitellmModel {
             model,
@@ -454,6 +557,53 @@ impl ModelProvider for AnyLLMProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pairs_tool_calls_with_their_results() {
+        let messages = vec![
+            serde_json::json!({"role": "user", "content": "go"}),
+            serde_json::json!({"role": "assistant", "content": "thinking",
+            "thinking_blocks": [{"signature": "s"}],
+            "tool_calls": [
+                {"id": "a", "type": "function", "function": {"name": "f", "arguments": "{}"}},
+                {"id": "b", "type": "function", "function": {"name": "g", "arguments": "{}"}}
+            ]}),
+            serde_json::json!({"role": "tool", "tool_call_id": "b", "content": "B"}),
+            serde_json::json!({"role": "tool", "tool_call_id": "a", "content": "A"}),
+            serde_json::json!({"role": "tool", "tool_call_id": "orphan", "content": "O"}),
+        ];
+        let fixed = fix_tool_message_ordering(messages);
+        let shape: Vec<String> = fixed
+            .iter()
+            .map(|m| match m["role"].as_str().unwrap() {
+                "tool" => format!("tool:{}", m["tool_call_id"].as_str().unwrap()),
+                "assistant" => format!("call:{}", m["tool_calls"][0]["id"].as_str().unwrap()),
+                other => other.to_string(),
+            })
+            .collect();
+        assert_eq!(
+            shape,
+            [
+                "user",
+                "call:a",
+                "tool:a",
+                "call:b",
+                "tool:b",
+                "tool:orphan"
+            ]
+        );
+        // Only the first split keeps the shared assistant text and thinking blocks.
+        assert_eq!(fixed[1]["content"], "thinking");
+        assert!(fixed[3].get("content").is_none());
+        assert!(fixed[3].get("thinking_blocks").is_none());
+    }
+
+    #[test]
+    fn strict_tool_ordering_matches_anthropic_and_gemini() {
+        assert!(requires_strict_tool_ordering("anthropic/claude-sonnet-4-5"));
+        assert!(requires_strict_tool_ordering("vertex/GEMINI-2.5-pro"));
+        assert!(!requires_strict_tool_ordering("groq/llama-3.3-70b"));
+    }
 
     #[test]
     fn resolves_providers() {

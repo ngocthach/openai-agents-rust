@@ -14,6 +14,7 @@
 //! # }
 //! ```
 
+pub mod error_tracing;
 pub mod processors;
 pub mod provider;
 pub mod scope;
@@ -25,11 +26,18 @@ use std::sync::Arc;
 
 use serde_json::{Map, Value};
 
+pub use error_tracing::{
+    REDACTED_TOOL_ERROR_MESSAGE, REDACTED_TRACE_ERROR_MESSAGE, attach_error_to_current_span,
+    get_trace_error, get_trace_tool_error, model_error_text, record_model_error_on_span,
+    record_tool_error_on_span,
+};
 pub use processors::{
     BackendSpanExporter, BatchTraceProcessor, ConsoleSpanExporter, ExportItem,
     InMemoryTraceProcessor, TracingExporter, TracingProcessor,
 };
-pub use provider::{TraceProvider, provider};
+pub use provider::{
+    DefaultTraceProvider, TraceProvider, provider, reset_trace_provider, set_trace_provider,
+};
 pub use scope::{current_span, current_trace};
 pub use span_data::SpanData;
 pub use spans::{Span, SpanError, Trace, gen_group_id, gen_span_id, gen_trace_id};
@@ -98,6 +106,48 @@ pub fn trace(workflow_name: impl Into<String>) -> TraceBuilder {
     }
 }
 
+/// The name of the disabled span a masked run enters.
+pub const MASKED_RUN_SPAN_NAME: &str = "Agent run";
+
+/// The trace a run should use, or `None` when the run joins the already active trace.
+///
+/// With `disabled`, a disabled trace is always returned so that entering it hides an outer
+/// active trace: a run with tracing turned off must not export spans into its caller's trace.
+/// Pair it with [`masked_run_span`], which hides the caller's *span* the same way.
+pub fn create_trace_for_run(
+    workflow_name: impl Into<String>,
+    trace_id: Option<String>,
+    group_id: Option<String>,
+    metadata: Option<Map<String, Value>>,
+    tracing_api_key: Option<String>,
+    disabled: bool,
+) -> Option<Trace> {
+    if !disabled && scope::current_trace().is_some() {
+        return None;
+    }
+    Some(Trace::new(
+        workflow_name.into(),
+        trace_id,
+        group_id,
+        metadata,
+        tracing_api_key,
+        disabled || provider().is_disabled(),
+    ))
+}
+
+/// A disabled span entered by a run whose tracing is turned off, so code that reads
+/// [`current_span`] does not see the caller's span.
+pub fn masked_run_span() -> Span {
+    create_span(
+        SpanData::Custom {
+            name: MASKED_RUN_SPAN_NAME.to_string(),
+            data: Value::Null,
+        },
+        None,
+        true,
+    )
+}
+
 /// Create a span under the current span (or the current trace).
 pub fn create_span(data: SpanData, parent: Option<&Span>, disabled: bool) -> Span {
     let current;
@@ -142,6 +192,31 @@ pub fn agent_span(
             handoffs,
             tools,
             output_type,
+        },
+        None,
+        false,
+    )
+}
+
+/// A task span: one `Runner` invocation.
+pub fn task_span(name: &str) -> Span {
+    create_span(
+        SpanData::Task {
+            name: name.to_string(),
+            usage: None,
+        },
+        None,
+        false,
+    )
+}
+
+/// A turn span: one model turn of an agent.
+pub fn turn_span(turn: u64, agent_name: &str) -> Span {
+    create_span(
+        SpanData::Turn {
+            turn,
+            agent_name: agent_name.to_string(),
+            usage: None,
         },
         None,
         false,
@@ -282,7 +357,7 @@ pub fn set_tracing_disabled(disabled: bool) {
 
 /// Set the API key used to export traces to OpenAI.
 pub fn set_tracing_export_api_key(key: impl Into<String>) {
-    provider().set_export_api_key(key);
+    provider::set_export_api_key(key);
 }
 
 /// Replace the trace processors (the default OpenAI exporter is removed).
@@ -298,6 +373,11 @@ pub fn add_trace_processor(processor: Arc<dyn TracingProcessor>) {
 /// Block until buffered traces and spans are exported.
 pub fn flush_traces() {
     provider().force_flush();
+}
+
+/// Stop the tracing pipeline, flushing everything buffered.
+pub fn shutdown_tracing() {
+    provider().shutdown();
 }
 
 /// Export buffered traces and spans without blocking the async runtime.

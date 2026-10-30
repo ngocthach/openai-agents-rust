@@ -14,6 +14,28 @@ use crate::error::{AgentsError, Result};
 /// Default OpenAI API base URL.
 pub const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 
+/// The host of the official OpenAI API.
+const OPENAI_HOST: &str = "api.openai.com";
+
+/// Whether `base_url` points at the official OpenAI API.
+///
+/// Only the scheme and the host are compared, so a path or a port-less variant of the official
+/// endpoint still counts. Mirrors `is_official_openai_base_url`.
+pub fn is_official_openai_base_url(base_url: &str, websocket: bool) -> bool {
+    let expected_scheme = if websocket { "wss" } else { "https" };
+    let Some((scheme, rest)) = base_url.trim().split_once("://") else {
+        return false;
+    };
+    if !scheme.eq_ignore_ascii_case(expected_scheme) {
+        return false;
+    }
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    // Strip userinfo, then the port.
+    let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    let host = host.rsplit_once(':').map_or(host, |(h, _)| h);
+    host.eq_ignore_ascii_case(OPENAI_HOST)
+}
+
 /// Async client for the OpenAI REST API (or any compatible endpoint).
 #[derive(Clone)]
 pub struct OpenAIClient {
@@ -129,7 +151,7 @@ impl OpenAIClient {
 
     /// True when the client targets the official OpenAI API.
     pub fn is_openai_api(&self) -> bool {
-        self.base_url.trim_end_matches('/') == DEFAULT_BASE_URL
+        is_official_openai_base_url(&self.base_url, false)
     }
 
     /// The API key: explicit, then the global default, then `OPENAI_API_KEY`.
@@ -431,5 +453,28 @@ mod tests {
         )];
         let items: Vec<_> = sse_stream(futures::stream::iter(chunks)).collect().await;
         assert!(items[0].is_err());
+    }
+
+    #[test]
+    fn recognizes_the_official_endpoint_by_scheme_and_host() {
+        assert!(is_official_openai_base_url(DEFAULT_BASE_URL, false));
+        assert!(is_official_openai_base_url(
+            "https://api.openai.com/v2",
+            false
+        ));
+        assert!(is_official_openai_base_url("https://api.openai.com", false));
+        assert!(!is_official_openai_base_url(
+            "http://api.openai.com/v1",
+            false
+        ));
+        assert!(!is_official_openai_base_url(
+            "https://proxy.local/v1",
+            false
+        ));
+        assert!(is_official_openai_base_url("wss://api.openai.com/v1", true));
+        assert!(!is_official_openai_base_url(
+            "https://api.openai.com/v1",
+            true
+        ));
     }
 }

@@ -1,4 +1,7 @@
 //! Global trace provider. Mirrors `agents.tracing.provider` and `agents.tracing.setup`.
+//!
+//! [`provider`] returns the installed provider; [`set_trace_provider`] replaces it, so a custom
+//! tracing backend can take over trace and span lifecycle events entirely.
 
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -7,23 +10,54 @@ use std::sync::{Arc, OnceLock, RwLock};
 use super::processors::{BackendSpanExporter, BatchTraceProcessor, TracingProcessor};
 use super::spans::{Span, Trace};
 
-/// Holds the registered processors and the global disabled flag.
-pub struct TraceProvider {
-    processors: RwLock<Option<Vec<Arc<dyn TracingProcessor>>>>,
-    disabled: AtomicBool,
-    export_api_key: RwLock<Option<String>>,
+/// Receives trace and span lifecycle events and owns the global tracing switches.
+pub trait TraceProvider: Send + Sync + fmt::Debug {
+    /// Whether tracing is globally disabled.
+    fn is_disabled(&self) -> bool;
+    /// Globally enable or disable tracing.
+    fn set_disabled(&self, disabled: bool);
+    /// Replace all processors.
+    fn set_processors(&self, processors: Vec<Arc<dyn TracingProcessor>>);
+    /// Add a processor, keeping the default OpenAI exporter.
+    fn add_processor(&self, processor: Arc<dyn TracingProcessor>);
+    /// A trace started.
+    fn on_trace_start(&self, trace: &Trace);
+    /// A trace finished.
+    fn on_trace_end(&self, trace: &Trace);
+    /// A span started.
+    fn on_span_start(&self, span: &Span);
+    /// A span finished.
+    fn on_span_end(&self, span: &Span);
+    /// Flush all processors (blocking).
+    fn force_flush(&self);
+    /// Shut down all processors (blocking).
+    fn shutdown(&self);
 }
 
-impl fmt::Debug for TraceProvider {
+/// The built-in provider: holds the registered processors and the global disabled flag.
+pub struct DefaultTraceProvider {
+    processors: RwLock<Option<Vec<Arc<dyn TracingProcessor>>>>,
+    disabled: AtomicBool,
+}
+
+impl fmt::Debug for DefaultTraceProvider {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("TraceProvider")
+        f.debug_struct("DefaultTraceProvider")
             .field("disabled", &self.disabled.load(Ordering::Relaxed))
             .finish_non_exhaustive()
     }
 }
 
-static PROVIDER: OnceLock<TraceProvider> = OnceLock::new();
+impl Default for DefaultTraceProvider {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+static INSTALLED: RwLock<Option<Arc<dyn TraceProvider>>> = RwLock::new(None);
+static DEFAULT_PROVIDER: OnceLock<Arc<DefaultTraceProvider>> = OnceLock::new();
 static DEFAULT_PROCESSOR: OnceLock<Arc<BatchTraceProcessor>> = OnceLock::new();
+static EXPORT_API_KEY: RwLock<Option<String>> = RwLock::new(None);
 
 fn env_disabled() -> bool {
     matches!(
@@ -35,13 +69,29 @@ fn env_disabled() -> bool {
     )
 }
 
-/// The global trace provider.
-pub fn provider() -> &'static TraceProvider {
-    PROVIDER.get_or_init(|| TraceProvider {
-        processors: RwLock::new(None),
-        disabled: AtomicBool::new(env_disabled()),
-        export_api_key: RwLock::new(None),
-    })
+/// The installed trace provider.
+pub fn provider() -> Arc<dyn TraceProvider> {
+    if let Some(p) = INSTALLED.read().expect("provider poisoned").as_ref() {
+        return p.clone();
+    }
+    default_provider() as Arc<dyn TraceProvider>
+}
+
+/// The built-in provider instance, whether or not it is currently installed.
+pub fn default_provider() -> Arc<DefaultTraceProvider> {
+    DEFAULT_PROVIDER
+        .get_or_init(|| Arc::new(DefaultTraceProvider::new()))
+        .clone()
+}
+
+/// Install a custom trace provider for the whole process.
+pub fn set_trace_provider(provider: Arc<dyn TraceProvider>) {
+    *INSTALLED.write().expect("provider poisoned") = Some(provider);
+}
+
+/// Go back to the built-in trace provider.
+pub fn reset_trace_provider() {
+    *INSTALLED.write().expect("provider poisoned") = None;
 }
 
 /// The default batch processor exporting to OpenAI.
@@ -55,15 +105,25 @@ pub fn default_processor() -> Arc<BatchTraceProcessor> {
         .clone()
 }
 
-pub(crate) fn tracing_export_api_key() -> Option<String> {
-    provider()
-        .export_api_key
-        .read()
-        .expect("provider poisoned")
-        .clone()
+/// Set the API key used by the default exporter.
+pub fn set_export_api_key(key: impl Into<String>) {
+    *EXPORT_API_KEY.write().expect("provider poisoned") = Some(key.into());
 }
 
-impl TraceProvider {
+pub(crate) fn tracing_export_api_key() -> Option<String> {
+    EXPORT_API_KEY.read().expect("provider poisoned").clone()
+}
+
+impl DefaultTraceProvider {
+    /// A provider with no processors registered, reading the disabled flag from the
+    /// `OPENAI_AGENTS_DISABLE_TRACING` environment variable.
+    pub fn new() -> Self {
+        DefaultTraceProvider {
+            processors: RwLock::new(None),
+            disabled: AtomicBool::new(env_disabled()),
+        }
+    }
+
     fn processors(&self) -> Vec<Arc<dyn TracingProcessor>> {
         let guard = self.processors.read().expect("provider poisoned");
         match guard.as_ref() {
@@ -72,64 +132,60 @@ impl TraceProvider {
         }
     }
 
-    /// Whether tracing is globally disabled.
-    pub fn is_disabled(&self) -> bool {
+    /// Set the API key used by the default exporter.
+    pub fn set_export_api_key(&self, key: impl Into<String>) {
+        set_export_api_key(key);
+    }
+}
+
+impl TraceProvider for DefaultTraceProvider {
+    fn is_disabled(&self) -> bool {
         self.disabled.load(Ordering::Relaxed)
     }
 
-    /// Globally enable or disable tracing.
-    pub fn set_disabled(&self, disabled: bool) {
+    fn set_disabled(&self, disabled: bool) {
         self.disabled.store(disabled, Ordering::Relaxed);
     }
 
-    /// Replace all processors.
-    pub fn set_processors(&self, processors: Vec<Arc<dyn TracingProcessor>>) {
+    fn set_processors(&self, processors: Vec<Arc<dyn TracingProcessor>>) {
         *self.processors.write().expect("provider poisoned") = Some(processors);
     }
 
-    /// Add a processor (keeps the default OpenAI exporter).
-    pub fn add_processor(&self, processor: Arc<dyn TracingProcessor>) {
+    fn add_processor(&self, processor: Arc<dyn TracingProcessor>) {
         let mut guard = self.processors.write().expect("provider poisoned");
         let list =
             guard.get_or_insert_with(|| vec![default_processor() as Arc<dyn TracingProcessor>]);
         list.push(processor);
     }
 
-    /// Set the API key used by the default exporter.
-    pub fn set_export_api_key(&self, key: impl Into<String>) {
-        *self.export_api_key.write().expect("provider poisoned") = Some(key.into());
-    }
-
-    pub(crate) fn on_trace_start(&self, trace: &Trace) {
+    fn on_trace_start(&self, trace: &Trace) {
         for p in self.processors() {
             p.on_trace_start(trace);
         }
     }
-    pub(crate) fn on_trace_end(&self, trace: &Trace) {
+    fn on_trace_end(&self, trace: &Trace) {
         for p in self.processors() {
             p.on_trace_end(trace);
         }
     }
-    pub(crate) fn on_span_start(&self, span: &Span) {
+    fn on_span_start(&self, span: &Span) {
         for p in self.processors() {
             p.on_span_start(span);
         }
     }
-    pub(crate) fn on_span_end(&self, span: &Span) {
+    fn on_span_end(&self, span: &Span) {
         for p in self.processors() {
             p.on_span_end(span);
         }
     }
 
-    /// Flush all processors (blocking).
-    pub fn force_flush(&self) {
+    fn force_flush(&self) {
         for p in self.processors() {
             p.force_flush();
         }
     }
 
-    /// Shut down all processors (blocking).
-    pub fn shutdown(&self) {
+    fn shutdown(&self) {
         for p in self.processors() {
             p.shutdown();
         }

@@ -9,6 +9,8 @@ pub mod openai_provider;
 pub mod openai_responses;
 #[cfg(feature = "websocket")]
 pub mod openai_responses_ws;
+pub mod response_terminal;
+pub mod trace;
 
 use std::sync::RwLock;
 
@@ -16,13 +18,15 @@ pub use interface::{
     FunctionToolSpec, Model, ModelProvider, ModelRequest, ModelTracing, ResponseEventStream,
     ToolSpec,
 };
-pub use multi_provider::MultiProvider;
+pub use multi_provider::{MultiProvider, MultiProviderMap};
 pub use openai_chatcompletions::OpenAIChatCompletionsModel;
-pub use openai_client::OpenAIClient;
+pub use openai_client::{OpenAIClient, is_official_openai_base_url};
 pub use openai_provider::OpenAIProvider;
 pub use openai_responses::OpenAIResponsesModel;
 #[cfg(feature = "websocket")]
 pub use openai_responses_ws::OpenAIResponsesWSModel;
+pub use response_terminal::{format_response_error_event, format_response_terminal_failure};
+pub use trace::{model_config_for_trace, sanitize_url_for_trace};
 
 /// Placeholder id used for items synthesized from Chat Completions responses.
 pub const FAKE_RESPONSES_ID: &str = "__fake_id__";

@@ -97,6 +97,32 @@ impl Usage {
         }
     }
 
+    /// Account for model-call attempts that failed before this usage was produced.
+    ///
+    /// Each failed attempt still consumed a request, so it is counted and gets a zero-token
+    /// [`RequestUsage`] entry ahead of the successful one. Mirrors `apply_retry_attempt_usage`.
+    pub fn apply_retry_attempt_usage(&mut self, failed_attempts: u64) {
+        if failed_attempts == 0 {
+            return;
+        }
+        let mut entries = std::mem::take(&mut self.request_usage_entries);
+        if entries.is_empty() {
+            entries.push(RequestUsage {
+                input_tokens: self.input_tokens,
+                output_tokens: self.output_tokens,
+                total_tokens: self.total_tokens,
+                input_tokens_details: self.input_tokens_details.clone(),
+                output_tokens_details: self.output_tokens_details.clone(),
+            });
+        }
+        self.requests = self.requests.max(1) + failed_attempts;
+        let mut all: Vec<RequestUsage> = std::iter::repeat_with(RequestUsage::default) // one zero entry per failed attempt
+            .take(failed_attempts as usize)
+            .collect();
+        all.extend(entries);
+        self.request_usage_entries = all;
+    }
+
     /// Build a single-request usage from a Responses API `usage` object.
     pub fn from_responses_usage(value: &Value) -> Usage {
         let get = |k: &str| value.get(k).and_then(Value::as_u64).unwrap_or(0);

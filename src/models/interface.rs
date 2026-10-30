@@ -48,6 +48,8 @@ pub struct FunctionToolSpec {
     pub namespace_description: Option<String>,
     /// Programmatic callers allowed to invoke the tool (Responses API only).
     pub allowed_callers: Option<Vec<String>>,
+    /// Strict JSON object schema of the tool's output (Responses API only).
+    pub output_json_schema: Option<Value>,
 }
 
 impl FunctionToolSpec {
@@ -65,6 +67,9 @@ impl FunctionToolSpec {
         }
         if let Some(c) = &self.allowed_callers {
             v["allowed_callers"] = serde_json::json!(c);
+        }
+        if let Some(schema) = &self.output_json_schema {
+            v["output_schema"] = schema.clone();
         }
         v
     }
@@ -150,11 +155,21 @@ pub trait Model: Send + Sync + fmt::Debug {
         None
     }
 
+    /// Whether the SDK may add a generated `prompt_cache_key` for this model.
+    ///
+    /// Only the official OpenAI endpoints understand the field, so a compatible third-party
+    /// endpoint keeps the default `false`.
+    /// Mirrors `_supports_default_prompt_cache_key`.
+    fn supports_default_prompt_cache_key(&self) -> bool {
+        false
+    }
+
     /// Release resources held by the model.
     async fn close(&self) {}
 }
 
 /// Looks up models by name.
+#[async_trait]
 pub trait ModelProvider: Send + Sync + fmt::Debug {
     /// Get a model by name (`None` selects the provider default).
     fn get_model(&self, model_name: Option<&str>) -> Result<Arc<dyn Model>>;
@@ -163,4 +178,9 @@ pub trait ModelProvider: Send + Sync + fmt::Debug {
     fn agent_harness_id(&self) -> Option<String> {
         None
     }
+
+    /// Release resources held by the provider and the models it handed out.
+    ///
+    /// Mirrors `ModelProvider.aclose()`; the default does nothing.
+    async fn close(&self) {}
 }

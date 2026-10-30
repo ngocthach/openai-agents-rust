@@ -20,6 +20,9 @@ pub struct OpenAIProvider {
     client: Option<OpenAIClient>,
     use_responses: Option<bool>,
     agent_harness_id: Option<String>,
+    strict_feature_validation: bool,
+    #[cfg(feature = "websocket")]
+    websocket_base_url: Option<String>,
     #[cfg(feature = "websocket")]
     use_responses_websocket: bool,
     #[cfg(feature = "websocket")]
@@ -53,6 +56,21 @@ impl OpenAIProvider {
         self
     }
 
+    /// Override the Responses WebSocket base URL. Without it, the `OPENAI_WEBSOCKET_BASE_URL`
+    /// environment variable is used, and otherwise the client base URL with a `ws(s)` scheme.
+    #[cfg(feature = "websocket")]
+    pub fn with_websocket_base_url(mut self, url: impl Into<String>) -> Self {
+        self.websocket_base_url = Some(url.into());
+        self
+    }
+
+    /// Make Chat Completions models reject Responses-only features (`previous_response_id`,
+    /// `conversation_id`, `prompt`) instead of warning and ignoring them.
+    pub fn with_strict_feature_validation(mut self, strict: bool) -> Self {
+        self.strict_feature_validation = strict;
+        self
+    }
+
     /// Set the agent harness id recorded in trace metadata for runs using this provider.
     pub fn with_agent_harness_id(mut self, harness_id: impl Into<String>) -> Self {
         self.agent_harness_id = Some(harness_id.into());
@@ -81,13 +99,28 @@ impl OpenAIProvider {
             .unwrap_or_else(OpenAIClient::from_env)
     }
 
+    #[cfg(feature = "websocket")]
+    fn websocket_base_url(&self) -> Option<String> {
+        self.websocket_base_url.clone().or_else(|| {
+            std::env::var("OPENAI_WEBSOCKET_BASE_URL")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+        })
+    }
+
     fn use_responses(&self) -> bool {
         self.use_responses
             .unwrap_or_else(|| default_openai_api() == OpenAIApi::Responses)
     }
 }
 
+#[async_trait::async_trait]
 impl ModelProvider for OpenAIProvider {
+    #[cfg(feature = "websocket")]
+    async fn close(&self) {
+        self.close_websocket_models().await;
+    }
+
     fn agent_harness_id(&self) -> Option<String> {
         self.agent_harness_id.clone()
     }
@@ -104,10 +137,13 @@ impl ModelProvider for OpenAIProvider {
             let model = cache
                 .entry((name.clone(), explicit))
                 .or_insert_with(|| {
-                    Arc::new(
+                    let mut model =
                         super::openai_responses_ws::OpenAIResponsesWSModel::new(name, client)
-                            .with_explicit(explicit),
-                    )
+                            .with_explicit(explicit);
+                    if let Some(url) = self.websocket_base_url() {
+                        model = model.with_websocket_base_url(url);
+                    }
+                    Arc::new(model)
                 })
                 .clone();
             return Ok(model);
@@ -117,7 +153,10 @@ impl ModelProvider for OpenAIProvider {
                 OpenAIResponsesModel::new(name, client).with_explicit(explicit),
             ))
         } else {
-            Ok(Arc::new(OpenAIChatCompletionsModel::new(name, client)))
+            Ok(Arc::new(
+                OpenAIChatCompletionsModel::new(name, client)
+                    .with_strict_feature_validation(self.strict_feature_validation),
+            ))
         }
     }
 }

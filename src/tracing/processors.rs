@@ -73,6 +73,8 @@ pub struct BackendSpanExporter {
     organization: Option<String>,
     project: Option<String>,
     max_retries: u32,
+    base_delay: Duration,
+    max_delay: Duration,
     runtime: Arc<Mutex<Option<tokio::runtime::Runtime>>>,
     http: reqwest::Client,
 }
@@ -100,6 +102,8 @@ impl BackendSpanExporter {
             organization: std::env::var("OPENAI_ORG_ID").ok(),
             project: std::env::var("OPENAI_PROJECT_ID").ok(),
             max_retries: 3,
+            base_delay: Duration::from_secs(1),
+            max_delay: Duration::from_secs(30),
             runtime: Arc::new(Mutex::new(None)),
             http: crate::util::http_client(),
         }
@@ -114,6 +118,36 @@ impl BackendSpanExporter {
     /// Use a custom endpoint.
     pub fn with_endpoint(mut self, endpoint: impl Into<String>) -> Self {
         self.endpoint = endpoint.into();
+        self
+    }
+
+    /// Set the OpenAI organization header.
+    pub fn with_organization(mut self, organization: impl Into<String>) -> Self {
+        self.organization = Some(organization.into());
+        self
+    }
+
+    /// Set the OpenAI project header.
+    pub fn with_project(mut self, project: impl Into<String>) -> Self {
+        self.project = Some(project.into());
+        self
+    }
+
+    /// How many times a failed batch is retried (default 3).
+    pub fn with_max_retries(mut self, max_retries: u32) -> Self {
+        self.max_retries = max_retries;
+        self
+    }
+
+    /// The first backoff delay, doubled on each retry (default 1s).
+    pub fn with_base_delay(mut self, base_delay: Duration) -> Self {
+        self.base_delay = base_delay;
+        self
+    }
+
+    /// The backoff ceiling, which also bounds a server-sent `Retry-After` (default 30s).
+    pub fn with_max_delay(mut self, max_delay: Duration) -> Self {
+        self.max_delay = max_delay;
         self
     }
 
@@ -149,7 +183,7 @@ impl BackendSpanExporter {
             }
         }
         let rt = guard.as_ref().expect("runtime");
-        let mut delay = Duration::from_secs(1);
+        let mut delay = self.base_delay;
         for attempt in 0..=self.max_retries {
             let mut req = self
                 .http
@@ -167,17 +201,35 @@ impl BackendSpanExporter {
             let result = rt.block_on(async move {
                 let resp = req.send().await?;
                 let status = resp.status();
+                let headers: BTreeMap<String, String> = resp
+                    .headers()
+                    .iter()
+                    .filter_map(|(k, v)| {
+                        v.to_str()
+                            .ok()
+                            .map(|v| (k.as_str().to_lowercase(), v.into()))
+                    })
+                    .collect();
                 let text = resp.text().await.unwrap_or_default();
-                Ok::<_, reqwest::Error>((status, text))
+                Ok::<_, reqwest::Error>((status, headers, text))
             });
+            let mut retry_after = None;
             match result {
-                Ok((status, _)) if status.as_u16() < 300 => {
+                Ok((status, _, _)) if status.as_u16() < 300 => {
                     log::debug!("Exported {} items", data_len(&body));
                     return;
                 }
-                Ok((status, text)) => {
+                Ok((status, headers, text)) => {
                     let code = status.as_u16();
-                    let retryable = code >= 500 || matches!(code, 408 | 409 | 429);
+                    retry_after = crate::retry::parse_retry_after(&headers);
+                    // `x-should-retry: false` overrides the status classification, as in the
+                    // OpenAI client.
+                    let server_allows_retry = headers
+                        .get("x-should-retry")
+                        .map(|v| !v.trim().eq_ignore_ascii_case("false"))
+                        .unwrap_or(true);
+                    let retryable =
+                        server_allows_retry && (code >= 500 || matches!(code, 408 | 409 | 429));
                     if !retryable {
                         log::error!("[non-fatal] Tracing client error {code}: {text}");
                         return;
@@ -187,8 +239,16 @@ impl BackendSpanExporter {
                 Err(e) => log::warn!("[non-fatal] Tracing: request failed: {e}"),
             }
             if attempt < self.max_retries {
-                thread::sleep(delay);
-                delay = (delay * 2).min(Duration::from_secs(30));
+                // Honour the server's wait, bounded by max_delay so a large Retry-After
+                // cannot stall the export thread.
+                let wait = match retry_after {
+                    Some(secs) if secs > 0.0 => {
+                        delay.max(Duration::from_secs_f64(secs)).min(self.max_delay)
+                    }
+                    _ => delay,
+                };
+                thread::sleep(wait);
+                delay = (delay * 2).min(self.max_delay);
             }
         }
         log::error!("[non-fatal] Tracing: max retries reached, giving up on this batch.");
@@ -199,28 +259,180 @@ fn data_len(body: &Value) -> usize {
     body["data"].as_array().map(Vec::len).unwrap_or(0)
 }
 
-fn truncate_value(value: &Value) -> Value {
-    let size = value.to_string().len();
-    if size <= MAX_FIELD_BYTES {
+/// Serialized JSON size of `value`.
+fn json_size(value: &Value) -> usize {
+    value.to_string().len()
+}
+
+fn truncate_string_for_limit(s: &str, max_bytes: usize) -> Value {
+    // The two quotes of the serialized string count toward the budget.
+    let budget = max_bytes.saturating_sub(TRUNCATION_SUFFIX.len() + 2);
+    let mut cut = budget.min(s.len());
+    while cut > 0 && !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    Value::String(format!("{}{}", &s[..cut], TRUNCATION_SUFFIX))
+}
+
+/// Shrink `value` until its serialized form fits in `max_bytes`.
+///
+/// Mappings and lists are truncated recursively, largest child first, so a span whose input is a
+/// list of messages keeps its structure instead of becoming one truncated string. Child sizes are
+/// cached and the running total is updated incrementally, so a long input is not re-serialized
+/// once per removal.
+fn truncate_value_for_limit(value: &Value, max_bytes: usize) -> Value {
+    if json_size(value) <= max_bytes {
         return value.clone();
     }
     match value {
-        Value::String(s) => {
-            let mut cut = MAX_FIELD_BYTES.saturating_sub(TRUNCATION_SUFFIX.len() + 2);
-            while cut > 0 && !s.is_char_boundary(cut) {
-                cut -= 1;
+        Value::String(s) => truncate_string_for_limit(s, max_bytes),
+        Value::Object(map) => {
+            let mut truncated = map.clone();
+            // `{` + `}` plus, per entry, the quoted key, `:` and a separating `,`.
+            let overhead = |keys: &serde_json::Map<String, Value>| {
+                2 + keys
+                    .keys()
+                    .map(|k| json_size(&Value::String(k.clone())) + 1)
+                    .sum::<usize>()
+                    + keys.len().saturating_sub(1)
+            };
+            let mut sizes: Vec<(String, usize)> = truncated
+                .iter()
+                .map(|(k, v)| (k.clone(), json_size(v)))
+                .collect();
+            let mut current = overhead(&truncated) + sizes.iter().map(|(_, s)| *s).sum::<usize>();
+            while !sizes.is_empty() && current > max_bytes {
+                let pos = sizes
+                    .iter()
+                    .enumerate()
+                    .max_by_key(|(_, (_, size))| *size)
+                    .map(|(i, _)| i)
+                    .expect("non-empty");
+                let (key, child_size) = sizes[pos].clone();
+                let child = truncated[&key].clone();
+                let budget = max_bytes.saturating_sub(current - child_size);
+                let new_child = truncate_value_for_limit(&child, budget);
+                let new_size = json_size(&new_child);
+                if new_child == child || new_size >= child_size {
+                    truncated.remove(&key);
+                    sizes.remove(pos);
+                    current = overhead(&truncated) + sizes.iter().map(|(_, s)| *s).sum::<usize>();
+                } else {
+                    truncated.insert(key, new_child);
+                    sizes[pos].1 = new_size;
+                    current = current - child_size + new_size;
+                }
             }
-            Value::String(format!("{}{}", &s[..cut.min(s.len())], TRUNCATION_SUFFIX))
+            Value::Object(truncated)
         }
-        other => {
-            let s = other.to_string();
-            let mut cut = MAX_FIELD_BYTES.saturating_sub(TRUNCATION_SUFFIX.len() + 2);
-            while cut > 0 && !s.is_char_boundary(cut) {
-                cut -= 1;
+        Value::Array(items) => {
+            let mut truncated: Vec<Option<Value>> = items.iter().cloned().map(Some).collect();
+            let mut sizes: Vec<(usize, usize)> = items
+                .iter()
+                .enumerate()
+                .map(|(i, v)| (i, json_size(v)))
+                .collect();
+            // `[` + `]` plus a separating `,` between entries.
+            let overhead = |count: usize| 2 + count.saturating_sub(1);
+            let mut current = overhead(sizes.len()) + sizes.iter().map(|(_, s)| *s).sum::<usize>();
+            while !sizes.is_empty() && current > max_bytes {
+                let pos = sizes
+                    .iter()
+                    .enumerate()
+                    .max_by_key(|(_, (_, size))| *size)
+                    .map(|(i, _)| i)
+                    .expect("non-empty");
+                let (index, child_size) = sizes[pos];
+                let child = truncated[index].clone().expect("live entry");
+                let budget = max_bytes.saturating_sub(current - child_size);
+                let new_child = truncate_value_for_limit(&child, budget);
+                let new_size = json_size(&new_child);
+                if new_child == child || new_size >= child_size {
+                    truncated[index] = None;
+                    sizes.remove(pos);
+                    current = overhead(sizes.len()) + sizes.iter().map(|(_, s)| *s).sum::<usize>();
+                } else {
+                    truncated[index] = Some(new_child);
+                    sizes[pos].1 = new_size;
+                    current = current - child_size + new_size;
+                }
             }
-            Value::String(format!("{}{}", &s[..cut], TRUNCATION_SUFFIX))
+            Value::Array(truncated.into_iter().flatten().collect())
         }
+        other => truncate_string_for_limit(&other.to_string(), max_bytes),
     }
+}
+
+fn truncate_value(value: &Value) -> Value {
+    truncate_value_for_limit(value, MAX_FIELD_BYTES)
+}
+
+/// Drop reasoning from generation span input/output before export.
+///
+/// The OpenAI traces dashboard does not render reasoning, and replayed thinking blocks are
+/// provider-signed data that does not belong in a trace. Mirrors `_omit_generation_reasoning`;
+/// the untouched span is still delivered to custom processors.
+fn omit_generation_reasoning(value: &Value) -> Value {
+    fn omit_message_reasoning(item: &Value) -> Value {
+        let Some(map) = item.as_object() else {
+            return item.clone();
+        };
+        if map.get("role").and_then(Value::as_str) != Some("assistant") {
+            return item.clone();
+        }
+        let mut map = map.clone();
+        for key in [
+            "reasoning",
+            "reasoning_content",
+            "thinking_blocks",
+            "thinking",
+        ] {
+            map.remove(key);
+        }
+        if let Some(Value::Array(parts)) = map.get("content") {
+            // Legacy thinking replay uses inline Anthropic content blocks.
+            let kept: Vec<Value> = parts
+                .iter()
+                .filter(|p| {
+                    !matches!(
+                        p.get("type").and_then(Value::as_str),
+                        Some("thinking" | "redacted_thinking")
+                    )
+                })
+                .cloned()
+                .collect();
+            map.insert("content".into(), Value::Array(kept));
+        }
+        Value::Object(map)
+    }
+
+    fn omit_items(items: &[Value]) -> Vec<Value> {
+        items
+            .iter()
+            .filter(|i| i.get("type").and_then(Value::as_str) != Some("reasoning"))
+            .map(omit_message_reasoning)
+            .collect()
+    }
+
+    let Some(items) = value.as_array() else {
+        return value.clone();
+    };
+    Value::Array(
+        omit_items(items)
+            .into_iter()
+            .map(|item| {
+                let is_response = item.get("object").and_then(Value::as_str) == Some("response");
+                match (is_response, item.get("output").and_then(Value::as_array)) {
+                    (true, Some(output)) => {
+                        let mut item = item.clone();
+                        item["output"] = Value::Array(omit_items(output));
+                        item
+                    }
+                    _ => item,
+                }
+            })
+            .collect(),
+    )
 }
 
 /// Enforce OpenAI traces ingest limits: truncate large fields and keep usage only on
@@ -229,13 +441,18 @@ pub(crate) fn sanitize_for_openai(mut payload: Value) -> Value {
     let Some(span_data) = payload.get_mut("span_data").and_then(Value::as_object_mut) else {
         return payload;
     };
+    let is_generation = span_data.get("type").and_then(Value::as_str) == Some("generation");
     for field in ["input", "output"] {
         if let Some(v) = span_data.get(field) {
-            let t = truncate_value(v);
+            let v = if is_generation {
+                omit_generation_reasoning(v)
+            } else {
+                v.clone()
+            };
+            let t = truncate_value(&v);
             span_data.insert(field.into(), t);
         }
     }
-    let is_generation = span_data.get("type").and_then(Value::as_str) == Some("generation");
     if !is_generation {
         span_data.remove("usage");
     } else if let Some(usage) = span_data.get("usage").cloned() {
@@ -503,6 +720,81 @@ mod tests {
         assert!(input.len() <= MAX_FIELD_BYTES && input.ends_with(TRUNCATION_SUFFIX));
         let g = json!({"span_data": {"type": "generation", "usage": {"input_tokens": 1, "output_tokens": 2}}});
         assert!(sanitize_for_openai(g)["span_data"]["usage"].is_object());
+    }
+
+    #[test]
+    fn truncates_structures_recursively() {
+        let big = "x".repeat(MAX_FIELD_BYTES);
+        let payload = json!({"span_data": {"type": "generation", "input": [
+            {"role": "user", "content": big.clone()},
+            {"role": "user", "content": "short"},
+        ]}});
+        let input = sanitize_for_openai(payload)["span_data"]["input"].clone();
+        assert!(input.is_array(), "the list structure is kept: {input}");
+        assert!(input.to_string().len() <= MAX_FIELD_BYTES);
+        let first = &input[0];
+        assert_eq!(first["role"], "user");
+        assert!(
+            first["content"]
+                .as_str()
+                .unwrap()
+                .ends_with(TRUNCATION_SUFFIX),
+            "{first}"
+        );
+    }
+
+    #[test]
+    fn omits_reasoning_from_generation_spans() {
+        let payload = json!({"span_data": {"type": "generation", "output": [
+            {"type": "reasoning", "summary": [{"type": "summary_text", "text": "secret"}]},
+            {"role": "assistant", "content": "hi", "reasoning_content": "secret",
+             "thinking_blocks": [{"signature": "s"}]},
+            {"object": "response", "output": [
+                {"type": "reasoning", "summary": []},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "secret"},
+                    {"type": "text", "text": "kept"},
+                ]},
+            ]},
+        ], "usage": {"input_tokens": 1, "output_tokens": 1}}});
+        let out = sanitize_for_openai(payload)["span_data"]["output"].clone();
+        assert_eq!(out.as_array().unwrap().len(), 2, "{out}");
+        assert_eq!(out[0]["content"], "hi");
+        assert!(out[0].get("reasoning_content").is_none());
+        assert!(out[0].get("thinking_blocks").is_none());
+        let nested = &out[1]["output"];
+        assert_eq!(nested.as_array().unwrap().len(), 1, "{nested}");
+        assert_eq!(
+            nested[0]["content"],
+            json!([{"type": "text", "text": "kept"}])
+        );
+        // Non-generation spans are untouched.
+        let other = json!({"span_data": {"type": "function",
+            "output": [{"type": "reasoning", "summary": []}]}});
+        assert_eq!(
+            sanitize_for_openai(other)["span_data"]["output"],
+            json!([{"type": "reasoning", "summary": []}])
+        );
+    }
+
+    #[test]
+    fn truncation_keeps_nested_structure_within_the_limit() {
+        let big = "y".repeat(MAX_FIELD_BYTES * 2);
+        let value = json!({"keep": "small", "big": {"inner": big}});
+        let out = truncate_value(&value);
+        assert!(
+            out.to_string().len() <= MAX_FIELD_BYTES,
+            "{}",
+            out.to_string().len()
+        );
+        assert_eq!(out["keep"], "small");
+        assert!(
+            out["big"]["inner"]
+                .as_str()
+                .unwrap()
+                .ends_with(TRUNCATION_SUFFIX),
+            "{out}"
+        );
     }
 
     #[derive(Debug, Default)]
