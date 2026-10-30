@@ -17,10 +17,11 @@ use openai_agents_sdk::extensions::sandbox::e2b::{
     WorkspacePersistence,
 };
 use openai_agents_sdk::extensions::sandbox::vercel::{
-    VercelSandboxClient, VercelSandboxClientOptions,
+    VercelCloudBucketMountStrategy, VercelSandboxClient, VercelSandboxClientOptions,
     WorkspacePersistence as VercelWorkspacePersistence,
 };
 use openai_agents_sdk::sandbox::entries::Entry;
+use openai_agents_sdk::sandbox::mounts::MountStrategy;
 use openai_agents_sdk::sandbox::pty::{PtyExecRequest, PtyWriteRequest};
 use openai_agents_sdk::sandbox::{
     ErrorCode, ExecRequest, Manifest, SandboxClient, SandboxSessionState,
@@ -1220,6 +1221,10 @@ async fn vercel_runs_a_create_write_exec_read_stop_flow() {
     assert_eq!(body["projectId"], "prj_1");
     assert_eq!(body["persistent"], false);
     assert_eq!(body["timeout"], 270_000);
+    // The runtime alias is resolved to a concrete Amazon Linux image, which is what ships the
+    // S3 mount tools; `/v3/sandboxes` has no `runtime` field to fall back on.
+    assert_eq!(body["image"], "vercel/sandbox/node:al-24");
+    assert!(body["runtime"].is_null(), "{body}");
     assert!(
         body["name"].as_str().expect("name").starts_with("agents-"),
         "{body}"
@@ -1566,8 +1571,15 @@ async fn e2b_activates_an_rclone_cloud_bucket_mount() {
                 ("POST", "/filesystem.Filesystem/MakeDir") => {
                     MockResponse::json(serde_json::json!({}))
                 }
-                // Every preflight probe and the mount itself succeed.
-                ("POST", "/process.Process/Start") => e2b_process_stream("", 0),
+                // Every preflight probe and the mount itself succeed. The sandbox reports the
+                // user it runs commands as, which the mount has to hand to `rclone`.
+                ("POST", "/process.Process/Start") => {
+                    if request.text().contains("id -u; id -g") {
+                        e2b_process_stream("1000\n1001\n", 0)
+                    } else {
+                        e2b_process_stream("", 0)
+                    }
+                }
                 ("POST", "/files") => MockResponse::json(serde_json::json!([])),
                 _ => MockResponse::error(404, "unexpected request"),
             },
@@ -1625,8 +1637,12 @@ async fn e2b_activates_an_rclone_cloud_bucket_mount() {
     assert!(command.contains("/workspace/data"), "{command}");
     assert!(command.contains("--read-only"), "{command}");
     assert!(command.contains("--daemon"), "{command}");
-    // The provider adds the flags its image needs; the core pattern does not.
+    // The provider adds the flags its image needs; the core pattern does not. `rclone mount`
+    // runs as root, so without the command user's ids the mounted tree is not usable by the
+    // user the sandbox runs commands as.
     assert!(command.contains("--allow-other"), "{command}");
+    assert!(command.contains("--uid 1000"), "{command}");
+    assert!(command.contains("--gid 1001"), "{command}");
     assert!(
         command.contains("/workspace/.sandbox-rclone-config/"),
         "{command}"
@@ -2285,4 +2301,591 @@ async fn providers_honor_per_command_environment_variables() {
     assert_eq!(cmd.json()["env"]["TASK"], "per-command");
     assert_eq!(cmd.json()["env"]["KEEP"], "yes");
     vercel_server.stop();
+}
+
+// ---------------------------------------------------------------------------------------------
+// Vercel cloud bucket mounts
+// ---------------------------------------------------------------------------------------------
+
+/// One finished command, with the stdout it produced.
+fn vercel_command_result(stdout: &str, exit_code: i64) -> MockResponse {
+    MockResponse::ndjson(&[
+        serde_json::json!({ "stream": "stdout", "data": stdout }),
+        serde_json::json!({
+            "command": {
+                "id": "cmd-1",
+                "name": "sh",
+                "args": [],
+                "cwd": "/vercel/sandbox",
+                "sessionId": "sess-1",
+                "exitCode": exit_code,
+                "startedAt": 1,
+            },
+        }),
+    ])
+}
+
+/// The command and arguments of a recorded `cmd` request.
+fn vercel_command_argv(request: &Recorded) -> Vec<String> {
+    let body = request.json();
+    let mut argv = vec![body["command"].as_str().unwrap_or_default().to_string()];
+    argv.extend(
+        body["args"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|arg| arg.as_str().map(str::to_string)),
+    );
+    argv
+}
+
+/// Every recorded `cmd` request whose command is `command`.
+fn vercel_commands(server: &MockServer, command: &str) -> Vec<Recorded> {
+    server
+        .requests()
+        .into_iter()
+        .filter(|request| request.path.ends_with("/cmd") && request.json()["command"] == command)
+        .collect()
+}
+
+/// The one recorded `cmd` request whose command is `command`.
+fn vercel_command(server: &MockServer, command: &str) -> Recorded {
+    vercel_commands(server, command)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| panic!("no `{command}` command was run"))
+}
+
+/// Answer the fixed part of the mount flow: a healthy Mountpoint and an empty mount directory.
+fn vercel_mount_handler(request: &Recorded) -> Option<MockResponse> {
+    match (request.method.as_str(), request.path.as_str()) {
+        ("POST", "/v3/sandboxes") => {
+            Some(MockResponse::json(vercel_sandbox_and_session("running")))
+        }
+        ("GET", "/v2/sandboxes/sessions/sess-1") => {
+            let mut body = vercel_sandbox_and_session("running");
+            Some(MockResponse::json(serde_json::json!({
+                "session": body["session"].take(),
+                "routes": [],
+            })))
+        }
+        ("POST", "/v2/sandboxes/sessions/sess-1/fs/mkdir") => {
+            Some(MockResponse::json(serde_json::json!({})))
+        }
+        ("POST", "/v2/sandboxes/sessions/sess-1/stop") => {
+            let mut body = vercel_sandbox_and_session("stopped");
+            Some(MockResponse::json(
+                serde_json::json!({ "session": body["session"].take() }),
+            ))
+        }
+        ("POST", "/v2/sandboxes/sessions/sess-1/cmd") => {
+            let argv = vercel_command_argv(request);
+            let command = argv.first().cloned().unwrap_or_default();
+            Some(match command.as_str() {
+                "/usr/bin/rpm" => vercel_command_result("1.21.0", 0),
+                "/usr/bin/test" => vercel_command_result("", 0),
+                // `realpath -m` echoes the path back when nothing resolves through a symlink.
+                "/usr/bin/realpath" => {
+                    vercel_command_result(argv.last().map(String::as_str).unwrap_or_default(), 0)
+                }
+                // An empty mount directory prints nothing.
+                "/usr/bin/find" => vercel_command_result("", 0),
+                "/usr/bin/id" => vercel_command_result(
+                    if argv.contains(&"-u".to_string()) {
+                        "1000"
+                    } else {
+                        "1001"
+                    },
+                    0,
+                ),
+                _ => vercel_command_result("", 0),
+            })
+        }
+        _ => None,
+    }
+}
+
+/// A Vercel client pointed at `server`.
+fn vercel_mount_client(server: &MockServer) -> VercelSandboxClient {
+    VercelSandboxClient::with_options(
+        VercelSandboxClientOptions::new()
+            .with_token("vercel_test")
+            .with_base_url(&server.base_url)
+            .with_status_poll_interval(Duration::from_millis(1)),
+    )
+}
+
+/// A manifest attaching `strategy` at `/vercel/sandbox/data`.
+fn vercel_mount_manifest(strategy: VercelCloudBucketMountStrategy, read_only: bool) -> Manifest {
+    Manifest::new()
+        .with_entry(
+            "data",
+            Entry::mount(strategy.mount().with_read_only(read_only)),
+        )
+        // An authenticated mount hands a credential to the sandbox, so the manifest has to
+        // acknowledge its exact path before it can activate.
+        .with_in_container_mount_credential_exposure_acknowledged(["/vercel/sandbox/data"])
+}
+
+#[tokio::test]
+async fn vercel_mounts_a_writable_bucket_as_the_session_user() {
+    let server = MockServer::start(|request| {
+        vercel_mount_handler(request).unwrap_or_else(|| MockResponse::error(404, "unexpected"))
+    })
+    .await;
+
+    let strategy = VercelCloudBucketMountStrategy::new("my-bucket")
+        .with_region("us-east-1")
+        .with_credentials("AKIAEXAMPLE", "s3cr3t");
+    let session = vercel_mount_client(&server)
+        .create(Some(vercel_mount_manifest(strategy, false)))
+        .await
+        .expect("create");
+    session.start().await.expect("start");
+
+    let mount = vercel_command(&server, "/usr/bin/mount-s3");
+    let argv = vercel_command_argv(&mount);
+    assert_eq!(
+        argv,
+        vec![
+            "/usr/bin/mount-s3",
+            "my-bucket",
+            "/vercel/sandbox/data",
+            "--allow-other",
+            "--allow-overwrite",
+            "--allow-delete",
+            "--uid",
+            "1000",
+            "--gid",
+            "1001",
+            "--region",
+            "us-east-1",
+        ]
+    );
+    // Mountpoint needs root, and the backend takes the escalation out of band.
+    assert_eq!(mount.json()["sudo"], true);
+    // The credentials travel as the command's environment, never in its argument vector.
+    assert_eq!(mount.json()["env"]["AWS_ACCESS_KEY_ID"], "AKIAEXAMPLE");
+    assert_eq!(mount.json()["env"]["AWS_SECRET_ACCESS_KEY"], "s3cr3t");
+    assert!(!argv.join(" ").contains("s3cr3t"), "{argv:?}");
+
+    // The ownership probe must not run as root, or the mount would be owned by root.
+    let uid = vercel_commands(&server, "/usr/bin/id");
+    assert_eq!(uid.len(), 2, "both the user and the group id are probed");
+    assert!(uid.iter().all(|request| request.json()["sudo"].is_null()));
+
+    // The mount path is checked before the directory exists and again after `mkdir -p`, because
+    // a symlink planted in between would move the mount somewhere else.
+    assert_eq!(vercel_commands(&server, "/usr/bin/realpath").len(), 2);
+    // An existing file under the mount path would vanish behind the mount.
+    let find = vercel_command_argv(&vercel_command(&server, "/usr/bin/find"));
+    assert!(find.contains(&"-mindepth".to_string()), "{find:?}");
+    // A healthy Mountpoint is left alone.
+    assert!(vercel_commands(&server, "/usr/bin/dnf").is_empty());
+    server.stop();
+}
+
+#[tokio::test]
+async fn vercel_keeps_a_read_only_mount_read_only_although_it_authenticates() {
+    let server = MockServer::start(|request| {
+        vercel_mount_handler(request).unwrap_or_else(|| MockResponse::error(404, "unexpected"))
+    })
+    .await;
+
+    let strategy = VercelCloudBucketMountStrategy::new("my-bucket")
+        .with_prefix("exports")
+        .with_credentials("AKIAEXAMPLE", "s3cr3t");
+    let session = vercel_mount_client(&server)
+        .create(Some(vercel_mount_manifest(strategy, true)))
+        .await
+        .expect("create");
+    session.start().await.expect("start");
+
+    let argv = vercel_command_argv(&vercel_command(&server, "/usr/bin/mount-s3"));
+    assert_eq!(
+        argv,
+        vec![
+            "/usr/bin/mount-s3",
+            "my-bucket",
+            "/vercel/sandbox/data",
+            "--allow-other",
+            "--read-only",
+            "--prefix",
+            "exports/",
+        ]
+    );
+    // Write flags follow writability, not authentication.
+    assert!(!argv.contains(&"--allow-delete".to_string()), "{argv:?}");
+    assert!(!argv.contains(&"--allow-overwrite".to_string()), "{argv:?}");
+    // A signed mount must not ask for anonymous access.
+    assert!(!argv.contains(&"--no-sign-request".to_string()), "{argv:?}");
+    // A read-only mount exposes no files the session user has to own.
+    assert!(vercel_commands(&server, "/usr/bin/id").is_empty());
+    server.stop();
+}
+
+#[tokio::test]
+async fn vercel_mounts_a_public_bucket_without_credentials() {
+    let server = MockServer::start(|request| {
+        vercel_mount_handler(request).unwrap_or_else(|| MockResponse::error(404, "unexpected"))
+    })
+    .await;
+
+    let manifest = Manifest::new().with_entry(
+        "data",
+        Entry::mount(
+            VercelCloudBucketMountStrategy::new("public-bucket")
+                .mount()
+                .with_read_only(true),
+        ),
+    );
+    let session = vercel_mount_client(&server)
+        .create(Some(manifest))
+        .await
+        .expect("create");
+    session.start().await.expect("start");
+
+    let mount = vercel_command(&server, "/usr/bin/mount-s3");
+    let argv = vercel_command_argv(&mount);
+    assert!(argv.contains(&"--no-sign-request".to_string()), "{argv:?}");
+    assert!(mount.json()["env"]["AWS_ACCESS_KEY_ID"].is_null());
+    server.stop();
+}
+
+#[tokio::test]
+async fn vercel_installs_mountpoint_when_the_image_ships_an_old_one() {
+    let probes = Arc::new(Mutex::new(0usize));
+    let handler_probes = probes.clone();
+    let server = MockServer::start(move |request| {
+        let argv = vercel_command_argv(request);
+        if request.path.ends_with("/cmd") && argv.first().is_some_and(|c| c == "/usr/bin/rpm") {
+            let mut seen = handler_probes.lock().expect("poisoned");
+            *seen += 1;
+            // The image ships a release this strategy cannot drive; the install fixes that.
+            return vercel_command_result(if *seen == 1 { "1.20.9" } else { "1.21.0" }, 0);
+        }
+        vercel_mount_handler(request).unwrap_or_else(|| MockResponse::error(404, "unexpected"))
+    })
+    .await;
+
+    let session = vercel_mount_client(&server)
+        .create(Some(vercel_mount_manifest(
+            VercelCloudBucketMountStrategy::new("public-bucket"),
+            true,
+        )))
+        .await
+        .expect("create");
+    session.start().await.expect("start");
+
+    let install = vercel_command(&server, "/usr/bin/dnf");
+    assert_eq!(
+        vercel_command_argv(&install),
+        vec![
+            "/usr/bin/dnf",
+            "install",
+            "-y",
+            "--setopt=gpgcheck=1",
+            "fuse",
+            "mount-s3",
+        ]
+    );
+    // Installing a package needs root, and the package signature check stays on.
+    assert_eq!(install.json()["sudo"], true);
+    // The version is verified again after the install rather than assumed.
+    assert_eq!(*probes.lock().expect("poisoned"), 2);
+    assert!(!vercel_commands(&server, "/usr/bin/mount-s3").is_empty());
+    server.stop();
+}
+
+#[tokio::test]
+async fn vercel_refuses_an_unsupported_mountpoint_release() {
+    let server = MockServer::start(|request| {
+        let argv = vercel_command_argv(request);
+        if request.path.ends_with("/cmd") && argv.first().is_some_and(|c| c == "/usr/bin/rpm") {
+            // A new major release is not assumed to take the same flags.
+            return vercel_command_result("2.0.0", 0);
+        }
+        vercel_mount_handler(request).unwrap_or_else(|| MockResponse::error(404, "unexpected"))
+    })
+    .await;
+
+    let session = vercel_mount_client(&server)
+        .create(Some(vercel_mount_manifest(
+            VercelCloudBucketMountStrategy::new("public-bucket"),
+            true,
+        )))
+        .await
+        .expect("create");
+    let error = session
+        .start()
+        .await
+        .expect_err("an unsupported Mountpoint");
+    assert_eq!(error.code, ErrorCode::MountConfigInvalid);
+    assert!(error.message.contains("2.0.0"), "{}", error.message);
+    assert!(vercel_commands(&server, "/usr/bin/mount-s3").is_empty());
+    server.stop();
+}
+
+#[tokio::test]
+async fn vercel_refuses_a_mount_path_that_resolves_through_a_symlink() {
+    let server = MockServer::start(|request| {
+        let argv = vercel_command_argv(request);
+        if request.path.ends_with("/cmd") && argv.first().is_some_and(|c| c == "/usr/bin/realpath")
+        {
+            return vercel_command_result("/vercel/sandbox/elsewhere", 0);
+        }
+        vercel_mount_handler(request).unwrap_or_else(|| MockResponse::error(404, "unexpected"))
+    })
+    .await;
+
+    let session = vercel_mount_client(&server)
+        .create(Some(vercel_mount_manifest(
+            VercelCloudBucketMountStrategy::new("public-bucket"),
+            true,
+        )))
+        .await
+        .expect("create");
+    let error = session.start().await.expect_err("a symlinked mount path");
+    assert_eq!(error.code, ErrorCode::MountConfigInvalid);
+    assert!(error.message.contains("elsewhere"), "{}", error.message);
+    assert!(vercel_commands(&server, "/usr/bin/mount-s3").is_empty());
+    server.stop();
+}
+
+#[tokio::test]
+async fn vercel_refuses_to_mount_over_a_populated_directory() {
+    let server = MockServer::start(|request| {
+        let argv = vercel_command_argv(request);
+        if request.path.ends_with("/cmd") && argv.first().is_some_and(|c| c == "/usr/bin/find") {
+            return vercel_command_result("/vercel/sandbox/data/existing.txt", 0);
+        }
+        vercel_mount_handler(request).unwrap_or_else(|| MockResponse::error(404, "unexpected"))
+    })
+    .await;
+
+    let session = vercel_mount_client(&server)
+        .create(Some(vercel_mount_manifest(
+            VercelCloudBucketMountStrategy::new("public-bucket"),
+            true,
+        )))
+        .await
+        .expect("create");
+    let error = session.start().await.expect_err("a populated mount path");
+    assert_eq!(error.code, ErrorCode::MountConfigInvalid);
+    assert!(error.message.contains("empty"), "{}", error.message);
+    server.stop();
+}
+
+#[tokio::test]
+async fn vercel_redacts_a_failing_mount_command_and_stops_the_sandbox() {
+    let server = MockServer::start(|request| {
+        let argv = vercel_command_argv(request);
+        if request.path.ends_with("/cmd") && argv.first().is_some_and(|c| c == "/usr/bin/mount-s3")
+        {
+            // Mountpoint is the one command that has seen the credentials.
+            return MockResponse::ndjson(&[
+                serde_json::json!({
+                    "stream": "stderr",
+                    "data": "Error: failed to sign request with AKIAEXAMPLE/s3cr3t\n",
+                }),
+                serde_json::json!({
+                    "command": {
+                        "id": "cmd-1", "name": "sh", "args": [], "cwd": "/vercel/sandbox",
+                        "sessionId": "sess-1", "exitCode": 1, "startedAt": 1,
+                    },
+                }),
+            ]);
+        }
+        vercel_mount_handler(request).unwrap_or_else(|| MockResponse::error(404, "unexpected"))
+    })
+    .await;
+
+    let strategy =
+        VercelCloudBucketMountStrategy::new("my-bucket").with_credentials("AKIAEXAMPLE", "s3cr3t");
+    let session = vercel_mount_client(&server)
+        .create(Some(vercel_mount_manifest(strategy, true)))
+        .await
+        .expect("create");
+    let error = session.start().await.expect_err("the mount fails");
+    assert_eq!(error.code, ErrorCode::MountFailed);
+    assert!(!error.message.contains("AKIAEXAMPLE"), "{}", error.message);
+    assert!(!error.message.contains("s3cr3t"), "{}", error.message);
+    assert!(
+        !error.message.contains("failed to sign"),
+        "{}",
+        error.message
+    );
+    assert!(error.message.contains("exit code 1"), "{}", error.message);
+    // A privileged mount that failed part way leaves a state nothing can reason about.
+    assert!(
+        server
+            .requests()
+            .iter()
+            .any(|request| request.path.ends_with("/stop")),
+        "the sandbox should be stopped"
+    );
+    server.stop();
+}
+
+#[tokio::test]
+async fn vercel_refuses_to_attach_a_mount_after_the_sandbox_started() {
+    let server = MockServer::start(|request| {
+        vercel_mount_handler(request).unwrap_or_else(|| MockResponse::error(404, "unexpected"))
+    })
+    .await;
+
+    let strategy = VercelCloudBucketMountStrategy::new("my-bucket");
+    let session = vercel_mount_client(&server)
+        .create(Some(vercel_mount_manifest(strategy.clone(), true)))
+        .await
+        .expect("create");
+    session.start().await.expect("start");
+    let mounted = vercel_commands(&server, "/usr/bin/mount-s3").len();
+
+    // Vercel fixes its mount topology when the sandbox is created, so a manifest applied to a
+    // running session must not be able to hand it a fresh bucket.
+    let mount = strategy.clone().mount().with_read_only(true);
+    let error = strategy
+        .activate(&mount, session.as_ref(), "/vercel/sandbox/data")
+        .await
+        .expect_err("a late mount");
+    assert_eq!(error.code, ErrorCode::MountConfigInvalid);
+    assert!(error.message.contains("fixed"), "{}", error.message);
+    assert_eq!(vercel_commands(&server, "/usr/bin/mount-s3").len(), mounted);
+    server.stop();
+}
+
+#[tokio::test]
+async fn vercel_detaches_only_the_mounts_it_attached() {
+    let server = MockServer::start(|request| {
+        let argv = vercel_command_argv(request);
+        if request.path.ends_with("/cmd") && argv.first().is_some_and(|c| c == "/usr/bin/findmnt") {
+            return vercel_command_result("mountpoint-s3", 0);
+        }
+        vercel_mount_handler(request).unwrap_or_else(|| MockResponse::error(404, "unexpected"))
+    })
+    .await;
+
+    let strategy = VercelCloudBucketMountStrategy::new("my-bucket");
+    let session = vercel_mount_client(&server)
+        .create(Some(vercel_mount_manifest(strategy.clone(), true)))
+        .await
+        .expect("create");
+    session.start().await.expect("start");
+
+    let mount = strategy.clone().mount().with_read_only(true);
+    // A path this session never mounted is left alone rather than unmounted blindly.
+    strategy
+        .deactivate(&mount, session.as_ref(), "/vercel/sandbox/other")
+        .await
+        .expect("an untracked path is a no-op");
+    assert!(vercel_commands(&server, "/usr/bin/findmnt").is_empty());
+
+    strategy
+        .deactivate(&mount, session.as_ref(), "/vercel/sandbox/data")
+        .await
+        .expect("deactivate");
+    let unmount = vercel_command(&server, "/usr/bin/umount");
+    assert_eq!(
+        vercel_command_argv(&unmount),
+        vec!["/usr/bin/umount", "/vercel/sandbox/data"]
+    );
+    assert_eq!(unmount.json()["sudo"], true);
+
+    // The mount is gone, so detaching it again does nothing.
+    let unmounts = vercel_commands(&server, "/usr/bin/umount").len();
+    strategy
+        .deactivate(&mount, session.as_ref(), "/vercel/sandbox/data")
+        .await
+        .expect("a detached path is a no-op");
+    assert_eq!(vercel_commands(&server, "/usr/bin/umount").len(), unmounts);
+    server.stop();
+}
+
+#[tokio::test]
+async fn vercel_refuses_to_unmount_a_filesystem_it_did_not_create() {
+    let server = MockServer::start(|request| {
+        let argv = vercel_command_argv(request);
+        if request.path.ends_with("/cmd") && argv.first().is_some_and(|c| c == "/usr/bin/findmnt") {
+            // Something else took the mount path while the session was running.
+            return vercel_command_result("/dev/nvme0n1p1", 0);
+        }
+        vercel_mount_handler(request).unwrap_or_else(|| MockResponse::error(404, "unexpected"))
+    })
+    .await;
+
+    let strategy = VercelCloudBucketMountStrategy::new("my-bucket");
+    let session = vercel_mount_client(&server)
+        .create(Some(vercel_mount_manifest(strategy.clone(), true)))
+        .await
+        .expect("create");
+    session.start().await.expect("start");
+
+    let mount = strategy.clone().mount().with_read_only(true);
+    let error = strategy
+        .deactivate(&mount, session.as_ref(), "/vercel/sandbox/data")
+        .await
+        .expect_err("a foreign filesystem");
+    assert_eq!(error.code, ErrorCode::MountConfigInvalid);
+    assert!(
+        error.message.contains("unexpected filesystem"),
+        "{}",
+        error.message
+    );
+    assert!(vercel_commands(&server, "/usr/bin/umount").is_empty());
+    server.stop();
+}
+
+#[tokio::test]
+async fn vercel_detaches_and_restores_a_mount_around_a_snapshot() {
+    let server = MockServer::start(|request| {
+        let argv = vercel_command_argv(request);
+        if request.path.ends_with("/cmd") && argv.first().is_some_and(|c| c == "/usr/bin/findmnt") {
+            return vercel_command_result("mountpoint-s3", 0);
+        }
+        vercel_mount_handler(request).unwrap_or_else(|| MockResponse::error(404, "unexpected"))
+    })
+    .await;
+
+    let strategy = VercelCloudBucketMountStrategy::new("my-bucket");
+    let session = vercel_mount_client(&server)
+        .create(Some(vercel_mount_manifest(strategy.clone(), true)))
+        .await
+        .expect("create");
+    session.start().await.expect("start");
+    assert_eq!(vercel_commands(&server, "/usr/bin/mount-s3").len(), 1);
+
+    // A native snapshot cannot capture a live FUSE mount, so it is detached first.
+    let mount = strategy.clone().mount().with_read_only(true);
+    strategy
+        .teardown_for_snapshot(&mount, session.as_ref(), "/vercel/sandbox/data")
+        .await
+        .expect("teardown");
+    assert_eq!(
+        vercel_command(&server, "/usr/bin/umount").json()["sudo"],
+        true
+    );
+
+    // Re-attaching happens after the sandbox started, so it is the detached state, not the
+    // start window, that authorizes it.
+    strategy
+        .restore_after_snapshot(&mount, session.as_ref(), "/vercel/sandbox/data")
+        .await
+        .expect("restore");
+    assert_eq!(vercel_commands(&server, "/usr/bin/mount-s3").len(), 2);
+
+    // Restoring again is a no-op: the mount is attached, not detached.
+    strategy
+        .restore_after_snapshot(&mount, session.as_ref(), "/vercel/sandbox/data")
+        .await
+        .expect("a second restore");
+    assert_eq!(vercel_commands(&server, "/usr/bin/mount-s3").len(), 2);
+
+    // The snapshot bypass does not reopen the start window for a new mount.
+    let error = strategy
+        .activate(&mount, session.as_ref(), "/vercel/sandbox/data")
+        .await
+        .expect_err("a late mount");
+    assert_eq!(error.code, ErrorCode::MountConfigInvalid);
+    server.stop();
 }

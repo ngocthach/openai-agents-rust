@@ -86,7 +86,7 @@ use crate::sandbox::state::SandboxSessionState;
 use crate::sandbox::types::{ExecResult, FileEntry, Permissions};
 use crate::sandbox::workspace_paths::provider_scratch_path;
 
-use self::rclone::{ensure_fuse_support, ensure_rclone};
+use self::rclone::{ensure_fuse_support, ensure_rclone, rclone_pattern_for_session};
 
 /// The backend identifier reported by this client and its sessions.
 pub const BACKEND_ID: &str = "e2b";
@@ -1726,9 +1726,9 @@ impl E2BCloudBucketMountStrategy {
         &self,
         mount: &Mount,
         session: &dyn SandboxSession,
+        pattern: RcloneMountPattern,
         include_credentials: bool,
     ) -> SandboxResult<InContainerMountStrategy> {
-        let pattern = self.fuse_pattern();
         let config = match &self.spec {
             Some(spec) => spec.build_in_container_config(
                 session.id(),
@@ -1746,21 +1746,6 @@ impl E2BCloudBucketMountStrategy {
             }
         };
         Ok(InContainerMountStrategy::new(Arc::new(pattern), config))
-    }
-
-    /// The pattern with the flags this provider's images need.
-    ///
-    /// Mirrors Python's `rclone_pattern_for_session`: a FUSE mount is made readable by the
-    /// sandbox's command user, which is not the root user the mount command runs as.
-    fn fuse_pattern(&self) -> RcloneMountPattern {
-        if self.pattern.mode != RcloneMountMode::Fuse {
-            return self.pattern.clone();
-        }
-        let mut pattern = self.pattern.clone();
-        if !pattern.extra_args.iter().any(|arg| arg == "--allow-other") {
-            pattern.extra_args.push("--allow-other".to_string());
-        }
-        pattern
     }
 
     /// Run the preflight the provider's image needs before an rclone mount.
@@ -1819,7 +1804,8 @@ impl MountStrategy for E2BCloudBucketMountStrategy {
         assert_e2b_session(session)?;
         session.authorize_mount_activation(mount, mount_path)?;
         self.preflight(session).await?;
-        self.delegate(mount, session, true)?
+        let pattern = rclone_pattern_for_session(session, &self.pattern).await?;
+        self.delegate(mount, session, pattern, true)?
             .activate(mount, session, mount_path)
             .await
     }
@@ -1831,7 +1817,9 @@ impl MountStrategy for E2BCloudBucketMountStrategy {
         mount_path: &str,
     ) -> SandboxResult<()> {
         assert_e2b_session(session)?;
-        self.delegate(mount, session, false)?
+        // Teardown only needs the remote the mount attached, so it does not pay for the `id`
+        // round trip, as Python's plain `_delegate()` does not either.
+        self.delegate(mount, session, self.pattern.clone(), false)?
             .deactivate(mount, session, mount_path)
             .await
     }
@@ -1845,7 +1833,8 @@ impl MountStrategy for E2BCloudBucketMountStrategy {
         assert_e2b_session(session)?;
         session.authorize_mount_activation(mount, mount_path)?;
         self.preflight(session).await?;
-        self.delegate(mount, session, true)?
+        let pattern = rclone_pattern_for_session(session, &self.pattern).await?;
+        self.delegate(mount, session, pattern, true)?
             .activate(mount, session, mount_path)
             .await
     }

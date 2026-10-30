@@ -9,6 +9,7 @@ Requests (`op` selects the operation):
 
     {"op": "create", "app_name": ..., "image_tag"|"image_id": ..., "workdir": ..., "env": {...},
      "encrypted_ports": [...], "gpu": ..., "cpu": ..., "memory": ..., "timeout": 300,
+     (`cpu` and `memory` are a number, or a two-element `[request, limit]` array)
      "idle_timeout": ..., "use_sleep_cmd": true, "image_builder_version": ...,
      "volumes": [{"mount_path": ..., "bucket_name": ..., ...}]}
         -> {"sandbox_id": ..., "image_id": ...}
@@ -94,6 +95,20 @@ def _build_volumes(modal: Any, request: dict[str, Any]) -> dict[str, Any]:
     return volumes
 
 
+def _resource_pair(value: Any) -> Any:
+    """Turn a JSON `[request, limit]` array into the tuple Modal's resource conversion needs.
+
+    `modal.Sandbox.create` accepts `cpu`/`memory` as a number or as a `(request, limit)` tuple,
+    and the conversion behind it tests `isinstance(value, tuple)`. JSON has no tuple, so a pair
+    arrives here as a list, which matches neither branch and would silently drop both the request
+    and the limit. A pair of any other length is left alone so Modal reports it itself.
+    """
+
+    if isinstance(value, list) and len(value) == 2:
+        return tuple(value)
+    return value
+
+
 async def _op_create(modal: Any, request: dict[str, Any]) -> dict[str, Any]:
     builder_version = request.get("image_builder_version")
     previous_builder_version = os.environ.get("MODAL_IMAGE_BUILDER_VERSION")
@@ -110,8 +125,8 @@ async def _op_create(modal: Any, request: dict[str, Any]) -> dict[str, Any]:
             encrypted_ports=request.get("encrypted_ports") or [],
             volumes=_build_volumes(modal, request),
             gpu=request.get("gpu"),
-            cpu=request.get("cpu"),
-            memory=request.get("memory"),
+            cpu=_resource_pair(request.get("cpu")),
+            memory=_resource_pair(request.get("memory")),
             timeout=request.get("timeout"),
             idle_timeout=request.get("idle_timeout"),
         )

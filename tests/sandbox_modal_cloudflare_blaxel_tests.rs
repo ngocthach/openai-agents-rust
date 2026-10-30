@@ -13,9 +13,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use openai_agents_sdk::extensions::sandbox::blaxel::{
-    BlaxelCloudBucketMountConfig, BlaxelCloudBucketMountStrategy, BlaxelDriveMountConfig,
-    BlaxelDriveMountStrategy, BlaxelSandboxClient, BlaxelSandboxClientOptions, BlaxelTimeouts,
-    DEFAULT_BLAXEL_WORKSPACE_ROOT, encode_sandbox_path,
+    BlaxelCloudBucketMountConfig, BlaxelCloudBucketMountStrategy, BlaxelDriveMount,
+    BlaxelDriveMountConfig, BlaxelDriveMountStrategy, BlaxelSandboxClient,
+    BlaxelSandboxClientOptions, BlaxelTimeouts, DEFAULT_BLAXEL_WORKSPACE_ROOT, encode_sandbox_path,
 };
 use openai_agents_sdk::extensions::sandbox::cloudflare::{
     CloudflareBucketMountConfig, CloudflareBucketMountStrategy, CloudflareSandboxClient,
@@ -871,6 +871,51 @@ async fn blaxel_mounts_a_drive_and_a_bucket() {
 }
 
 #[tokio::test]
+async fn blaxel_mounts_a_drive_declared_as_a_mount_entry() {
+    // The same drive, described as a `BlaxelDriveMount` entry rather than as a strategy
+    // configuration, reaches the drives API with the same body.
+    let shared: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let url_slot = shared.clone();
+    let handler: Handler = Arc::new(move |request| {
+        let sandbox_url = url_slot.lock().unwrap().clone().unwrap_or_default();
+        blaxel_handler(sandbox_url)(request)
+    });
+    let server = MockServer::start(handler).await;
+    *shared.lock().unwrap() = Some(server.base_url.clone());
+
+    let entry = BlaxelDriveMount::new("shared")
+        .with_drive_path("/data")
+        .with_read_only(true);
+    let client = BlaxelSandboxClient::new(blaxel_options(&server.base_url));
+    let manifest = Manifest::new()
+        .with_root(DEFAULT_BLAXEL_WORKSPACE_ROOT)
+        .with_entry("drive", Entry::mount(entry.mount()));
+    let session = client.create(Some(manifest)).await.unwrap();
+    session.start().await.unwrap();
+
+    assert_eq!(
+        server.find("POST", "/drives/mount").json(),
+        json!({
+            "driveName": "shared",
+            "mountPath": "/workspace/drive",
+            "drivePath": "/data",
+            "readOnly": true,
+        })
+    );
+
+    // The entry builds exactly the strategy the configuration form builds, so the rest of the
+    // lifecycle is the one `blaxel_mounts_a_drive_and_a_bucket` already covers.
+    assert_eq!(
+        BlaxelDriveMountStrategy::for_mount(&entry)
+            .unwrap()
+            .config(),
+        &BlaxelDriveMountConfig::new("shared")
+            .with_drive_path("/data")
+            .with_read_only(true)
+    );
+}
+
+#[tokio::test]
 async fn blaxel_requires_a_workspace() {
     // SAFETY-equivalent note: the test only reads its own process environment, and the provider
     // reports the missing workspace instead of guessing one.
@@ -1033,6 +1078,86 @@ async fn modal_persists_and_restores_a_filesystem_snapshot() {
     assert_eq!(creates.len(), 2);
     assert_eq!(creates[1]["image_id"], "im-sb-1");
     assert_eq!(fake.of_op("terminate")[0]["sandbox_id"], "sb-1");
+    // The first create was unbounded; the restore is bounded by the restore timeout rather than
+    // by the capture timeout or by `sandbox_create_timeout`.
+    assert!(creates[0].get("create_timeout").is_none());
+    assert_eq!(creates[1]["create_timeout"], 60.0);
+}
+
+#[tokio::test]
+async fn modal_bounds_a_snapshot_restore_with_its_own_timeout() {
+    let fake = FakeModal::new();
+    let client = ModalSandboxClient::new(
+        ModalSandboxClientOptions::new("agents-app")
+            .with_workspace_persistence(ModalWorkspacePersistence::SnapshotFilesystem)
+            .with_sandbox_create_timeout(Duration::from_secs(45))
+            .with_snapshot_filesystem_timeout(Duration::from_secs(30))
+            .with_snapshot_filesystem_restore_timeout(Duration::from_secs(90))
+            .with_helper_command(fake.command()),
+    );
+    let session = client.create(None).await.unwrap();
+    let archive = session.persist_workspace().await.unwrap();
+    session.hydrate_workspace(&archive).await.unwrap();
+
+    assert_eq!(fake.of_op("snapshot_filesystem")[0]["timeout"], 30);
+    let creates = fake.of_op("create");
+    assert_eq!(creates[0]["create_timeout"], 45.0);
+    assert_eq!(creates[1]["create_timeout"], 90.0);
+}
+
+#[tokio::test]
+async fn modal_sends_a_cpu_and_memory_range_to_the_helper() {
+    let fake = FakeModal::new();
+    let client = ModalSandboxClient::new(
+        ModalSandboxClientOptions::new("agents-app")
+            .with_cpu_range(2.0, 4.0)
+            .with_memory_mb_range(4096, 8192)
+            .with_helper_command(fake.command()),
+    );
+    let _session = client.create(None).await.unwrap();
+
+    let create = fake.of_op("create").remove(0);
+    assert_eq!(create["cpu"], json!([2.0, 4.0]));
+    assert_eq!(create["memory"], json!([4096, 8192]));
+}
+
+#[tokio::test]
+async fn modal_bundled_helper_turns_a_resource_pair_into_a_tuple() {
+    // Modal's resource conversion tests `isinstance(value, tuple)`, so a JSON array reaching
+    // `Sandbox.create` as a list would drop both the request and the limit without an error.
+    // The fake helper never calls Modal, so only the bundled helper's own conversion proves it.
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("helper.py");
+    std::fs::write(
+        &path,
+        openai_agents_sdk::extensions::sandbox::modal::HELPER_SOURCE,
+    )
+    .unwrap();
+    let script = format!(
+        "import pathlib, types; module = types.ModuleType('helper'); \
+         exec(compile(pathlib.Path({:?}).read_text(), 'helper.py', 'exec'), module.__dict__); \
+         print(repr(module._resource_pair([2.0, 4.0])), repr(module._resource_pair(2.0)), \
+         repr(module._resource_pair(None)))",
+        path.to_string_lossy()
+    );
+    let Ok(output) = tokio::process::Command::new("python3")
+        .arg("-c")
+        .arg(script)
+        .output()
+        .await
+    else {
+        // A machine without `python3` cannot run the provider at all.
+        return;
+    };
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "(2.0, 4.0) 2.0 None"
+    );
 }
 
 #[tokio::test]

@@ -8,16 +8,21 @@
 //!   [`MountCredentialAuthority::MountScoped`] and the manifest must acknowledge its exact mount
 //!   path.
 //! - [`BlaxelDriveMountStrategy`] attaches a Blaxel Drive, a persistent network volume, through
-//!   the sandbox's own `POST /drives/mount` endpoint.
+//!   the sandbox's own `POST /drives/mount` endpoint. The drive is described either by a
+//!   [`BlaxelDriveMountConfig`] handed straight to the strategy, or by a [`BlaxelDriveMount`]
+//!   entry, which is the mount-entry form the other providers' storage types take.
 
+use std::any::Any;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::{Map, Value};
 
 use crate::sandbox::errors::{ErrorCode, SandboxError, SandboxResult};
-use crate::sandbox::mount_entries::{ConfiguredMount, GCS_S3_ENDPOINT, GcsMount, R2Mount, S3Mount};
-use crate::sandbox::mounts::{Mount, MountCredentialAuthority, MountStrategy};
+use crate::sandbox::mount_entries::{
+    BuiltinMountPattern, ConfiguredMount, GCS_S3_ENDPOINT, GcsMount, R2Mount, S3Mount,
+};
+use crate::sandbox::mounts::{Mount, MountCredentialAuthority, MountPatternConfig, MountStrategy};
 use crate::sandbox::session::{ExecRequest, SandboxSession, shell_quote};
 
 const INSTALL_RETRIES: usize = 3;
@@ -568,6 +573,146 @@ impl BlaxelDriveMountConfig {
         body.insert("readOnly".to_string(), Value::Bool(self.read_only));
         Value::Object(body)
     }
+
+    /// The drive configuration carried by a [`BlaxelDriveMount`] entry.
+    ///
+    /// Mirrors Python's `BlaxelDriveMountStrategy._resolve_config`, which refuses any other
+    /// mount entry.
+    pub fn from_configured_mount(mount: &dyn ConfiguredMount) -> SandboxResult<Self> {
+        mount.validate()?;
+        mount
+            .as_any()
+            .downcast_ref::<BlaxelDriveMount>()
+            .map(BlaxelDriveMount::config)
+            .ok_or_else(|| {
+                SandboxError::new(
+                    ErrorCode::MountConfigInvalid,
+                    format!(
+                        "blaxel drive mounts require a `{MOUNT_TYPE_BLAXEL_DRIVE}` entry, not \
+                         `{}`",
+                        mount.mount_type()
+                    ),
+                )
+            })
+    }
+}
+
+/// The Python `type` discriminator of a [`BlaxelDriveMount`].
+pub const MOUNT_TYPE_BLAXEL_DRIVE: &str = "blaxel_drive_mount";
+
+/// A Blaxel Drive described as a mount entry. Mirrors Python's `BlaxelDriveMount`.
+///
+/// A drive is a persistent network volume the Blaxel platform attaches itself, so unlike the
+/// bucket mounts it names no in-container pattern and no Docker volume driver: the only way to
+/// attach it is [`BlaxelDriveMountStrategy`], which [`mount`](Self::mount) pairs it with.
+///
+/// ```no_run
+/// use openai_agents_sdk::extensions::sandbox::blaxel::BlaxelDriveMount;
+/// use openai_agents_sdk::sandbox::entries::Entry;
+///
+/// let entry = Entry::mount(BlaxelDriveMount::new("my-drive").with_drive_path("/data").mount());
+/// ```
+///
+/// Python's `drive_mount_path` has no field of its own here: the core [`Mount`] already carries
+/// the path override, so `BlaxelDriveMount::new("d").mount().with_mount_path("/workspace/d")`
+/// does the same job.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlaxelDriveMount {
+    /// The drive name.
+    pub drive_name: String,
+    /// The path inside the drive to expose.
+    pub drive_path: String,
+    /// Whether the drive is mounted read-only.
+    pub read_only: bool,
+}
+
+impl BlaxelDriveMount {
+    /// The whole of `drive_name`, mounted writable.
+    pub fn new(drive_name: impl Into<String>) -> Self {
+        BlaxelDriveMount {
+            drive_name: drive_name.into(),
+            drive_path: "/".to_string(),
+            read_only: false,
+        }
+    }
+
+    /// Expose only `drive_path` from the drive.
+    pub fn with_drive_path(mut self, drive_path: impl Into<String>) -> Self {
+        self.drive_path = drive_path.into();
+        self
+    }
+
+    /// Mount the drive read-only.
+    pub fn with_read_only(mut self, read_only: bool) -> Self {
+        self.read_only = read_only;
+        self
+    }
+
+    /// This entry as the configuration the drives API is called with.
+    pub fn config(&self) -> BlaxelDriveMountConfig {
+        BlaxelDriveMountConfig {
+            drive_name: self.drive_name.clone(),
+            drive_path: self.drive_path.clone(),
+            read_only: self.read_only,
+        }
+    }
+
+    /// A [`Mount`] attaching this drive through [`BlaxelDriveMountStrategy`].
+    pub fn mount(&self) -> Mount {
+        BlaxelDriveMountStrategy::mount(self.config())
+    }
+}
+
+impl ConfiguredMount for BlaxelDriveMount {
+    fn mount_type(&self) -> &'static str {
+        MOUNT_TYPE_BLAXEL_DRIVE
+    }
+
+    fn supported_in_container_patterns(&self) -> &'static [&'static str] {
+        // The platform attaches the drive over its own API; no mount tool runs in the sandbox.
+        &[]
+    }
+
+    fn validate(&self) -> SandboxResult<()> {
+        if self.drive_name.is_empty() {
+            return Err(SandboxError::new(
+                ErrorCode::MountConfigInvalid,
+                "blaxel drive mounts require a drive name",
+            ));
+        }
+        Ok(())
+    }
+
+    fn credential_authority(
+        &self,
+        _pattern_type: &str,
+        _has_config_file: bool,
+    ) -> MountCredentialAuthority {
+        // The sandbox's own control-plane credential attaches the drive; nothing reaches code
+        // running inside the sandbox.
+        MountCredentialAuthority::None
+    }
+
+    fn build_in_container_config(
+        &self,
+        _session_id: &str,
+        pattern: &BuiltinMountPattern,
+        _read_only: bool,
+        _include_credentials: bool,
+    ) -> SandboxResult<MountPatternConfig> {
+        Err(SandboxError::new(
+            ErrorCode::MountConfigInvalid,
+            format!(
+                "`{MOUNT_TYPE_BLAXEL_DRIVE}` cannot be attached with the `{}` mount pattern; use \
+                 `BlaxelDriveMountStrategy`",
+                pattern.pattern_type()
+            ),
+        ))
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
 }
 
 /// Attaches a Blaxel Drive through the sandbox's drives API.
@@ -591,6 +736,13 @@ impl BlaxelDriveMountStrategy {
     /// The drive this strategy attaches.
     pub fn config(&self) -> &BlaxelDriveMountConfig {
         &self.config
+    }
+
+    /// A strategy attaching the drive a [`BlaxelDriveMount`] entry describes.
+    pub fn for_mount(mount: &dyn ConfiguredMount) -> SandboxResult<Self> {
+        Ok(BlaxelDriveMountStrategy::new(
+            BlaxelDriveMountConfig::from_configured_mount(mount)?,
+        ))
     }
 
     fn connection(
@@ -893,6 +1045,46 @@ url=https://s3.eu-west-1.amazonaws.com,endpoint=eu-west-1,ro"
                 "drivePath": "/data",
                 "readOnly": true,
             })
+        );
+    }
+
+    #[test]
+    fn builds_a_drive_strategy_from_a_drive_mount_entry() {
+        let entry = BlaxelDriveMount::new("shared")
+            .with_drive_path("/data")
+            .with_read_only(true);
+        assert_eq!(entry.mount_type(), "blaxel_drive_mount");
+        let strategy = BlaxelDriveMountStrategy::for_mount(&entry).unwrap();
+        assert_eq!(strategy.config(), &entry.config());
+        // The entry's own read-only flag reaches the `Mount`, as it does for the bucket mounts.
+        assert!(entry.mount().read_only);
+        assert!(!BlaxelDriveMount::new("shared").mount().read_only);
+    }
+
+    #[test]
+    fn rejects_a_drive_mount_without_a_name_and_a_foreign_entry() {
+        assert_eq!(
+            BlaxelDriveMountStrategy::for_mount(&BlaxelDriveMount::new(""))
+                .unwrap_err()
+                .code,
+            ErrorCode::MountConfigInvalid
+        );
+        let foreign = BlaxelDriveMountStrategy::for_mount(&S3Mount::new("bucket")).unwrap_err();
+        assert_eq!(foreign.code, ErrorCode::MountConfigInvalid);
+        assert!(foreign.message.contains("blaxel_drive_mount"), "{foreign}");
+    }
+
+    #[test]
+    fn refuses_to_attach_a_drive_with_an_in_container_pattern() {
+        // A drive names no in-container pattern, so the core strategy rejects it before any
+        // mount command is built, the way Python's `validate_mount` does.
+        let mount = crate::sandbox::mount_entries::ConfiguredMountStrategy::rclone(
+            BlaxelDriveMount::new("shared"),
+        )
+        .mount();
+        assert_eq!(
+            mount.validate().unwrap_err().code,
+            ErrorCode::MountConfigInvalid
         );
     }
 }

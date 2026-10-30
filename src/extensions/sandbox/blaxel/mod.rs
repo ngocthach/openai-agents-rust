@@ -28,7 +28,7 @@ pub mod sandbox;
 
 pub use mounts::{
     BlaxelBucketProvider, BlaxelCloudBucketMountConfig, BlaxelCloudBucketMountStrategy,
-    BlaxelDriveMountConfig, BlaxelDriveMountStrategy,
+    BlaxelDriveMount, BlaxelDriveMountConfig, BlaxelDriveMountStrategy, MOUNT_TYPE_BLAXEL_DRIVE,
 };
 pub use pty::{BlaxelPtySessions, terminal_url};
 pub use sandbox::{

@@ -92,10 +92,16 @@ pub struct ModalSandboxClientOptions {
     pub timeout_secs: u32,
     /// The idle timeout in seconds.
     pub idle_timeout_secs: Option<u32>,
-    /// The CPU reservation.
+    /// The CPU reservation, which Modal reads as the request of a `(request, limit)` pair.
     pub cpu: Option<f64>,
-    /// The memory reservation in MiB.
+    /// The CPU limit, which turns [`cpu`](Self::cpu) into Modal's `(request, limit)` pair.
+    pub cpu_limit: Option<f64>,
+    /// The memory reservation in MiB, which Modal reads as the request of a `(request, limit)`
+    /// pair.
     pub memory_mb: Option<u32>,
+    /// The memory limit in MiB, which turns [`memory_mb`](Self::memory_mb) into Modal's
+    /// `(request, limit)` pair.
+    pub memory_limit_mb: Option<u32>,
     /// Override the image command with `sleep infinity` so the sandbox stays up for `exec`.
     pub use_sleep_cmd: bool,
     /// The Modal image builder version.
@@ -106,6 +112,11 @@ pub struct ModalSandboxClientOptions {
     pub exec_timeout: Duration,
     /// How long `snapshot_filesystem` may take.
     pub snapshot_filesystem_timeout: Duration,
+    /// How long restoring a filesystem snapshot may take.
+    ///
+    /// Restoring boots a replacement sandbox from the snapshot image, which is a different call
+    /// from the capture, so Modal bounds it separately.
+    pub snapshot_filesystem_restore_timeout: Duration,
     /// The command that runs the helper, or the bundled helper when unset.
     pub helper_command: Option<Vec<String>>,
     /// The interpreter the bundled helper runs under.
@@ -125,12 +136,15 @@ impl ModalSandboxClientOptions {
             timeout_secs: 300,
             idle_timeout_secs: None,
             cpu: None,
+            cpu_limit: None,
             memory_mb: None,
+            memory_limit_mb: None,
             use_sleep_cmd: true,
             image_builder_version: Some(DEFAULT_IMAGE_BUILDER_VERSION.to_string()),
             sandbox_create_timeout: None,
             exec_timeout: DEFAULT_TIMEOUT,
             snapshot_filesystem_timeout: DEFAULT_SNAPSHOT_FILESYSTEM_TIMEOUT,
+            snapshot_filesystem_restore_timeout: DEFAULT_SNAPSHOT_FILESYSTEM_TIMEOUT,
             helper_command: None,
             python: None,
         }
@@ -178,15 +192,37 @@ impl ModalSandboxClientOptions {
         self
     }
 
-    /// Reserve CPU.
+    /// Reserve CPU, leaving the limit to Modal.
     pub fn with_cpu(mut self, cpu: f64) -> Self {
         self.cpu = Some(cpu);
+        self.cpu_limit = None;
         self
     }
 
-    /// Reserve memory, in MiB.
+    /// Reserve CPU with an explicit limit, Modal's `(request, limit)` pair.
+    ///
+    /// Modal rejects a limit below the request, and rejects either end being zero; the error
+    /// comes back from the control plane rather than being anticipated here, so the message the
+    /// caller sees is Modal's own.
+    pub fn with_cpu_range(mut self, request: f64, limit: f64) -> Self {
+        self.cpu = Some(request);
+        self.cpu_limit = Some(limit);
+        self
+    }
+
+    /// Reserve memory, in MiB, leaving the limit to Modal.
     pub fn with_memory_mb(mut self, memory_mb: u32) -> Self {
         self.memory_mb = Some(memory_mb);
+        self.memory_limit_mb = None;
+        self
+    }
+
+    /// Reserve memory with an explicit limit, in MiB: Modal's `(request, limit)` pair.
+    ///
+    /// Modal rejects a limit below the request, and reports it from the control plane.
+    pub fn with_memory_mb_range(mut self, request: u32, limit: u32) -> Self {
+        self.memory_mb = Some(request);
+        self.memory_limit_mb = Some(limit);
         self
     }
 
@@ -217,6 +253,12 @@ impl ModalSandboxClientOptions {
     /// Bound `snapshot_filesystem`.
     pub fn with_snapshot_filesystem_timeout(mut self, timeout: Duration) -> Self {
         self.snapshot_filesystem_timeout = timeout;
+        self
+    }
+
+    /// Bound a filesystem snapshot restore, which boots a replacement sandbox.
+    pub fn with_snapshot_filesystem_restore_timeout(mut self, timeout: Duration) -> Self {
+        self.snapshot_filesystem_restore_timeout = timeout;
         self
     }
 
@@ -450,11 +492,26 @@ impl ModalSandboxClient {
         if let Some(gpu) = &self.options.gpu {
             request.insert("gpu".to_string(), Value::String(gpu.clone()));
         }
+        // Modal takes either a scalar reservation or a `(request, limit)` pair. The pair travels
+        // as a two-element array and the helper turns it back into a tuple, which is the only
+        // shape Modal's own resource conversion recognizes.
         if let Some(cpu) = self.options.cpu {
-            request.insert("cpu".to_string(), Value::from(cpu));
+            request.insert(
+                "cpu".to_string(),
+                match self.options.cpu_limit {
+                    Some(limit) => Value::Array(vec![Value::from(cpu), Value::from(limit)]),
+                    None => Value::from(cpu),
+                },
+            );
         }
         if let Some(memory) = self.options.memory_mb {
-            request.insert("memory".to_string(), Value::from(memory));
+            request.insert(
+                "memory".to_string(),
+                match self.options.memory_limit_mb {
+                    Some(limit) => Value::Array(vec![Value::from(memory), Value::from(limit)]),
+                    None => Value::from(memory),
+                },
+            );
         }
         if let Some(idle_timeout) = self.options.idle_timeout_secs {
             request.insert("idle_timeout".to_string(), Value::from(idle_timeout));
@@ -749,8 +806,13 @@ impl ModalSandboxSession {
 
     /// Replace the sandbox with one booted from `image_id`, as a snapshot restore does.
     async fn restore_from_image(&self, image_id: &str) -> SandboxResult<()> {
+        // A restore is bounded by its own timeout rather than by the one that bounds a fresh
+        // `Sandbox.create`: the replacement boots from a snapshot image, which Modal pulls before
+        // the sandbox is reachable.
+        let mut options = self.options.clone();
+        options.sandbox_create_timeout = Some(self.options.snapshot_filesystem_restore_timeout);
         let replacement = ModalSandboxClient {
-            options: self.options.clone(),
+            options,
             snapshot: self.snapshot.clone(),
         }
         .create_session(self.manifest.clone(), Some(image_id))
@@ -1227,6 +1289,34 @@ mod tests {
         );
         assert_eq!(request["create_timeout"], 45.0);
         assert_eq!(request["volumes"], json!([]));
+    }
+
+    #[test]
+    fn serializes_a_cpu_and_memory_range_as_a_pair() {
+        let client = ModalSandboxClient::new(
+            ModalSandboxClientOptions::new("agents")
+                .with_cpu_range(2.0, 4.0)
+                .with_memory_mb_range(4096, 8192),
+        );
+        let request = client.create_request(&Manifest::new(), None);
+        assert_eq!(request["cpu"], json!([2.0, 4.0]));
+        assert_eq!(request["memory"], json!([4096, 8192]));
+    }
+
+    #[test]
+    fn a_scalar_reservation_drops_an_earlier_limit() {
+        // The two builders describe the same reservation, so setting one must not leave the
+        // other's limit behind and turn a scalar back into a pair.
+        let client = ModalSandboxClient::new(
+            ModalSandboxClientOptions::new("agents")
+                .with_cpu_range(2.0, 4.0)
+                .with_memory_mb_range(4096, 8192)
+                .with_cpu(1.0)
+                .with_memory_mb(512),
+        );
+        let request = client.create_request(&Manifest::new(), None);
+        assert_eq!(request["cpu"], 1.0);
+        assert_eq!(request["memory"], 512);
     }
 
     #[test]

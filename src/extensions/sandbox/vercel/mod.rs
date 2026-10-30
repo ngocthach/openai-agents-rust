@@ -42,10 +42,13 @@
 //! - Python refuses any `user` argument. This port maps `root` to the API's `sudo` flag, so the
 //!   provider's own `mount-s3` mount strategy can run, and still rejects every other user.
 //! - OIDC token refresh, drives, forks and exposed-route resolution are not ported.
+//! - Python installs a shell helper to resolve a mount path through its symlinks. This port has
+//!   no runtime-helper installer, so [`mounts`] runs `realpath -m` instead, which has the same
+//!   semantics for a path whose leaf may not exist yet.
 //!
 //! [`supports_pty`]: crate::sandbox::SandboxSession::supports_pty
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -56,8 +59,6 @@ use serde_json::{Value, json};
 
 use crate::sandbox::errors::{ErrorCode, SandboxError, SandboxResult};
 use crate::sandbox::manifest::{DEFAULT_MANIFEST_ROOT, Manifest};
-use crate::sandbox::mount_entries::{ConfiguredMount, S3Mount};
-use crate::sandbox::mounts::{Mount, MountCredentialAuthority, MountStrategy};
 use crate::sandbox::session::{
     ExecRequest, SandboxClient, SandboxSession, restore_session_snapshot, shell_quote,
     workspace_archive_excludes,
@@ -67,11 +68,13 @@ use crate::sandbox::state::SandboxSessionState;
 use crate::sandbox::types::{ExecResult, User};
 use crate::sandbox::workspace_paths::provider_scratch_path;
 
-use super::e2b::{adopt_recorded_root, decode_snapshot_ref, encode_snapshot_ref};
+use super::e2b::adopt_recorded_root;
 use crate::sandbox::http::{expect_success, http_error, parse_json, transport};
 
+pub mod mounts;
 pub mod tar_gz;
 
+pub use self::mounts::VercelCloudBucketMountStrategy;
 use self::tar_gz::TarGzBuilder;
 
 /// The backend identifier reported by this client and its sessions.
@@ -92,6 +95,62 @@ pub const DEFAULT_VERCEL_WORKSPACE_ROOT: &str = "/vercel/sandbox";
 pub const DEFAULT_VERCEL_SANDBOX_TIMEOUT_MS: u64 = 270_000;
 /// How long a freshly created sandbox is given to report `running`.
 pub const DEFAULT_WAIT_FOR_RUNNING: Duration = Duration::from_secs(45);
+/// The runtime alias a sandbox is created from when none is configured, matching Python.
+pub const DEFAULT_VERCEL_RUNTIME: &str = "node24";
+
+/// The concrete image each runtime alias names. Mirrors Python's `_RUNTIME_IMAGES`.
+///
+/// The released runtime images are Amazon Linux, which is what ships the S3 mount tools the
+/// [`mounts`] strategy drives, so the alias is resolved here rather than left to the API.
+const RUNTIME_IMAGES: [(&str, &str); 4] = [
+    ("node22", "vercel/sandbox/node:al-22"),
+    ("node24", "vercel/sandbox/node:al-24"),
+    ("node26", "vercel/sandbox/node:al-26"),
+    ("python3.13", "vercel/sandbox/python:al-3.13.1"),
+];
+
+/// Marks a workspace archive that only references a native Vercel sandbox snapshot.
+///
+/// Vercel has its own marker so a reference written here round-trips with the Python SDK, and so
+/// a reference from another backend is never mistaken for one of these.
+const SNAPSHOT_REF_MAGIC: &[u8] = b"UC_VERCEL_SNAPSHOT_V1\n";
+
+/// The image a runtime alias names, defaulting to [`DEFAULT_VERCEL_RUNTIME`].
+fn resolve_runtime_image(runtime: Option<&str>) -> SandboxResult<&'static str> {
+    let runtime = runtime.unwrap_or(DEFAULT_VERCEL_RUNTIME);
+    RUNTIME_IMAGES
+        .iter()
+        .find(|(alias, _)| *alias == runtime)
+        .map(|(_, image)| *image)
+        .ok_or_else(|| {
+            SandboxError::new(
+                ErrorCode::SandboxConfigInvalid,
+                format!("unsupported Vercel runtime: `{runtime}`"),
+            )
+        })
+}
+
+/// Encode a reference to a native Vercel snapshot as a workspace archive.
+fn encode_snapshot_ref(snapshot_id: &str) -> Vec<u8> {
+    let mut encoded = SNAPSHOT_REF_MAGIC.to_vec();
+    encoded.extend_from_slice(
+        serde_json::to_string(&json!({ "snapshot_id": snapshot_id }))
+            .expect("serializable")
+            .as_bytes(),
+    );
+    encoded
+}
+
+/// Read back a snapshot reference written by [`encode_snapshot_ref`].
+fn decode_snapshot_ref(raw: &[u8]) -> Option<String> {
+    let body = raw.strip_prefix(SNAPSHOT_REF_MAGIC)?;
+    serde_json::from_slice::<Value>(body)
+        .ok()?
+        .get("snapshot_id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+}
 
 /// How a session persists its workspace into a [`Snapshot`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -101,6 +160,62 @@ pub enum WorkspacePersistence {
     Tar,
     /// Take a native Vercel snapshot and store only a reference to it.
     Snapshot,
+}
+
+/// One rewrite applied to a request that matched a domain. Mirrors
+/// `agents.extensions.sandbox.vercel._network_policy.NetworkTransformer`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NetworkTransformer {
+    /// Headers injected into, or replaced on, the outgoing request.
+    pub headers: BTreeMap<String, String>,
+}
+
+impl NetworkTransformer {
+    /// A transformer that rewrites nothing.
+    pub fn new() -> Self {
+        NetworkTransformer::default()
+    }
+
+    /// Inject or replace one header.
+    pub fn with_header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.headers.insert(name.into(), value.into());
+        self
+    }
+}
+
+/// One rule attached to an allowed domain. Mirrors
+/// `agents.extensions.sandbox.vercel._network_policy.NetworkPolicyRule`.
+///
+/// A domain that carries rules is intercepted rather than proxied through an encrypted
+/// connection, which is what lets the platform rewrite the request.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NetworkPolicyRule {
+    /// The rewrites applied to a matching request, in order.
+    pub transform: Vec<NetworkTransformer>,
+}
+
+impl NetworkPolicyRule {
+    /// A rule that allows the domain without rewriting anything.
+    pub fn new() -> Self {
+        NetworkPolicyRule::default()
+    }
+
+    /// Append a rewrite.
+    pub fn with_transform(mut self, transform: NetworkTransformer) -> Self {
+        self.transform.push(transform);
+        self
+    }
+
+    /// The JSON body the API expects.
+    fn to_api(&self) -> Value {
+        json!({
+            "transform": self
+                .transform
+                .iter()
+                .map(|transform| json!({ "headers": transform.headers }))
+                .collect::<Vec<_>>(),
+        })
+    }
 }
 
 /// The network policy applied to a sandbox. Mirrors `agents.extensions.sandbox.vercel`'s
@@ -120,29 +235,59 @@ pub enum NetworkPolicy {
         /// Subnets egress may never reach.
         deny_subnets: Vec<String>,
     },
+    /// Allow the listed domains, each with its own rules.
+    ///
+    /// This is Python's per-domain `NetworkPolicyCustom.allow` mapping: a domain with no rules
+    /// is allowed as-is, and a domain with rules has those rewrites applied to its requests.
+    CustomRules {
+        /// Domains egress may reach, and the rules attached to each.
+        allow: BTreeMap<String, Vec<NetworkPolicyRule>>,
+        /// Subnets egress may reach.
+        allow_subnets: Vec<String>,
+        /// Subnets egress may never reach.
+        deny_subnets: Vec<String>,
+    },
 }
 
 impl NetworkPolicy {
     /// The JSON body the API expects.
     fn to_api(&self) -> Value {
-        match self {
-            NetworkPolicy::AllowAll => json!({ "allow": "all" }),
-            NetworkPolicy::DenyAll => json!({ "allow": [] }),
+        let (allow, allow_subnets, deny_subnets) = match self {
+            NetworkPolicy::AllowAll => return json!({ "allow": "all" }),
+            NetworkPolicy::DenyAll => return json!({ "allow": [] }),
             NetworkPolicy::Custom {
                 allow,
                 allow_subnets,
                 deny_subnets,
-            } => {
-                let mut policy = json!({ "allow": allow });
-                if !allow_subnets.is_empty() || !deny_subnets.is_empty() {
-                    policy.as_object_mut().expect("object").insert(
-                        "subnets".into(),
-                        json!({ "allow": allow_subnets, "deny": deny_subnets }),
-                    );
-                }
-                policy
-            }
+            } => (json!(allow), allow_subnets, deny_subnets),
+            NetworkPolicy::CustomRules {
+                allow,
+                allow_subnets,
+                deny_subnets,
+            } => (
+                Value::Object(
+                    allow
+                        .iter()
+                        .map(|(domain, rules)| {
+                            (
+                                domain.clone(),
+                                Value::Array(rules.iter().map(NetworkPolicyRule::to_api).collect()),
+                            )
+                        })
+                        .collect(),
+                ),
+                allow_subnets,
+                deny_subnets,
+            ),
+        };
+        let mut policy = json!({ "allow": allow });
+        if !allow_subnets.is_empty() || !deny_subnets.is_empty() {
+            policy.as_object_mut().expect("object").insert(
+                "subnets".into(),
+                json!({ "allow": allow_subnets, "deny": deny_subnets }),
+            );
         }
+        policy
     }
 }
 
@@ -179,7 +324,7 @@ pub struct VercelSandboxClientOptions {
     pub team_id: Option<String>,
     /// Execution time limit in milliseconds.
     pub timeout_ms: Option<u64>,
-    /// Runtime image alias, such as `node24`; `None` uses the API default.
+    /// Runtime image alias, such as `node24`; `None` uses [`DEFAULT_VERCEL_RUNTIME`].
     pub runtime: Option<String>,
     /// Resource limits.
     pub resources: VercelSandboxResources,
@@ -474,9 +619,13 @@ impl VercelSandboxClient {
         if let Some(vcpus) = self.options.resources.vcpus {
             map.insert("resources".into(), json!({ "vcpus": vcpus }));
         }
-        if let Some(runtime) = &self.options.runtime {
-            map.insert("runtime".into(), json!(runtime));
-        }
+        // Python resolves the runtime alias to a concrete image, and `/v3/sandboxes` has no
+        // `runtime` field at all: an unresolved alias would silently fall back to the universal
+        // image, which does not ship the S3 mount tools.
+        map.insert(
+            "image".into(),
+            json!(resolve_runtime_image(self.options.runtime.as_deref())?),
+        );
         if let Some(policy) = &self.options.network_policy {
             map.insert("networkPolicy".into(), policy.to_api());
         }
@@ -486,15 +635,10 @@ impl VercelSandboxClient {
         if let Some(expiration) = self.options.snapshot_expiration_ms {
             map.insert("snapshotExpiration".into(), json!(expiration));
         }
-        // `/v3/sandboxes` is the current endpoint; `/v2` is kept for an explicit runtime alias.
-        let path = if self.options.runtime.is_some() {
-            "/v2/sandboxes"
-        } else {
-            "/v3/sandboxes"
-        };
         let response = self
             .request(
-                self.http.post(format!("{}{path}", self.options.api_base())),
+                self.http
+                    .post(format!("{}/v3/sandboxes", self.options.api_base())),
                 token,
             )
             .json(&body)
@@ -634,6 +778,16 @@ fn resolve_manifest_root(manifest: Manifest) -> Manifest {
     }
 }
 
+/// The key a mount path is tracked under, so one trailing slash cannot hide a tracked mount.
+fn mount_path_key(mount_path: &str) -> String {
+    let trimmed = mount_path.trim_end_matches('/');
+    if trimmed.is_empty() {
+        "/".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 /// Split the `<sandbox name>:<session id>` pair stored in the persisted state.
 fn split_provider_id(provider_id: &str) -> SandboxResult<(String, String)> {
     provider_id
@@ -662,6 +816,13 @@ pub struct VercelSandboxSession {
     snapshot: Option<SnapshotSpec>,
     snapshot_id: String,
     resuming: bool,
+    /// Whether the session is inside [`start`](SandboxSession::start), the only point at which
+    /// its S3 mount topology may be applied.
+    s3_mounts_startable: AtomicBool,
+    /// The mount paths currently carrying a Mountpoint filesystem.
+    active_s3_mounts: std::sync::Mutex<BTreeSet<String>>,
+    /// The mount paths detached so a native snapshot could be taken.
+    detached_s3_mounts: std::sync::Mutex<BTreeSet<String>>,
 }
 
 /// The mutable provider identity: a snapshot restore replaces both halves.
@@ -711,7 +872,98 @@ impl VercelSandboxSession {
             terminated: tokio::sync::Mutex::new(false),
             snapshot,
             resuming: false,
+            s3_mounts_startable: AtomicBool::new(false),
+            active_s3_mounts: std::sync::Mutex::new(BTreeSet::new()),
+            detached_s3_mounts: std::sync::Mutex::new(BTreeSet::new()),
         }
+    }
+
+    /// Whether an S3 mount may be attached right now.
+    ///
+    /// Mirrors Python's `_runtime_s3_mount_activation_allowed`: Vercel fixes its mount topology
+    /// when the sandbox is created, so a manifest applied to a running session must not be able
+    /// to hand a fresh credential to a sandbox that has already run model-controlled code.
+    pub(crate) fn s3_mount_activation_allowed(&self) -> bool {
+        self.s3_mounts_startable.load(Ordering::SeqCst)
+    }
+
+    /// Fail unless `mount_path` is one of the mount targets this session was created with.
+    ///
+    /// Mirrors Python's `_runtime_trusted_s3_mount`, which only knows the mounts captured at
+    /// creation: the manifest the session holds is that same trusted topology.
+    pub(crate) fn assert_trusted_s3_mount(&self, mount_path: &str) -> SandboxResult<()> {
+        let key = mount_path_key(mount_path);
+        let trusted = self
+            .manifest
+            .mount_targets()
+            .into_iter()
+            .any(|(_, path)| mount_path_key(&path) == key);
+        if trusted {
+            return Ok(());
+        }
+        Err(SandboxError::new(
+            ErrorCode::MountConfigInvalid,
+            format!(
+                "the Vercel S3 mount configuration for `{mount_path}` is unavailable outside \
+                 sandbox creation"
+            ),
+        ))
+    }
+
+    /// Whether this session attached a mount at `mount_path`.
+    pub(crate) fn s3_mount_is_active(&self, mount_path: &str) -> bool {
+        self.active_s3_mounts
+            .lock()
+            .expect("poisoned")
+            .contains(&mount_path_key(mount_path))
+    }
+
+    /// Whether this session detached a mount at `mount_path` for a snapshot.
+    pub(crate) fn s3_mount_is_detached(&self, mount_path: &str) -> bool {
+        self.detached_s3_mounts
+            .lock()
+            .expect("poisoned")
+            .contains(&mount_path_key(mount_path))
+    }
+
+    /// Record that a mount is attached at `mount_path`.
+    pub(crate) fn record_s3_mount_active(&self, mount_path: &str) {
+        let key = mount_path_key(mount_path);
+        self.detached_s3_mounts
+            .lock()
+            .expect("poisoned")
+            .remove(&key);
+        self.active_s3_mounts.lock().expect("poisoned").insert(key);
+    }
+
+    /// Record that a mount is gone from `mount_path`.
+    pub(crate) fn record_s3_mount_inactive(&self, mount_path: &str) {
+        let key = mount_path_key(mount_path);
+        self.active_s3_mounts.lock().expect("poisoned").remove(&key);
+        self.detached_s3_mounts
+            .lock()
+            .expect("poisoned")
+            .remove(&key);
+    }
+
+    /// Record that a mount was detached at `mount_path` so a snapshot could be taken.
+    pub(crate) fn record_s3_mount_detached(&self, mount_path: &str) {
+        let key = mount_path_key(mount_path);
+        self.active_s3_mounts.lock().expect("poisoned").remove(&key);
+        self.detached_s3_mounts
+            .lock()
+            .expect("poisoned")
+            .insert(key);
+    }
+
+    /// Stop the sandbox after a mount transition failed, and return the original error.
+    ///
+    /// Mirrors Python's `_runtime_fail_s3_mount_transition`: a privileged mount command that
+    /// failed part way leaves the sandbox in a state no later step can reason about, so the
+    /// sandbox does not survive it.
+    pub(crate) async fn fail_s3_mount_transition(&self, error: SandboxError) -> SandboxError {
+        let _ = self.terminate().await;
+        error
     }
 
     fn with_session_key(mut self, session_key: String) -> Self {
@@ -1097,6 +1349,9 @@ impl SandboxSession for VercelSandboxSession {
             ));
         }
         self.started.store(true, Ordering::SeqCst);
+        // The S3 mount topology is applied here and nowhere else, so the window in which a mount
+        // may attach is exactly the manifest application below.
+        self.s3_mounts_startable.store(true, Ordering::SeqCst);
         let result = if self.resuming {
             match restore_session_snapshot(self).await {
                 Ok(false) => self
@@ -1111,6 +1366,7 @@ impl SandboxSession for VercelSandboxSession {
         } else {
             self.manifest.clone().apply(self).await.map(|_| ())
         };
+        self.s3_mounts_startable.store(false, Ordering::SeqCst);
         result.inspect_err(|_| {
             self.started.store(false, Ordering::SeqCst);
         })?;
@@ -1316,306 +1572,6 @@ fn parse_command_stream(body: &str) -> SandboxResult<ExecResult> {
     })
 }
 
-// -------------------------------------------------------------------------------------------
-// Cloud bucket mounts
-// -------------------------------------------------------------------------------------------
-
-/// Refuse a mount on any backend other than Vercel.
-///
-/// Mirrors Python's `_assert_vercel_session`: the strategy depends on the runtime image shipping
-/// `mount-s3` and on how this backend delivers a command's environment.
-fn assert_vercel_session(session: &dyn SandboxSession) -> SandboxResult<()> {
-    let is_vercel = session
-        .as_any()
-        .is_some_and(|any| any.is::<VercelSandboxSession>());
-    if !is_vercel {
-        return Err(SandboxError::new(
-            ErrorCode::MountConfigInvalid,
-            format!(
-                "a Vercel cloud bucket mount requires a Vercel sandbox session, not the `{}` \
-                 backend",
-                session.backend_id()
-            ),
-        ));
-    }
-    Ok(())
-}
-
-/// Mounts an S3 bucket inside a Vercel sandbox with `mount-s3`. Mirrors
-/// `agents.extensions.sandbox.vercel.mounts.VercelCloudBucketMountStrategy`.
-///
-/// Vercel's released runtime images ship `mount-s3` (Mountpoint for Amazon S3), so the mount is
-/// an in-sandbox command rather than part of the sandbox specification. When the mount carries
-/// credentials they reach the sandbox as process environment variables, so the mount reports
-/// [`MountCredentialAuthority::MountScoped`] and the manifest has to acknowledge the exact mount
-/// path before it activates.
-#[derive(Clone, Default)]
-pub struct VercelCloudBucketMountStrategy {
-    /// The bucket to mount.
-    pub bucket: String,
-    /// Optional key prefix inside the bucket.
-    pub prefix: Option<String>,
-    /// Optional AWS region.
-    pub region: Option<String>,
-    /// Optional S3-compatible endpoint.
-    pub endpoint_url: Option<String>,
-    /// Access key id, when the bucket needs credentials.
-    pub access_key_id: Option<String>,
-    /// Secret access key, when the bucket needs credentials.
-    pub secret_access_key: Option<String>,
-    /// Session token, for temporary credentials.
-    pub session_token: Option<String>,
-}
-
-// The secret must never reach a log line through the `MountStrategy: Debug` bound.
-impl std::fmt::Debug for VercelCloudBucketMountStrategy {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("VercelCloudBucketMountStrategy")
-            .field("bucket", &self.bucket)
-            .field("prefix", &self.prefix)
-            .field("region", &self.region)
-            .field("endpoint_url", &self.endpoint_url)
-            .field(
-                "access_key_id",
-                &self.access_key_id.as_ref().map(|_| "<redacted>"),
-            )
-            .field(
-                "secret_access_key",
-                &self.secret_access_key.as_ref().map(|_| "<redacted>"),
-            )
-            .field(
-                "session_token",
-                &self.session_token.as_ref().map(|_| "<redacted>"),
-            )
-            .finish()
-    }
-}
-
-impl VercelCloudBucketMountStrategy {
-    /// A credential-free (anonymous) mount of `bucket`.
-    pub fn new(bucket: impl Into<String>) -> Self {
-        VercelCloudBucketMountStrategy {
-            bucket: bucket.into(),
-            ..Default::default()
-        }
-    }
-
-    /// Mount only the keys under `prefix`.
-    pub fn with_prefix(mut self, prefix: impl Into<String>) -> Self {
-        self.prefix = Some(prefix.into());
-        self
-    }
-
-    /// Pin the bucket's region.
-    pub fn with_region(mut self, region: impl Into<String>) -> Self {
-        self.region = Some(region.into());
-        self
-    }
-
-    /// Use an S3-compatible endpoint.
-    pub fn with_endpoint_url(mut self, endpoint_url: impl Into<String>) -> Self {
-        self.endpoint_url = Some(endpoint_url.into());
-        self
-    }
-
-    /// Authenticate with static credentials.
-    pub fn with_credentials(
-        mut self,
-        access_key_id: impl Into<String>,
-        secret_access_key: impl Into<String>,
-    ) -> Self {
-        self.access_key_id = Some(access_key_id.into());
-        self.secret_access_key = Some(secret_access_key.into());
-        self
-    }
-
-    /// Add a session token, for temporary credentials.
-    pub fn with_session_token(mut self, session_token: impl Into<String>) -> Self {
-        self.session_token = Some(session_token.into());
-        self
-    }
-
-    /// A strategy attaching one of the built-in remote storage mounts.
-    ///
-    /// Mirrors Python's `_validate_s3_mount`: Vercel's runtime images mount buckets with
-    /// `mount-s3`, so only an [`S3Mount`] fits. The mount's own `read_only` flag still governs
-    /// the mount command, so it is not copied here.
-    pub fn for_mount(mount: &dyn ConfiguredMount) -> SandboxResult<Self> {
-        mount.validate()?;
-        let Some(s3) = mount.as_any().downcast_ref::<S3Mount>() else {
-            return Err(SandboxError::new(
-                ErrorCode::MountConfigInvalid,
-                format!(
-                    "vercel cloud bucket mounts only support `s3_mount`, not `{}`",
-                    mount.mount_type()
-                ),
-            ));
-        };
-        Ok(VercelCloudBucketMountStrategy {
-            bucket: s3.bucket.clone(),
-            prefix: s3.prefix.clone(),
-            region: s3.region.clone(),
-            endpoint_url: s3.endpoint_url.clone(),
-            access_key_id: s3.access_key_id.clone(),
-            secret_access_key: s3.secret_access_key.clone(),
-            session_token: s3.session_token.clone(),
-        })
-    }
-
-    /// Whether this mount hands credentials to the sandbox.
-    fn authenticated(&self) -> bool {
-        self.access_key_id.is_some() && self.secret_access_key.is_some()
-    }
-
-    /// The environment `mount-s3` reads its credentials from.
-    ///
-    /// Mirrors Python's `_runtime_s3_mount_environment`. The values travel as the command's
-    /// environment, never in its argument vector, so they stay out of the sandbox's process
-    /// table and out of the provider's command log.
-    fn credential_env(&self) -> BTreeMap<String, String> {
-        let mut env = BTreeMap::new();
-        if let (Some(access_key_id), Some(secret_access_key)) =
-            (&self.access_key_id, &self.secret_access_key)
-        {
-            env.insert("AWS_ACCESS_KEY_ID".to_string(), access_key_id.clone());
-            env.insert(
-                "AWS_SECRET_ACCESS_KEY".to_string(),
-                secret_access_key.clone(),
-            );
-        }
-        if let Some(session_token) = &self.session_token {
-            env.insert("AWS_SESSION_TOKEN".to_string(), session_token.clone());
-        }
-        if let Some(region) = &self.region {
-            env.insert("AWS_REGION".to_string(), region.clone());
-        }
-        env
-    }
-
-    /// A [`Mount`] using this strategy.
-    pub fn mount(self) -> Mount {
-        Mount::new(Arc::new(self))
-    }
-
-    /// The `mount-s3` argument vector for `mount_path`.
-    fn mount_argv(&self, mount_path: &str, read_only: bool) -> Vec<String> {
-        let mut argv = vec![
-            "mount-s3".to_string(),
-            self.bucket.clone(),
-            mount_path.to_string(),
-            "--allow-other".to_string(),
-        ];
-        if read_only {
-            argv.push("--read-only".to_string());
-        }
-        if self.authenticated() {
-            argv.push("--allow-delete".to_string());
-        } else {
-            argv.push("--no-sign-request".to_string());
-        }
-        if let Some(region) = &self.region {
-            argv.extend(["--region".to_string(), region.clone()]);
-        }
-        if let Some(endpoint_url) = &self.endpoint_url {
-            argv.extend(["--endpoint-url".to_string(), endpoint_url.clone()]);
-        }
-        if let Some(prefix) = &self.prefix {
-            let prefix = if prefix.ends_with('/') {
-                prefix.clone()
-            } else {
-                format!("{prefix}/")
-            };
-            argv.extend(["--prefix".to_string(), prefix]);
-        }
-        argv
-    }
-}
-
-#[async_trait]
-impl MountStrategy for VercelCloudBucketMountStrategy {
-    fn strategy_type(&self) -> &str {
-        "vercel_cloud_bucket"
-    }
-
-    fn validate(&self, _mount: &Mount) -> SandboxResult<()> {
-        if self.bucket.trim().is_empty() {
-            return Err(SandboxError::new(
-                ErrorCode::MountConfigInvalid,
-                "a Vercel cloud bucket mount requires a bucket name",
-            ));
-        }
-        Ok(())
-    }
-
-    fn credential_authority(&self) -> MountCredentialAuthority {
-        if self.authenticated() {
-            MountCredentialAuthority::MountScoped
-        } else {
-            MountCredentialAuthority::None
-        }
-    }
-
-    fn supports_native_snapshot_detach(&self) -> bool {
-        false
-    }
-
-    async fn activate(
-        &self,
-        mount: &Mount,
-        session: &dyn SandboxSession,
-        mount_path: &str,
-    ) -> SandboxResult<()> {
-        // `mount-s3` ships in Vercel's runtime images, and the credentials are handed to the
-        // command as environment variables; on another backend that environment would land
-        // somewhere this strategy has not reasoned about, so it refuses to run there.
-        assert_vercel_session(session)?;
-        session.authorize_mount_activation(mount, mount_path)?;
-        session.mkdir(mount_path, true).await?;
-        let argv = self.mount_argv(mount_path, mount.read_only);
-        let result = session
-            .exec(
-                ExecRequest::argv(argv)
-                    .with_envs(self.credential_env())
-                    .with_timeout(Some(Duration::from_secs(120))),
-            )
-            .await?;
-        if !result.ok() {
-            // Never echo the command back: it names the bucket the credentials belong to.
-            return Err(SandboxError::new(
-                ErrorCode::MountFailed,
-                format!(
-                    "`mount-s3` failed for `{mount_path}` with exit code {}: {}",
-                    result.exit_code,
-                    result.stderr_text().trim()
-                ),
-            ));
-        }
-        Ok(())
-    }
-
-    async fn deactivate(
-        &self,
-        _mount: &Mount,
-        session: &dyn SandboxSession,
-        mount_path: &str,
-    ) -> SandboxResult<()> {
-        assert_vercel_session(session)?;
-        let quoted = shell_quote(mount_path);
-        let script = format!(
-            "fusermount3 -u -- {quoted} 2>/dev/null || fusermount -u -- {quoted} 2>/dev/null || \
-             umount -- {quoted} 2>/dev/null || true"
-        );
-        session
-            .exec(
-                ExecRequest::argv(["sh", "-lc", script.as_str()])
-                    .with_shell(crate::sandbox::session::ExecShell::None)
-                    .with_timeout(Some(Duration::from_secs(60))),
-            )
-            .await?;
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1691,66 +1647,6 @@ mod tests {
     }
 
     #[test]
-    fn builds_mount_s3_arguments() {
-        let strategy = VercelCloudBucketMountStrategy::new("my-bucket")
-            .with_prefix("data")
-            .with_region("us-east-1");
-        assert_eq!(
-            strategy.mount_argv("/vercel/sandbox/data", true),
-            vec![
-                "mount-s3",
-                "my-bucket",
-                "/vercel/sandbox/data",
-                "--allow-other",
-                "--read-only",
-                "--no-sign-request",
-                "--region",
-                "us-east-1",
-                "--prefix",
-                "data/",
-            ]
-        );
-    }
-
-    #[test]
-    fn keeps_bucket_credentials_out_of_the_command_line() {
-        let strategy = VercelCloudBucketMountStrategy::new("my-bucket")
-            .with_region("us-east-1")
-            .with_credentials("AKIAEXAMPLE", "s3cr3t")
-            .with_session_token("token");
-        let argv = strategy.mount_argv("/vercel/sandbox/data", false);
-        let command = argv.join(" ");
-        assert!(!command.contains("s3cr3t"), "{command}");
-        assert!(!command.contains("AKIAEXAMPLE"), "{command}");
-        // An authenticated mount signs its requests; an anonymous one must not try.
-        assert!(command.contains("--allow-delete"), "{command}");
-        assert!(!command.contains("--no-sign-request"), "{command}");
-
-        let env = strategy.credential_env();
-        assert_eq!(env["AWS_ACCESS_KEY_ID"], "AKIAEXAMPLE");
-        assert_eq!(env["AWS_SECRET_ACCESS_KEY"], "s3cr3t");
-        assert_eq!(env["AWS_SESSION_TOKEN"], "token");
-        assert_eq!(env["AWS_REGION"], "us-east-1");
-
-        let debug = format!("{strategy:?}");
-        assert!(!debug.contains("s3cr3t"), "{debug}");
-        assert!(debug.contains("<redacted>"));
-
-        // An anonymous mount carries no credentials at all.
-        let anonymous = VercelCloudBucketMountStrategy::new("public-bucket");
-        assert!(anonymous.credential_env().is_empty());
-        assert_eq!(
-            anonymous.credential_authority(),
-            MountCredentialAuthority::None
-        );
-        assert!(
-            anonymous
-                .mount_argv("/vercel/sandbox/data", true)
-                .contains(&"--no-sign-request".to_string())
-        );
-    }
-
-    #[test]
     fn serializes_network_policies() {
         assert_eq!(NetworkPolicy::AllowAll.to_api(), json!({ "allow": "all" }));
         assert_eq!(NetworkPolicy::DenyAll.to_api(), json!({ "allow": [] }));
@@ -1766,5 +1662,71 @@ mod tests {
                 "subnets": { "allow": ["10.0.0.0/8"], "deny": [] },
             })
         );
+    }
+
+    #[test]
+    fn serializes_per_domain_network_policy_rules() {
+        let policy = NetworkPolicy::CustomRules {
+            allow: BTreeMap::from([
+                ("open.example.com".to_string(), Vec::new()),
+                (
+                    "api.example.com".to_string(),
+                    vec![NetworkPolicyRule::new().with_transform(
+                        NetworkTransformer::new().with_header("x-api-key", "injected"),
+                    )],
+                ),
+            ]),
+            allow_subnets: Vec::new(),
+            deny_subnets: vec!["10.0.0.0/8".into()],
+        };
+        assert_eq!(
+            policy.to_api(),
+            json!({
+                "allow": {
+                    "api.example.com": [
+                        { "transform": [{ "headers": { "x-api-key": "injected" } }] },
+                    ],
+                    "open.example.com": [],
+                },
+                "subnets": { "allow": [], "deny": ["10.0.0.0/8"] },
+            })
+        );
+    }
+
+    #[test]
+    fn resolves_runtime_aliases_to_amazon_linux_images() {
+        assert_eq!(
+            resolve_runtime_image(None).unwrap(),
+            "vercel/sandbox/node:al-24"
+        );
+        assert_eq!(
+            resolve_runtime_image(Some("python3.13")).unwrap(),
+            "vercel/sandbox/python:al-3.13.1"
+        );
+        let error = resolve_runtime_image(Some("node18")).unwrap_err();
+        assert_eq!(error.code, ErrorCode::SandboxConfigInvalid);
+        assert!(error.message.contains("node18"), "{}", error.message);
+    }
+
+    #[test]
+    fn round_trips_a_vercel_snapshot_reference() {
+        let encoded = encode_snapshot_ref("snap-1");
+        assert!(encoded.starts_with(b"UC_VERCEL_SNAPSHOT_V1\n"));
+        assert_eq!(decode_snapshot_ref(&encoded).as_deref(), Some("snap-1"));
+        // A reference written by another backend is not a Vercel snapshot.
+        assert_eq!(
+            decode_snapshot_ref(b"E2B_SANDBOX_SNAPSHOT_V1\n{\"snapshot_id\":\"snap-1\"}"),
+            None
+        );
+        assert_eq!(decode_snapshot_ref(b"not a snapshot"), None);
+    }
+
+    #[test]
+    fn tracks_mount_paths_regardless_of_a_trailing_slash() {
+        assert_eq!(
+            mount_path_key("/vercel/sandbox/data/"),
+            "/vercel/sandbox/data"
+        );
+        assert_eq!(mount_path_key("/"), "/");
     }
 }

@@ -7,7 +7,10 @@
 //! lives here: E2B downloads the release Python pins and verifies its SHA-256, while Daytona
 //! installs the distribution package.
 
+use std::time::Duration;
+
 use crate::sandbox::errors::{ErrorCode, SandboxError, SandboxResult};
+use crate::sandbox::mounts::{RcloneMountMode, RcloneMountPattern};
 use crate::sandbox::session::{ExecRequest, ExecShell, SandboxSession};
 use crate::sandbox::types::User;
 
@@ -370,9 +373,142 @@ pub async fn ensure_fuse_support(
     Ok(())
 }
 
+/// Append an option and its values unless the caller already set that option.
+///
+/// Mirrors Python's `_append_option`: a pattern that pins `--uid` keeps the value it pins.
+fn append_option(args: &mut Vec<String>, option: &str, values: &[&str]) {
+    if args.iter().any(|arg| arg == option) {
+        return;
+    }
+    args.push(option.to_string());
+    args.extend(values.iter().map(|value| (*value).to_string()));
+}
+
+/// The uid and gid of the user the sandbox runs commands as.
+///
+/// Mirrors Python's `_default_user_ids`. A sandbox that cannot report them is not an error: the
+/// mount is attached without the ownership flags, exactly as Python leaves it.
+async fn default_user_ids(session: &dyn SandboxSession) -> SandboxResult<Option<(String, String)>> {
+    let result = session
+        .exec(
+            ExecRequest::argv(["sh", "-lc", "id -u; id -g"])
+                .with_shell(ExecShell::None)
+                .with_timeout(Some(Duration::from_secs(30))),
+        )
+        .await?;
+    if !result.ok() {
+        return Ok(None);
+    }
+    let stdout = result.stdout_text();
+    let mut lines = stdout.lines();
+    let (Some(uid), Some(gid)) = (lines.next(), lines.next()) else {
+        return Ok(None);
+    };
+    if !is_id(uid) || !is_id(gid) {
+        return Ok(None);
+    }
+    Ok(Some((uid.to_string(), gid.to_string())))
+}
+
+/// Whether `value` is a plain numeric id, as Python's `str.isdigit` decides.
+fn is_id(value: &str) -> bool {
+    !value.is_empty() && value.chars().all(|c| c.is_ascii_digit())
+}
+
+/// The pattern one FUSE activation uses, resolved against the live session.
+///
+/// Mirrors Python's `rclone_pattern_for_session`. `rclone mount` runs as root, so without
+/// `--allow-other` and the command user's `--uid`/`--gid` the mounted tree is not usable by the
+/// user the sandbox runs commands as. Only FUSE needs this; an NFS mount is served, not owned.
+pub async fn rclone_pattern_for_session(
+    session: &dyn SandboxSession,
+    pattern: &RcloneMountPattern,
+) -> SandboxResult<RcloneMountPattern> {
+    if pattern.mode != RcloneMountMode::Fuse {
+        return Ok(pattern.clone());
+    }
+    let mut extra_args = pattern.extra_args.clone();
+    append_option(&mut extra_args, "--allow-other", &[]);
+    if let Some((uid, gid)) = default_user_ids(session).await? {
+        append_option(&mut extra_args, "--uid", &[uid.as_str()]);
+        append_option(&mut extra_args, "--gid", &[gid.as_str()]);
+    }
+    let mut pattern = pattern.clone();
+    pattern.extra_args = extra_args;
+    Ok(pattern)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sandbox::testing::{SandboxMethod, SandboxStep, scripted_sandbox_session};
+    use crate::sandbox::types::ExecResult;
+
+    fn exec_result(exit_code: i32, stdout: &str) -> ExecResult {
+        ExecResult {
+            exit_code,
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn gives_a_fuse_mount_the_command_user_ids() {
+        let session = scripted_sandbox_session([SandboxStep::new(SandboxMethod::Exec)
+            .matching(|call| call.has_argument("id -u; id -g"))
+            .returning_exec(exec_result(0, "1000\n1001\n"))]);
+        let pattern = rclone_pattern_for_session(&session, &RcloneMountPattern::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            pattern.extra_args,
+            vec!["--allow-other", "--uid", "1000", "--gid", "1001"]
+        );
+        session.assert_complete();
+    }
+
+    #[tokio::test]
+    async fn keeps_the_options_the_caller_pinned() {
+        let session = scripted_sandbox_session([
+            SandboxStep::new(SandboxMethod::Exec).returning_exec(exec_result(0, "0\n0\n"))
+        ]);
+        let pinned = RcloneMountPattern::new().with_extra_args(["--uid", "1234"]);
+        let pattern = rclone_pattern_for_session(&session, &pinned).await.unwrap();
+        // `--uid` was pinned, so only the options the caller left out are appended.
+        assert_eq!(
+            pattern.extra_args,
+            vec!["--uid", "1234", "--allow-other", "--gid", "0"]
+        );
+    }
+
+    #[tokio::test]
+    async fn mounts_without_ownership_when_the_ids_are_unreadable() {
+        for result in [
+            exec_result(1, ""),
+            exec_result(0, "1000\n"),
+            exec_result(0, "root\nroot\n"),
+        ] {
+            let session = scripted_sandbox_session([
+                SandboxStep::new(SandboxMethod::Exec).returning_exec(result)
+            ]);
+            let pattern = rclone_pattern_for_session(&session, &RcloneMountPattern::new())
+                .await
+                .unwrap();
+            assert_eq!(pattern.extra_args, vec!["--allow-other"]);
+        }
+    }
+
+    #[tokio::test]
+    async fn leaves_a_served_mount_alone() {
+        // An NFS mount is reached over the loopback, so it has no FUSE ownership flags and must
+        // not cost an `id` round trip either.
+        let session = scripted_sandbox_session([]);
+        let pattern = rclone_pattern_for_session(&session, &RcloneMountPattern::nfs())
+            .await
+            .unwrap();
+        assert!(pattern.extra_args.is_empty());
+        session.assert_complete();
+    }
 
     #[test]
     fn maps_machine_names_to_release_architectures() {
