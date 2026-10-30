@@ -131,6 +131,9 @@ pub use util::{transform_string_function_style, transform_string_function_style_
 
 /// Compiles the README examples as doctests.
 #[doc = include_str!("../README.md")]
+#[cfg(doctest)]
+pub struct ReadmeDoctests;
+
 /// Turn a function into a [`FunctionTool`] (feature `macros`). See the macro crate docs.
 #[cfg(feature = "macros")]
 pub use openai_agents_sdk_macros::function_tool;
@@ -141,6 +144,3 @@ pub mod __private {
     pub use serde;
     pub use serde_json;
 }
-
-#[cfg(doctest)]
-pub struct ReadmeDoctests;

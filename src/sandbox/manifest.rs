@@ -199,7 +199,7 @@ impl Manifest {
     /// Export a variable whose value is fetched when the session starts.
     ///
     /// Use this for a value that should not be written into the manifest, such as a secret read
-    /// from a credential store. See [`EnvValue`].
+    /// from a credential store. See [`EnvValue`](crate::sandbox::EnvValue).
     pub fn with_env_entry(mut self, key: impl Into<String>, entry: EnvEntry) -> Self {
         self.resolved_environment = self.resolved_environment.with_entry(key, entry);
         self

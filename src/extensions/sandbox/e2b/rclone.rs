@@ -2,7 +2,7 @@
 //! `agents.extensions.sandbox._rclone` and the preflight halves of the E2B and Daytona
 //! `mounts.py`.
 //!
-//! The mount itself is [`RcloneMountPattern`](crate::sandbox::mounts::RcloneMountPattern) in the
+//! The mount itself is [`crate::sandbox::mounts::RcloneMountPattern`] in the
 //! core, which only checks that `rclone` is present. Installing it is provider-specific, so it
 //! lives here: E2B downloads the release Python pins and verifies its SHA-256, while Daytona
 //! installs the distribution package.
