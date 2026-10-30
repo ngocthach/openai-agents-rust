@@ -11,8 +11,18 @@
 //! // Logs `Error getting response` only, unless OPENAI_AGENTS_DONT_LOG_MODEL_DATA=0.
 //! logger::log_model_action_error("Error getting response", &err);
 //! ```
+//!
+//! An application that has not wired up a `log` backend sees nothing at all. Port of Python's
+//! `enable_verbose_stdout_logging()`: [`enable_verbose_stdout_logging`] installs a minimal stdout
+//! backend for the SDK's own messages, so debugging needs no extra dependency.
+//!
+//! ```
+//! openai_agents_sdk::enable_verbose_stdout_logging();
+//! ```
 
 use std::fmt::Display;
+use std::io::Write;
+use std::sync::OnceLock;
 
 use log::Level;
 
@@ -108,4 +118,83 @@ pub fn log_model_and_tool_data_warning(
     } else {
         log::warn!(target: LOG_TARGET, "{}", diagnostic());
     }
+}
+
+/// Whether `target` is the SDK's own log target, or one of its dotted children.
+fn is_sdk_target(target: &str) -> bool {
+    target
+        .strip_prefix(LOG_TARGET)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
+}
+
+/// The stdout backend installed by [`enable_verbose_stdout_logging`].
+///
+/// It only accepts records on [`LOG_TARGET`], so an application that enables it does not also get
+/// the debug output of every other crate in the process.
+#[derive(Debug)]
+struct VerboseStdoutLogger;
+
+static VERBOSE_STDOUT_LOGGER: VerboseStdoutLogger = VerboseStdoutLogger;
+
+impl log::Log for VerboseStdoutLogger {
+    fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+        metadata.level() <= Level::Debug && is_sdk_target(metadata.target())
+    }
+
+    fn log(&self, record: &log::Record<'_>) {
+        // The `log::debug!` family calls `log` without consulting `enabled`, so filter here too.
+        if !self.enabled(record.metadata()) {
+            return;
+        }
+        // A logger must never panic, so a closed stdout is ignored rather than unwrapped.
+        let mut out = std::io::stdout().lock();
+        let _ = writeln!(
+            out,
+            "{} {}: {}",
+            record.level(),
+            record.target(),
+            record.args()
+        );
+    }
+
+    fn flush(&self) {
+        let _ = std::io::stdout().flush();
+    }
+}
+
+static VERBOSE_STDOUT_INSTALLED: OnceLock<bool> = OnceLock::new();
+
+/// Enable verbose SDK logging to stdout. Port of Python's `enable_verbose_stdout_logging()`.
+///
+/// Installs a minimal `log` backend that prints every SDK record of level `Debug` or higher to
+/// stdout as `LEVEL target: message`, and raises the global level filter to `Debug`. Records on
+/// other targets are dropped, so no other crate becomes verbose.
+///
+/// Returns `true` when the SDK backend is in place (this call installed it, or an earlier one
+/// did), and `false` when another `log` backend already owns the process: the `log` crate allows
+/// a single global logger, so nothing is replaced and nothing panics. Raise the verbosity of the
+/// `openai.agents` target in that backend instead (for example `RUST_LOG=openai.agents=debug`).
+///
+/// Verbose logging does not defeat redaction: model and tool payloads still appear as
+/// [`REDACTED_DATA_PLACEHOLDER`] unless [`crate::debug::set_dont_log_model_data`] /
+/// [`crate::debug::set_dont_log_tool_data`] (or `OPENAI_AGENTS_DONT_LOG_MODEL_DATA=0` /
+/// `OPENAI_AGENTS_DONT_LOG_TOOL_DATA=0`) allow them.
+///
+/// ```
+/// use openai_agents_sdk::enable_verbose_stdout_logging;
+///
+/// // Idempotent: a second call is a no-op that reports the same state.
+/// assert!(enable_verbose_stdout_logging());
+/// assert!(enable_verbose_stdout_logging());
+/// ```
+pub fn enable_verbose_stdout_logging() -> bool {
+    *VERBOSE_STDOUT_INSTALLED.get_or_init(|| {
+        if log::set_logger(&VERBOSE_STDOUT_LOGGER).is_err() {
+            return false;
+        }
+        if log::max_level() < log::LevelFilter::Debug {
+            log::set_max_level(log::LevelFilter::Debug);
+        }
+        true
+    })
 }

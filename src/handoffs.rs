@@ -14,7 +14,7 @@ use crate::items::{InputItem, RunItem};
 use crate::models::interface::FunctionToolSpec;
 use crate::run_context::RunContext;
 use crate::strict_schema::ensure_strict_json_schema;
-use crate::tool::IsEnabled;
+use crate::tool::{IsEnabled, ToolErrorFn};
 use crate::util::{BoxFuture, transform_string_function_style};
 
 /// Data passed to a handoff input filter.
@@ -96,6 +96,14 @@ pub struct Handoff<C> {
     pub strict_json_schema: bool,
     /// Enablement check.
     pub is_enabled: IsEnabled<C>,
+    /// Formats the model-visible output when the handoff invocation fails.
+    ///
+    /// `None` propagates the error and terminates the run. When it is set, a failed
+    /// invocation is not a transfer: the run records a tool output carrying the formatted
+    /// text and gives the calling agent another turn, so it can retry or answer without
+    /// transferring. Transfer hooks and input filters run only after a successful
+    /// invocation and are not covered by this handler.
+    pub failure_error_function: Option<ToolErrorFn<C>>,
     on_invoke_handoff: InvokeFn<C>,
     pub(crate) agent: Option<Arc<Agent<C>>>,
 }
@@ -111,6 +119,7 @@ impl<C> Clone for Handoff<C> {
             nest_handoff_history: self.nest_handoff_history,
             strict_json_schema: self.strict_json_schema,
             is_enabled: self.is_enabled.clone(),
+            failure_error_function: self.failure_error_function.clone(),
             on_invoke_handoff: self.on_invoke_handoff.clone(),
             agent: self.agent.clone(),
         }
@@ -159,6 +168,7 @@ impl<C: Send + Sync + 'static> Handoff<C> {
             nest_handoff_history: None,
             strict_json_schema: true,
             is_enabled: IsEnabled::Static(true),
+            failure_error_function: None,
             on_invoke_handoff: Arc::new(move |_ctx, _args| {
                 let a = target.clone();
                 Box::pin(async move { Ok(a) })
@@ -190,6 +200,7 @@ impl<C: Send + Sync + 'static> Handoff<C> {
             nest_handoff_history: None,
             strict_json_schema: true,
             is_enabled: IsEnabled::Static(true),
+            failure_error_function: None,
             on_invoke_handoff: Arc::new(move |c, a| Box::pin(f(c, a))),
             agent: None,
         }
@@ -302,6 +313,20 @@ impl<C: Send + Sync + 'static> Handoff<C> {
         Fut: Future<Output = bool> + Send + 'static,
     {
         self.is_enabled = IsEnabled::Dynamic(Arc::new(move |c, a| Box::pin(f(c, a))));
+        self
+    }
+
+    /// Recover from a failed handoff invocation by sending `f`'s text back to the calling
+    /// agent as the handoff tool's output, instead of ending the run with the error.
+    ///
+    /// Pass [`crate::tool::default_tool_error_function`] for the generic SDK message. A custom
+    /// formatter must return only application-approved error details. Recovery does not roll
+    /// back side effects an `on_handoff` callback already performed.
+    pub fn with_failure_error_function<F>(mut self, f: F) -> Self
+    where
+        F: Fn(&RunContext<C>, &AgentsError) -> String + Send + Sync + 'static,
+    {
+        self.failure_error_function = Some(Arc::new(f));
         self
     }
 

@@ -74,7 +74,7 @@ pub struct Entry {
     /// Group or user ownership applied after the entry is written.
     pub group: Option<Group>,
     /// Whether the entry is runtime-attached state that snapshots must exclude and resume must
-    /// re-apply. Mounts are always ephemeral.
+    /// re-apply. A mount entry takes this from [`Mount::ephemeral`], which defaults to `true`.
     pub ephemeral: bool,
     /// How many files a `local_dir` entry copies at once.
     pub copy_concurrency: usize,
@@ -89,7 +89,15 @@ impl Entry {
                 | EntryKind::GitRepo { .. }
                 | EntryKind::Mount { .. }
         );
-        let ephemeral = matches!(kind, EntryKind::Mount { .. });
+        // A mount carries its own flag, as Python's `Mount.ephemeral` does: it defaults to true,
+        // because a mount is runtime-attached storage rather than workspace content, but a mount
+        // that declares itself durable must not be overridden into an ephemeral entry — the
+        // snapshot and resume paths read the entry's flag, and the two disagreeing is what makes
+        // a durable mount get excluded from a snapshot and re-attached on resume anyway.
+        let ephemeral = match &kind {
+            EntryKind::Mount { mount } => mount.ephemeral,
+            _ => false,
+        };
         Entry {
             kind,
             description: None,
@@ -685,6 +693,28 @@ mod tests {
         assert!(entry.as_mount().is_some());
         assert!(!Entry::text_file("x").ephemeral);
         assert!(Entry::text_file("x").as_mount().is_none());
+    }
+
+    #[test]
+    fn a_mount_entry_follows_the_mounts_own_ephemeral_flag() {
+        use crate::sandbox::mounts::BindMountStrategy;
+
+        let durable = Entry::mount(BindMountStrategy::mount("/host/data").with_ephemeral(false));
+        assert!(
+            !durable.ephemeral,
+            "a durable mount must not become an ephemeral entry"
+        );
+        // The manifest reads the entry's flag, so a durable mount stays in the snapshot and is
+        // not re-applied on resume.
+        let manifest = crate::sandbox::manifest::Manifest::new().with_entry("data", durable);
+        assert!(manifest.ephemeral_mount_targets().is_empty());
+        assert!(manifest.ephemeral_entry_paths().is_empty());
+
+        let manifest = crate::sandbox::manifest::Manifest::new().with_entry(
+            "cache",
+            Entry::mount(BindMountStrategy::mount("/host/cache")),
+        );
+        assert_eq!(manifest.ephemeral_mount_targets().len(), 1);
     }
 
     #[test]

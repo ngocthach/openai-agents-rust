@@ -675,7 +675,17 @@ impl MountStrategy for VercelCloudBucketMountStrategy {
         Some(self)
     }
 
-    fn validate(&self, _mount: &Mount) -> SandboxResult<()> {
+    fn validate(&self, mount: &Mount) -> SandboxResult<()> {
+        // Port of the `if not mount.ephemeral` branch of Python's `_validate_s3_mount`. Vercel
+        // attaches the bucket with `mount-s3` at runtime and has nothing that could persist its
+        // contents into a snapshot, so a mount asking to be durable is refused rather than
+        // silently treated as ephemeral.
+        if !mount.ephemeral {
+            return Err(SandboxError::new(
+                ErrorCode::MountConfigInvalid,
+                "a Vercel cloud bucket mount must be ephemeral",
+            ));
+        }
         if self.bucket.trim().is_empty() {
             return Err(SandboxError::new(
                 ErrorCode::MountConfigInvalid,
@@ -918,6 +928,28 @@ mod tests {
             anonymous
                 .mount_argv("/vercel/sandbox/data", true, None)
                 .contains(&"--no-sign-request".to_string())
+        );
+    }
+
+    #[test]
+    fn refuses_a_mount_that_asks_not_to_be_ephemeral() {
+        let strategy = VercelCloudBucketMountStrategy::new("my-bucket");
+        let ephemeral = Mount::new(Arc::new(strategy.clone()));
+        // The default stands: a mount is ephemeral unless the caller says otherwise.
+        assert!(ephemeral.ephemeral);
+        assert!(strategy.validate(&ephemeral).is_ok());
+
+        // Port of Python's `if not mount.ephemeral: raise MountConfigError`.
+        let durable = Mount::new(Arc::new(strategy.clone())).with_ephemeral(false);
+        let err = strategy.validate(&durable).unwrap_err();
+        assert_eq!(err.code, ErrorCode::MountConfigInvalid);
+        assert!(err.to_string().contains("ephemeral"), "{err}");
+
+        // The signal reaches the strategy through `Mount::validate` too, which is the path the
+        // manifest actually takes.
+        assert_eq!(
+            durable.validate().unwrap_err().code,
+            ErrorCode::MountConfigInvalid
         );
     }
 

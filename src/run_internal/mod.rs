@@ -10,7 +10,7 @@ mod tool_caller;
 pub(crate) mod tool_invocation;
 mod tools;
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -202,6 +202,11 @@ struct RunLoop<C> {
     trace_id: Option<String>,
     /// Canonical identity of every tool call the run has seen, restored from the snapshot.
     tool_invocations: BTreeMap<String, ToolInvocationRecord>,
+    /// Call ids whose restored approval decision no ledger entry binds to an invocation, so
+    /// the decision does not authorize the call and the user is asked again. Mirrors
+    /// `RunContextWrapper._restored_unbound_approval_call_ids`; empty unless this run resumed
+    /// a snapshot that is held to the binding rule.
+    unbound_approvals: BTreeSet<String>,
     /// Identifies this run to models that keep per-run state.
     model_owner: crate::models::run_context::ModelRunOwner,
     /// Every model this run resolved, so each is told when the run ends.
@@ -340,7 +345,7 @@ fn resolve_tool_name_collisions<C>(
         if policy == crate::run_config::ToolNameCollisionPolicy::Error {
             return Err(AgentsError::user(message));
         }
-        log::warn!("{message}");
+        log::warn!(target: crate::logger::LOG_TARGET, "{message}");
         let winner = entries
             .iter()
             .rev()
@@ -594,6 +599,7 @@ pub(crate) async fn run_loop<C: Send + Sync + 'static>(
         agent_span: None,
         trace_id: None,
         tool_invocations: BTreeMap::new(),
+        unbound_approvals: BTreeSet::new(),
         model_owner: crate::models::run_context::new_model_run_owner(),
         models_used: Vec::new(),
         trace_state: None,
@@ -776,12 +782,21 @@ fn validate_restored_tool_invocations(state: &RunState) -> Result<()> {
 /// Build the canonical tool-invocation ledger of a run from its generated items.
 /// Mirrors the state `RunContextWrapper._tool_invocations` holds at snapshot time: one record
 /// per tool call, marked executed and completed once its output item is in history.
-fn tool_invocation_ledger(items: &[RunItem]) -> BTreeMap<String, ToolInvocationRecord> {
+fn tool_invocation_ledger(
+    items: &[RunItem],
+    unbound_approvals: &BTreeSet<String>,
+) -> BTreeMap<String, ToolInvocationRecord> {
     let mut ledger: BTreeMap<String, ToolInvocationRecord> = BTreeMap::new();
     for item in items {
         if let Some((raw, role)) = invocation_raw_item(item)
             && let Some(id) = tool_invocation::tool_invocation_identity(&raw, role)
         {
+            // A call whose restored decision is unbound is never registered, so re-snapshotting
+            // an un-renewed approval cannot turn it into a bound one. Port of the
+            // `is_restored_unbound` early return in `_tool_invocation_status`.
+            if unbound_approvals.contains(&id.call_id) {
+                continue;
+            }
             ledger
                 .entry(id.call_id)
                 .or_insert_with(|| ToolInvocationRecord {
@@ -974,6 +989,9 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
         // arguments or routing were edited is rejected instead of silently re-approved.
         validate_restored_tool_invocations(&state)?;
         self.tool_invocations = state.tool_invocations.clone();
+        // A decision the snapshot could not bind to a concrete invocation is not an
+        // authorization; the resumed run raises the approval again.
+        self.unbound_approvals = state.restored_unbound_approval_call_ids.clone();
         self.resume_pending_tools = state.pending_tool_processing;
         // Carried so a snapshot taken before the resumed turn re-executes still names the
         // tools the parked response asked for; `process_response` replaces it.
@@ -1465,7 +1483,16 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
             // Rust returns an error instead of a snapshot when a terminal save fails, so a
             // snapshot this loop builds is always resumable.
             terminal_unrecoverable: false,
-            tool_invocations: tool_invocation_ledger(&self.generated_items),
+            tool_invocations: tool_invocation_ledger(
+                &self.generated_items,
+                &self.unbound_approvals,
+            ),
+            // An approval the user has not renewed stays unbound across the snapshot, so the
+            // decision cannot quietly become authoritative again on the next resume.
+            restored_unbound_approval_call_ids: self.unbound_approvals.clone(),
+            // The application owns its context; a snapshot this loop builds never claims to
+            // carry one, so nothing needs restoring.
+            context_requires_restoration: false,
             // Python keeps the processed response only while a turn is parked on an
             // approval, and clears it once the run finishes.
             last_processed_response: (!interruptions.is_empty())
@@ -2016,6 +2043,7 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
                         ));
                     }
                     Some(_) => {}
+                    None if self.unbound_approvals.contains(&id.call_id) => {}
                     None => {
                         self.tool_invocations.insert(
                             id.call_id.clone(),
@@ -2426,6 +2454,7 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
                 agent,
                 hooks: self.hooks.as_ref(),
                 config: &self.config,
+                unbound_approvals: &self.unbound_approvals,
             };
             Box::pin(tools::execute_function_tools(&env, processed.functions)).await?
         };
@@ -2501,16 +2530,20 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
                     .await;
                     Some((r.approve, r.reason))
                 }
-                None => self
-                    .ctx
-                    .is_tool_approved(&agent.name, &identity, &request_id)
-                    .map(|a| {
-                        (
-                            a,
-                            self.ctx
-                                .rejection_message(&agent.name, &identity, &request_id),
-                        )
-                    }),
+                None => tools::bound_approval_status(
+                    &self.ctx,
+                    &self.unbound_approvals,
+                    &agent.name,
+                    &identity,
+                    &request_id,
+                )
+                .map(|a| {
+                    (
+                        a,
+                        self.ctx
+                            .rejection_message(&agent.name, &identity, &request_id),
+                    )
+                }),
             };
             match decision {
                 Some((approve, reason)) => {
@@ -2570,17 +2603,22 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
                     agent,
                     hooks: self.hooks.as_ref(),
                     config: &self.config,
+                    unbound_approvals: &self.unbound_approvals,
                 };
                 Box::pin(local_tools::execute_local_call(&env, call)).await?
             };
             match outcome {
-                local_tools::LocalOutcome::Output { raw_item, output } => {
+                local_tools::LocalOutcome::Output {
+                    raw_item,
+                    output,
+                    custom_data,
+                } => {
                     let ri = RunItem::new(
                         agent.name.clone(),
                         RunItemKind::ToolCallOutput {
                             raw_item,
                             output,
-                            custom_data: None,
+                            custom_data,
                         },
                     );
                     self.push_item(ri, Some(RunItemStreamEventName::ToolOutput));
@@ -2779,14 +2817,39 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
         {
             Ok(a) => a,
             Err(e) => {
-                span.set_error(
-                    "Error invoking handoff",
-                    Some(json!({
-                        "error": tr::model_error_text(&e, self.config.trace_include_sensitive_data)
-                    })),
-                );
+                // A failed invocation is not a transfer: the recovery formatter turns it into
+                // a tool output for the calling agent and the run continues. Without one the
+                // error ends the run. Port of `execute_handoffs`' failure branch.
+                let Some(format_error) = handoff.failure_error_function.clone() else {
+                    span.set_error(
+                        "Error invoking handoff",
+                        Some(json!({
+                            "error": tr::model_error_text(
+                                &e,
+                                self.config.trace_include_sensitive_data,
+                            )
+                        })),
+                    );
+                    span.finish();
+                    return Err(e);
+                };
+                span.set_error("Handoff invocation failed", Some(json!({})));
                 span.finish();
-                return Err(e);
+                let text = format_error(&self.ctx, &e);
+                let item = RunItem::new(
+                    agent.name.clone(),
+                    RunItemKind::ToolCallOutput {
+                        raw_item: InputItem::function_call_output(
+                            call.call_id.clone(),
+                            text.clone(),
+                        )
+                        .0,
+                        output: Value::String(text),
+                        custom_data: None,
+                    },
+                );
+                self.push_item(item, Some(RunItemStreamEventName::ToolOutput));
+                return Ok(NextStep::RunAgain);
             }
         };
         span.update_data(|d| {
@@ -2847,25 +2910,39 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
         } else if handoff
             .nest_handoff_history
             .unwrap_or(self.config.nest_handoff_history)
-            && !self.server_managed()
         {
-            // Model history can be shorter than the public history after an earlier filter,
-            // so anchor the pre-handoff split at its tail.
-            let model_pre_count = self
-                .model_items
-                .len()
-                .saturating_sub(self.generated_items.len() - pre_handoff_count);
-            let normalized = history::normalize_handoff_items(&self.model_items, model_pre_count);
-            self.model_prefix = match &self.config.handoff_history_mapper {
-                Some(m) => {
-                    let mut transcript = self.model_prefix.clone();
-                    transcript.extend(normalized.into_iter().map(|(item, _)| item));
-                    m(transcript)
-                }
-                None => history::build_ordered_history(self.model_prefix.clone(), normalized),
-            };
-            self.model_items.clear();
-            self.server_sent_items = 0;
+            if self.server_managed() {
+                // The server owns the transcript, so a nested rewrite cannot be applied; the
+                // next agent gets delta-only input. Port of
+                // `_resolve_server_managed_handoff_behavior`'s warning.
+                log::warn!(
+                    target: crate::logger::LOG_TARGET,
+                    "Server-managed conversations do not support nest_handoff_history for \
+                     handoff {} -> {}. Disabling nested handoff history and continuing with \
+                     delta-only input.",
+                    agent.name,
+                    new_agent.name,
+                );
+            } else {
+                // Model history can be shorter than the public history after an earlier
+                // filter, so anchor the pre-handoff split at its tail.
+                let model_pre_count = self
+                    .model_items
+                    .len()
+                    .saturating_sub(self.generated_items.len() - pre_handoff_count);
+                let normalized =
+                    history::normalize_handoff_items(&self.model_items, model_pre_count);
+                self.model_prefix = match &self.config.handoff_history_mapper {
+                    Some(m) => {
+                        let mut transcript = self.model_prefix.clone();
+                        transcript.extend(normalized.into_iter().map(|(item, _)| item));
+                        m(transcript)
+                    }
+                    None => history::build_ordered_history(self.model_prefix.clone(), normalized),
+                };
+                self.model_items.clear();
+                self.server_sent_items = 0;
+            }
         }
         Ok(NextStep::Handoff(new_agent))
     }

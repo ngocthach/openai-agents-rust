@@ -28,6 +28,20 @@ pub(super) const SUPPORTED_SCHEMA_VERSIONS: [&str; 22] = [
     "1.13", "1.14", "1.15", "1.16", "1.17", "1.18", "1.19", "1.20", "1.21",
 ];
 
+/// Split a `major.minor` schema version into its numbers.
+///
+/// The comparison has to be numeric: `"1.9"` and `"1.15"` order the other way round as strings,
+/// which would put every 1.9-and-later snapshot on the wrong side of the binding cut-off.
+fn parse_schema_version(version: &str) -> Option<(u32, u32)> {
+    let (major, minor) = version.split_once('.')?;
+    Some((major.parse().ok()?, minor.parse().ok()?))
+}
+
+/// Whether `version` is at least `major.minor`, compared numerically.
+pub(super) fn schema_version_at_least(version: &str, major: u32, minor: u32) -> bool {
+    parse_schema_version(version).is_some_and(|v| v >= (major, minor))
+}
+
 fn agent_ref(name: &str) -> Value {
     json!({ "name": name })
 }
@@ -866,7 +880,17 @@ pub(super) fn to_wire(state: &RunState) -> Result<Value> {
                 "requires_deserializer": false,
                 "omitted": false,
             }),
-            _ => json!({
+            // A context that is not a JSON object is one Python's deserializer refuses
+            // ("Serialized run state context must be a mapping"), so the metadata has to say
+            // so rather than claim there was no context at all. `RunState::to_json_strict`
+            // rejects the snapshot outright instead of writing this.
+            Some(_) => json!({
+                "original_type": "custom",
+                "serialized_via": "custom",
+                "requires_deserializer": true,
+                "omitted": false,
+            }),
+            None => json!({
                 "original_type": "none",
                 "serialized_via": "none",
                 "requires_deserializer": false,
@@ -990,6 +1014,32 @@ pub(super) fn to_wire(state: &RunState) -> Result<Value> {
         );
     }
     Ok(envelope)
+}
+
+/// Whether `context_meta` says the snapshot's context cannot be restored from the payload
+/// alone. Port of `_context_meta_requires_deserializer`.
+pub(super) fn context_meta_requires_restoration(context_meta: Option<&Value>) -> bool {
+    let Some(Value::Object(meta)) = context_meta else {
+        return false;
+    };
+    if meta.get("omitted") == Some(&Value::Bool(true)) {
+        return true;
+    }
+    meta.get("requires_deserializer") == Some(&Value::Bool(true))
+}
+
+/// The message describing what a snapshot needs before its context can be restored.
+/// Port of `_context_meta_warning_message`.
+pub(super) fn context_meta_warning(context_meta: Option<&Value>) -> &'static str {
+    let Some(Value::Object(meta)) = context_meta else {
+        return "RunState context was serialized from a custom type; provide a context override \
+                to restore it.";
+    };
+    if meta.get("omitted") == Some(&Value::Bool(true)) {
+        return "RunState context was omitted during serialization; provide a context override \
+                to supply it.";
+    }
+    "RunState context requires explicit restoration; provide a context override to restore it."
 }
 
 /// Rebuild a run state from Python's envelope.
@@ -1191,6 +1241,9 @@ pub(super) fn from_wire(value: &Value) -> Result<RunState> {
                 || !t.extra.is_empty()
         }),
         context: context.get("context").cloned().filter(|v| !v.is_null()),
+        context_requires_restoration: context_meta_requires_restoration(
+            context.get("context_meta"),
+        ),
         turn_start_index: rust_usize("turn_start_index", default_turn_start),
         tool_use_tracker: value
             .get("tool_use_tracker")
@@ -1212,6 +1265,9 @@ pub(super) fn from_wire(value: &Value) -> Result<RunState> {
             )?),
             _ => None,
         },
+        // Derived by `RunState::from_json` once the schema version is known; the wire format
+        // never carries it.
+        restored_unbound_approval_call_ids: Default::default(),
     })
 }
 

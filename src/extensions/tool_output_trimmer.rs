@@ -203,7 +203,7 @@ impl ToolOutputTrimmer {
             })
             .collect();
         if trimmed_count > 0 {
-            log::debug!(
+            log::debug!(target: crate::logger::LOG_TARGET,
                 "ToolOutputTrimmer: trimmed {trimmed_count} tool output(s), saved ~{saved} chars"
             );
         }

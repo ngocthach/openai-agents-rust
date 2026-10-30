@@ -86,6 +86,7 @@ pub use items::{
     OutputItem, ReasoningOutput, RunInput, RunItem, RunItemKind, ToolApprovalItem,
 };
 pub use lifecycle::{AgentHooks, RunHooks};
+pub use logger::enable_verbose_stdout_logging;
 pub use memory::{InMemorySession, Session, SessionSettings};
 pub use model_settings::{MCPToolChoice, ModelSettings, Reasoning, ToolChoice};
 pub use models::{

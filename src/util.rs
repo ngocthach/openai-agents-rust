@@ -36,7 +36,7 @@ pub fn transform_string_function_style_with(name: &str, warn_on_whitespace: bool
         .collect();
     let final_name = transformed.to_lowercase();
     if transformed != name && (warn_on_whitespace || transformed != whitespace_normalized) {
-        log::warn!(
+        log::warn!(target: crate::logger::LOG_TARGET,
             "Tool name {name:?} contains invalid characters for function calling and has been \
              transformed to {final_name:?}. Please use only letters, digits, and underscores to \
              avoid potential naming conflicts."

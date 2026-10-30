@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 
 use crate::sandbox::errors::{ErrorCode, SandboxError, SandboxResult};
@@ -19,7 +19,8 @@ use crate::sandbox::manifest::Manifest;
 use crate::sandbox::mounts::{ContainerPrivileges, docker_volume_name};
 use crate::sandbox::pty::{PtyExecRequest, PtyExecUpdate, PtyManager, PtySpawn, PtyWriteRequest};
 use crate::sandbox::session::{
-    ExecRequest, SandboxClient, SandboxSession, restore_session_snapshot, shell_quote,
+    ExecRequest, SandboxClient, SandboxSession, capture_workspace_tar, restore_session_snapshot,
+    shell_quote,
 };
 use crate::sandbox::snapshot::{Snapshot, SnapshotSpec, resolve_snapshot};
 use crate::sandbox::state::{SandboxSessionState, SnapshotFingerprint};
@@ -780,7 +781,7 @@ impl SandboxSession for DockerSandboxSession {
         // In-container mounts have to be released while the container is still alive. Bind and
         // volume mounts are detached by the runtime when the container goes away.
         if let Err(error) = self.manifest.unmount_all(self).await {
-            log::warn!("Failed to detach a container mount before removal: {error}");
+            log::warn!(target: crate::logger::LOG_TARGET, "Failed to detach a container mount before removal: {error}");
         }
         let mut removed = self.removed.lock().await;
         if *removed {
@@ -818,7 +819,7 @@ impl SandboxSession for DockerSandboxSession {
                 && output.exit_code != 0
                 && !output.stderr_text().contains("no such volume")
             {
-                log::warn!(
+                log::warn!(target: crate::logger::LOG_TARGET,
                     "Failed to remove the sandbox Docker volume `{volume}`: {}",
                     output.stderr_text().trim()
                 );
@@ -1021,7 +1022,23 @@ impl SandboxSession for DockerSandboxSession {
         Ok(())
     }
 
+    async fn persist_workspace_once(&self) -> SandboxResult<Vec<u8>> {
+        let raw = capture_workspace_tar(self).await?;
+        // A container workspace carries links recorded against its own root, and the hydrate
+        // policy refuses an absolute target. Python rewrites them as it captures the archive
+        // (`strip_tar_member_prefix(relativize_symlinks_under=root)`); so does this.
+        let roots = vec![self.manifest.root().to_string()];
+        crate::sandbox::archive::rebase_archive_symlink_targets(&raw, &roots)
+    }
+
+    fn validate_restorable_archive(&self, archive: &[u8]) -> SandboxResult<()> {
+        // A resume clears the workspace before it hydrates, so an archive that cannot be
+        // restored must be refused while the live files are still there.
+        crate::sandbox::archive::validate_hydrate_archive(archive)
+    }
+
     async fn hydrate_workspace(&self, archive: &[u8]) -> SandboxResult<()> {
+        crate::sandbox::archive::validate_hydrate_archive(archive)?;
         let root = self.manifest.root().to_string();
         let script = format!(
             "mkdir -p {root} && tar -xzf - -C {root}",
@@ -1052,8 +1069,28 @@ impl SandboxSession for DockerSandboxSession {
 /// Run the `docker` CLI, optionally piping `stdin` into it.
 async fn run_docker(argv: &[String], stdin: Option<&[u8]>) -> SandboxResult<ExecResult> {
     let mut command = tokio::process::Command::new("docker");
+    command.args(argv);
+    run_piped(command, &format!("docker {}", argv.join(" ")), stdin).await
+}
+
+/// Spawn `command` with piped streams, feeding `stdin` while draining stdout and stderr.
+///
+/// The three streams are pumped concurrently because they deadlock otherwise: a child that
+/// writes more than a pipe buffer before it finishes reading stdin blocks on its own stdout,
+/// stops draining stdin, and leaves the caller blocked mid-write forever. Writing stdin to
+/// completion first is only safe when the child is known to stay quiet until EOF, which is not
+/// a property the caller can guarantee for `docker exec`.
+///
+/// This is the job Python's `_LENGTH_FRAMED_STDIN_SCRIPT` and `_DockerExecSocket` do over a raw
+/// hijacked socket, where `docker-py` cannot half-close a TLS stdin. Through the CLI the half
+/// close is the `docker` client's own (`moby/client/hijack.go`), so the framing is unnecessary
+/// — but the concurrent pumping is not.
+async fn run_piped(
+    mut command: tokio::process::Command,
+    label: &str,
+    stdin: Option<&[u8]>,
+) -> SandboxResult<ExecResult> {
     command
-        .args(argv)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .stdin(if stdin.is_some() {
@@ -1065,28 +1102,61 @@ async fn run_docker(argv: &[String], stdin: Option<&[u8]>) -> SandboxResult<Exec
     let mut child = command.spawn().map_err(|e| {
         SandboxError::new(
             ErrorCode::ExecTransportError,
-            format!("Failed to run `docker {}`: {e}", argv.join(" ")),
+            format!("Failed to run `{label}`: {e}"),
         )
     })?;
-    if let (Some(data), Some(mut pipe)) = (stdin, child.stdin.take()) {
-        pipe.write_all(data).await.map_err(|e| {
-            SandboxError::new(
-                ErrorCode::ExecTransportError,
-                format!("Failed to stream stdin into `docker`: {e}"),
-            )
-        })?;
-        pipe.shutdown().await.ok();
-    }
-    let output = child.wait_with_output().await.map_err(|e| {
+
+    let stdin_pipe = child.stdin.take();
+    let mut stdout_pipe = child.stdout.take();
+    let mut stderr_pipe = child.stderr.take();
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+
+    let feed = async move {
+        if let (Some(data), Some(mut pipe)) = (stdin, stdin_pipe) {
+            let written = pipe.write_all(data).await;
+            // Closing the write side is the child's EOF; the handle drops with this block.
+            pipe.shutdown().await.ok();
+            // A child that exits without reading all of its input leaves a broken pipe. That
+            // is the child's business, not a transport failure, and its exit code reports it.
+            if let Err(e) = written
+                && e.kind() != std::io::ErrorKind::BrokenPipe
+            {
+                return Err(e);
+            }
+        }
+        Ok(())
+    };
+    let drain_stdout = async {
+        match stdout_pipe.as_mut() {
+            Some(pipe) => pipe.read_to_end(&mut stdout).await.map(|_| ()),
+            None => Ok(()),
+        }
+    };
+    let drain_stderr = async {
+        match stderr_pipe.as_mut() {
+            Some(pipe) => pipe.read_to_end(&mut stderr).await.map(|_| ()),
+            None => Ok(()),
+        }
+    };
+
+    tokio::try_join!(feed, drain_stdout, drain_stderr).map_err(|e| {
         SandboxError::new(
             ErrorCode::ExecTransportError,
-            format!("Failed to wait for `docker {}`: {e}", argv.join(" ")),
+            format!("Failed to stream `{label}`: {e}"),
+        )
+    })?;
+
+    let status = child.wait().await.map_err(|e| {
+        SandboxError::new(
+            ErrorCode::ExecTransportError,
+            format!("Failed to wait for `{label}`: {e}"),
         )
     })?;
     Ok(ExecResult {
-        stdout: output.stdout,
-        stderr: output.stderr,
-        exit_code: output.status.code().unwrap_or(-1),
+        stdout,
+        stderr,
+        exit_code: status.code().unwrap_or(-1),
     })
 }
 
@@ -1533,5 +1603,124 @@ mod tests {
         assert!(session.normalize_path("../etc").is_err());
         assert!(session.normalize_path("/etc/passwd").is_err());
         assert_eq!(session.normalize_path("a/b").unwrap(), "/workspace/a/b");
+    }
+
+    /// Payload larger than any pipe buffer, so a sequential write-then-read would wedge.
+    const BIG: usize = 4 * 1024 * 1024;
+
+    fn sh(script: &str) -> tokio::process::Command {
+        let mut command = tokio::process::Command::new("sh");
+        command.arg("-c").arg(script);
+        command
+    }
+
+    #[tokio::test]
+    async fn a_large_stdin_payload_survives_a_child_that_floods_stdout_first() {
+        // The child writes megabytes before it reads a byte of stdin. Feeding stdin to
+        // completion first would block: the child is stuck on its own full stdout pipe.
+        let payload = vec![b'x'; BIG];
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            run_piped(
+                sh("dd if=/dev/zero bs=1024 count=4096 2>/dev/null; wc -c"),
+                "flood then read",
+                Some(&payload),
+            ),
+        )
+        .await
+        .expect("run_piped deadlocked on a large stdin payload")
+        .expect("run_piped");
+
+        assert_eq!(result.exit_code, 0);
+        // 4 MiB of zeroes, then `wc -c` reporting every byte of stdin it drained.
+        assert!(result.stdout.len() > BIG, "stdout was truncated");
+        assert!(result.stdout[..BIG].iter().all(|b| *b == 0));
+        let tail = String::from_utf8_lossy(&result.stdout[BIG..]);
+        assert_eq!(
+            tail.split_whitespace().next(),
+            Some(BIG.to_string().as_str()),
+            "stdin was truncated: {tail:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stdout_and_stderr_stay_separate_and_the_exit_code_survives() {
+        let result = run_piped(
+            sh("echo out; echo err >&2; exit 7"),
+            "streams",
+            Some(b"ignored"),
+        )
+        .await
+        .expect("run_piped");
+        assert_eq!(result.exit_code, 7);
+        assert_eq!(result.stdout_text(), "out\n");
+        assert_eq!(result.stderr_text(), "err\n");
+    }
+
+    #[tokio::test]
+    async fn stdin_reaches_eof_so_a_draining_child_can_finish() {
+        // `cat` only exits when its stdin is closed, so this hangs unless the write side is
+        // dropped. That half-close is what Python's length framing exists to work around on a
+        // TLS socket docker-py cannot shut down.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            run_piped(sh("cat"), "cat", Some(b"hello")),
+        )
+        .await
+        .expect("stdin never reached EOF")
+        .expect("run_piped");
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.stdout_text(), "hello");
+    }
+
+    /// A one-member archive: a symlink when `link_target` is set, a regular file otherwise.
+    fn probe_archive(name: &str, link_target: Option<&str>) -> Vec<u8> {
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_mode(0o644);
+        header.set_size(0);
+        match link_target {
+            Some(target) => {
+                header.set_entry_type(tar::EntryType::Symlink);
+                builder.append_link(&mut header, name, target).unwrap();
+            }
+            None => {
+                header.set_size(2);
+                builder.append_data(&mut header, name, &b"hi"[..]).unwrap();
+            }
+        }
+        builder.into_inner().unwrap()
+    }
+
+    #[test]
+    fn a_resume_refuses_an_archive_that_cannot_replace_the_workspace() {
+        let session = DockerSandboxSession::new("abc123", Manifest::new());
+
+        // A resume clears the container workspace before it hydrates, so the archive is judged
+        // while the live files are still there. Mirrors Python's
+        // `_restore_snapshot_into_workspace_on_resume`.
+        let error = session
+            .validate_restorable_archive(&probe_archive("bin/python", Some("/usr/bin/python3")))
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::WorkspaceArchiveWriteError);
+        assert_eq!(
+            error.context.get("reason").map(String::as_str),
+            Some("absolute symlink target not allowed: /usr/bin/python3")
+        );
+
+        session
+            .validate_restorable_archive(&probe_archive("notes.txt", None))
+            .expect("a restorable archive is accepted");
+    }
+
+    #[tokio::test]
+    async fn a_child_that_ignores_its_stdin_is_not_a_transport_error() {
+        // A broken pipe here is the child's choice, reported by its exit code, not a failure
+        // of the transport.
+        let payload = vec![b'x'; BIG];
+        let result = run_piped(sh("exit 3"), "early exit", Some(&payload))
+            .await
+            .expect("an unread stdin must not fail the call");
+        assert_eq!(result.exit_code, 3);
     }
 }

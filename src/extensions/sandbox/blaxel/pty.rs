@@ -271,7 +271,7 @@ async fn pump_output(
             Ok(Message::Close(_)) | Ok(Message::Frame(_)) | Err(_) => break,
         };
         let Ok(payload) = serde_json::from_str::<Value>(&text) else {
-            log::debug!("ignoring a malformed Blaxel PTY frame");
+            log::debug!(target: crate::logger::LOG_TARGET, "ignoring a malformed Blaxel PTY frame");
             continue;
         };
         // Older sandbox builds capitalize the field names.

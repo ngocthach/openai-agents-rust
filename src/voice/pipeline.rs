@@ -220,7 +220,7 @@ async fn run_turns(
     match outcome {
         Ok(()) => writer.finish().await,
         Err(error) => {
-            log::error!("Error processing voice turns: {error}");
+            log::error!(target: crate::logger::LOG_TARGET, "Error processing voice turns: {error}");
             // A synthesis failure already queued its own error, in audio order.
             if !writer.has_failed() {
                 writer.add_error(error);
@@ -265,7 +265,7 @@ async fn run_multi_turn(
                     emitted_intro = true;
                 }
                 Err(error) => {
-                    log::warn!("Voice workflow on_start failed: {error}");
+                    log::warn!(target: crate::logger::LOG_TARGET, "Voice workflow on_start failed: {error}");
                     break;
                 }
             }
@@ -297,7 +297,7 @@ async fn run_multi_turn(
 
     // Report a close failure only when the turns themselves succeeded.
     if let Err(error) = session.close().await {
-        log::error!("Error closing voice transcription session: {error}");
+        log::error!(target: crate::logger::LOG_TARGET, "Error closing voice transcription session: {error}");
         if turns.is_ok() {
             turns = Err(error);
         }

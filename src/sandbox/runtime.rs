@@ -22,6 +22,7 @@ use crate::sandbox::session::{
     ExecRequest, SandboxClient, SandboxSession, persist_session_snapshot,
 };
 use crate::sandbox::state::SandboxSessionState;
+use crate::sandbox::types::SandboxArchiveLimits;
 use crate::sandbox::workspace_paths::SandboxWorkspaceScope;
 
 /// Where a sandbox run executes, mirroring Python's `RunConfig(sandbox=...)` options.
@@ -60,6 +61,12 @@ pub struct SandboxRunConfig {
     ///
     /// Mirrors Python's `SandboxRunConfig.concurrency_limits`.
     pub concurrency_limits: Option<SandboxConcurrencyLimits>,
+    /// Resource limits for archives the session extracts.
+    ///
+    /// Mirrors Python's `SandboxRunConfig.archive_limits`. `None` keeps the default behavior
+    /// with no SDK archive resource limits; [`SandboxArchiveLimits::new`] enables the SDK
+    /// defaults.
+    pub archive_limits: Option<SandboxArchiveLimits>,
 }
 
 /// How a [`SandboxAgent`] handoff graph is bound to sandbox sessions.
@@ -128,6 +135,12 @@ impl SandboxRunConfig {
     /// Override the manifest's materialization concurrency limits.
     pub fn concurrency_limits(mut self, limits: SandboxConcurrencyLimits) -> Self {
         self.concurrency_limits = Some(limits);
+        self
+    }
+
+    /// Apply resource limits to every archive the session extracts.
+    pub fn archive_limits(mut self, limits: SandboxArchiveLimits) -> Self {
+        self.archive_limits = Some(limits);
         self
     }
 }
@@ -282,6 +295,9 @@ impl SandboxRunner {
         if let Some(limits) = &config.concurrency_limits {
             limits.validate()?;
         }
+        if let Some(limits) = &config.archive_limits {
+            limits.validate()?;
+        }
         let (session, client) = match (&config.session, &config.client) {
             (Some(session), _) => {
                 if config.session_mode == SandboxSessionMode::PerAgent {
@@ -296,6 +312,7 @@ impl SandboxRunner {
                 // entries to them. Mirrors Python's `_process_live_session_manifest`.
                 let processed = agent.resolved_manifest(Some(session.manifest().clone()));
                 apply_live_session_manifest(session.as_ref(), &processed).await?;
+                session.set_archive_limits(config.archive_limits);
                 (session.clone(), None)
             }
             (None, Some(client)) => {
@@ -304,6 +321,7 @@ impl SandboxRunner {
                     None => client.create(Some(manifest)).await?,
                     Some(state) => client.resume(state, manifest).await?,
                 };
+                session.set_archive_limits(config.archive_limits);
                 if let Err(error) = session.start().await {
                     // Release the backend resources the failed start may already hold.
                     let _ = client.delete(session.clone()).await;
@@ -450,6 +468,7 @@ impl SandboxRunner {
         // `SandboxRunConfig::manifest` override is shared, as it is in Python.
         let manifest = Self::effective_manifest(node.as_ref(), config)?;
         let session = client.create(Some(manifest)).await?;
+        session.set_archive_limits(config.archive_limits);
         if let Err(error) = session.start().await {
             let _ = client.delete(session.clone()).await;
             return Err(error.into());
@@ -514,7 +533,7 @@ impl SandboxRunner {
                 )
                 .await
         {
-            log::warn!("Failed to record the sandbox memory rollout: {error}");
+            log::warn!(target: crate::logger::LOG_TARGET, "Failed to record the sandbox memory rollout: {error}");
         }
 
         let suspend = matches!(&result, Ok(result) if !result.interruptions.is_empty());
@@ -530,7 +549,7 @@ impl SandboxRunner {
                 .flush(prepared.guard.session().clone(), model_provider)
                 .await
             {
-                log::warn!("Failed to generate sandbox memory: {error}");
+                log::warn!(target: crate::logger::LOG_TARGET, "Failed to generate sandbox memory: {error}");
             }
         }
 
@@ -543,13 +562,13 @@ impl SandboxRunner {
                 // same rollout instead of starting a new one.
                 Ok(state) => Some(state.with_rollout_id(Some(rollout_id))),
                 Err(error) => {
-                    log::warn!("Failed to suspend the sandbox session: {error}");
+                    log::warn!(target: crate::logger::LOG_TARGET, "Failed to suspend the sandbox session: {error}");
                     None
                 }
             }
         } else {
             if let Err(error) = prepared.guard.close().await {
-                log::warn!("Failed to tear down the sandbox session: {error}");
+                log::warn!(target: crate::logger::LOG_TARGET, "Failed to tear down the sandbox session: {error}");
             }
             None
         };
@@ -636,7 +655,7 @@ impl SandboxRunner {
                         .enqueue_rollout_payload(guard.session().as_ref(), &rollout_id, &payload)
                         .await
                     {
-                        log::warn!("Failed to record the sandbox memory rollout: {error}");
+                        log::warn!(target: crate::logger::LOG_TARGET, "Failed to record the sandbox memory rollout: {error}");
                     }
                 }
                 let extra = std::mem::take(&mut *hook_agent_guards.lock().expect("poisoned"));
@@ -737,13 +756,13 @@ async fn release_agent_guards(
                     states.insert(name, state.with_rollout_id(Some(rollout_id.to_string())));
                 }
                 Err(error) => {
-                    log::warn!("Failed to suspend the sandbox session of `{name}`: {error}");
+                    log::warn!(target: crate::logger::LOG_TARGET, "Failed to suspend the sandbox session of `{name}`: {error}");
                 }
             }
             continue;
         }
         if let Err(error) = guard.close().await {
-            log::warn!("Failed to tear down the sandbox session of `{name}`: {error}");
+            log::warn!(target: crate::logger::LOG_TARGET, "Failed to tear down the sandbox session of `{name}`: {error}");
         }
     }
     states
@@ -761,19 +780,19 @@ async fn finish_sandbox_run(
         && let Some(manager) = &memory_manager
         && let Err(error) = manager.flush(guard.session().clone(), model_provider).await
     {
-        log::warn!("Failed to generate sandbox memory: {error}");
+        log::warn!(target: crate::logger::LOG_TARGET, "Failed to generate sandbox memory: {error}");
     }
     if suspend {
         match guard.suspend().await {
             Ok(state) => return Some(state.with_rollout_id(Some(rollout_id))),
             Err(error) => {
-                log::warn!("Failed to suspend the sandbox session: {error}");
+                log::warn!(target: crate::logger::LOG_TARGET, "Failed to suspend the sandbox session: {error}");
                 return None;
             }
         }
     }
     if let Err(error) = guard.close().await {
-        log::warn!("Failed to tear down the sandbox session: {error}");
+        log::warn!(target: crate::logger::LOG_TARGET, "Failed to tear down the sandbox session: {error}");
     }
     None
 }

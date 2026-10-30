@@ -4,6 +4,9 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use serde_json::{Map, Value};
 
+use crate::sandbox::errors::{ErrorCode, SandboxError, SandboxResult};
+use crate::sandbox::session::{ExecRequest, SandboxSession, shell_quote};
+
 /// Encode bytes as standard base64 with padding, for `view_image` data URLs.
 pub fn base64_encode(data: &[u8]) -> String {
     BASE64.encode(data)
@@ -328,6 +331,74 @@ pub fn truncate_text_by_tokens(
     max_output_tokens: Option<usize>,
 ) -> (String, Option<usize>) {
     formatted_truncate_text_with_token_count(text, max_output_tokens)
+}
+
+/// Fail unless `git` is callable inside the sandbox. Mirrors `agents.sandbox.util.github`.
+pub async fn ensure_git_available(session: &dyn SandboxSession) -> SandboxResult<()> {
+    let probe = session
+        .exec(ExecRequest::shell("command -v git >/dev/null 2>&1"))
+        .await?;
+    if probe.ok() {
+        return Ok(());
+    }
+    Err(SandboxError::new(
+        ErrorCode::GitMissingInImage,
+        "git is required to use github_repo artifacts",
+    )
+    .with_retryable(false))
+}
+
+/// Shallow-clone a GitHub repository at `git_ref` into `dest` inside the sandbox.
+///
+/// Mirrors `agents.sandbox.util.github.clone_repo`, with the clone running inside the sandbox
+/// rather than on the host: the destination is a workspace path, so cloning on the host would
+/// only be useful for a backend that shares the host filesystem. A tag or branch is fetched with
+/// a shallow clone; a commit sha, which `--branch` does not accept, falls back to a checkout of
+/// a repository cloned without one.
+pub async fn clone_repo(
+    session: &dyn SandboxSession,
+    repo: &str,
+    git_ref: &str,
+    dest: &str,
+) -> SandboxResult<()> {
+    ensure_git_available(session).await?;
+    let target = session.normalize_path_for_write(dest)?;
+    let url = format!("https://github.com/{repo}.git");
+    let quoted_target = shell_quote(&target);
+    let quoted_url = shell_quote(&url);
+    let quoted_ref = shell_quote(git_ref);
+
+    let shallow = format!(
+        "set -e\nmkdir -p \"$(dirname {target})\"\nrm -rf {target}\n\
+         git clone --depth 1 --no-tags --branch {git_ref} {url} {target}",
+        target = quoted_target,
+        url = quoted_url,
+        git_ref = quoted_ref,
+    );
+    if session.exec(ExecRequest::shell(shallow)).await?.ok() {
+        return Ok(());
+    }
+
+    let pinned = format!(
+        "set -e\nmkdir -p \"$(dirname {target})\"\nrm -rf {target}\n\
+         git clone --no-checkout {url} {target}\ngit -C {target} checkout {git_ref}",
+        target = quoted_target,
+        url = quoted_url,
+        git_ref = quoted_ref,
+    );
+    let result = session.exec(ExecRequest::shell(pinned)).await?;
+    if !result.ok() {
+        return Err(SandboxError::new(
+            ErrorCode::GitCloneError,
+            format!(
+                "Failed to clone `{url}` at `{git_ref}`: {}",
+                result.stderr_text().trim()
+            ),
+        )
+        .with_context("repo", repo)
+        .with_context("ref", git_ref));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

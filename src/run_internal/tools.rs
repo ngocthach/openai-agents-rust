@@ -1,5 +1,6 @@
 //! Function tool execution: approvals, tool guardrails, hooks, timeouts and error handling.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use futures::StreamExt;
@@ -27,6 +28,28 @@ pub(crate) struct ToolEnv<'a, C> {
     pub agent: &'a Arc<Agent<C>>,
     pub hooks: Option<&'a Arc<dyn RunHooks<C>>>,
     pub config: &'a Arc<RunConfig<C>>,
+    /// Call ids whose restored approval decision authorizes nothing; see
+    /// [`bound_approval_status`].
+    pub unbound_approvals: &'a BTreeSet<String>,
+}
+
+/// The approval decision in force for `call_id`, honouring the restored binding rule.
+///
+/// Port of the `_restored_unbound_approval_call_ids` branch of
+/// `RunContextWrapper._tool_invocation_status`: a decision restored from a snapshot that holds
+/// no ledger entry binding it to a concrete invocation authorizes nothing, so the call reads as
+/// undecided and goes back to the user for a fresh decision.
+pub(crate) fn bound_approval_status<C>(
+    ctx: &RunContext<C>,
+    unbound: &BTreeSet<String>,
+    agent: &str,
+    tool_name: &str,
+    call_id: &str,
+) -> Option<bool> {
+    if unbound.contains(call_id) {
+        return None;
+    }
+    ctx.is_tool_approved(agent, tool_name, call_id)
 }
 
 /// The outcome of one function tool call.
@@ -198,10 +221,13 @@ pub(crate) async fn execute_function_tool<C: Send + Sync + 'static>(
                 output_results,
             ));
         }
-        match env
-            .ctx
-            .is_tool_approved(&env.agent.name, &approval_name, &call.call_id)
-        {
+        match bound_approval_status(
+            env.ctx,
+            env.unbound_approvals,
+            &env.agent.name,
+            &approval_name,
+            &call.call_id,
+        ) {
             None => {
                 let item = ToolApprovalItem {
                     agent: env.agent.name.clone(),

@@ -1520,7 +1520,12 @@ impl SandboxSession for BlaxelSandboxSession {
         archive
     }
 
+    fn validate_restorable_archive(&self, archive: &[u8]) -> SandboxResult<()> {
+        crate::sandbox::archive::validate_hydrate_archive(archive)
+    }
+
     async fn hydrate_workspace(&self, archive: &[u8]) -> SandboxResult<()> {
+        crate::sandbox::archive::validate_hydrate_archive(archive)?;
         let root = self.manifest.root().to_string();
         let tar_path = self.tar_path("hydrate");
         self.mkdir(&root, true).await?;
@@ -1669,6 +1674,7 @@ fn parse_directory(payload: &Value, base: &str) -> Vec<FileEntry> {
             size: None,
             permissions: None,
             is_dir: true,
+            is_symlink: false,
         });
     }
     for file in payload
@@ -1695,6 +1701,8 @@ fn parse_directory(payload: &Value, base: &str) -> Vec<FileEntry> {
                 .and_then(Value::as_str)
                 .and_then(Permissions::from_ls_field),
             is_dir: false,
+            // The directory listing endpoint reports no link metadata.
+            is_symlink: false,
         });
     }
     entries

@@ -19,45 +19,45 @@ pub use crate::debug::{
 /// Log a failure involving model data, with the detail only when redaction is off.
 pub(crate) fn log_model_action_error(message: &str, detail: &dyn fmt::Display) {
     if dont_log_model_data() {
-        log::error!("{message}");
+        log::error!(target: crate::logger::LOG_TARGET, "{message}");
     } else {
-        log::error!("{message}: {detail}");
+        log::error!(target: crate::logger::LOG_TARGET, "{message}: {detail}");
     }
 }
 
 /// Warn about a failure involving model data, with the detail only when redaction is off.
 pub(crate) fn log_model_action_warning(message: &str, detail: &dyn fmt::Display) {
     if dont_log_model_data() {
-        log::warn!("{message}");
+        log::warn!(target: crate::logger::LOG_TARGET, "{message}");
     } else {
-        log::warn!("{message}: {detail}");
+        log::warn!(target: crate::logger::LOG_TARGET, "{message}: {detail}");
     }
 }
 
 /// Log model data at debug level, naming it only when redaction is off.
 pub(crate) fn log_model_data_debug(message: &str, detail: &dyn fmt::Display) {
     if dont_log_model_data() {
-        log::debug!("{message}");
+        log::debug!(target: crate::logger::LOG_TARGET, "{message}");
     } else {
-        log::debug!("{message}: {detail}");
+        log::debug!(target: crate::logger::LOG_TARGET, "{message}: {detail}");
     }
 }
 
 /// Log a failure involving tool data, with the detail only when redaction is off.
 pub(crate) fn log_tool_action_error(message: &str, detail: &dyn fmt::Display) {
     if dont_log_tool_data() {
-        log::error!("{message}");
+        log::error!(target: crate::logger::LOG_TARGET, "{message}");
     } else {
-        log::error!("{message}: {detail}");
+        log::error!(target: crate::logger::LOG_TARGET, "{message}: {detail}");
     }
 }
 
 /// Warn about a failure involving tool data, with the detail only when redaction is off.
 pub(crate) fn log_tool_action_warning(message: &str, detail: &dyn fmt::Display) {
     if dont_log_tool_data() {
-        log::warn!("{message}");
+        log::warn!(target: crate::logger::LOG_TARGET, "{message}");
     } else {
-        log::warn!("{message}: {detail}");
+        log::warn!(target: crate::logger::LOG_TARGET, "{message}: {detail}");
     }
 }
 

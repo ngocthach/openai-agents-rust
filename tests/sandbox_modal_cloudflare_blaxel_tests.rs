@@ -32,6 +32,45 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 // ---------------------------------------------------------------------------------------------
+// Workspace archive fixtures
+// ---------------------------------------------------------------------------------------------
+
+/// A well-formed single-file `tar` archive.
+///
+/// Workspace archives are validated member by member before a provider unpacks them, so a probe
+/// archive has to be a real tar rather than an opaque marker string. The marker lives in the
+/// member payload, which is where the assertions below look for it.
+fn probe_tar(marker: &str) -> Vec<u8> {
+    fn put(header: &mut [u8; 512], offset: usize, bytes: &[u8]) {
+        header[offset..offset + bytes.len()].copy_from_slice(bytes);
+    }
+
+    let mut header = [0u8; 512];
+    put(&mut header, 0, b"marker.txt");
+    put(&mut header, 100, b"0000644\0");
+    put(&mut header, 108, b"0000000\0");
+    put(&mut header, 116, b"0000000\0");
+    put(
+        &mut header,
+        124,
+        format!("{:011o}\0", marker.len()).as_bytes(),
+    );
+    put(&mut header, 136, b"00000000000\0");
+    put(&mut header, 148, b"        ");
+    put(&mut header, 156, b"0");
+    put(&mut header, 257, b"ustar\0");
+    put(&mut header, 263, b"00");
+    let checksum: u32 = header.iter().map(|byte| u32::from(*byte)).sum();
+    put(&mut header, 148, format!("{checksum:06o}\0 ").as_bytes());
+
+    let mut archive = header.to_vec();
+    archive.extend_from_slice(marker.as_bytes());
+    archive.extend(std::iter::repeat_n(0u8, (512 - marker.len() % 512) % 512));
+    archive.extend(std::iter::repeat_n(0u8, 1024));
+    archive
+}
+
+// ---------------------------------------------------------------------------------------------
 // A tiny recording HTTP server
 // ---------------------------------------------------------------------------------------------
 
@@ -365,8 +404,11 @@ async fn cloudflare_runs_a_full_session_against_the_worker_protocol() {
          .sandbox-rclone-config%2Ccache"
     );
 
-    session.hydrate_workspace(b"restored").await.unwrap();
-    assert_eq!(server.find("POST", "/hydrate").text(), "restored");
+    session
+        .hydrate_workspace(&probe_tar("restored"))
+        .await
+        .unwrap();
+    assert!(server.find("POST", "/hydrate").text().contains("restored"));
 
     session.shutdown().await.unwrap();
     assert_eq!(server.count("DELETE", "/v1/sandbox/sbx-77"), 1);
@@ -756,7 +798,10 @@ async fn blaxel_persists_and_hydrates_through_a_tar_file() {
         ) >= 1
     );
 
-    session.hydrate_workspace(b"payload").await.unwrap();
+    session
+        .hydrate_workspace(&probe_tar("payload"))
+        .await
+        .unwrap();
     let upload = server.find(
         "PUT",
         "openai-agents-sandbox-blaxel-hydrate-agents-test.tar",
@@ -1186,7 +1231,8 @@ async fn modal_persists_a_tar_archive_by_default() {
         ])
     );
 
-    session.hydrate_workspace(b"payload").await.unwrap();
+    let archive = probe_tar("payload");
+    session.hydrate_workspace(&archive).await.unwrap();
     // The archive is staged with the helper's chunked `write_file`, never as a command argument,
     // because a real workspace would blow past the kernel's per-argument limit.
     let staged = fake.of_op("write_file").pop().unwrap();
@@ -1197,7 +1243,11 @@ async fn modal_persists_a_tar_archive_by_default() {
             .starts_with("/tmp/openai-agents-sandbox-modal-hydrate-"),
         "{staged}"
     );
-    assert_eq!(staged["data"], "cGF5bG9hZA==");
+    // The whole archive travels as one base64 payload.
+    assert_eq!(
+        staged["data"].as_str().unwrap().len(),
+        4 * archive.len().div_ceil(3)
+    );
     let extract = fake
         .of_op("exec")
         .into_iter()

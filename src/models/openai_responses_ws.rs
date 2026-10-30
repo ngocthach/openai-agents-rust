@@ -1084,3 +1084,183 @@ mod tests {
         assert_eq!(advice(&untyped, false).suggested, Some(true));
     }
 }
+
+// -------------------------------------------------------------------------------------------
+// WebSocket dependency log suppression
+// -------------------------------------------------------------------------------------------
+
+/// Log targets of the WebSocket stack this model is built on.
+///
+/// `log`'s macros default their target to the emitting module path, so every record from
+/// `tungstenite` and `tokio-tungstenite` arrives under one of these roots.
+pub const WEBSOCKET_LOG_TARGETS: [&str; 2] = ["tungstenite", "tokio_tungstenite"];
+
+/// An `RUST_LOG` fragment that silences the WebSocket stack's verbose levels.
+///
+/// Useful when the application configures its logger from the environment rather than wrapping
+/// it in [`WebSocketDebugFilter`]: `RUST_LOG=info,{WEBSOCKET_LOG_FILTER_DIRECTIVES}`.
+pub const WEBSOCKET_LOG_FILTER_DIRECTIVES: &str = "tungstenite=info,tokio_tungstenite=info";
+
+/// Whether a record from the WebSocket stack is one this SDK suppresses.
+///
+/// Mirrors `_OpenAIWebSocketLoggerAdapter.isEnabledFor`, which drops everything at or below
+/// Python's `DEBUG` for the `websockets.client` logger. `tungstenite` splits the same material
+/// across two Rust levels — connection and close-frame detail at `DEBUG`, and whole decoded
+/// frames at `TRACE` (`tungstenite::protocol` logs `Received message {message}`) — so both are
+/// covered. Levels at `INFO` and above pass through: suppressing those would hide real faults.
+pub fn is_suppressed_websocket_record(target: &str, level: log::Level) -> bool {
+    if level < log::Level::Debug {
+        return false;
+    }
+    WEBSOCKET_LOG_TARGETS.iter().any(|root| {
+        target == *root
+            || target
+                .strip_prefix(root)
+                .is_some_and(|rest| rest.starts_with("::"))
+    })
+}
+
+/// A `log::Log` wrapper that drops the WebSocket stack's `DEBUG` and `TRACE` records.
+///
+/// Those records carry connection detail and whole decoded frames, which for this model means
+/// model input and output. Python suppresses the equivalent by swapping the `websockets.client`
+/// logger for an adapter; in Rust only the installed logger can filter another crate's target,
+/// and the installed logger belongs to the application — so the SDK ships the filter and the
+/// application wraps its own logger in it:
+///
+/// ```no_run
+/// use openai_agents_sdk::models::openai_responses_ws::WebSocketDebugFilter;
+///
+/// let inner = env_logger::Builder::from_default_env().build();
+/// let level = inner.filter();
+/// log::set_boxed_logger(Box::new(WebSocketDebugFilter::new(inner))).unwrap();
+/// log::set_max_level(level);
+/// ```
+///
+/// [`WEBSOCKET_LOG_FILTER_DIRECTIVES`] is the equivalent for an environment-configured logger.
+#[derive(Debug, Clone)]
+pub struct WebSocketDebugFilter<L> {
+    inner: L,
+}
+
+impl<L> WebSocketDebugFilter<L> {
+    /// Wrap `inner`, dropping the WebSocket stack's verbose records before it sees them.
+    pub fn new(inner: L) -> Self {
+        Self { inner }
+    }
+
+    /// The wrapped logger.
+    pub fn inner(&self) -> &L {
+        &self.inner
+    }
+}
+
+impl<L: log::Log> log::Log for WebSocketDebugFilter<L> {
+    fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+        if is_suppressed_websocket_record(metadata.target(), metadata.level()) {
+            return false;
+        }
+        self.inner.enabled(metadata)
+    }
+
+    fn log(&self, record: &log::Record<'_>) {
+        if is_suppressed_websocket_record(record.target(), record.level()) {
+            return;
+        }
+        self.inner.log(record);
+    }
+
+    fn flush(&self) {
+        self.inner.flush();
+    }
+}
+
+#[cfg(test)]
+mod websocket_log_suppression_tests {
+    use super::*;
+    use log::{Level, Log};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    struct Collector(Arc<Mutex<Vec<String>>>);
+
+    impl Log for Collector {
+        fn enabled(&self, _: &log::Metadata<'_>) -> bool {
+            true
+        }
+        fn log(&self, record: &log::Record<'_>) {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("{} {}", record.target(), record.args()));
+        }
+        fn flush(&self) {}
+    }
+
+    fn emit(target: &str, level: Level, message: &str, filter: &dyn Log) {
+        filter.log(
+            &log::Record::builder()
+                .target(target)
+                .level(level)
+                .args(format_args!("{message}"))
+                .build(),
+        );
+    }
+
+    #[test]
+    fn the_websocket_stacks_verbose_records_are_dropped() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let filter = WebSocketDebugFilter::new(Collector(seen.clone()));
+
+        // Frame payloads: `tungstenite::protocol` logs whole decoded messages at TRACE.
+        emit(
+            "tungstenite::protocol",
+            Level::Trace,
+            "Received message secret",
+            &filter,
+        );
+        emit(
+            "tungstenite::handshake::client",
+            Level::Debug,
+            "Client handshake done.",
+            &filter,
+        );
+        emit(
+            "tokio_tungstenite::compat",
+            Level::Trace,
+            "Read.read",
+            &filter,
+        );
+        // A real fault from the same stack still gets through.
+        emit("tungstenite::client", Level::Warn, "No `Location`", &filter);
+        // Another crate that merely starts with the same letters is untouched.
+        emit("tungstenite_extra", Level::Debug, "unrelated", &filter);
+        // The SDK's own records are never WebSocket-stack records.
+        emit("openai.agents", Level::Debug, "sdk detail", &filter);
+
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(
+            seen,
+            vec![
+                "tungstenite::client No `Location`".to_string(),
+                "tungstenite_extra unrelated".to_string(),
+                "openai.agents sdk detail".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn enabled_reports_the_same_decision_as_log() {
+        let filter = WebSocketDebugFilter::new(Collector::default());
+        let suppressed = log::Metadata::builder()
+            .target("tungstenite::protocol")
+            .level(Level::Trace)
+            .build();
+        let kept = log::Metadata::builder()
+            .target("tungstenite::protocol")
+            .level(Level::Info)
+            .build();
+        assert!(!filter.enabled(&suppressed));
+        assert!(filter.enabled(&kept));
+    }
+}

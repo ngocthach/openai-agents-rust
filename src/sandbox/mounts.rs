@@ -11,8 +11,10 @@
 //! - [`InContainerMountStrategy`] runs a [`MountPattern`] inside the sandbox; cloud providers
 //!   implement patterns such as FUSE, `mount-s3` or `rclone` on top of it.
 //!
-//! Mounts are always ephemeral: they are runtime-attached filesystems, never durable workspace
-//! state, so snapshots exclude them.
+//! Mounts default to ephemeral: they are runtime-attached filesystems, never durable workspace
+//! state, so snapshots exclude them. [`Mount::ephemeral`] carries that as a signal a
+//! [`MountStrategy`] can read in [`MountStrategy::validate`], because a backend may require it
+//! — Vercel's cloud-bucket strategy refuses a mount it would otherwise have to persist.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -434,6 +436,14 @@ pub struct Mount {
     pub mount_path: Option<String>,
     /// Whether the SDK treats the mount as read-only.
     pub read_only: bool,
+    /// Whether snapshots treat the mount as runtime-attached state rather than durable
+    /// workspace content. Mirrors Python's `Mount.ephemeral`, which defaults to `True` for the
+    /// same reason and is readable by a strategy's validation.
+    ///
+    /// A strategy that cannot honour a persisted mount rejects it in
+    /// [`MountStrategy::validate`]; without this field the strategy only ever saw the `Mount`
+    /// and could not tell.
+    pub ephemeral: bool,
     /// How the backend attaches the storage.
     pub strategy: Arc<dyn MountStrategy>,
 }
@@ -444,6 +454,7 @@ impl Mount {
         Mount {
             mount_path: None,
             read_only: true,
+            ephemeral: true,
             strategy,
         }
     }
@@ -457,6 +468,15 @@ impl Mount {
     /// Allow the SDK to write through the mount.
     pub fn with_read_only(mut self, read_only: bool) -> Self {
         self.read_only = read_only;
+        self
+    }
+
+    /// Declare whether snapshots treat the mount as runtime-attached state.
+    ///
+    /// Clearing it asks for the mount's contents to be treated as durable workspace state. Not
+    /// every backend can do that, so a strategy may refuse the mount outright.
+    pub fn with_ephemeral(mut self, ephemeral: bool) -> Self {
+        self.ephemeral = ephemeral;
         self
     }
 
@@ -866,6 +886,62 @@ impl MountStrategy for InContainerMountStrategy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A strategy that refuses anything it would have to persist, the way Vercel's does.
+    #[derive(Debug)]
+    struct EphemeralOnlyStrategy;
+
+    #[async_trait::async_trait]
+    impl MountStrategy for EphemeralOnlyStrategy {
+        fn strategy_type(&self) -> &str {
+            "ephemeral_only"
+        }
+
+        fn validate(&self, mount: &Mount) -> SandboxResult<()> {
+            if !mount.ephemeral {
+                return Err(SandboxError::new(
+                    ErrorCode::MountConfigInvalid,
+                    "this mount must be ephemeral",
+                ));
+            }
+            Ok(())
+        }
+
+        async fn activate(
+            &self,
+            _mount: &Mount,
+            _session: &dyn SandboxSession,
+            _mount_path: &str,
+        ) -> SandboxResult<()> {
+            Ok(())
+        }
+
+        async fn deactivate(
+            &self,
+            _mount: &Mount,
+            _session: &dyn SandboxSession,
+            _mount_path: &str,
+        ) -> SandboxResult<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_strategy_can_read_whether_its_mount_is_ephemeral() {
+        // Mounts are runtime-attached state, so the default is ephemeral, as in Python.
+        let mount = Mount::new(Arc::new(EphemeralOnlyStrategy));
+        assert!(mount.ephemeral);
+        assert!(mount.validate().is_ok());
+
+        // Asking for a durable mount reaches the strategy, which is the point of the field:
+        // before it, a `MountStrategy` only ever saw the `Mount` and could not tell.
+        let durable = Mount::new(Arc::new(EphemeralOnlyStrategy)).with_ephemeral(false);
+        assert!(!durable.ephemeral);
+        assert_eq!(
+            durable.validate().unwrap_err().code,
+            ErrorCode::MountConfigInvalid
+        );
+    }
 
     #[tokio::test]
     async fn a_mount_transition_keeps_other_tasks_out_of_the_workspace() {

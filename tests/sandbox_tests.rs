@@ -2618,21 +2618,28 @@ async fn an_archive_cannot_write_through_a_symlink() {
         .await
         .unwrap();
     session.start().await.unwrap();
-    // `tar` itself refuses to write through the link, so the extraction fails loudly.
-    let result = session.hydrate_workspace(&archive).await;
-    assert!(
-        result.is_err(),
-        "extracting through a symlink must not succeed"
-    );
-    // Nothing was written outside the workspace.
-    assert!(!outside.join("file").exists());
-    // The link itself is left exactly as the archive recorded it, the way Python leaves an
-    // absolute target outside the workspace: containment is enforced where a path is used, not
-    // by deleting links a restored workspace legitimately needs.
+    // The SDK inspects every member before extracting, so an archive whose own symlink is used
+    // as a directory is refused outright rather than part-extracted. The link's target is
+    // checked while the member list is read, before the pass that refuses a path descending
+    // through a symlink, so this archive is refused for pointing out of the workspace.
+    let error = session
+        .hydrate_workspace(&archive)
+        .await
+        .expect_err("extracting through a symlink must not succeed");
     assert_eq!(
-        tokio::fs::read_link(root.join("link")).await.unwrap(),
-        outside
+        error.context.get("reason").map(String::as_str),
+        Some(
+            format!(
+                "absolute symlink target not allowed: {}",
+                outside.to_string_lossy()
+            )
+            .as_str()
+        )
     );
+    // Nothing was written outside the workspace, and nothing inside it either: the refusal
+    // happens before the first member reaches the filesystem.
+    assert!(!outside.join("file").exists());
+    assert!(!root.join("link").exists());
     client.delete(session).await.unwrap();
 }
 

@@ -112,7 +112,25 @@ fn to_json_emits_the_python_envelope() {
 #[test]
 fn round_trips_through_the_envelope() {
     let state = sample_state();
-    let restored = RunState::from_json(state.to_json().unwrap()).unwrap();
+    let mut restored = RunState::from_json(state.to_json().unwrap()).unwrap();
+
+    // `sample_state` approves a call that its (empty) tool-invocation ledger does not bind, so
+    // reading it back through the 1.21 envelope correctly flags that approval for renewal —
+    // the one thing the round trip is meant to add. A snapshot a real run produces always
+    // ledgers its parked call, so this does not arise there.
+    let call_id = state
+        .interruptions
+        .first()
+        .expect("sample state parks on an approval")
+        .call_id()
+        .to_string();
+    assert_eq!(
+        restored.restored_unbound_approval_call_ids,
+        std::collections::BTreeSet::from([call_id])
+    );
+
+    // Everything else has to survive the envelope untouched.
+    restored.restored_unbound_approval_call_ids.clear();
     assert_eq!(restored, state);
 }
 

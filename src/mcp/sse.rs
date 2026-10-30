@@ -199,13 +199,13 @@ pub(crate) async fn connect(
                 Ok(ev) if ev.event == "message" => match serde_json::from_str(&ev.data) {
                     Ok(msg) => Some(msg),
                     Err(e) => {
-                        log::warn!("Ignoring invalid MCP SSE message: {e}");
+                        log::warn!(target: crate::logger::LOG_TARGET, "Ignoring invalid MCP SSE message: {e}");
                         None
                     }
                 },
                 Ok(_) => None,
                 Err(e) => {
-                    log::warn!("MCP SSE stream error: {e}");
+                    log::warn!(target: crate::logger::LOG_TARGET, "MCP SSE stream error: {e}");
                     None
                 }
             }

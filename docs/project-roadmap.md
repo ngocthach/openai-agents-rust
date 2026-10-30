@@ -28,6 +28,11 @@ Last updated: 2026-10-29.
 - MCP legacy HTTP+SSE transport
 - Extensions: tool output trimmer, Codex tool, hosted multi-agent (experimental)
 
+## 0.5.0 (released)
+
+- Independent-audit fixes: handoff failure recovery, in-process archive validation and limits, `extract()`,
+  strict `RunState` context, typed realtime reasoning, verbose stdout logging
+
 ## 0.4.0 (released)
 
 - Closes the remaining 0.3.0 parity rows: provider adapters (Anthropic, Bedrock, Vertex, Azure, watsonx),
@@ -59,6 +64,6 @@ Last updated: 2026-10-29.
 | `FunctionTool` | `output_type` is `with_output_type::<T>()` (schema derived with `schemars`) |
 | Modal selectors | Live `modal.Image`/`modal.Sandbox` objects are replaced by id/tag selectors |
 | Docker sandbox | Uses the Docker CLI; no raw-socket exec transport or PTY `preexec_fn` signal reset |
-| WebSocket logging | The dependency's DEBUG logs cannot be filtered from a library |
+| WebSocket logging | The dependency's DEBUG logs cannot be filtered by a library; wrap your logger in `WebSocketDebugFilter` |
 
 Module-level divergences are listed in `plans/reports/*-report.md`.

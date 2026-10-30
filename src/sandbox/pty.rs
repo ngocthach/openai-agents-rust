@@ -508,7 +508,7 @@ impl PtyManager {
             ));
         }
         if processes.len() >= PTY_PROCESSES_WARNING {
-            log::warn!(
+            log::warn!(target: crate::logger::LOG_TARGET,
                 "sandbox session has {} live PTY sessions (limit {PTY_PROCESSES_MAX})",
                 processes.len()
             );
@@ -895,7 +895,7 @@ impl RemotePtyManager {
             ));
         }
         if processes.len() >= PTY_PROCESSES_WARNING {
-            log::warn!(
+            log::warn!(target: crate::logger::LOG_TARGET,
                 "sandbox session has {} live PTY sessions (limit {PTY_PROCESSES_MAX})",
                 processes.len()
             );

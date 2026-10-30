@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 
+use crate::sandbox::archive::{self, CompressionScheme};
 use crate::sandbox::errors::{ErrorCode, SandboxError, SandboxResult};
 use crate::sandbox::manifest::Manifest;
 use crate::sandbox::mounts::{Mount, MountTransition};
@@ -19,7 +20,7 @@ use crate::sandbox::state::{
     SnapshotFingerprint,
 };
 use crate::sandbox::types::{
-    ExecResult, ExposedPortEndpoint, ExposedPortUnavailable, FileEntry, User,
+    ExecResult, ExposedPortEndpoint, ExposedPortUnavailable, FileEntry, SandboxArchiveLimits, User,
     exposed_port_unavailable, parse_ls_la,
 };
 use crate::sandbox::workspace_paths::{WorkspacePathPolicy, is_provider_scratch_path};
@@ -652,27 +653,156 @@ pub trait SandboxSession: Send + Sync + fmt::Debug {
 
     /// One attempt at capturing the workspace archive.
     async fn persist_workspace_once(&self) -> SandboxResult<Vec<u8>> {
-        let root = self.workspace_root().to_string();
-        let mut command = format!("tar -czf - -C {}", shell_quote(&root));
-        for exclude in workspace_archive_excludes(self.manifest(), &root) {
-            command.push_str(&format!(" --exclude {}", shell_quote(&exclude)));
-        }
-        command.push_str(" .");
-        let result = self.exec(ExecRequest::shell(command.clone())).await?;
-        if !result.ok() {
-            return Err(SandboxError::new(
-                ErrorCode::SnapshotPersistError,
-                format!(
-                    "Failed to archive workspace `{root}`: {}",
-                    result.stderr_text().trim()
-                ),
-            ));
-        }
-        Ok(result.stdout)
+        capture_workspace_tar(self).await
     }
 
     /// Restore a gzipped tar archive produced by [`persist_workspace`](Self::persist_workspace).
+    ///
+    /// Every implementation validates the archive with
+    /// [`validate_tar_bytes`](crate::sandbox::archive::validate_tar_bytes) under
+    /// [`TarValidationOptions::hydrate`](crate::sandbox::archive::TarValidationOptions::hydrate) before a member can reach a filesystem, local or remote.
     async fn hydrate_workspace(&self, archive: &[u8]) -> SandboxResult<()>;
+
+    /// Reject an archive this session could not safely hydrate, before a restore clears the
+    /// workspace.
+    ///
+    /// Mirrors the validation Python runs in `_restore_workspace_snapshot` ahead of
+    /// `_clear_workspace_root_on_resume`: a workspace must never be emptied for an archive that
+    /// turns out to be unusable. The default accepts everything, because a backend whose
+    /// "archive" is a provider-native snapshot reference has no tar to inspect; a backend that
+    /// unpacks a tar overrides it with [`validate_tar_bytes`](crate::sandbox::archive::validate_tar_bytes).
+    fn validate_restorable_archive(&self, archive: &[u8]) -> SandboxResult<()> {
+        let _ = archive;
+        Ok(())
+    }
+
+    /// The archive resource limits this session extracts under.
+    ///
+    /// Mirrors Python's `BaseSandboxSession._archive_limits`. `None` means no SDK ceiling, which
+    /// is also what [`SandboxRunConfig::archive_limits`] defaults to.
+    ///
+    /// [`SandboxRunConfig::archive_limits`]: crate::sandbox::SandboxRunConfig::archive_limits
+    fn archive_limits(&self) -> Option<SandboxArchiveLimits> {
+        None
+    }
+
+    /// Record the archive limits the runner resolved for this session.
+    ///
+    /// Mirrors Python's `_set_archive_limits`. The default drops them, which costs a backend
+    /// nothing but the per-session default: a caller can still pass limits to
+    /// [`extract_with_limits`](Self::extract_with_limits) explicitly.
+    fn set_archive_limits(&self, limits: Option<SandboxArchiveLimits>) {
+        let _ = limits;
+    }
+
+    /// Write an archive into the workspace and extract it next to itself.
+    ///
+    /// Mirrors Python's `BaseSandboxSession.extract`. `compression_scheme` is inferred from the
+    /// path's extension when it is `None`, and the session's [`archive_limits`](Self::archive_limits)
+    /// apply. Every member is validated in process first: a member that is absolute, traverses
+    /// out of the archive, is a link, or is a device node is refused before anything is written,
+    /// on every backend.
+    async fn extract(
+        &self,
+        path: &str,
+        data: &[u8],
+        compression_scheme: Option<CompressionScheme>,
+    ) -> SandboxResult<()> {
+        self.extract_with_limits(path, data, compression_scheme, self.archive_limits())
+            .await
+    }
+
+    /// [`extract`](Self::extract) with per-call resource limits.
+    async fn extract_with_limits(
+        &self,
+        path: &str,
+        data: &[u8],
+        compression_scheme: Option<CompressionScheme>,
+        limits: Option<SandboxArchiveLimits>,
+    ) -> SandboxResult<()> {
+        if let Some(limits) = limits.as_ref() {
+            limits.validate()?;
+        }
+        let scheme = compression_scheme
+            .or_else(|| CompressionScheme::infer_from_path(path))
+            .ok_or_else(|| {
+                SandboxError::new(
+                    ErrorCode::InvalidCompressionScheme,
+                    format!("`{path}` has no supported compression scheme: expected tar or zip"),
+                )
+                .with_context("path", path)
+                .with_retryable(false)
+            })?;
+        let archive_path = self.normalize_path_for_write(path)?;
+        let destination_root = parent_sandbox_path(&archive_path);
+
+        archive::check_input_bytes(data.len() as u64, limits.as_ref())?;
+        // The archive itself lands in the workspace first, as Python's `extract_archive` does:
+        // the caller asked for it at `path`, and the members are restored beside it.
+        self.write_file(&archive_path, data).await?;
+
+        let entries = match scheme {
+            CompressionScheme::Tar => archive::validated_tar_entries(
+                data,
+                &archive::TarValidationOptions::extract(limits),
+            )?,
+            CompressionScheme::Zip => archive::validated_zip_entries(data, limits.as_ref())?,
+        };
+
+        // Children of each listed directory, as `name -> is_symlink`. A member must not be
+        // written through a link that is already in the destination, and the listing is what
+        // says so before the write happens.
+        let mut listings: BTreeMap<String, BTreeMap<String, bool>> = BTreeMap::new();
+        for entry in entries {
+            let relative = sandbox_rel_parts(&entry.rel_path);
+            let mut current = destination_root.clone();
+            let mut traversed = String::new();
+            for part in &relative {
+                if !listings.contains_key(&current) {
+                    let children = self
+                        .ls(&current)
+                        .await
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|child| (child.name, child.is_symlink))
+                        .collect();
+                    listings.insert(current.clone(), children);
+                }
+                let Some(is_symlink) = listings[&current].get(part).copied() else {
+                    break;
+                };
+                traversed = if traversed.is_empty() {
+                    part.clone()
+                } else {
+                    format!("{traversed}/{part}")
+                };
+                if is_symlink {
+                    return Err(archive::unsafe_tar_member(
+                        &entry.rel_path.to_string_lossy(),
+                        format!("symlink in parent path: {traversed}"),
+                    ));
+                }
+                current = join_sandbox_path(&current, part);
+            }
+
+            let dest = join_sandbox_path(&destination_root, &relative.join("/"));
+            if entry.is_dir {
+                self.mkdir(&dest, true).await?;
+            } else {
+                self.mkdir(&parent_sandbox_path(&dest), true).await?;
+                self.write_file(&dest, &entry.contents).await?;
+            }
+            // What was just created is known not to be a link, so a later member descending
+            // through it does not list the directory again.
+            if let (Some(parent), Some(name)) = (
+                listings.get_mut(&parent_sandbox_path(&dest)),
+                relative.last(),
+            ) {
+                parent.insert(name.clone(), false);
+            }
+        }
+        Ok(())
+    }
 
     /// A short description of the workspace layout, for logs and prompts.
     fn describe(&self) -> String {
@@ -917,6 +1047,32 @@ pub trait SandboxSession: Send + Sync + fmt::Debug {
         .with_context("check", label.to_string())
         .with_context("path", args.first().copied().unwrap_or("").to_string()))
     }
+}
+
+/// The directory an absolute sandbox path lives in.
+fn parent_sandbox_path(path: &str) -> String {
+    let trimmed = path.trim_end_matches('/');
+    match trimmed.rsplit_once('/') {
+        Some(("", _)) => "/".to_string(),
+        Some((parent, _)) => parent.to_string(),
+        None => ".".to_string(),
+    }
+}
+
+/// Append `part` to an absolute sandbox path.
+fn join_sandbox_path(base: &str, part: &str) -> String {
+    if part.is_empty() {
+        return base.to_string();
+    }
+    format!("{}/{}", base.trim_end_matches('/'), part)
+}
+
+/// The components of a validated archive member path.
+fn sandbox_rel_parts(rel_path: &std::path::Path) -> Vec<String> {
+    rel_path
+        .iter()
+        .map(|part| part.to_string_lossy().into_owned())
+        .collect()
 }
 
 /// How long an access-probe command may run. Mirrors Python's `_READ_PATH_PROBE_TIMEOUT_S`.
@@ -1165,6 +1321,36 @@ pub fn workspace_archive_excludes(manifest: &Manifest, root: &str) -> Vec<String
     excludes
 }
 
+/// Capture a session's workspace as a gzipped tar through the backend's own `tar`.
+///
+/// This is the body of the default [`SandboxSession::persist_workspace_once`], extracted so a
+/// backend that post-processes its archive — the ones whose workspace can hold a symlink
+/// recorded against the host root, see
+/// [`rebase_archive_symlink_targets`](crate::sandbox::archive::rebase_archive_symlink_targets) —
+/// can capture it exactly the same way.
+pub async fn capture_workspace_tar<S>(session: &S) -> SandboxResult<Vec<u8>>
+where
+    S: SandboxSession + ?Sized,
+{
+    let root = session.workspace_root().to_string();
+    let mut command = format!("tar -czf - -C {}", shell_quote(&root));
+    for exclude in workspace_archive_excludes(session.manifest(), &root) {
+        command.push_str(&format!(" --exclude {}", shell_quote(&exclude)));
+    }
+    command.push_str(" .");
+    let result = session.exec(ExecRequest::shell(command.clone())).await?;
+    if !result.ok() {
+        return Err(SandboxError::new(
+            ErrorCode::SnapshotPersistError,
+            format!(
+                "Failed to archive workspace `{root}`: {}",
+                result.stderr_text().trim()
+            ),
+        ));
+    }
+    Ok(result.stdout)
+}
+
 /// Capture a session's workspace into its snapshot.
 ///
 /// Mounts whose strategy cannot be snapshotted in place are detached first and re-attached
@@ -1239,12 +1425,16 @@ pub async fn restore_session_snapshot(session: &dyn SandboxSession) -> SandboxRe
         manifest.apply_ephemeral(session).await?;
         return Ok(true);
     }
-    // Everything the archive does not contain has to go, or a file the paused run deleted comes
-    // back. The live mounts are the exception: under them is remote storage, not workspace.
-    clear_workspace_root_on_resume(session).await?;
     let archive = snapshot
         .restore_with(session.dependencies().map(Arc::as_ref))
         .await?;
+    // An older snapshot may hold members this SDK refuses. A backend that unpacks a tar rejects
+    // them before the live files are discarded: `validate_restorable_archive` is a no-op for the
+    // backends whose archive is a provider-native snapshot reference rather than a tar.
+    session.validate_restorable_archive(&archive)?;
+    // Everything the archive does not contain has to go, or a file the paused run deleted comes
+    // back. The live mounts are the exception: under them is remote storage, not workspace.
+    clear_workspace_root_on_resume(session).await?;
     session.hydrate_workspace(&archive).await?;
     manifest.apply_ephemeral(session).await?;
     Ok(true)

@@ -50,9 +50,10 @@
 //! - The cloud provider backends in `agents.extensions.sandbox` (Blaxel, Cloudflare, Daytona,
 //!   E2B, Modal, Vercel). Implement [`SandboxClient`] and [`SandboxSession`] to add one, and
 //!   [`MountPattern`] for their storage mounts.
-//! - Exposed ports, archive extraction limits and the runtime helper scripts.
+//! - Exposed ports and the runtime helper scripts.
 
 pub mod agent;
+pub mod archive;
 pub mod capabilities;
 pub mod dependencies;
 pub mod editor;
@@ -82,6 +83,11 @@ pub mod util;
 pub mod workspace_paths;
 
 pub use agent::{DEFAULT_SANDBOX_INSTRUCTIONS, PreparedSandboxGraph, SandboxAgent};
+pub use archive::{
+    ArchiveMemberKind, CompressionScheme, TarValidationOptions, extract_tar_to,
+    rebase_archive_symlink_targets, safe_tar_member_rel_path, safe_zip_member_rel_path,
+    should_skip_tar_member, validate_hydrate_archive, validate_tar_bytes, validate_zip_bytes,
+};
 pub use capabilities::{
     Capabilities, Capability, CapabilityBinding, Compaction, ConfiguredCapability, Filesystem,
     LazySkillSource, LocalDirLazySkillSource, Memory, Shell, Skill, SkillMetadata, Skills,
@@ -129,10 +135,10 @@ pub use runtime_helpers::{
     RESOLVE_WORKSPACE_PATH_HELPER, RuntimeHelperScript, WORKSPACE_FINGERPRINT_HELPER,
 };
 pub use session::{
-    ExecRequest, ExecShell, SandboxClient, SandboxSession, clear_workspace_root_on_resume,
-    compute_and_cache_snapshot_fingerprint, live_workspace_matches_snapshot_on_resume,
-    parse_snapshot_fingerprint_record, read_cached_snapshot_fingerprint,
-    snapshot_fingerprint_cache_path,
+    ExecRequest, ExecShell, SandboxClient, SandboxSession, capture_workspace_tar,
+    clear_workspace_root_on_resume, compute_and_cache_snapshot_fingerprint,
+    live_workspace_matches_snapshot_on_resume, parse_snapshot_fingerprint_record,
+    read_cached_snapshot_fingerprint, snapshot_fingerprint_cache_path,
 };
 pub use snapshot::{
     LocalSnapshot, NoopSnapshot, RemoteSnapshot, RemoteSnapshotClient, Snapshot, SnapshotSpec,
@@ -146,8 +152,9 @@ pub use testing::{
     scripted_sandbox_session,
 };
 pub use types::{
-    ExecResult, ExposedPortEndpoint, ExposedPortUnavailable, FileEntry, Group, Permissions, User,
-    exposed_port_unavailable, file_mode,
+    DEFAULT_MAX_ARCHIVE_EXTRACTED_BYTES, DEFAULT_MAX_ARCHIVE_INPUT_BYTES,
+    DEFAULT_MAX_ARCHIVE_MEMBERS, ExecResult, ExposedPortEndpoint, ExposedPortUnavailable,
+    FileEntry, Group, Permissions, SandboxArchiveLimits, User, exposed_port_unavailable, file_mode,
 };
 pub use workspace_paths::{
     PROVIDER_SCRATCH_PREFIX, SandboxPathGrant, SandboxWorkspaceScope, WorkspacePathPolicy,

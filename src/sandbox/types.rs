@@ -245,6 +245,12 @@ pub struct FileEntry {
     pub permissions: Option<Permissions>,
     /// Whether the entry is a directory.
     pub is_dir: bool,
+    /// Whether the entry is a symbolic link.
+    ///
+    /// Mirrors Python's `EntryKind.SYMLINK`. Archive extraction needs it: a member whose path
+    /// descends through a link that is *already* in the destination would be written outside the
+    /// workspace, and the listing is the only thing that says so before the write happens.
+    pub is_symlink: bool,
 }
 
 /// Parse the output of `ls -la` into [`FileEntry`] values.
@@ -285,6 +291,7 @@ pub fn parse_ls_la(output: &str, base: &str) -> Vec<FileEntry> {
             size,
             permissions: Some(permissions),
             is_dir: permissions.directory,
+            is_symlink: mode.starts_with('l'),
         });
     }
     entries
@@ -434,6 +441,90 @@ pub fn exposed_port_unavailable(
         error = error.with_retryable(false);
     }
     error
+}
+
+/// The default ceiling on the bytes [`SandboxSession::extract`] accepts.
+///
+/// [`SandboxSession::extract`]: crate::sandbox::SandboxSession::extract
+pub const DEFAULT_MAX_ARCHIVE_INPUT_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// The default ceiling on the bytes an archive may declare it extracts.
+pub const DEFAULT_MAX_ARCHIVE_EXTRACTED_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
+/// The default ceiling on the number of extractable archive members.
+pub const DEFAULT_MAX_ARCHIVE_MEMBERS: u64 = 100_000;
+
+/// Resource limits for sandbox archive extraction. Mirrors Python's `SandboxArchiveLimits`.
+///
+/// Each limit is independently nullable: `None` disables that one ceiling. The defaults are the
+/// Python ones, and [`SandboxRunConfig::archive_limits`] is `None` by default, so an application
+/// that sets nothing keeps the SDK out of the way.
+///
+/// [`SandboxRunConfig::archive_limits`]: crate::sandbox::SandboxRunConfig::archive_limits
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SandboxArchiveLimits {
+    /// Maximum archive input bytes accepted by [`SandboxSession::extract`].
+    ///
+    /// [`SandboxSession::extract`]: crate::sandbox::SandboxSession::extract
+    pub max_input_bytes: Option<u64>,
+    /// Maximum bytes an archive may declare that it extracts.
+    pub max_extracted_bytes: Option<u64>,
+    /// Maximum number of extractable archive members.
+    pub max_members: Option<u64>,
+}
+
+impl Default for SandboxArchiveLimits {
+    fn default() -> Self {
+        SandboxArchiveLimits {
+            max_input_bytes: Some(DEFAULT_MAX_ARCHIVE_INPUT_BYTES),
+            max_extracted_bytes: Some(DEFAULT_MAX_ARCHIVE_EXTRACTED_BYTES),
+            max_members: Some(DEFAULT_MAX_ARCHIVE_MEMBERS),
+        }
+    }
+}
+
+impl SandboxArchiveLimits {
+    /// The SDK default limits.
+    pub fn new() -> Self {
+        SandboxArchiveLimits::default()
+    }
+
+    /// Set the maximum accepted archive input size.
+    pub fn with_max_input_bytes(mut self, bytes: Option<u64>) -> Self {
+        self.max_input_bytes = bytes;
+        self
+    }
+
+    /// Set the maximum declared extracted size.
+    pub fn with_max_extracted_bytes(mut self, bytes: Option<u64>) -> Self {
+        self.max_extracted_bytes = bytes;
+        self
+    }
+
+    /// Set the maximum number of extractable members.
+    pub fn with_max_members(mut self, members: Option<u64>) -> Self {
+        self.max_members = members;
+        self
+    }
+
+    /// Reject a limit that is set to zero. Mirrors Python's `SandboxArchiveLimits.validate`.
+    pub fn validate(&self) -> crate::sandbox::errors::SandboxResult<()> {
+        use crate::sandbox::errors::{ErrorCode, SandboxError};
+
+        for (name, value) in [
+            ("max_input_bytes", self.max_input_bytes),
+            ("max_extracted_bytes", self.max_extracted_bytes),
+            ("max_members", self.max_members),
+        ] {
+            if value == Some(0) {
+                return Err(SandboxError::new(
+                    ErrorCode::SandboxConfigInvalid,
+                    format!("archive_limits.{name} must be at least 1"),
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

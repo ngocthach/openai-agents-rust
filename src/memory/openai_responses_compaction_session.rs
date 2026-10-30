@@ -603,7 +603,7 @@ impl OpenAIResponsesCompactionSession {
             session_items,
         };
         if !args.force && !(self.should_trigger)(&context) {
-            log::debug!("skip: decision hook declined compaction for {response_id:?}");
+            log::debug!(target: crate::logger::LOG_TARGET, "skip: decision hook declined compaction for {response_id:?}");
             return Ok(Usage::default());
         }
 
@@ -629,7 +629,7 @@ impl OpenAIResponsesCompactionSession {
                         self.ignore_ids_for_matching(),
                     ) > 0
                 {
-                    log::warn!(
+                    log::warn!(target: crate::logger::LOG_TARGET,
                         "Skipped automatic compaction because the stored history could not be \
                          fully matched to the latest model exchange and this store cannot \
                          replace a suffix; history was retained"
@@ -653,7 +653,7 @@ impl OpenAIResponsesCompactionSession {
                 self.ignore_ids_for_matching(),
             );
             if suffix_start == found.items.len() {
-                log::warn!(
+                log::warn!(target: crate::logger::LOG_TARGET,
                     "Skipped automatic compaction because the stored history could not be \
                      matched to the latest model exchange; history was retained"
                 );
@@ -666,7 +666,7 @@ impl OpenAIResponsesCompactionSession {
                 if args.compaction_mode.unwrap_or(self.compaction_mode)
                     == CompactionMode::PreviousResponseId
                 {
-                    log::warn!(
+                    log::warn!(target: crate::logger::LOG_TARGET,
                         "Skipped automatic compaction because previous_response_id mode cannot \
                          summarize a partial history suffix"
                     );
@@ -678,7 +678,7 @@ impl OpenAIResponsesCompactionSession {
                 // the model item that must follow it.
                 let Some(boundary) = found.items[suffix_start..].iter().position(is_user_message)
                 else {
-                    log::warn!(
+                    log::warn!(target: crate::logger::LOG_TARGET,
                         "Skipped automatic compaction because the replaceable suffix contains no \
                          user message to start from"
                     );
@@ -692,7 +692,7 @@ impl OpenAIResponsesCompactionSession {
             // Keep tool and approval groups intact, including calls whose outputs are still
             // pending: wait for them rather than compacting the call away.
             if !has_complete_tool_groups(&items_to_compact) {
-                log::warn!(
+                log::warn!(target: crate::logger::LOG_TARGET,
                     "Skipped automatic compaction because the replaceable suffix splits a tool \
                      call group; history was retained"
                 );
@@ -711,7 +711,7 @@ impl OpenAIResponsesCompactionSession {
                     session_items: items_to_compact.clone(),
                 })
             {
-                log::debug!("skip: decision hook declined the reloaded compaction snapshot");
+                log::debug!(target: crate::logger::LOG_TARGET, "skip: decision hook declined the reloaded compaction snapshot");
                 return Ok(Usage::default());
             }
 
@@ -733,7 +733,7 @@ impl OpenAIResponsesCompactionSession {
             .replace_compaction_suffix(&snapshot.handles[suffix_start..], output_items)
             .await?;
         if !replaced {
-            log::warn!(
+            log::warn!(target: crate::logger::LOG_TARGET,
                 "Skipped compaction replacement because the stored suffix changed while the \
                  compaction request was in flight; history was retained"
             );
@@ -767,7 +767,7 @@ impl OpenAIResponsesCompactionSession {
         // cannot revive items that expired meanwhile.
         let current_items = self.all_underlying_items().await?;
         if current_items != session_items {
-            log::warn!(
+            log::warn!(target: crate::logger::LOG_TARGET,
                 "Skipped compaction replacement because the stored history changed while the \
                  compaction request was in flight; history was retained"
             );
@@ -833,12 +833,12 @@ impl OpenAIResponsesCompactionSession {
             Ok(()) => Ok(()),
             Err(error) => {
                 if let Err(restore_error) = self.restore(previous).await {
-                    log::warn!(
+                    log::warn!(target: crate::logger::LOG_TARGET,
                         "Failed to restore session history after compaction replacement failed: \
                          {restore_error}"
                     );
                 } else {
-                    log::warn!(
+                    log::warn!(target: crate::logger::LOG_TARGET,
                         "Restored previous session history after compaction replacement failed: \
                          {error}"
                     );
@@ -939,7 +939,7 @@ impl Session for OpenAIResponsesCompactionSession {
         let _guard = self.mutation_lock.lock().await;
         if info.has_local_tool_outputs {
             self.defer_compaction(&response_id, info.store).await?;
-            log::debug!("skip: deferring compaction for response {response_id} (tool outputs)");
+            log::debug!(target: crate::logger::LOG_TARGET, "skip: deferring compaction for response {response_id} (tool outputs)");
             return Ok(Usage::default());
         }
         let force = self.state.lock().await.deferred_response_id.is_some();

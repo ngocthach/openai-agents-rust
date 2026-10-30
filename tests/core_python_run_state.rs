@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use openai_agents_sdk::items::RunItemKind;
-use openai_agents_sdk::run_state::RunState;
+use openai_agents_sdk::run_state::{ContextRestoreOptions, RunState};
 use openai_agents_sdk::testing::{FakeModel, assistant_message, assistant_message_with_id};
 use openai_agents_sdk::tool::FunctionTool;
 use openai_agents_sdk::{Agent, RunConfig, RunOptions, Runner, handoff};
@@ -682,4 +682,246 @@ async fn write_rust_states_for_the_python_consumer() {
     .unwrap();
     assert_eq!(result.interruptions.len(), 1);
     write("rust_second_turn_interrupted.json", &result.to_state());
+}
+
+/// `interrupted_approval.json` with the parked call already approved in the serialized
+/// approvals bucket, so a resume needs no `RunState::approve` call of its own.
+fn preapproved_interruption_fixture() -> Value {
+    let mut wire = fixture("interrupted_approval.json");
+    wire["context"]["approvals"] = json!({
+        "delete_file": { "approved": ["call_delete_1"], "rejected": [] }
+    });
+    wire
+}
+
+/// Resume `wire` against a `delete_file` tool that needs approval, reporting how many times the
+/// tool body ran and how many approvals the run came back asking for.
+async fn resume_preapproved(wire: Value) -> (usize, usize) {
+    let state = RunState::from_json(wire).expect("from_json");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let seen = calls.clone();
+    let tool = FunctionTool::<()>::new("delete_file", "Delete a file", move |_c, _a: Value| {
+        let seen = seen.clone();
+        async move {
+            seen.fetch_add(1, Ordering::SeqCst);
+            Ok("deleted".to_string())
+        }
+    })
+    .with_needs_approval(true);
+
+    let model = fake();
+    model.add_turn(vec![assistant_message("Deleted the report.")]);
+    let agent = Agent::<()>::new("File Agent")
+        .with_tool(tool)
+        .with_model_instance(model);
+
+    let result = Runner::run(&agent, state).await.expect("run");
+    (calls.load(Ordering::SeqCst), result.interruptions.len())
+}
+
+#[tokio::test]
+async fn an_approval_the_ledger_cannot_bind_is_requested_again() {
+    let mut wire = preapproved_interruption_fixture();
+    // A decision for a call the snapshot never bound to an invocation. Python stops honouring
+    // this from schema 1.15 on, and asks the user again.
+    wire["context"]["tool_invocations"] = json!({});
+
+    let state = RunState::from_json(wire.clone()).expect("from_json");
+    assert!(
+        state
+            .restored_unbound_approval_call_ids
+            .contains("call_delete_1")
+    );
+
+    let (ran, interruptions) = resume_preapproved(wire).await;
+    assert_eq!(ran, 0, "an unbound approval must not authorize the call");
+    assert_eq!(interruptions, 1, "the approval is raised again");
+}
+
+#[tokio::test]
+async fn a_renewed_approval_clears_the_unbound_call_id() {
+    let mut wire = preapproved_interruption_fixture();
+    wire["context"]["tool_invocations"] = json!({});
+    let mut state = RunState::from_json(wire).expect("from_json");
+    assert_eq!(state.restored_unbound_approval_call_ids.len(), 1);
+
+    // A fresh decision replaces the unbound one, exactly as Python's
+    // `_apply_approval_decision` discards the call id.
+    let item = state.get_interruptions()[0].clone();
+    state.approve(&item, false);
+    assert!(state.restored_unbound_approval_call_ids.is_empty());
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let seen = calls.clone();
+    let tool = FunctionTool::<()>::new("delete_file", "Delete a file", move |_c, _a: Value| {
+        let seen = seen.clone();
+        async move {
+            seen.fetch_add(1, Ordering::SeqCst);
+            Ok("deleted".to_string())
+        }
+    })
+    .with_needs_approval(true);
+    let model = fake();
+    model.add_turn(vec![assistant_message("Deleted the report.")]);
+    let agent = Agent::<()>::new("File Agent")
+        .with_tool(tool)
+        .with_model_instance(model);
+
+    let result = Runner::run(&agent, state).await.expect("run");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(result.interruptions.is_empty());
+}
+
+#[tokio::test]
+async fn an_approval_the_ledger_binds_still_authorizes_the_call() {
+    // The same payload, with the ledger entry Python writes for the parked call.
+    let (ran, interruptions) = resume_preapproved(preapproved_interruption_fixture()).await;
+    assert_eq!(ran, 1);
+    assert_eq!(interruptions, 0);
+}
+
+#[tokio::test]
+async fn a_pre_binding_schema_keeps_the_tolerant_approval_rule() {
+    let mut wire = preapproved_interruption_fixture();
+    wire["context"]["tool_invocations"] = json!({});
+    // 1.14 predates the binding; Python clears the ledger instead of enforcing it, so the
+    // decision still stands. The numeric compare matters here: "1.14" sorts above "1.15" as a
+    // string.
+    wire["$schemaVersion"] = json!("1.14");
+
+    let state = RunState::from_json(wire.clone()).expect("from_json");
+    assert!(state.restored_unbound_approval_call_ids.is_empty());
+
+    let (ran, interruptions) = resume_preapproved(wire).await;
+    assert_eq!(ran, 1, "a pre-1.15 snapshot keeps the tolerant rule");
+    assert_eq!(interruptions, 0);
+}
+
+#[tokio::test]
+async fn a_legacy_flat_rust_snapshot_keeps_the_tolerant_approval_rule() {
+    // The flat `"1.0"` shape this crate wrote before the Python envelope. It never recorded a
+    // ledger, so every decision in it would read as unbound; the tolerance stays.
+    let state = load("interrupted_approval.json");
+    let mut flat = serde_json::to_value(&state).expect("serialize flat");
+    flat["$schemaVersion"] = json!("1.0");
+    flat["approvals"] = json!({
+        "\u{1}delete_file": { "approved_call_ids": ["call_delete_1"] }
+    });
+    flat["tool_invocations"] = json!({});
+    assert!(flat.get("current_agent_name").is_some());
+
+    let restored = RunState::from_json(flat.clone()).expect("from_json");
+    assert!(restored.restored_unbound_approval_call_ids.is_empty());
+
+    let (ran, interruptions) = resume_preapproved(flat).await;
+    assert_eq!(ran, 1, "a flat 1.0 snapshot predates the ledger");
+    assert_eq!(interruptions, 0);
+}
+
+#[tokio::test]
+async fn an_un_renewed_approval_stays_unbound_across_a_re_snapshot() {
+    let mut wire = preapproved_interruption_fixture();
+    wire["context"]["tool_invocations"] = json!({});
+    let state = RunState::from_json(wire).expect("from_json");
+
+    let tool = FunctionTool::<()>::new("delete_file", "Delete a file", |_c, _a: Value| async {
+        Ok("deleted".to_string())
+    })
+    .with_needs_approval(true);
+    let model = fake();
+    model.add_turn(vec![assistant_message("Deleted the report.")]);
+    let agent = Agent::<()>::new("File Agent")
+        .with_tool(tool)
+        .with_model_instance(model);
+
+    let result = Runner::run(&agent, state).await.expect("run");
+    assert_eq!(result.interruptions.len(), 1);
+
+    // Re-snapshotting must not quietly bind the call the user never re-approved: the next
+    // resume would otherwise honour the stale decision.
+    let next = result.to_state();
+    assert!(!next.tool_invocations.contains_key("call_delete_1"));
+    assert!(
+        next.restored_unbound_approval_call_ids
+            .contains("call_delete_1")
+    );
+}
+
+#[test]
+fn a_non_object_context_is_refused_by_a_strict_serialization() {
+    let state = load("completed.json").with_context(json!("an opaque handle"));
+    // Python's deserializer requires a mapping, so this snapshot would be unreadable there.
+    let err = state.to_json_strict().expect_err("strict serialize");
+    assert!(
+        err.to_string().contains("JSON object"),
+        "unexpected message: {err}"
+    );
+    // The tolerant form still writes it, and says so in the metadata.
+    let wire = state.to_json().expect("to_json");
+    assert_eq!(
+        wire["context"]["context_meta"]["requires_deserializer"],
+        json!(true)
+    );
+    assert_eq!(wire["context"]["context"], json!("an opaque handle"));
+
+    // An object context is serializable either way.
+    let ok = load("completed.json").with_context(json!({ "tenant": "acme" }));
+    let wire = ok.to_json_strict().expect("strict serialize");
+    assert_eq!(wire["context"]["context"], json!({ "tenant": "acme" }));
+    assert_eq!(
+        wire["context"]["context_meta"]["requires_deserializer"],
+        json!(false)
+    );
+}
+
+#[test]
+fn a_context_that_needs_restoring_is_an_error_only_under_strict_context() {
+    let mut wire = fixture("completed.json");
+    wire["context"]["context"] = Value::Null;
+    wire["context"]["context_meta"] = json!({
+        "original_type": "custom",
+        "serialized_via": "omitted",
+        "requires_deserializer": true,
+        "omitted": true,
+        "class_path": "app.context.Tenant",
+    });
+
+    // Tolerant read: the state loads, and reports that its context needs restoring.
+    let state = RunState::from_json(wire.clone()).expect("from_json");
+    assert!(state.context_requires_restoration);
+    assert_eq!(state.context, None);
+
+    // Strict read without an override: refused, naming what is missing.
+    let err = RunState::from_json_with(wire.clone(), ContextRestoreOptions::strict())
+        .expect_err("strict read");
+    assert!(
+        err.to_string().contains("omitted during serialization"),
+        "unexpected message: {err}"
+    );
+
+    // An override supplies the context and satisfies the strict read.
+    let state = RunState::from_json_with(
+        wire,
+        ContextRestoreOptions::strict().with_override(json!({ "tenant": "acme" })),
+    )
+    .expect("override read");
+    assert!(!state.context_requires_restoration);
+    assert_eq!(state.context, Some(json!({ "tenant": "acme" })));
+}
+
+#[test]
+fn a_restorable_context_passes_a_strict_read_untouched() {
+    let mut wire = fixture("completed.json");
+    wire["context"]["context"] = json!({ "tenant": "acme" });
+    let state = RunState::from_json_with(wire, ContextRestoreOptions::strict()).expect("strict");
+    assert!(!state.context_requires_restoration);
+    assert_eq!(state.context, Some(json!({ "tenant": "acme" })));
+}
+
+#[test]
+fn a_rust_written_context_round_trips_through_the_strict_read() {
+    let state = load("completed.json").with_context(json!({ "tenant": "acme" }));
+    let wire = state.to_json_strict().expect("strict serialize");
+    let back = RunState::from_json_with(wire, ContextRestoreOptions::strict()).expect("strict");
+    assert_eq!(back.context, Some(json!({ "tenant": "acme" })));
 }

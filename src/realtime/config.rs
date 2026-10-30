@@ -3,7 +3,7 @@
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use crate::guardrail::OutputGuardrail;
 use crate::prompts::Prompt;
@@ -288,6 +288,54 @@ impl RealtimeTurnDetectionConfig {
     }
 }
 
+/// Reasoning configuration for realtime model responses.
+///
+/// Port of Python's `RealtimeReasoningConfig`. Unknown keys live in
+/// [`extra`](RealtimeReasoningConfig::extra) and are sent verbatim, so a field the API adds needs
+/// no SDK release.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RealtimeReasoningConfig {
+    /// Reasoning effort: `minimal`, `low`, `medium`, `high` or `xhigh`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    /// Any further keys, serialized alongside `effort`.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+impl RealtimeReasoningConfig {
+    /// A reasoning config with only the effort set.
+    pub fn new(effort: impl Into<String>) -> Self {
+        RealtimeReasoningConfig {
+            effort: Some(effort.into()),
+            ..Default::default()
+        }
+    }
+
+    /// Add a key that this struct does not model.
+    pub fn with_extra(mut self, key: impl Into<String>, value: impl Into<Value>) -> Self {
+        self.extra.insert(key.into(), value.into());
+        self
+    }
+
+    /// The `session.reasoning` value to send.
+    pub fn to_session_value(&self) -> Value {
+        serde_json::to_value(self).unwrap_or(Value::Null)
+    }
+}
+
+impl From<&str> for RealtimeReasoningConfig {
+    fn from(effort: &str) -> Self {
+        RealtimeReasoningConfig::new(effort)
+    }
+}
+
+impl From<String> for RealtimeReasoningConfig {
+    fn from(effort: String) -> Self {
+        RealtimeReasoningConfig::new(effort)
+    }
+}
+
 /// Input half of the nested [`RealtimeAudioConfig`] tree.
 ///
 /// These take precedence over the flat `input_audio_*` and `turn_detection` settings, as in
@@ -422,8 +470,8 @@ pub struct RealtimeSessionModelSettings {
     pub tool_choice: Option<String>,
     /// Whether the model may call tools in parallel.
     pub parallel_tool_calls: Option<bool>,
-    /// Reasoning configuration, e.g. `{"effort": "low"}`.
-    pub reasoning: Option<Value>,
+    /// Reasoning configuration, e.g. `RealtimeReasoningConfig::new("low")`.
+    pub reasoning: Option<RealtimeReasoningConfig>,
     /// Tools and handoffs exposed to the model.
     pub tools: Option<Vec<RealtimeFunctionToolSpec>>,
     /// Tracing configuration.
@@ -523,6 +571,12 @@ impl RealtimeSessionModelSettings {
     /// Disable turn detection explicitly.
     pub fn without_turn_detection(mut self) -> Self {
         self.turn_detection = Some(None);
+        self
+    }
+
+    /// Set the reasoning configuration.
+    pub fn with_reasoning(mut self, reasoning: impl Into<RealtimeReasoningConfig>) -> Self {
+        self.reasoning = Some(reasoning.into());
         self
     }
 

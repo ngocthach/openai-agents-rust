@@ -360,7 +360,7 @@ impl AudioResultWriter {
                     get_trace_error(include_text, &error),
                     Some(json!({"text": if include_text { text } else { String::new() }})),
                 );
-                log::error!("Error streaming voice audio: {error}");
+                log::error!(target: crate::logger::LOG_TARGET, "Error streaming voice audio: {error}");
                 let _ = events.send(VoiceStreamEvent::Error(Arc::new(error)));
             }
         }

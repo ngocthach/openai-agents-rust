@@ -517,7 +517,7 @@ impl MountStrategy for BlaxelCloudBucketMountStrategy {
         }
         // A mount point that is already gone is not an error worth failing teardown over, which
         // matches the Python port's best-effort unmount.
-        log::warn!("every unmount attempt failed for the Blaxel mount at `{mount_path}`");
+        log::warn!(target: crate::logger::LOG_TARGET, "every unmount attempt failed for the Blaxel mount at `{mount_path}`");
         Ok(())
     }
 }

@@ -313,7 +313,7 @@ impl DaprSession {
             })
             .await;
         if let Err(e) = result {
-            log::warn!(
+            log::warn!(target: crate::logger::LOG_TARGET,
                 "DaprSession stored the new items but could not update the session metadata for \
                  {}: {e}",
                 self.session_id

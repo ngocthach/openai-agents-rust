@@ -18,17 +18,20 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 
+use crate::sandbox::archive::{
+    TarValidationOptions, extract_tar_to, rebase_archive_symlink_targets, validate_tar_bytes,
+};
 use crate::sandbox::errors::{ErrorCode, SandboxError, SandboxResult};
 use crate::sandbox::manifest::{DEFAULT_MANIFEST_ROOT, Manifest};
 use crate::sandbox::pty::{PtyExecRequest, PtyExecUpdate, PtyManager, PtySpawn, PtyWriteRequest};
 use crate::sandbox::session::{
-    ExecRequest, SandboxClient, SandboxSession, restore_session_snapshot,
+    ExecRequest, SandboxClient, SandboxSession, capture_workspace_tar, restore_session_snapshot,
 };
 use crate::sandbox::snapshot::{Snapshot, SnapshotSpec, resolve_snapshot};
 use crate::sandbox::state::{
     SandboxSessionState, SnapshotFingerprint, is_sdk_owned_workspace_root,
 };
-use crate::sandbox::types::ExecResult;
+use crate::sandbox::types::{ExecResult, SandboxArchiveLimits};
 
 /// Prefix of the temporary workspace directories created for Unix-local sessions.
 const WORKSPACE_PREFIX: &str = "openai-agents-sandbox-";
@@ -199,6 +202,8 @@ pub struct UnixLocalSandboxSession {
     resuming: bool,
     /// The workspace fingerprint of the snapshot this session resumes, when it has one.
     resume_fingerprint: std::sync::Mutex<Option<SnapshotFingerprint>>,
+    /// The archive resource limits the runner resolved for this session.
+    archive_limits: std::sync::Mutex<Option<SandboxArchiveLimits>>,
 }
 
 impl UnixLocalSandboxSession {
@@ -233,6 +238,7 @@ impl UnixLocalSandboxSession {
             snapshot: None,
             resuming: false,
             resume_fingerprint: std::sync::Mutex::new(None),
+            archive_limits: std::sync::Mutex::new(None),
         })
     }
 
@@ -341,6 +347,22 @@ impl UnixLocalSandboxSession {
     /// absolute paths outside the root, `..` segments and symlinks that escape the workspace.
     pub async fn host_path(&self, path: &str) -> SandboxResult<PathBuf> {
         self.host_path_for(path, false).await
+    }
+
+    /// The workspace roots an archived symlink target may be recorded against.
+    ///
+    /// Mirrors Python's `roots = (root, root.resolve(strict=False))`: a link created through the
+    /// canonical path records `/private/var/...` on macOS where the workspace root is `/var/...`,
+    /// and both spellings name the same directory.
+    async fn rebase_roots(&self) -> Vec<String> {
+        let mut roots = vec![self.root.to_string_lossy().into_owned()];
+        if let Ok(canonical) = tokio::fs::canonicalize(&self.root).await {
+            let canonical = canonical.to_string_lossy().into_owned();
+            if !roots.contains(&canonical) {
+                roots.push(canonical);
+            }
+        }
+        roots
     }
 
     /// Resolve a model-provided path for reading or writing.
@@ -749,150 +771,53 @@ impl SandboxSession for UnixLocalSandboxSession {
         *self.resume_fingerprint.lock().expect("fingerprint lock") = record;
     }
 
-    async fn hydrate_workspace(&self, archive: &[u8]) -> SandboxResult<()> {
-        tokio::fs::create_dir_all(&self.root).await.map_err(|e| {
-            SandboxError::new(
-                ErrorCode::SnapshotRestoreError,
-                format!("Failed to create workspace `{}`: {e}", self.root.display()),
-            )
-        })?;
-        extract_tar_gz(&self.root, archive).await
+    fn archive_limits(&self) -> Option<SandboxArchiveLimits> {
+        *self.archive_limits.lock().expect("archive limits lock")
     }
-}
 
-/// Extract a gzipped tar archive into `root` with the `tar` CLI.
-pub(crate) async fn extract_tar_gz(root: &Path, archive: &[u8]) -> SandboxResult<()> {
-    use tokio::io::AsyncWriteExt;
+    fn set_archive_limits(&self, limits: Option<SandboxArchiveLimits>) {
+        *self.archive_limits.lock().expect("archive limits lock") = limits;
+    }
 
-    let mut child = tokio::process::Command::new("tar")
-        .arg("-xzf")
-        .arg("-")
-        .arg("-C")
-        .arg(root)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
+    fn validate_restorable_archive(&self, archive: &[u8]) -> SandboxResult<()> {
+        validate_tar_bytes(archive, &TarValidationOptions::hydrate())
+    }
+
+    async fn persist_workspace_once(&self) -> SandboxResult<Vec<u8>> {
+        let raw = capture_workspace_tar(self).await?;
+        // A workspace link recorded as `<root>/lib/thing` names a path that no longer exists once
+        // the snapshot is restored under a different root, and the hydrate policy refuses an
+        // absolute target anyway. Python rewrites those targets while it captures the archive
+        // (`unix_local._archive_workspace`); so does this.
+        let roots = self.rebase_roots().await;
+        tokio::task::spawn_blocking(move || rebase_archive_symlink_targets(&raw, &roots))
+            .await
+            .map_err(|e| {
+                SandboxError::new(
+                    ErrorCode::SnapshotPersistError,
+                    format!("Failed to archive workspace `{}`: {e}", self.root.display()),
+                )
+            })?
+    }
+
+    async fn hydrate_workspace(&self, archive: &[u8]) -> SandboxResult<()> {
+        let root = self.root.clone();
+        let raw = archive.to_vec();
+        // The archive is unpacked by the SDK, not by whichever `tar` the host happens to ship:
+        // every member is validated first, and traversal, hardlink and device members are
+        // refused before a byte is written.
+        tokio::task::spawn_blocking(move || {
+            extract_tar_to(&root, &raw, &TarValidationOptions::hydrate())
+        })
+        .await
         .map_err(|e| {
             SandboxError::new(
                 ErrorCode::SnapshotRestoreError,
-                format!("Failed to run `tar`: {e}"),
+                format!("Failed to restore workspace `{}`: {e}", self.root.display()),
             )
-        })?;
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(archive).await.map_err(|e| {
-            SandboxError::new(
-                ErrorCode::SnapshotRestoreError,
-                format!("Failed to stream the archive into `tar`: {e}"),
-            )
-        })?;
-        stdin.shutdown().await.ok();
+        })??;
+        Ok(())
     }
-    let output = child.wait_with_output().await.map_err(|e| {
-        SandboxError::new(
-            ErrorCode::SnapshotRestoreError,
-            format!("Failed to wait for `tar`: {e}"),
-        )
-    })?;
-    // The rebase runs whether or not `tar` succeeded: a partial restore still holds links that
-    // have to follow the workspace to its new root.
-    rebase_absolute_symlinks(root).await;
-    if !output.status.success() {
-        return Err(SandboxError::new(
-            ErrorCode::SnapshotRestoreError,
-            format!(
-                "`tar` failed to restore the workspace: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            ),
-        ));
-    }
-    Ok(())
-}
-
-/// Rewrite absolute symlink targets that point inside the workspace as link-relative ones.
-///
-/// Mirrors Python's `_rebase_symlink_target`. A snapshot can be restored under a different root
-/// than the one it was taken at — a new temporary directory, a different container — and an
-/// absolute link recorded as `<old root>/lib/thing` then points at a path that no longer exists.
-/// Rewriting it relative to the link's own directory makes it follow the workspace wherever it
-/// lands.
-///
-/// Targets outside the workspace are left exactly as they are, as Python leaves them: a
-/// workspace legitimately contains links out, such as a virtualenv's
-/// `bin/python -> /usr/bin/python3`, and deleting or rewriting those would break the very tools
-/// the agent restored the workspace to use. Containment is enforced where a path is *used*
-/// rather than here — `host_path_for` canonicalizes both the candidate and the root before every
-/// file operation, and `tar` itself refuses to extract through a symlink.
-async fn rebase_absolute_symlinks(root: &Path) {
-    let Ok(canonical_root) = tokio::fs::canonicalize(root).await else {
-        return;
-    };
-    let mut pending = vec![canonical_root.clone()];
-    while let Some(directory) = pending.pop() {
-        let Ok(mut read_dir) = tokio::fs::read_dir(&directory).await else {
-            continue;
-        };
-        while let Ok(Some(entry)) = read_dir.next_entry().await {
-            let path = entry.path();
-            let Ok(file_type) = entry.file_type().await else {
-                continue;
-            };
-            if file_type.is_dir() {
-                pending.push(path);
-                continue;
-            }
-            if !file_type.is_symlink() {
-                continue;
-            }
-            let Ok(target) = tokio::fs::read_link(&path).await else {
-                continue;
-            };
-            let Some(rebased) = rebase_symlink_target(&canonical_root, &path, &target) else {
-                continue;
-            };
-            // Replacing a link is two steps; if the second fails the link is gone, so the
-            // original is put back rather than left missing.
-            if tokio::fs::remove_file(&path).await.is_ok()
-                && let Err(error) = tokio::fs::symlink(&rebased, &path).await
-            {
-                log::warn!(
-                    "failed to rebase the symlink `{}` onto the restored workspace: {error}",
-                    path.display()
-                );
-                let _ = tokio::fs::symlink(&target, &path).await;
-            }
-        }
-    }
-}
-
-/// The link-relative form of `target`, when it is absolute and points inside `root`.
-///
-/// Returns `None` when there is nothing to do: a relative target already follows the workspace,
-/// and an absolute one pointing outside it is the caller's own reference to the host.
-fn rebase_symlink_target(root: &Path, link: &Path, target: &Path) -> Option<PathBuf> {
-    if !target.is_absolute() {
-        return None;
-    }
-    let rest = target.strip_prefix(root).ok()?;
-    // Climb out of the link's own directory, then descend the part after the root. The
-    // components after the root are kept verbatim: `..` following a symlink component is
-    // resolved by the kernel against that link's target, so normalizing here would change
-    // where the link points.
-    let depth = link
-        .parent()
-        .and_then(|parent| parent.strip_prefix(root).ok())
-        .map(|relative| relative.components().count())
-        .unwrap_or(0);
-    let mut rebased = PathBuf::new();
-    for _ in 0..depth {
-        rebased.push("..");
-    }
-    rebased.push(rest);
-    if rebased.as_os_str().is_empty() {
-        rebased.push(".");
-    }
-    Some(rebased)
 }
 
 #[cfg(test)]
@@ -900,71 +825,103 @@ mod tests {
     use super::*;
     use crate::sandbox::entries::Entry;
 
-    #[tokio::test]
-    async fn a_restored_workspace_keeps_its_links_and_follows_its_new_root() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join("workspace");
+    /// Build a workspace holding `links` (link path → target) beside `lib/real.so`.
+    async fn session_with_links(
+        client: &UnixLocalSandboxClient,
+        links: &[(&str, &str)],
+    ) -> std::sync::Arc<dyn SandboxSession> {
+        let session = client.create(None).await.unwrap();
+        session.start().await.unwrap();
+        let root = PathBuf::from(session.workspace_root());
         tokio::fs::create_dir_all(root.join("bin")).await.unwrap();
         tokio::fs::create_dir_all(root.join("lib")).await.unwrap();
         tokio::fs::write(root.join("lib/real.so"), b"ok")
             .await
             .unwrap();
         let canonical_root = tokio::fs::canonicalize(&root).await.unwrap();
+        for (link, target) in links {
+            let target = target.replace("<root>", &canonical_root.to_string_lossy());
+            std::os::unix::fs::symlink(&target, root.join(link)).unwrap();
+        }
+        session
+    }
 
-        // An absolute link into the workspace: this is the one that breaks when a snapshot is
-        // restored under a different root, so it is rewritten to follow the workspace.
-        std::os::unix::fs::symlink(canonical_root.join("lib/real.so"), root.join("bin/inside"))
-            .unwrap();
-        // A link out of the workspace, as a virtualenv interpreter is. The agent restored the
-        // workspace to use it, so it stays exactly as it was.
-        std::os::unix::fs::symlink("/usr/bin/env", root.join("bin/python")).unwrap();
-        // A relative link already follows the workspace.
-        std::os::unix::fs::symlink("../lib/real.so", root.join("bin/relative")).unwrap();
+    /// The link target the archive records for `name`.
+    fn archived_link_target(archive: &[u8], name: &str) -> String {
+        crate::sandbox::archive::read_tar_members(archive)
+            .unwrap()
+            .into_iter()
+            .find(|member| member.name.trim_start_matches("./") == name)
+            .unwrap_or_else(|| panic!("`{name}` is archived"))
+            .link_target
+            .unwrap_or_default()
+    }
 
-        rebase_absolute_symlinks(&root).await;
+    #[tokio::test]
+    async fn persist_rebases_a_link_into_the_workspace_so_a_restore_follows_the_new_root() {
+        let client = UnixLocalSandboxClient::new();
+        let source = session_with_links(
+            &client,
+            &[
+                ("bin/inside", "<root>/lib/real.so"),
+                ("bin/relative", "../lib/real.so"),
+            ],
+        )
+        .await;
+        let archive = source.persist_workspace().await.unwrap();
 
+        // Captured relative to the link's own directory, as Python's `_archive_workspace` does.
+        assert_eq!(
+            archived_link_target(&archive, "bin/inside"),
+            "../lib/real.so"
+        );
+        assert_eq!(
+            archived_link_target(&archive, "bin/relative"),
+            "../lib/real.so"
+        );
+
+        // Restored under a different root, the link still resolves to the archived file.
+        let target = client.create(None).await.unwrap();
+        target.start().await.unwrap();
+        target.hydrate_workspace(&archive).await.unwrap();
+        let root = PathBuf::from(target.workspace_root());
         assert_eq!(
             tokio::fs::read_link(root.join("bin/inside")).await.unwrap(),
             PathBuf::from("../lib/real.so")
         );
         assert_eq!(
-            tokio::fs::read_link(root.join("bin/python")).await.unwrap(),
-            PathBuf::from("/usr/bin/env")
-        );
-        assert_eq!(
-            tokio::fs::read_link(root.join("bin/relative"))
-                .await
-                .unwrap(),
-            PathBuf::from("../lib/real.so")
-        );
-        // The rewritten link still resolves to the same file.
-        assert_eq!(
             tokio::fs::read(root.join("bin/inside")).await.unwrap(),
             b"ok"
         );
+
+        client.delete(source).await.unwrap();
+        client.delete(target).await.unwrap();
     }
 
-    #[test]
-    fn only_absolute_in_workspace_targets_are_rebased() {
-        let root = Path::new("/w");
+    #[tokio::test]
+    async fn a_link_out_of_the_workspace_stays_absolute_and_is_refused_on_restore() {
+        let client = UnixLocalSandboxClient::new();
+        let source = session_with_links(&client, &[("bin/python", "/usr/bin/env")]).await;
+        let archive = source.persist_workspace().await.unwrap();
+
+        // Only targets under the workspace are rewritten; a virtualenv-style link out keeps its
+        // absolute form, which the hydrate policy then refuses, exactly as Python's does.
+        assert_eq!(archived_link_target(&archive, "bin/python"), "/usr/bin/env");
+        let target = client.create(None).await.unwrap();
+        target.start().await.unwrap();
+        let error = target.hydrate_workspace(&archive).await.unwrap_err();
         assert_eq!(
-            rebase_symlink_target(root, Path::new("/w/bin/x"), Path::new("/w/lib/y")),
-            Some(PathBuf::from("../lib/y"))
+            error.context.get("reason").map(String::as_str),
+            Some("absolute symlink target not allowed: /usr/bin/env")
         );
-        // At the root there is nothing to climb out of.
-        assert_eq!(
-            rebase_symlink_target(root, Path::new("/w/x"), Path::new("/w/lib/y")),
-            Some(PathBuf::from("lib/y"))
+        assert!(
+            !PathBuf::from(target.workspace_root())
+                .join("lib/real.so")
+                .exists()
         );
-        // Outside the workspace, and already relative: left alone.
-        assert_eq!(
-            rebase_symlink_target(root, Path::new("/w/bin/x"), Path::new("/usr/bin/env")),
-            None
-        );
-        assert_eq!(
-            rebase_symlink_target(root, Path::new("/w/bin/x"), Path::new("../lib/y")),
-            None
-        );
+
+        client.delete(source).await.unwrap();
+        client.delete(target).await.unwrap();
     }
 
     #[tokio::test]

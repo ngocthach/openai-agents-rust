@@ -11,11 +11,12 @@ use crate::error::{AgentsError, Result};
 use crate::items::{FunctionCall, ToolApprovalItem};
 use crate::run_config::ToolErrorKind;
 use crate::tool::{
-    ApplyPatchTool, ComputerTool, ComputerToolSafetyCheckData, CustomTool,
+    ApplyPatchTool, ApplyPatchToolCustomDataContext, ComputerTool, ComputerToolCustomDataContext,
+    ComputerToolSafetyCheckData, CustomTool, CustomToolCustomDataContext,
     DEFAULT_APPROVAL_REJECTION_MESSAGE, LocalShellCommandRequest, LocalShellTool, OnApprovalFn,
     ShellCallData, ShellCommandRequest, ShellExecutorOutput, ShellTool, Tool, ToolOutput,
-    normalize_shell_output_entries, parse_apply_patch_operations, render_shell_outputs,
-    truncate_shell_outputs,
+    normalize_custom_data, normalize_shell_output_entries, parse_apply_patch_operations,
+    render_shell_outputs, truncate_shell_outputs,
 };
 use crate::tool_context::ToolContext;
 use crate::tracing::{Span, SpanData, create_span, scope};
@@ -23,9 +24,9 @@ use crate::tracing::{Span, SpanData, create_span, scope};
 /// Log a tool failure, keeping the error text out unless tool data logging is enabled.
 fn log_tool_error(label: &str, msg: &str) {
     if crate::debug::dont_log_tool_data() {
-        log::error!("{label}");
+        log::error!(target: crate::logger::LOG_TARGET, "{label}");
     } else {
-        log::error!("{label}: {msg}");
+        log::error!(target: crate::logger::LOG_TARGET, "{label}: {msg}");
     }
 }
 
@@ -52,7 +53,12 @@ impl<C> LocalCall<C> {
 
 /// Outcome of one local tool call.
 pub(crate) enum LocalOutcome {
-    Output { raw_item: Value, output: Value },
+    Output {
+        raw_item: Value,
+        output: Value,
+        /// SDK-only data a tool's `custom_data_extractor` attached to the output item.
+        custom_data: Option<Value>,
+    },
     Interruption(ToolApprovalItem),
 }
 
@@ -115,7 +121,13 @@ async fn approval_gate<C: Send + Sync + 'static>(
 ) -> Gate {
     let agent = &env.agent.name;
     let call_id = call.call_id.clone();
-    let mut status = env.ctx.is_tool_approved(agent, tool_name, &call_id);
+    let mut status = super::tools::bound_approval_status(
+        env.ctx,
+        env.unbound_approvals,
+        agent,
+        tool_name,
+        &call_id,
+    );
     if status.is_none() {
         if !needs_approval.await {
             return Gate::Proceed;
@@ -125,9 +137,11 @@ async fn approval_gate<C: Send + Sync + 'static>(
             raw_item: call,
             tool_name: tool_name.to_string(),
         };
+        let mut decided = false;
         if let Some(handler) = on_approval
             && let Some(decision) = handler(env.ctx.clone(), item.clone()).await
         {
+            decided = true;
             if decision.approve {
                 env.ctx.approve_tool(&item, false);
             } else {
@@ -135,7 +149,13 @@ async fn approval_gate<C: Send + Sync + 'static>(
                     .reject_tool(&item, false, decision.reason.filter(|r| !r.is_empty()));
             }
         }
-        status = env.ctx.is_tool_approved(agent, tool_name, &call_id);
+        // A decision the handler just made is bound to this very call, so it is read without
+        // the restored-binding mask. Without a fresh decision the call stays undecided, which
+        // is what the mask means. Mirrors the `discard(call_id)` that ends Python's
+        // `_apply_approval_decision`.
+        status = decided
+            .then(|| env.ctx.is_tool_approved(agent, tool_name, &call_id))
+            .flatten();
         if status.is_none() {
             return Gate::Pending(Box::new(item));
         }
@@ -360,7 +380,7 @@ async fn run_computer<C: Send + Sync + 'static>(
                 }
                 acknowledged = Some(acks);
             }
-            None => log::warn!(
+            None => log::warn!(target: crate::logger::LOG_TARGET,
                 "Computer call has pending safety checks, but no on_safety_check handler is \
                  configured. The action will proceed without acknowledging the checks."
             ),
@@ -413,9 +433,23 @@ async fn run_computer<C: Send + Sync + 'static>(
     if let Some(acks) = acknowledged {
         raw_item["acknowledged_safety_checks"] = Value::Array(acks);
     }
+    let custom_data = match &tool.custom_data_extractor {
+        Some(extractor) => {
+            let ctx = ComputerToolCustomDataContext {
+                run_context: env.ctx,
+                tool: &tool,
+                tool_call: &raw,
+                output: &image_url,
+                raw_item: &raw_item,
+            };
+            normalize_custom_data(extractor(&ctx).await)?
+        }
+        None => None,
+    };
     Ok(LocalOutcome::Output {
         raw_item,
         output: Value::String(image_url),
+        custom_data,
     })
 }
 
@@ -429,6 +463,7 @@ fn shell_rejection(call: &Value, call_id: &str, message: String) -> LocalOutcome
     LocalOutcome::Output {
         raw_item,
         output: Value::String(message),
+        custom_data: None,
     }
 }
 
@@ -568,6 +603,7 @@ async fn run_shell<C: Send + Sync + 'static>(
     Ok(LocalOutcome::Output {
         raw_item,
         output: Value::String(output_text),
+        custom_data: None,
     })
 }
 
@@ -596,6 +632,7 @@ async fn run_local_shell<C: Send + Sync + 'static>(
     Ok(LocalOutcome::Output {
         raw_item: json!({"type": "local_shell_call_output", "call_id": call_id, "output": result}),
         output: Value::String(result),
+        custom_data: None,
     })
 }
 
@@ -647,6 +684,7 @@ async fn run_apply_patch<C: Send + Sync + 'static>(
             return Ok(LocalOutcome::Output {
                 raw_item,
                 output: Value::String(message),
+                custom_data: None,
             });
         }
         Gate::Proceed => {}
@@ -706,14 +744,29 @@ async fn run_apply_patch<C: Send + Sync + 'static>(
             raw_item["output"] = json!(output_text);
         }
         end_hooks(env, &tool_ctx, &tool_enum, &output_text).await;
-        (raw_item, output_text)
+        (raw_item, output_text, status)
     };
-    let (raw_item, output_text) = scope::with_span(span.clone(), Box::pin(run)).await;
+    let (raw_item, output_text, status) = scope::with_span(span.clone(), Box::pin(run)).await;
     finish_span(env, &span, &output_text);
     span.finish();
+    let custom_data = match &tool.custom_data_extractor {
+        Some(extractor) => {
+            let ctx = ApplyPatchToolCustomDataContext {
+                run_context: env.ctx,
+                tool: &tool,
+                operations: &operations,
+                output: &output_text,
+                status,
+                raw_item: &raw_item,
+            };
+            normalize_custom_data(extractor(&ctx).await)?
+        }
+        None => None,
+    };
     Ok(LocalOutcome::Output {
         raw_item,
         output: Value::String(output_text),
+        custom_data,
     })
 }
 
@@ -743,6 +796,7 @@ async fn run_custom<C: Send + Sync + 'static>(
         LocalOutcome::Output {
             raw_item,
             output: Value::String(text),
+            custom_data: None,
         }
     };
     let gate = approval_gate(
@@ -791,5 +845,22 @@ async fn run_custom<C: Send + Sync + 'static>(
     let text = scope::with_span(span.clone(), Box::pin(run)).await;
     finish_span(env, &span, &text);
     span.finish();
-    Ok(output_item(text))
+    let mut outcome = output_item(text.clone());
+    if let Some(extractor) = &tool.custom_data_extractor
+        && let LocalOutcome::Output {
+            raw_item,
+            custom_data,
+            ..
+        } = &mut outcome
+    {
+        let ctx = CustomToolCustomDataContext {
+            tool_context: &tool_ctx,
+            tool: &tool,
+            input: &input,
+            output: &text,
+            raw_item,
+        };
+        *custom_data = normalize_custom_data(extractor(&ctx).await)?;
+    }
+    Ok(outcome)
 }

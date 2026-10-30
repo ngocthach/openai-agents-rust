@@ -403,7 +403,7 @@ pub fn items_to_messages(items: &[crate::items::InputItem]) -> Result<Vec<Value>
                 );
             }
             (Some(other), _) => {
-                log::debug!("Skipping item type {other} not supported by Anthropic Messages");
+                log::debug!(target: crate::logger::LOG_TARGET, "Skipping item type {other} not supported by Anthropic Messages");
             }
             (None, _) => {
                 return Err(AgentsError::user(format!("Unhandled input item: {v}")));

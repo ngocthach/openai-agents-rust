@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.5.0 (2026-10-30)
+
+Closes the gaps found by an independent audit of the public Python surface (1845 names, options and
+documented features checked). See `plans/reports/independent-parity-audit-report.md` and the
+`audit-fixes-*`, `final-divergences-closure` and `final-sweep` reports.
+
+Added:
+
+- `Handoff::with_failure_error_function`: a failed handoff invocation becomes a tool output and the
+  agent runs again instead of ending the run (Python behavior).
+- Sandbox archives are validated in process before any member is written (absolute paths, `..`,
+  link and device members, zip-slip), with `SandboxArchiveLimits`, a public `extract()` for tar and
+  zip, `clone_repo` / `ensure_git_available`; workspace restore no longer shells out to `tar`.
+- `custom_data_extractor` on computer, apply-patch and custom tools; typed `RealtimeReasoningConfig`;
+  `enable_verbose_stdout_logging()`; `WebSocketDebugFilter`; `RunState` strict context checking and
+  `context_override`; `Mount::ephemeral`; Docker concurrent stdin/stdout pumping.
+
+Breaking changes (pre-1.0):
+
+- Per-call approvals on Python-envelope snapshots from schema 1.15 re-raise when the call is not in
+  the tool-invocation ledger (Python rule); flat Rust `"1.0"` snapshots keep the old tolerance.
+- Archive hydrate refuses symlink members whose target is absolute or leaves the archive; in-root
+  absolute links are rebased at capture time, as in Python.
+- `RealtimeSessionModelSettings::reasoning` is a `RealtimeReasoningConfig`; `Handoff`,
+  `ComputerTool`, `ApplyPatchTool`, `CustomTool`, `SandboxRunConfig` and `FileEntry` gained public
+  fields; `Mount` has its own `ephemeral` flag.
+- SDK log calls use the `openai.agents` target (`logger::LOG_TARGET`).
+
 ## 0.4.0 (2026-10-30)
 
 Closes the parity rows left open in 0.3.0. Per-area detail is in `plans/reports/*-final-parity-report.md`.

@@ -1111,7 +1111,7 @@ impl DaytonaSandboxSession {
                     Ok(()) => Ok(()),
                     // A stop that cannot be taken must not leak the sandbox.
                     Err(error) => {
-                        log::warn!(
+                        log::warn!(target: crate::logger::LOG_TARGET,
                             "failed to stop the Daytona sandbox, deleting it instead: {error}"
                         );
                         self.delete_sandbox().await
@@ -1541,7 +1541,12 @@ impl SandboxSession for DaytonaSandboxSession {
         })
     }
 
+    fn validate_restorable_archive(&self, archive: &[u8]) -> SandboxResult<()> {
+        crate::sandbox::archive::validate_hydrate_archive(archive)
+    }
+
     async fn hydrate_workspace(&self, archive: &[u8]) -> SandboxResult<()> {
+        crate::sandbox::archive::validate_hydrate_archive(archive)?;
         let root = self.manifest.root().to_string();
         let archive_path = self.resolve_internal_path(&provider_scratch_path(&format!(
             "{}.tar.gz",
@@ -2521,6 +2526,8 @@ fn file_info_to_file_entry(value: &Value, base: &str) -> FileEntry {
         size: value.get("size").and_then(Value::as_u64),
         permissions,
         is_dir,
+        // The toolbox file-info payload reports no link metadata.
+        is_symlink: false,
     }
 }
 

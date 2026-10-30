@@ -1081,8 +1081,10 @@ async fn daytona_round_trips_a_workspace_archive() {
     assert!(command.contains("-C /home/daytona/workspace"), "{command}");
     assert!(command.contains("/tmp/openai-agents-"), "{command}");
 
+    // The SDK validates archive bytes before the provider unpacks them, so the probe archive is
+    // an empty but well-formed tar.
     session
-        .hydrate_workspace(&[0x1f, 0x8b])
+        .hydrate_workspace(&[0u8; 1024])
         .await
         .expect("hydrate");
     let upload = server.find("POST", "/toolbox/sbx-daytona/files/upload-v2");

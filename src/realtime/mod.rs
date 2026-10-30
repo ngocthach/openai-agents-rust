@@ -80,10 +80,11 @@ pub use config::{
     DEFAULT_REALTIME_VOICE, RealtimeAudioConfig, RealtimeAudioFormat, RealtimeAudioInputConfig,
     RealtimeAudioOutputConfig, RealtimeAudioStorage, RealtimeFunctionToolSpec,
     RealtimeGuardrailsSettings, RealtimeInputAudioTranscriptionConfig, RealtimeModelTracing,
-    RealtimeModelTracingConfig, RealtimeNoiseReductionConfig, RealtimeRunConfig,
-    RealtimeSessionModelSettings, RealtimeToolErrorArgs, RealtimeToolErrorFormatter,
-    RealtimeToolErrorKind, RealtimeToolExecutionConfig, RealtimeTurnDetectionConfig,
-    RealtimeUserInput, RealtimeUserInputContent, RealtimeVoice, default_model_settings,
+    RealtimeModelTracingConfig, RealtimeNoiseReductionConfig, RealtimeReasoningConfig,
+    RealtimeRunConfig, RealtimeSessionModelSettings, RealtimeToolErrorArgs,
+    RealtimeToolErrorFormatter, RealtimeToolErrorKind, RealtimeToolExecutionConfig,
+    RealtimeTurnDetectionConfig, RealtimeUserInput, RealtimeUserInputContent, RealtimeVoice,
+    default_model_settings,
 };
 pub use events::{RealtimeEventInfo, RealtimeSessionEvent};
 pub use handoffs::{RealtimeHandoff, realtime_handoff};

@@ -11,12 +11,113 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 use crate::computer::Computer;
-use crate::editor::{ApplyPatchEditor, ApplyPatchOperation};
+use crate::editor::{ApplyPatchEditor, ApplyPatchOperation, ApplyPatchStatus};
 use crate::error::{AgentsError, Result};
 use crate::items::ToolApprovalItem;
 use crate::run_context::RunContext;
 use crate::tool_context::ToolContext;
 use crate::util::BoxFuture;
+
+// ---------------------------------------------------------------------------------------------
+// Custom data extractors
+// ---------------------------------------------------------------------------------------------
+
+/// Context passed to a computer-tool custom data extractor.
+/// Mirrors `agents.tool.ComputerToolCustomDataContext`.
+pub struct ComputerToolCustomDataContext<'a, C> {
+    /// The current run context.
+    pub run_context: &'a RunContext<C>,
+    /// The computer tool that was invoked.
+    pub tool: &'a ComputerTool<C>,
+    /// The raw computer tool call produced by the model.
+    pub tool_call: &'a Value,
+    /// The screenshot data URL returned to the model.
+    pub output: &'a str,
+    /// The raw computer call output item that will be replayed to the model.
+    pub raw_item: &'a Value,
+}
+
+impl<C> fmt::Debug for ComputerToolCustomDataContext<'_, C> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ComputerToolCustomDataContext")
+            .field("raw_item", &self.raw_item)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Produces SDK-only data to attach to a computer call output item.
+/// Mirrors `ComputerToolCustomDataExtractor`.
+pub type ComputerToolCustomDataExtractor<C> = Arc<
+    dyn for<'a> Fn(&ComputerToolCustomDataContext<'a, C>) -> BoxFuture<'static, Option<Value>>
+        + Send
+        + Sync,
+>;
+
+/// Context passed to an apply-patch custom data extractor.
+/// Mirrors `agents.tool.ApplyPatchToolCustomDataContext`.
+pub struct ApplyPatchToolCustomDataContext<'a, C> {
+    /// The current run context.
+    pub run_context: &'a RunContext<C>,
+    /// The `apply_patch` tool that was invoked.
+    pub tool: &'a ApplyPatchTool<C>,
+    /// The patch operations requested by the model.
+    pub operations: &'a [ApplyPatchOperation],
+    /// The model-visible `apply_patch` output.
+    pub output: &'a str,
+    /// The serialized `apply_patch` output status.
+    pub status: ApplyPatchStatus,
+    /// The raw `apply_patch` output item that will be replayed to the model.
+    pub raw_item: &'a Value,
+}
+
+impl<C> fmt::Debug for ApplyPatchToolCustomDataContext<'_, C> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ApplyPatchToolCustomDataContext")
+            .field("status", &self.status)
+            .field("raw_item", &self.raw_item)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Produces SDK-only data to attach to an `apply_patch` output item.
+/// Mirrors `ApplyPatchToolCustomDataExtractor`.
+pub type ApplyPatchToolCustomDataExtractor<C> = Arc<
+    dyn for<'a> Fn(&ApplyPatchToolCustomDataContext<'a, C>) -> BoxFuture<'static, Option<Value>>
+        + Send
+        + Sync,
+>;
+
+/// Context passed to a custom-tool custom data extractor.
+/// Mirrors `agents.tool.CustomToolCustomDataContext`.
+pub struct CustomToolCustomDataContext<'a, C> {
+    /// The tool invocation context.
+    pub tool_context: &'a ToolContext<C>,
+    /// The custom tool that was invoked.
+    pub tool: &'a CustomTool<C>,
+    /// The raw model-provided custom tool input.
+    pub input: &'a str,
+    /// The model-visible custom tool output.
+    pub output: &'a str,
+    /// The raw custom tool output item that will be replayed to the model.
+    pub raw_item: &'a Value,
+}
+
+impl<C> fmt::Debug for CustomToolCustomDataContext<'_, C> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CustomToolCustomDataContext")
+            .field("tool", &self.tool.name)
+            .field("raw_item", &self.raw_item)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Produces SDK-only data to attach to a custom tool output item.
+/// Mirrors `CustomToolCustomDataExtractor`.
+pub type CustomToolCustomDataExtractor<C> = Arc<
+    dyn for<'a> Fn(&CustomToolCustomDataContext<'a, C>) -> BoxFuture<'static, Option<Value>>
+        + Send
+        + Sync,
+>;
 
 // ---------------------------------------------------------------------------------------------
 // Approvals
@@ -434,8 +535,17 @@ impl<C: Send + Sync + 'static> ShellTool<C> {
         })
     }
 
+    /// A shell tool running in a hosted OpenAI container, from the typed environment.
+    /// Rejects [`ShellToolEnvironment::Local`], which needs an executor.
+    pub fn hosted_typed(environment: ShellToolEnvironment) -> Result<Self> {
+        Self::hosted(environment.to_value())
+    }
+
     /// A shell tool running in a hosted OpenAI container (`container_auto` or
     /// `container_reference` environment). Hosted shells do not support approvals.
+    ///
+    /// [`hosted_typed`](Self::hosted_typed) takes the typed form; this one stays a [`Value`]
+    /// so an unmodelled environment still works.
     pub fn hosted(environment: Value) -> Result<Self> {
         let ty = environment.get("type").and_then(Value::as_str);
         if matches!(ty, None | Some("local")) {
@@ -675,6 +785,8 @@ pub struct ApplyPatchTool<C> {
     pub on_approval: Option<OnApprovalFn<C>>,
     /// Callers allowed to invoke this tool (`["direct"]` when unset).
     pub allowed_callers: Option<Vec<String>>,
+    /// Attaches SDK-only data to the `apply_patch` output item.
+    pub custom_data_extractor: Option<ApplyPatchToolCustomDataExtractor<C>>,
 }
 
 impl<C> Clone for ApplyPatchTool<C> {
@@ -685,6 +797,7 @@ impl<C> Clone for ApplyPatchTool<C> {
             needs_approval: self.needs_approval.clone(),
             on_approval: self.on_approval.clone(),
             allowed_callers: self.allowed_callers.clone(),
+            custom_data_extractor: self.custom_data_extractor.clone(),
         }
     }
 }
@@ -712,6 +825,7 @@ impl<C> ApplyPatchTool<C> {
             name: "apply_patch".into(),
             needs_approval: ApprovalPolicy::Static(false),
             on_approval: None,
+            custom_data_extractor: None,
         }
     }
 
@@ -750,6 +864,16 @@ impl<C> ApplyPatchTool<C> {
     /// Restrict which callers may invoke the tool (`"direct"`, `"programmatic"`).
     pub fn with_allowed_callers(mut self, callers: Vec<String>) -> Self {
         self.allowed_callers = Some(callers);
+        self
+    }
+
+    /// Attach SDK-only data to the `apply_patch` output item.
+    pub fn with_custom_data_extractor<F, Fut>(mut self, f: F) -> Self
+    where
+        F: for<'a> Fn(&ApplyPatchToolCustomDataContext<'a, C>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Option<Value>> + Send + 'static,
+    {
+        self.custom_data_extractor = Some(Arc::new(move |ctx| Box::pin(f(ctx))));
         self
     }
 
@@ -879,6 +1003,8 @@ pub struct ComputerTool<C> {
     /// Callback for pending safety checks. Without it, checks are left unacknowledged and the
     /// action proceeds with a warning.
     pub on_safety_check: Option<SafetyCheckFn<C>>,
+    /// Attaches SDK-only data to the computer call output item.
+    pub custom_data_extractor: Option<ComputerToolCustomDataExtractor<C>>,
 }
 
 impl<C> Clone for ComputerTool<C> {
@@ -886,6 +1012,7 @@ impl<C> Clone for ComputerTool<C> {
         ComputerTool {
             source: self.source.clone(),
             on_safety_check: self.on_safety_check.clone(),
+            custom_data_extractor: self.custom_data_extractor.clone(),
         }
     }
 }
@@ -907,6 +1034,7 @@ impl<C> ComputerTool<C> {
         ComputerTool {
             source: ComputerSource::Ready(computer),
             on_safety_check: None,
+            custom_data_extractor: None,
         }
     }
 
@@ -924,6 +1052,7 @@ impl<C> ComputerTool<C> {
                 slot: Arc::new(tokio::sync::Mutex::new(None)),
             },
             on_safety_check: None,
+            custom_data_extractor: None,
         }
     }
 
@@ -944,6 +1073,7 @@ impl<C> ComputerTool<C> {
                 slot: Arc::new(tokio::sync::Mutex::new(None)),
             },
             on_safety_check: None,
+            custom_data_extractor: None,
         }
     }
 
@@ -972,6 +1102,16 @@ impl<C> ComputerTool<C> {
         Fut: Future<Output = bool> + Send + 'static,
     {
         self.on_safety_check = Some(Arc::new(move |d| Box::pin(f(d))));
+        self
+    }
+
+    /// Attach SDK-only data to the computer call output item.
+    pub fn with_custom_data_extractor<F, Fut>(mut self, f: F) -> Self
+    where
+        F: for<'a> Fn(&ComputerToolCustomDataContext<'a, C>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Option<Value>> + Send + 'static,
+    {
+        self.custom_data_extractor = Some(Arc::new(move |ctx| Box::pin(f(ctx))));
         self
     }
 
@@ -1037,6 +1177,8 @@ pub struct CustomTool<C> {
     pub defer_loading: bool,
     /// Callers allowed to invoke this tool (`["direct"]` when unset).
     pub allowed_callers: Option<Vec<String>>,
+    /// Attaches SDK-only data to the custom tool output item.
+    pub custom_data_extractor: Option<CustomToolCustomDataExtractor<C>>,
     on_invoke: CustomToolFn<C>,
 }
 
@@ -1050,6 +1192,7 @@ impl<C> Clone for CustomTool<C> {
             on_approval: self.on_approval.clone(),
             defer_loading: self.defer_loading,
             allowed_callers: self.allowed_callers.clone(),
+            custom_data_extractor: self.custom_data_extractor.clone(),
             on_invoke: self.on_invoke.clone(),
         }
     }
@@ -1080,6 +1223,7 @@ impl<C: Send + Sync + 'static> CustomTool<C> {
             needs_approval: ApprovalPolicy::Static(false),
             on_approval: None,
             defer_loading: false,
+            custom_data_extractor: None,
             on_invoke: Arc::new(move |c, i| Box::pin(f(c, i))),
         }
     }
@@ -1089,6 +1233,16 @@ impl<C> CustomTool<C> {
     /// Constrain the input format.
     pub fn with_format(mut self, format: Value) -> Self {
         self.format = Some(format);
+        self
+    }
+
+    /// Attach SDK-only data to the custom tool output item.
+    pub fn with_custom_data_extractor<F, Fut>(mut self, f: F) -> Self
+    where
+        F: for<'a> Fn(&CustomToolCustomDataContext<'a, C>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Option<Value>> + Send + 'static,
+    {
+        self.custom_data_extractor = Some(Arc::new(move |ctx| Box::pin(f(ctx))));
         self
     }
 
@@ -1504,6 +1658,12 @@ impl ShellToolEnvironment {
     /// The wire payload for [`ShellTool::environment`].
     pub fn to_value(&self) -> Value {
         serde_json::to_value(self).unwrap_or_else(|_| json!({"type": "local"}))
+    }
+
+    /// True for the two environments OpenAI runs the commands in. The Rust equivalent of
+    /// Python's `ShellToolHostedEnvironment` union.
+    pub fn is_hosted(&self) -> bool {
+        !matches!(self, ShellToolEnvironment::Local { .. })
     }
 }
 

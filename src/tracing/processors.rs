@@ -233,7 +233,7 @@ impl BackendSpanExporter {
             {
                 Ok(rt) => *guard = Some(rt),
                 Err(e) => {
-                    log::error!("[non-fatal] Tracing: failed to build export runtime: {e}");
+                    log::error!(target: crate::logger::LOG_TARGET, "[non-fatal] Tracing: failed to build export runtime: {e}");
                     return;
                 }
             }
@@ -272,7 +272,7 @@ impl BackendSpanExporter {
             let mut retry_after = None;
             match result {
                 Ok((status, _, _)) if status.as_u16() < 300 => {
-                    log::debug!("Exported {} items", data_len(&body));
+                    log::debug!(target: crate::logger::LOG_TARGET, "Exported {} items", data_len(&body));
                     return;
                 }
                 Ok((status, headers, text)) => {
@@ -287,12 +287,14 @@ impl BackendSpanExporter {
                     let retryable =
                         server_allows_retry && (code >= 500 || matches!(code, 408 | 409 | 429));
                     if !retryable {
-                        log::error!("[non-fatal] Tracing client error {code}: {text}");
+                        log::error!(target: crate::logger::LOG_TARGET, "[non-fatal] Tracing client error {code}: {text}");
                         return;
                     }
-                    log::warn!("[non-fatal] Tracing: server error {code}, retrying.");
+                    log::warn!(target: crate::logger::LOG_TARGET, "[non-fatal] Tracing: server error {code}, retrying.");
                 }
-                Err(e) => log::warn!("[non-fatal] Tracing: request failed: {e}"),
+                Err(e) => {
+                    log::warn!(target: crate::logger::LOG_TARGET, "[non-fatal] Tracing: request failed: {e}")
+                }
             }
             if attempt < self.max_retries {
                 // Honour the server's wait, bounded by max_delay so a large Retry-After
@@ -307,7 +309,7 @@ impl BackendSpanExporter {
                 delay = (delay * 2).min(self.max_delay);
             }
         }
-        log::error!("[non-fatal] Tracing: max retries reached, giving up on this batch.");
+        log::error!(target: crate::logger::LOG_TARGET, "[non-fatal] Tracing: max retries reached, giving up on this batch.");
     }
 }
 
@@ -540,7 +542,7 @@ impl TracingExporter for BackendSpanExporter {
         }
         for (key, data) in grouped {
             let Some(api_key) = key.or_else(|| self.resolve_api_key()) else {
-                log::warn!("OPENAI_API_KEY is not set, skipping trace export");
+                log::warn!(target: crate::logger::LOG_TARGET, "OPENAI_API_KEY is not set, skipping trace export");
                 continue;
             };
             for chunk in data.chunks(100) {
@@ -613,7 +615,7 @@ impl BatchTraceProcessor {
                 .name("agents-trace-exporter".into())
                 .spawn(move || worker(rx, exporter, max_queue, max_batch, delay, trigger));
             if spawned.is_err() {
-                log::error!("[non-fatal] Tracing: failed to spawn exporter thread");
+                log::error!(target: crate::logger::LOG_TARGET, "[non-fatal] Tracing: failed to spawn exporter thread");
                 return false;
             }
             *guard = Some(tx);
@@ -659,7 +661,7 @@ fn worker(
                 if queue.len() < max_queue {
                     queue.push(item);
                 } else {
-                    log::warn!("Queue is full, dropping trace item.");
+                    log::warn!(target: crate::logger::LOG_TARGET, "Queue is full, dropping trace item.");
                 }
                 if queue.len() >= trigger {
                     export_all(&mut queue);

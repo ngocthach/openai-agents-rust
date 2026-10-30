@@ -212,7 +212,7 @@ impl SandboxMemoryGenerationManager {
                 Ok(Some(item)) => extracted.push(item),
                 Ok(None) => {}
                 Err(error) => {
-                    log::warn!("sandbox memory phase 1 failed for `{rollout_id}`: {error}");
+                    log::warn!(target: crate::logger::LOG_TARGET, "sandbox memory phase 1 failed for `{rollout_id}`: {error}");
                 }
             }
         }
@@ -221,7 +221,7 @@ impl SandboxMemoryGenerationManager {
         }
 
         if let Err(error) = self.run_phase_two(session.clone(), &model_provider).await {
-            log::warn!("sandbox memory phase 2 failed: {error}");
+            log::warn!(target: crate::logger::LOG_TARGET, "sandbox memory phase 2 failed: {error}");
         }
         Ok(())
     }

@@ -280,7 +280,7 @@ async fn pump_output(
             Ok(Message::Binary(bytes)) => process.push_output(&bytes),
             Ok(Message::Text(text)) => {
                 let Ok(payload) = serde_json::from_str::<Value>(&text) else {
-                    log::debug!("ignoring a non-JSON Cloudflare PTY text frame");
+                    log::debug!(target: crate::logger::LOG_TARGET, "ignoring a non-JSON Cloudflare PTY text frame");
                     continue;
                 };
                 match payload.get("type").and_then(Value::as_str) {
@@ -295,7 +295,7 @@ async fn pump_output(
                         return;
                     }
                     Some("error") => {
-                        log::warn!("Cloudflare PTY error frame");
+                        log::warn!(target: crate::logger::LOG_TARGET, "Cloudflare PTY error frame");
                         process.close(None);
                         return;
                     }

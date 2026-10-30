@@ -18,7 +18,7 @@ This crate is not affiliated with or endorsed by OpenAI.
 
 ```toml
 [dependencies]
-openai-agents-sdk = "0.4"
+openai-agents-sdk = "0.5"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
@@ -227,6 +227,20 @@ ends. `Runner::run_sync` flushes for you. Disable tracing with `set_tracing_disa
 into one trace with `trace("My workflow").run(async { ... })`, and add your own processors with
 `add_trace_processor` or `set_trace_processors`.
 
+## Logging
+
+The SDK logs through the [`log`](https://crates.io/crates/log) facade on the `openai.agents`
+target, so nothing is printed until a backend is installed. `enable_verbose_stdout_logging()`
+installs a built-in one for SDK messages only (the port of Python's call of the same name); any
+other backend (`env_logger`, `tracing-subscriber`, ...) works too — just enable `openai.agents` at
+debug level. Model and tool payloads stay redacted either way until
+`set_dont_log_model_data(false)` / `OPENAI_AGENTS_DONT_LOG_MODEL_DATA=0` allow them.
+
+```rust
+// Returns false if another log backend already owns the process.
+openai_agents_sdk::enable_verbose_stdout_logging();
+```
+
 ## Models
 
 The default provider uses the OpenAI Responses API with the model in `OPENAI_DEFAULT_MODEL`
@@ -253,6 +267,7 @@ per-attempt timeouts and raw request extras.
 | `SQLiteSession` | `memory::SqliteSession` (feature `sqlite`) |
 | `MCPServerStdio` / `MCPServerStreamableHttp` | `mcp::MCPServerStdio` / `mcp::MCPServerStreamableHttp` (feature `mcp`) |
 | `agents.testing` | `testing::FakeModel` |
+| `enable_verbose_stdout_logging()` | `enable_verbose_stdout_logging()` (returns `false` if another `log` backend is already installed) |
 | `ShellTool` / `ApplyPatchTool` / `ComputerTool` | `tool::ShellTool` / `tool::ApplyPatchTool` / `tool::ComputerTool` |
 | `retry_policies.any(...)` | `retry::retry_policies::any(vec![...])` |
 | `RealtimeAgent` / `RealtimeRunner` | `realtime::RealtimeAgent` / `realtime::RealtimeRunner` (feature `realtime`) |

@@ -908,7 +908,7 @@ impl WsInner {
                         .elapsed()
                 };
                 if since_pong > interval + timeout {
-                    log::warn!("Realtime keepalive timed out; closing the connection");
+                    log::warn!(target: crate::logger::LOG_TARGET, "Realtime keepalive timed out; closing the connection");
                     self.emit(RealtimeModelEvent::ConnectionStatus {
                         status: RealtimeConnectionStatus::Disconnected,
                     });
@@ -1147,7 +1147,7 @@ impl WsInner {
             );
         }
         if let Some(reasoning) = &settings.reasoning {
-            session.insert("reasoning".to_string(), reasoning.clone());
+            session.insert("reasoning".to_string(), reasoning.to_session_value());
         }
         Value::Object(session)
     }
@@ -1260,7 +1260,7 @@ impl WsInner {
         let interrupted_item = match (position.item_id.clone(), position.elapsed_ms) {
             (Some(item_id), Some(elapsed_ms)) => Some((item_id, elapsed_ms)),
             _ => {
-                log::debug!(
+                log::debug!(target: crate::logger::LOG_TARGET,
                     "Skipping realtime interrupt; item id {:?}, elapsed ms {:?}",
                     position.item_id,
                     position.elapsed_ms
@@ -1298,12 +1298,12 @@ impl WsInner {
                         .await
                         .err();
                 } else {
-                    log::debug!(
+                    log::debug!(target: crate::logger::LOG_TARGET,
                         "Skipping realtime truncate; playback of {item_id} appears complete"
                     );
                 }
             } else {
-                log::debug!("Skipping realtime truncate; elapsed ms is negative");
+                log::debug!(target: crate::logger::LOG_TARGET, "Skipping realtime truncate; elapsed ms is negative");
             }
         }
 
@@ -1677,7 +1677,7 @@ impl WsInner {
             let playback_complete =
                 max_audio_ms.is_some_and(|max_ms| truncated_ms >= max_ms) && !owns_audio;
             if playback_complete {
-                log::debug!(
+                log::debug!(target: crate::logger::LOG_TARGET,
                     "Skipping realtime truncate; playback of {playback_item_id} appears complete"
                 );
             } else {

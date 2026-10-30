@@ -1645,10 +1645,18 @@ impl SandboxSession for VercelSandboxSession {
         })
     }
 
+    fn validate_restorable_archive(&self, archive: &[u8]) -> SandboxResult<()> {
+        if decode_snapshot_ref(archive).is_some() {
+            return Ok(());
+        }
+        crate::sandbox::archive::validate_hydrate_archive(archive)
+    }
+
     async fn hydrate_workspace(&self, archive: &[u8]) -> SandboxResult<()> {
         if let Some(snapshot_id) = decode_snapshot_ref(archive) {
             return self.restore_native_snapshot(&snapshot_id).await;
         }
+        crate::sandbox::archive::validate_hydrate_archive(archive)?;
         let root = self.manifest.root().to_string();
         self.mkdir(&root, true).await?;
         // `fs/write` extracts a gzipped tar directly, which is exactly the archive format

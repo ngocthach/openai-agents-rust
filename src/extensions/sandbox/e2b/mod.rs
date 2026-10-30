@@ -1146,7 +1146,7 @@ impl E2BSandboxSession {
                     Ok(()) => Ok(()),
                     // A pause that cannot be taken must not leak the sandbox.
                     Err(error) => {
-                        log::warn!("failed to pause the E2B sandbox, killing it instead: {error}");
+                        log::warn!(target: crate::logger::LOG_TARGET, "failed to pause the E2B sandbox, killing it instead: {error}");
                         self.kill().await
                     }
                 }
@@ -1651,10 +1651,18 @@ impl SandboxSession for E2BSandboxSession {
         .await
     }
 
+    fn validate_restorable_archive(&self, archive: &[u8]) -> SandboxResult<()> {
+        if decode_snapshot_ref(archive).is_some() {
+            return Ok(());
+        }
+        crate::sandbox::archive::validate_hydrate_archive(archive)
+    }
+
     async fn hydrate_workspace(&self, archive: &[u8]) -> SandboxResult<()> {
         if let Some(snapshot_id) = decode_snapshot_ref(archive) {
             return self.restore_native_snapshot(&snapshot_id).await;
         }
+        crate::sandbox::archive::validate_hydrate_archive(archive)?;
         let root = self.manifest.root().to_string();
         let archive_path = self.resolve_internal_path(&provider_scratch_path(&format!(
             "{}.tar.gz",
@@ -2107,6 +2115,7 @@ fn entry_info_to_file_entry(value: &Value) -> FileEntry {
         size,
         permissions,
         is_dir,
+        is_symlink: value.get("type").and_then(Value::as_str) == Some("FILE_TYPE_SYMLINK"),
     }
 }
 

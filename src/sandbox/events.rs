@@ -325,7 +325,7 @@ impl EventSink for JsonlFileSink {
                 Ok(file) => *handle = Some(file),
                 // A broken audit file must not break the run it is describing.
                 Err(error) => {
-                    log::warn!(
+                    log::warn!(target: crate::logger::LOG_TARGET,
                         "failed to open the sandbox event log `{}`: {error}",
                         self.path.display()
                     );
@@ -336,7 +336,7 @@ impl EventSink for JsonlFileSink {
         if let Some(file) = handle.as_mut()
             && let Err(error) = file.write_all(line.as_bytes()).await
         {
-            log::warn!(
+            log::warn!(target: crate::logger::LOG_TARGET,
                 "failed to append to the sandbox event log `{}`: {error}",
                 self.path.display()
             );
@@ -545,7 +545,7 @@ impl WorkspaceJsonlSink {
             {
                 state.disabled = true;
                 state.buffer.clear();
-                log::warn!(
+                log::warn!(target: crate::logger::LOG_TARGET,
                     "WorkspaceJsonlSink outbox exceeded the transport's bounded-read limit; \
                      delivery stopped."
                 );
@@ -558,7 +558,7 @@ impl WorkspaceJsonlSink {
         {
             state.disabled = true;
             state.buffer.clear();
-            log::warn!(
+            log::warn!(target: crate::logger::LOG_TARGET,
                 "WorkspaceJsonlSink exceeded max_bytes={max_bytes}; delivery stopped. Use a new \
                  outbox and sink, or JsonlFileSink / HttpProxySink."
             );
@@ -592,7 +592,7 @@ impl EventSink for WorkspaceJsonlSink {
         {
             state.disabled = true;
             state.buffer.clear();
-            log::warn!("WorkspaceJsonlSink exceeded max_bytes={max_bytes}; delivery stopped.");
+            log::warn!(target: crate::logger::LOG_TARGET, "WorkspaceJsonlSink exceeded max_bytes={max_bytes}; delivery stopped.");
             return;
         }
         state.buffer.push_str(&line);
@@ -1106,6 +1106,18 @@ impl crate::sandbox::session::SandboxSession for InstrumentedSession {
             self.inner.hydrate_workspace(archive),
         )
         .await
+    }
+
+    fn validate_restorable_archive(&self, archive: &[u8]) -> SandboxResult<()> {
+        self.inner.validate_restorable_archive(archive)
+    }
+
+    fn archive_limits(&self) -> Option<crate::sandbox::types::SandboxArchiveLimits> {
+        self.inner.archive_limits()
+    }
+
+    fn set_archive_limits(&self, limits: Option<crate::sandbox::types::SandboxArchiveLimits>) {
+        self.inner.set_archive_limits(limits);
     }
 }
 

@@ -992,7 +992,7 @@ pub fn items_to_messages_with(
                 ));
             }
             (Some(other), _) => {
-                log::debug!("Skipping item type {other} not supported by Chat Completions");
+                log::debug!(target: crate::logger::LOG_TARGET, "Skipping item type {other} not supported by Chat Completions");
             }
             (None, _) => {
                 return Err(AgentsError::user(format!("Unhandled input item: {v}")));

@@ -140,7 +140,9 @@ impl rmcp::handler::client::ClientHandler for MCPClientHandler {
                         .unwrap_or("notifications/custom"),
                     value.get("params").cloned(),
                 ),
-                Err(e) => log::warn!("Ignoring unserializable MCP notification: {e}"),
+                Err(e) => {
+                    log::warn!(target: crate::logger::LOG_TARGET, "Ignoring unserializable MCP notification: {e}")
+                }
             }
         }
         std::future::ready(())

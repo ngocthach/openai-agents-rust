@@ -1011,7 +1011,12 @@ impl SandboxSession for CloudflareSandboxSession {
             .await
     }
 
+    fn validate_restorable_archive(&self, archive: &[u8]) -> SandboxResult<()> {
+        crate::sandbox::archive::validate_hydrate_archive(archive)
+    }
+
     async fn hydrate_workspace(&self, archive: &[u8]) -> SandboxResult<()> {
+        crate::sandbox::archive::validate_hydrate_archive(archive)?;
         self.archive_request(
             "hydrate",
             &[],

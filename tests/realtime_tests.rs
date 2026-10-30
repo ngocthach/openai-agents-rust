@@ -1472,6 +1472,45 @@ async fn discarding_history_audio_keeps_transcripts() {
 }
 
 #[test]
+fn typed_reasoning_config_keeps_the_wire_payload() {
+    use openai_agents_sdk::realtime::RealtimeReasoningConfig;
+
+    let transport = OpenAIRealtimeWebSocketModel::new();
+
+    let payload = transport
+        .session_payload_for_settings(&RealtimeSessionModelSettings::new().with_reasoning("low"));
+    assert_eq!(payload["reasoning"], json!({"effort": "low"}));
+
+    // Keys the struct does not model still reach the wire verbatim.
+    let with_extra = RealtimeReasoningConfig::new("high").with_extra("summary", "concise");
+    let payload = transport.session_payload_for_settings(
+        &RealtimeSessionModelSettings::new().with_reasoning(with_extra.clone()),
+    );
+    assert_eq!(
+        payload["reasoning"],
+        json!({"effort": "high", "summary": "concise"})
+    );
+    assert_eq!(
+        serde_json::from_value::<RealtimeReasoningConfig>(payload["reasoning"].clone()).unwrap(),
+        with_extra,
+        "the payload round-trips back into the typed config"
+    );
+
+    // Unset reasoning sends no key at all.
+    let payload = transport.session_payload_for_settings(&RealtimeSessionModelSettings::new());
+    assert!(payload.get("reasoning").is_none());
+
+    // The override wins when settings are merged, like every other field.
+    let merged = RealtimeSessionModelSettings::new()
+        .with_reasoning("low")
+        .merged_with(&RealtimeSessionModelSettings::new().with_reasoning("xhigh"));
+    assert_eq!(
+        merged.reasoning,
+        Some(RealtimeReasoningConfig::new("xhigh"))
+    );
+}
+
+#[test]
 fn log_redaction_overrides_beat_the_environment() {
     use openai_agents_sdk::realtime::{
         dont_log_model_data, reset_dont_log_model_data, set_dont_log_model_data,

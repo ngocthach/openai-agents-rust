@@ -1482,6 +1482,15 @@ impl SandboxSession for ModalSandboxSession {
         .await
     }
 
+    fn validate_restorable_archive(&self, archive: &[u8]) -> SandboxResult<()> {
+        if decode_snapshot_filesystem_ref(archive).is_some()
+            || decode_snapshot_directory_ref(archive).is_some()
+        {
+            return Ok(());
+        }
+        crate::sandbox::archive::validate_hydrate_archive(archive)
+    }
+
     async fn hydrate_workspace(&self, archive: &[u8]) -> SandboxResult<()> {
         if let Some(image_id) = decode_snapshot_filesystem_ref(archive) {
             return self.restore_from_image(&image_id).await;
@@ -1489,6 +1498,7 @@ impl SandboxSession for ModalSandboxSession {
         if let Some(image_id) = decode_snapshot_directory_ref(archive) {
             return self.mount_snapshot_directory(&image_id).await;
         }
+        crate::sandbox::archive::validate_hydrate_archive(archive)?;
         let root = self.manifest.root().to_string();
         // The archive is staged through the helper's own chunked stdin writer: a base64 command
         // argument would exceed the kernel's per-argument limit for any real workspace.

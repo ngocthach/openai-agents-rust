@@ -30,6 +30,16 @@ pub const CURRENT_SCHEMA_VERSION: &str = "1.21";
 /// [`RunState::from_json`] still reads it.
 pub const LEGACY_RUST_SCHEMA_VERSION: &str = "1.0";
 
+/// The first schema version that binds every approval decision to the tool-invocation ledger.
+///
+/// From this version on, a per-call approval whose call id has no ledger entry no longer
+/// authorizes anything: the call is put back to the user for a fresh decision. Mirrors the
+/// `(schema_major, schema_minor) >= (1, 15)` gate in Python's `_deserialize_run_state`, which
+/// is also where Python decides whether to rebuild `RunContextWrapper._tool_invocations` at
+/// all. Snapshots below it, and the flat Rust `"1.0"` snapshots this crate used to write,
+/// predate the ledger and keep the old tolerant behaviour.
+pub const STRICT_APPROVAL_BINDING_MIN_SCHEMA_VERSION: (u32, u32) = (1, 15);
+
 /// A resumable snapshot of a run.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct RunState {
@@ -133,6 +143,56 @@ pub struct RunState {
     /// interruption, which is also when Python writes it.
     #[serde(default)]
     pub last_processed_response: Option<ProcessedResponseSnapshot>,
+    /// Call ids whose restored approval decision no longer authorizes the call, because the
+    /// snapshot's [`tool_invocations`](Self::tool_invocations) ledger has no entry binding the
+    /// decision to a concrete invocation. Resuming asks for those approvals again.
+    ///
+    /// Mirrors `RunContextWrapper._restored_unbound_approval_call_ids`. It is derived from the
+    /// snapshot on read rather than stored in it, so it never travels on the wire;
+    /// [`approve`](Self::approve) and [`reject`](Self::reject) clear an id as soon as a fresh
+    /// decision replaces the unbound one, the way Python's `_apply_approval_decision` does.
+    #[serde(skip)]
+    pub restored_unbound_approval_call_ids: BTreeSet<String>,
+    /// The snapshot's `context_meta` says its context cannot be rebuilt from the payload
+    /// alone: it was written from a type the JSON does not describe, or omitted outright.
+    /// Mirrors `_context_meta_requires_deserializer`. Read-only; derived on deserialization.
+    #[serde(skip)]
+    pub context_requires_restoration: bool,
+}
+
+/// How [`RunState::from_json_with`] treats a snapshot whose context cannot be restored from
+/// the payload alone. Mirrors the `context_override` / `strict_context` arguments of Python's
+/// `RunState.from_string`.
+///
+/// Rust never serializes the application context automatically — the application stores its own
+/// JSON on [`RunState::context`] — so there is no `context_deserializer` equivalent: rebuilding
+/// a value from the stored JSON is the application's own deserialization step. What does carry
+/// over is the *decision*: a snapshot whose context is missing or was written from a type the
+/// JSON does not describe must not resume as though its context were intact.
+#[derive(Debug, Clone, Default)]
+pub struct ContextRestoreOptions {
+    /// Context to install instead of the serialized one. Supplying it satisfies
+    /// [`strict_context`](Self::strict_context).
+    pub context_override: Option<Value>,
+    /// Fail instead of warning when the snapshot's context needs explicit restoration and no
+    /// override was given.
+    pub strict_context: bool,
+}
+
+impl ContextRestoreOptions {
+    /// Require a restorable context, or an override.
+    pub fn strict() -> Self {
+        Self {
+            context_override: None,
+            strict_context: true,
+        }
+    }
+
+    /// Use `context` instead of the serialized one.
+    pub fn with_override(mut self, context: Value) -> Self {
+        self.context_override = Some(context);
+        self
+    }
 }
 
 /// One entry of the tool-invocation ledger. Mirrors `_ToolInvocationRecord`.
@@ -227,6 +287,8 @@ impl RunState {
     /// tool by the same agent.
     pub fn approve(&mut self, item: &ToolApprovalItem, always_approve: bool) {
         self.approvals.approve(item, always_approve);
+        self.restored_unbound_approval_call_ids
+            .remove(item.call_id());
     }
 
     /// Reject a pending tool call, optionally with a custom model-visible message.
@@ -238,6 +300,8 @@ impl RunState {
     ) {
         self.approvals
             .reject(item, always_reject, rejection_message);
+        self.restored_unbound_approval_call_ids
+            .remove(item.call_id());
     }
 
     /// Stage new user input for the next model call of the resumed run.
@@ -271,6 +335,24 @@ impl RunState {
         wire::to_wire(self)
     }
 
+    /// Serialize, refusing a context that no SDK could restore.
+    ///
+    /// Mirrors `to_json(strict_context=True)`. Python's deserializer requires the serialized
+    /// context to be a JSON object ("Serialized run state context must be a mapping"), so a
+    /// snapshot carrying a string, number or array context is one the Python SDK — and this
+    /// one's own strict read — will refuse. Catching it at write time reports the problem
+    /// while the run that produced it is still at hand, instead of at the resume.
+    pub fn to_json_strict(&self) -> Result<Value> {
+        if let Some(context) = &self.context
+            && !context.is_object()
+        {
+            return Err(AgentsError::user(
+                "RunState serialization requires context to be a JSON object when                  strict_context is set. Serialize the application context to an object before                  storing it on the run state.",
+            ));
+        }
+        self.to_json()
+    }
+
     /// Serialize to a JSON string.
     pub fn to_json_string(&self) -> Result<String> {
         Ok(serde_json::to_string(&self.to_json()?)?)
@@ -291,19 +373,86 @@ impl RunState {
                 wire::SUPPORTED_SCHEMA_VERSIONS.join(", ")
             )));
         }
-        let mut state = if wire::is_legacy_rust_envelope(&value) {
+        let context_meta = value
+            .get("context")
+            .and_then(|c| c.get("context_meta"))
+            .cloned();
+        let (strict_major, strict_minor) = STRICT_APPROVAL_BINDING_MIN_SCHEMA_VERSION;
+        let is_legacy_rust = wire::is_legacy_rust_envelope(&value);
+        // A flat Rust `"1.0"` snapshot predates the ledger entirely: it never recorded one, so
+        // every decision in it would look unbound. Only the Python-compatible envelope is held
+        // to the strict rule, and only from the version that introduced the binding.
+        let strict_binding =
+            !is_legacy_rust && wire::schema_version_at_least(version, strict_major, strict_minor);
+        let mut state = if is_legacy_rust {
             wire::from_legacy_rust(value)?
         } else {
             wire::from_wire(&value)?
         };
+        if strict_binding {
+            state.restored_unbound_approval_call_ids = state.unbound_approval_call_ids();
+        }
+        if state.context_requires_restoration {
+            // Python logs the same warning here and leaves the decision to the caller;
+            // `from_json_with` turns it into an error under `strict_context`.
+            log::warn!(
+                target: crate::logger::LOG_TARGET,
+                "{}",
+                wire::context_meta_warning(context_meta.as_ref()),
+            );
+        }
         // The in-memory state is always current; the version only describes the payload read.
         state.schema_version = CURRENT_SCHEMA_VERSION.to_string();
         Ok(state)
     }
 
+    /// Call ids carrying a per-call approval decision that no ledger entry binds to an
+    /// invocation. Port of `RunContextWrapper._mark_restored_unbound_approval_call_ids`.
+    fn unbound_approval_call_ids(&self) -> BTreeSet<String> {
+        self.approvals
+            .0
+            .values()
+            .flat_map(|record| {
+                record
+                    .approved_call_ids
+                    .iter()
+                    .chain(record.rejected_call_ids.iter())
+            })
+            .filter(|call_id| !self.tool_invocations.contains_key(*call_id))
+            .cloned()
+            .collect()
+    }
+
     /// Deserialize from a JSON string (only from trusted storage).
     pub fn from_json_str(s: &str) -> Result<Self> {
         Self::from_json(serde_json::from_str(s)?)
+    }
+
+    /// Deserialize, deciding what to do about a context the snapshot cannot restore.
+    ///
+    /// Mirrors the `context_override` / `strict_context` arguments of Python's
+    /// `RunState.from_string`: a snapshot whose `context_meta` reports a custom or omitted
+    /// context is an error under [`ContextRestoreOptions::strict_context`] and a warning
+    /// otherwise, and an override silences both by supplying the context itself.
+    ///
+    /// Neither option authenticates the snapshot. [`from_json`](Self::from_json) is the
+    /// non-strict form, and warns on the same condition.
+    pub fn from_json_with(value: Value, options: ContextRestoreOptions) -> Result<Self> {
+        let warning =
+            wire::context_meta_warning(value.get("context").and_then(|c| c.get("context_meta")));
+        let mut state = Self::from_json(value)?;
+        if let Some(context) = options.context_override {
+            state.context = Some(context);
+            state.context_requires_restoration = false;
+        } else if state.context_requires_restoration && options.strict_context {
+            return Err(AgentsError::user(warning));
+        }
+        Ok(state)
+    }
+
+    /// Deserialize from a JSON string with [`ContextRestoreOptions`].
+    pub fn from_json_str_with(s: &str, options: ContextRestoreOptions) -> Result<Self> {
+        Self::from_json_with(serde_json::from_str(s)?, options)
     }
 
     /// Attach a serialized application context.

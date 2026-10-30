@@ -621,9 +621,22 @@ const PROVIDERS: &[ProviderEndpoint] = &[
     // --- Endpoints whose auth or shape is not plain OpenAI. ---
     ProviderEndpoint {
         name: "bedrock",
-        // Bedrock exposes an OpenAI-compatible route next to the Converse API. A long-lived
-        // API key (`AWS_BEARER_TOKEN_BEDROCK`) is used when present; otherwise the request is
-        // signed with SigV4 from the usual AWS credentials.
+        // Bedrock exposes an OpenAI-compatible route next to the Converse API, and it accepts
+        // *both* authentication modes: "The `bedrock-runtime` endpoint supports AWS SigV4
+        // authentication and Amazon Bedrock API key authentication", with the published curl
+        // examples showing `Authorization: Bearer $OPENAI_API_KEY` and
+        // `--aws-sigv4 "aws:amz:<region>:bedrock"` against the same URL. See
+        // https://docs.aws.amazon.com/bedrock/latest/userguide/inference-chat-completions.html
+        // and https://docs.aws.amazon.com/bedrock/latest/userguide/api-keys.html.
+        //
+        // Precedence: an Amazon Bedrock API key in `AWS_BEARER_TOKEN_BEDROCK` wins, and the
+        // request is sent as a plain bearer; otherwise it is signed with SigV4 from the usual
+        // AWS credentials, under service name `bedrock`. That is the order boto3 itself uses
+        // when the variable is set, and the order any-llm's Bedrock provider inherits from it
+        // (`ENV_API_KEY_NAME = "AWS_BEARER_TOKEN_BEDROCK"`, otherwise the default credential
+        // chain). API keys come in both short-term (SigV4-derived, ≤12 h, recommended) and
+        // long-term (IAM service-specific credential) forms; both travel as the same header,
+        // so this adapter does not distinguish them.
         base_url: "https://bedrock-runtime.${AWS_REGION:us-east-1}.amazonaws.com/openai/v1",
         base_url_env: Some("AWS_BEDROCK_BASE_URL"),
         api_key_env: &["AWS_BEARER_TOKEN_BEDROCK"],
@@ -841,7 +854,10 @@ fn apply_auth(
         }
         #[cfg(feature = "provider-auth")]
         ProviderAuthKind::AwsSigV4 { service } => {
-            // Bedrock also accepts a long-lived API key; prefer it when one is configured.
+            // Bedrock accepts either mode on the same route, so a configured Amazon Bedrock
+            // API key is preferred and sent as a plain bearer, matching boto3's behaviour when
+            // `AWS_BEARER_TOKEN_BEDROCK` is set. SageMaker has no bearer mode and reaches this
+            // branch with an empty key, so it always signs.
             if !key.is_empty() {
                 return Ok(client);
             }
