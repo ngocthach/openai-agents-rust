@@ -37,6 +37,12 @@ Breaking changes (pre-1.0):
   - Tool error span data and invalid-JSON tool errors are redacted unless sensitive data
     logging is allowed.
   - Unix-local sandbox commands use the workspace root as `HOME`.
+- Vercel sandbox: snapshot references use Python's `UC_VERCEL_SNAPSHOT_V1` magic (older Rust
+  Vercel snapshots do not decode); runtimes map to images (default `node24`) and unknown aliases
+  are rejected; `NetworkPolicy::CustomRules` is new; S3 mount flags follow writability, mount
+  credentials are validated, and failing mounts report a redacted message.
+- Modal sandbox: `ModalSandboxClientOptions` has new public fields (cpu/memory limits, restore
+  timeout).
 
 ## 0.2.0 (2026-10-29)
 

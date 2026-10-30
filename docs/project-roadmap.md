@@ -53,5 +53,6 @@ Last updated: 2026-10-29.
 | any-llm providers | Providers without an OpenAI-compatible endpoint (Bedrock, Vertex, ...) are not supported |
 | `RunState` interop | Python can resume Rust snapshots except an interrupted run (no `last_processed_response`) |
 | `FunctionTool` | No `output_type` reflection; set `output_json_schema` explicitly |
+| Daytona mounts | rclone mounts add `--allow-other` so the sandbox command user can use them |
 
 Module-level divergences are listed in `plans/reports/*-report.md`.
