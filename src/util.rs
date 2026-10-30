@@ -7,10 +7,24 @@ use std::pin::Pin;
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// Transform a string into a valid function-style name (`transfer_to_Billing Agent` ->
-/// `transfer_to_Billing_Agent`). Port of `_transforms.transform_string_function_style`.
+/// `transfer_to_billing_agent`). Port of `_transforms.transform_string_function_style`.
+///
+/// Non-alphanumeric characters become `_` and the result is lowercased, so the name matches
+/// the Python SDK byte for byte on the wire.
 pub fn transform_string_function_style(name: &str) -> String {
-    let replaced = name.replace(' ', "_");
-    replaced
+    transform_string_function_style_with(name, true)
+}
+
+/// [`transform_string_function_style`] with control over the whitespace warning.
+///
+/// With `warn_on_whitespace` set to `false`, a name that only differs by whitespace
+/// substitution is transformed silently.
+pub fn transform_string_function_style_with(name: &str, warn_on_whitespace: bool) -> String {
+    let whitespace_normalized: String = name
+        .chars()
+        .map(|c| if c.is_whitespace() { '_' } else { c })
+        .collect();
+    let transformed: String = whitespace_normalized
         .chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || c == '_' {
@@ -19,7 +33,16 @@ pub fn transform_string_function_style(name: &str) -> String {
                 '_'
             }
         })
-        .collect()
+        .collect();
+    let final_name = transformed.to_lowercase();
+    if transformed != name && (warn_on_whitespace || transformed != whitespace_normalized) {
+        log::warn!(
+            "Tool name {name:?} contains invalid characters for function calling and has been \
+             transformed to {final_name:?}. Please use only letters, digits, and underscores to \
+             avoid potential naming conflicts."
+        );
+    }
+    final_name
 }
 
 /// Install the aws-lc-rs rustls crypto provider as the process default, unless one is already
@@ -61,8 +84,9 @@ mod tests {
     fn transforms_names() {
         assert_eq!(
             transform_string_function_style("transfer_to_Billing Agent"),
-            "transfer_to_Billing_Agent"
+            "transfer_to_billing_agent"
         );
         assert_eq!(transform_string_function_style("a-b.c"), "a_b_c");
+        assert_eq!(transform_string_function_style("A\tB"), "a_b");
     }
 }

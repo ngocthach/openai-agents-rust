@@ -1,8 +1,10 @@
 //! The runner: the agent loop. Mirrors `agents.run`.
 
+use std::any::{Any, TypeId};
+use std::collections::HashMap;
 use std::fmt;
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use tokio::sync::mpsc;
 
@@ -17,6 +19,7 @@ use crate::run_context::RunContext;
 use crate::run_error_handlers::RunErrorHandlers;
 use crate::run_internal::{EventSink, run_loop};
 use crate::tracing::scope::ScopeSnapshot;
+use crate::util::BoxFuture;
 
 /// Default maximum number of model turns per run.
 pub const DEFAULT_MAX_TURNS: usize = 10;
@@ -43,6 +46,8 @@ pub struct RunOptions<C> {
     pub session: Option<Arc<dyn Session>>,
     /// Set for nested `Agent::as_tool` runs that share the parent's run context.
     pub(crate) shares_parent_context: bool,
+    /// Set for nested `Agent::as_tool` runs, describing the invocation that started them.
+    pub(crate) agent_tool_invocation: Option<crate::result::AgentToolInvocation>,
 }
 
 impl<C> fmt::Debug for RunOptions<C> {
@@ -82,6 +87,7 @@ impl<C: Send + Sync + 'static> RunOptions<C> {
             conversation_id: None,
             session: None,
             shares_parent_context: false,
+            agent_tool_invocation: None,
         }
     }
 
@@ -155,6 +161,106 @@ impl<C> IntoAgentArc<C> for &Agent<C> {
     }
 }
 
+/// A swappable implementation of the agent loop. Mirrors `agents.run.AgentRunner`.
+///
+/// Install one with [`set_default_agent_runner`]; [`Runner`] then delegates to it. A custom
+/// runner must not call [`Runner::run`] for the same context type, or it recurses into itself:
+/// call [`DefaultAgentRunner`] instead.
+pub trait AgentRunner<C>: Send + Sync + 'static {
+    /// Run to completion.
+    fn run(
+        &self,
+        agent: Arc<Agent<C>>,
+        input: RunInput,
+        options: RunOptions<C>,
+    ) -> BoxFuture<'static, Result<RunResult<C>>>;
+
+    /// Run in streaming mode.
+    fn run_streamed(
+        &self,
+        agent: Arc<Agent<C>>,
+        input: RunInput,
+        options: RunOptions<C>,
+    ) -> RunResultStreaming<C>;
+}
+
+/// The SDK's own agent loop.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DefaultAgentRunner;
+
+impl<C: Send + Sync + 'static> AgentRunner<C> for DefaultAgentRunner {
+    fn run(
+        &self,
+        agent: Arc<Agent<C>>,
+        input: RunInput,
+        options: RunOptions<C>,
+    ) -> BoxFuture<'static, Result<RunResult<C>>> {
+        Box::pin(run_loop(agent, input, options, None))
+    }
+
+    fn run_streamed(
+        &self,
+        agent: Arc<Agent<C>>,
+        input: RunInput,
+        options: RunOptions<C>,
+    ) -> RunResultStreaming<C> {
+        run_streamed_default(agent, input, options)
+    }
+}
+
+fn default_runners() -> &'static Mutex<HashMap<TypeId, Box<dyn Any + Send + Sync>>> {
+    static RUNNERS: OnceLock<Mutex<HashMap<TypeId, Box<dyn Any + Send + Sync>>>> = OnceLock::new();
+    RUNNERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Install the agent runner used by [`Runner`] for context type `C`. Pass `None` to restore
+/// [`DefaultAgentRunner`]. Mirrors `agents.run.set_default_agent_runner`.
+pub fn set_default_agent_runner<C: 'static>(runner: Option<Arc<dyn AgentRunner<C>>>) {
+    let mut map = default_runners().lock().expect("agent runners poisoned");
+    match runner {
+        Some(r) => {
+            map.insert(TypeId::of::<C>(), Box::new(r));
+        }
+        None => {
+            map.remove(&TypeId::of::<C>());
+        }
+    }
+}
+
+/// The agent runner installed for context type `C`, if any.
+/// Mirrors `agents.run.get_default_agent_runner`.
+pub fn get_default_agent_runner<C: 'static>() -> Option<Arc<dyn AgentRunner<C>>> {
+    let map = default_runners().lock().expect("agent runners poisoned");
+    map.get(&TypeId::of::<C>())
+        .and_then(|boxed| boxed.downcast_ref::<Arc<dyn AgentRunner<C>>>())
+        .cloned()
+}
+
+fn run_streamed_default<C: Send + Sync + 'static>(
+    agent: Arc<Agent<C>>,
+    input: RunInput,
+    options: RunOptions<C>,
+) -> RunResultStreaming<C> {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let sink = EventSink {
+        tx: tx.clone(),
+        cancel_after_turn: cancel.clone(),
+    };
+    let scope = ScopeSnapshot::capture();
+    let start_agent = agent.clone();
+    let max_turns = options.max_turns;
+    let handle = tokio::spawn(async move {
+        let result = scope
+            .enter(Box::pin(run_loop(agent, input, options, Some(sink))))
+            .await;
+        let _ = tx.send(StreamMsg::Done(Box::new(result)));
+    });
+    let mut streaming = RunResultStreaming::new(rx, start_agent, cancel, handle);
+    streaming.set_max_turns(max_turns);
+    streaming
+}
+
 /// Runs agents.
 ///
 /// The loop calls the model, runs tools and handoffs, and stops when the current agent produces a
@@ -177,13 +283,12 @@ impl Runner {
         input: impl Into<RunInput>,
         options: RunOptions<C>,
     ) -> Result<RunResult<C>> {
-        Box::pin(run_loop(
-            agent.into_agent_arc(),
-            input.into(),
-            options,
-            None,
-        ))
-        .await
+        let agent = agent.into_agent_arc();
+        let input = input.into();
+        match get_default_agent_runner::<C>() {
+            Some(runner) => runner.run(agent, input, options).await,
+            None => Box::pin(run_loop(agent, input, options, None)).await,
+        }
     }
 
     /// Run synchronously on a new tokio runtime. Must not be called from within a runtime.
@@ -231,20 +336,9 @@ impl Runner {
     ) -> RunResultStreaming<C> {
         let agent = agent.into_agent_arc();
         let input = input.into();
-        let (tx, rx) = mpsc::unbounded_channel();
-        let cancel = Arc::new(AtomicBool::new(false));
-        let sink = EventSink {
-            tx: tx.clone(),
-            cancel_after_turn: cancel.clone(),
-        };
-        let scope = ScopeSnapshot::capture();
-        let start_agent = agent.clone();
-        let handle = tokio::spawn(async move {
-            let result = scope
-                .enter(Box::pin(run_loop(agent, input, options, Some(sink))))
-                .await;
-            let _ = tx.send(StreamMsg::Done(Box::new(result)));
-        });
-        RunResultStreaming::new(rx, start_agent, cancel, handle)
+        match get_default_agent_runner::<C>() {
+            Some(runner) => runner.run_streamed(agent, input, options),
+            None => run_streamed_default(agent, input, options),
+        }
     }
 }

@@ -375,6 +375,8 @@ pub struct ShellTool<C> {
     pub on_approval: Option<OnApprovalFn<C>>,
     /// Execution environment payload (`{"type": "local"}` by default).
     pub environment: Value,
+    /// Callers allowed to invoke this tool (`["direct"]` when unset).
+    pub allowed_callers: Option<Vec<String>>,
 }
 
 impl<C> Clone for ShellTool<C> {
@@ -385,6 +387,7 @@ impl<C> Clone for ShellTool<C> {
             needs_approval: self.needs_approval.clone(),
             on_approval: self.on_approval.clone(),
             environment: self.environment.clone(),
+            allowed_callers: self.allowed_callers.clone(),
         }
     }
 }
@@ -409,6 +412,7 @@ impl<C: Send + Sync + 'static> ShellTool<C> {
     {
         let f = Arc::new(executor);
         ShellTool {
+            allowed_callers: None,
             name: "shell".into(),
             executor: Some(Arc::new(move |req| {
                 let f = f.clone();
@@ -440,6 +444,7 @@ impl<C: Send + Sync + 'static> ShellTool<C> {
             ));
         }
         Ok(ShellTool {
+            allowed_callers: None,
             name: "shell".into(),
             executor: None,
             needs_approval: ApprovalPolicy::Static(false),
@@ -500,9 +505,25 @@ impl<C> ShellTool<C> {
         )
     }
 
+    /// Restrict which callers may invoke the tool (`"direct"`, `"programmatic"`).
+    pub fn with_allowed_callers(mut self, callers: Vec<String>) -> Self {
+        self.allowed_callers = Some(callers);
+        self
+    }
+
+    /// Set the execution environment from the typed form.
+    pub fn with_typed_environment(mut self, environment: ShellToolEnvironment) -> Self {
+        self.environment = environment.to_value();
+        self
+    }
+
     /// Responses API tool param.
     pub fn to_responses_param(&self) -> Value {
-        json!({"type": "shell", "environment": self.environment})
+        let mut v = json!({"type": "shell", "environment": self.environment});
+        if let Some(callers) = &self.allowed_callers {
+            v["allowed_callers"] = json!(callers);
+        }
+        v
     }
 }
 
@@ -652,6 +673,8 @@ pub struct ApplyPatchTool<C> {
     pub needs_approval: ApprovalPolicy<C, ApplyPatchOperation>,
     /// Optional automatic approval handler.
     pub on_approval: Option<OnApprovalFn<C>>,
+    /// Callers allowed to invoke this tool (`["direct"]` when unset).
+    pub allowed_callers: Option<Vec<String>>,
 }
 
 impl<C> Clone for ApplyPatchTool<C> {
@@ -661,6 +684,7 @@ impl<C> Clone for ApplyPatchTool<C> {
             name: self.name.clone(),
             needs_approval: self.needs_approval.clone(),
             on_approval: self.on_approval.clone(),
+            allowed_callers: self.allowed_callers.clone(),
         }
     }
 }
@@ -683,6 +707,7 @@ impl<C> ApplyPatchTool<C> {
     /// Create the tool around a shared editor.
     pub fn from_arc(editor: Arc<dyn ApplyPatchEditor>) -> Self {
         ApplyPatchTool {
+            allowed_callers: None,
             editor,
             name: "apply_patch".into(),
             needs_approval: ApprovalPolicy::Static(false),
@@ -722,9 +747,19 @@ impl<C> ApplyPatchTool<C> {
         self
     }
 
+    /// Restrict which callers may invoke the tool (`"direct"`, `"programmatic"`).
+    pub fn with_allowed_callers(mut self, callers: Vec<String>) -> Self {
+        self.allowed_callers = Some(callers);
+        self
+    }
+
     /// Responses API tool param.
     pub fn to_responses_param(&self) -> Value {
-        json!({"type": "apply_patch"})
+        let mut v = json!({"type": "apply_patch"});
+        if let Some(callers) = &self.allowed_callers {
+            v["allowed_callers"] = json!(callers);
+        }
+        v
     }
 }
 
@@ -825,13 +860,16 @@ pub type SafetyCheckFn<C> =
     Arc<dyn Fn(ComputerToolSafetyCheckData<C>) -> BoxFuture<'static, bool> + Send + Sync>;
 
 type ComputerFactory = Arc<dyn Fn() -> BoxFuture<'static, Result<Arc<dyn Computer>>> + Send + Sync>;
+/// Tears down a computer a factory created. Port of `ComputerProvider.dispose`.
+pub type ComputerDisposeFn = Arc<dyn Fn(Arc<dyn Computer>) -> BoxFuture<'static, ()> + Send + Sync>;
 
 #[derive(Clone)]
 enum ComputerSource {
     Ready(Arc<dyn Computer>),
     Lazy {
         factory: ComputerFactory,
-        cell: Arc<tokio::sync::OnceCell<Arc<dyn Computer>>>,
+        dispose: Option<ComputerDisposeFn>,
+        slot: Arc<tokio::sync::Mutex<Option<Arc<dyn Computer>>>>,
     },
 }
 
@@ -882,9 +920,48 @@ impl<C> ComputerTool<C> {
         ComputerTool {
             source: ComputerSource::Lazy {
                 factory: Arc::new(move || Box::pin(factory())),
-                cell: Arc::new(tokio::sync::OnceCell::new()),
+                dispose: None,
+                slot: Arc::new(tokio::sync::Mutex::new(None)),
             },
             on_safety_check: None,
+        }
+    }
+
+    /// Create the computer lazily and tear it down when the run that created it finishes,
+    /// so the next run starts from a fresh computer.
+    /// Port of `ComputerProvider { create, dispose }`.
+    pub fn from_provider<F, Fut, D, DFut>(factory: F, dispose: D) -> Self
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<Arc<dyn Computer>>> + Send + 'static,
+        D: Fn(Arc<dyn Computer>) -> DFut + Send + Sync + 'static,
+        DFut: Future<Output = ()> + Send + 'static,
+    {
+        ComputerTool {
+            source: ComputerSource::Lazy {
+                factory: Arc::new(move || Box::pin(factory())),
+                dispose: Some(Arc::new(move |c| Box::pin(dispose(c)))),
+                slot: Arc::new(tokio::sync::Mutex::new(None)),
+            },
+            on_safety_check: None,
+        }
+    }
+
+    /// Tear down a computer this tool created, if any, and forget it.
+    /// Port of `dispose_resolved_computers`.
+    pub async fn dispose(&self) {
+        let ComputerSource::Lazy {
+            dispose: Some(dispose),
+            slot,
+            ..
+        } = &self.source
+        else {
+            // Without a dispose hook the computer stays cached, as `from_factory` promises.
+            return;
+        };
+        let taken = slot.lock().await.take();
+        if let Some(computer) = taken {
+            dispose(computer).await;
         }
     }
 
@@ -907,8 +984,14 @@ impl<C> ComputerTool<C> {
     pub async fn resolve(&self) -> Result<Arc<dyn Computer>> {
         match &self.source {
             ComputerSource::Ready(c) => Ok(c.clone()),
-            ComputerSource::Lazy { factory, cell } => {
-                cell.get_or_try_init(|| factory()).await.cloned()
+            ComputerSource::Lazy { factory, slot, .. } => {
+                let mut guard = slot.lock().await;
+                if let Some(computer) = guard.as_ref() {
+                    return Ok(computer.clone());
+                }
+                let computer = factory().await?;
+                *guard = Some(computer.clone());
+                Ok(computer)
             }
         }
     }
@@ -952,6 +1035,8 @@ pub struct CustomTool<C> {
     pub on_approval: Option<OnApprovalFn<C>>,
     /// Hide the tool until loaded through tool search.
     pub defer_loading: bool,
+    /// Callers allowed to invoke this tool (`["direct"]` when unset).
+    pub allowed_callers: Option<Vec<String>>,
     on_invoke: CustomToolFn<C>,
 }
 
@@ -964,6 +1049,7 @@ impl<C> Clone for CustomTool<C> {
             needs_approval: self.needs_approval.clone(),
             on_approval: self.on_approval.clone(),
             defer_loading: self.defer_loading,
+            allowed_callers: self.allowed_callers.clone(),
             on_invoke: self.on_invoke.clone(),
         }
     }
@@ -987,6 +1073,7 @@ impl<C: Send + Sync + 'static> CustomTool<C> {
         Fut: Future<Output = Result<String>> + Send + 'static,
     {
         CustomTool {
+            allowed_callers: None,
             name: name.into(),
             description: description.into(),
             format: None,
@@ -1054,7 +1141,16 @@ impl<C> CustomTool<C> {
         if self.defer_loading {
             v.insert("defer_loading".into(), json!(true));
         }
+        if let Some(callers) = &self.allowed_callers {
+            v.insert("allowed_callers".into(), json!(callers));
+        }
         Value::Object(v)
+    }
+
+    /// Restrict which callers may invoke the tool (`"direct"`, `"programmatic"`).
+    pub fn with_allowed_callers(mut self, callers: Vec<String>) -> Self {
+        self.allowed_callers = Some(callers);
+        self
     }
 }
 
@@ -1297,5 +1393,233 @@ mod tests {
         let r = run_system_shell(&action, None).await;
         assert_eq!(r.output[0].stdout.trim(), "hi");
         assert_eq!(r.output[1].exit_code(), Some(3));
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Typed shell tool configuration
+// ---------------------------------------------------------------------------------------------
+
+/// Skill metadata for a local shell environment.
+/// Mirrors `agents.tool.ShellToolLocalSkill`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShellToolLocalSkill {
+    pub description: String,
+    pub name: String,
+    pub path: String,
+}
+
+/// Inline skill payload. Mirrors `ShellToolInlineSkillSource`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShellToolInlineSkillSource {
+    /// Base64 zip bundle.
+    pub data: String,
+    /// Always `application/zip`.
+    pub media_type: String,
+    /// Always `base64`.
+    #[serde(rename = "type")]
+    pub source_type: String,
+}
+
+impl ShellToolInlineSkillSource {
+    /// A base64 zip bundle.
+    pub fn zip(data: impl Into<String>) -> Self {
+        ShellToolInlineSkillSource {
+            data: data.into(),
+            media_type: "application/zip".into(),
+            source_type: "base64".into(),
+        }
+    }
+}
+
+/// A skill a hosted container may load. Mirrors `ShellToolContainerSkill`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ShellToolContainerSkill {
+    /// A hosted skill by id. Mirrors `ShellToolSkillReference`.
+    SkillReference {
+        skill_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        version: Option<String>,
+    },
+    /// An inline skill bundle. Mirrors `ShellToolInlineSkill`.
+    Inline {
+        description: String,
+        name: String,
+        source: ShellToolInlineSkillSource,
+    },
+}
+
+/// A secret bound to one domain in allowlist mode.
+/// Mirrors `ShellToolContainerNetworkPolicyDomainSecret`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShellToolContainerNetworkPolicyDomainSecret {
+    pub domain: String,
+    pub name: String,
+    pub value: String,
+}
+
+/// Network policy of a hosted shell container.
+/// Mirrors `ShellToolContainerNetworkPolicy`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ShellToolContainerNetworkPolicy {
+    Allowlist {
+        allowed_domains: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        domain_secrets: Option<Vec<ShellToolContainerNetworkPolicyDomainSecret>>,
+    },
+    Disabled,
+}
+
+/// A shell execution environment. Mirrors `ShellToolEnvironment`.
+///
+/// [`ShellTool::environment`] stays a [`Value`] so an unmodelled payload still works; use
+/// [`ShellTool::with_typed_environment`] for the typed form.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ShellToolEnvironment {
+    /// The SDK runs the commands through the tool's executor.
+    Local {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        skills: Option<Vec<ShellToolLocalSkill>>,
+    },
+    /// OpenAI provisions a container and runs the commands.
+    ContainerAuto {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        file_ids: Option<Vec<String>>,
+        /// `1g`, `4g`, `16g` or `64g`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        memory_limit: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        network_policy: Option<ShellToolContainerNetworkPolicy>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        skills: Option<Vec<ShellToolContainerSkill>>,
+    },
+    /// An existing hosted container.
+    ContainerReference { container_id: String },
+}
+
+impl ShellToolEnvironment {
+    /// The wire payload for [`ShellTool::environment`].
+    pub fn to_value(&self) -> Value {
+        serde_json::to_value(self).unwrap_or_else(|_| json!({"type": "local"}))
+    }
+}
+
+/// Image result settings for a web search. Mirrors `WebSearchToolImageSettings`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebSearchToolImageSettings {
+    /// Number of image results to return.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_results: Option<u32>,
+    /// Include a short caption with each image when one is available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caption: Option<bool>,
+}
+
+impl WebSearchToolImageSettings {
+    /// The wire payload for `WebSearchTool::image_settings`.
+    pub fn to_value(&self) -> Value {
+        serde_json::to_value(self).unwrap_or_else(|_| json!({}))
+    }
+}
+
+/// Responses image generation settings. Mirrors `ImageGenerationToolConfig`.
+///
+/// `ImageGenerationTool::tool_config` stays a [`Value`], so a field this struct does not model
+/// can still be sent; use [`ImageGenerationToolConfig::to_value`] for the typed form.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageGenerationToolConfig {
+    /// `generate`, `edit` or `auto`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
+    /// `transparent`, `opaque` or `auto`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background: Option<String>,
+    /// `high` or `low`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_fidelity: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_image_mask: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// `auto` or `low`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub moderation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_compression: Option<u32>,
+    /// `png`, `webp` or `jpeg`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_format: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partial_images: Option<u32>,
+    /// `low`, `medium`, `high`, `xhigh`, `max` or `auto`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quality: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<String>,
+}
+
+impl ImageGenerationToolConfig {
+    /// The wire payload for `ImageGenerationTool::tool_config`, including `type`.
+    pub fn to_value(&self) -> Value {
+        let mut value = serde_json::to_value(self).unwrap_or_else(|_| json!({}));
+        value["type"] = json!("image_generation");
+        value
+    }
+}
+
+#[cfg(test)]
+mod typed_config_tests {
+    use super::*;
+
+    #[test]
+    fn shell_environments_match_the_wire_shape() {
+        assert_eq!(
+            ShellToolEnvironment::Local { skills: None }.to_value(),
+            json!({"type": "local"})
+        );
+        assert_eq!(
+            ShellToolEnvironment::ContainerReference {
+                container_id: "c_1".into()
+            }
+            .to_value(),
+            json!({"type": "container_reference", "container_id": "c_1"})
+        );
+        let auto = ShellToolEnvironment::ContainerAuto {
+            file_ids: Some(vec!["f1".into()]),
+            memory_limit: Some("4g".into()),
+            network_policy: Some(ShellToolContainerNetworkPolicy::Allowlist {
+                allowed_domains: vec!["example.com".into()],
+                domain_secrets: None,
+            }),
+            skills: Some(vec![ShellToolContainerSkill::SkillReference {
+                skill_id: "s_1".into(),
+                version: None,
+            }]),
+        };
+        assert_eq!(
+            auto.to_value(),
+            json!({
+                "type": "container_auto",
+                "file_ids": ["f1"],
+                "memory_limit": "4g",
+                "network_policy": {"type": "allowlist", "allowed_domains": ["example.com"]},
+                "skills": [{"type": "skill_reference", "skill_id": "s_1"}],
+            })
+        );
+    }
+
+    #[test]
+    fn image_generation_config_keeps_its_type() {
+        let config = ImageGenerationToolConfig {
+            quality: Some("high".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            config.to_value(),
+            json!({"type": "image_generation", "quality": "high"})
+        );
     }
 }

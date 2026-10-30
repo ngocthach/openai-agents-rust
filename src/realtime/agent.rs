@@ -70,7 +70,7 @@ pub struct RealtimeAgent<C> {
     pub mcp_servers: Vec<Arc<dyn crate::mcp::MCPServer>>,
     /// How MCP tools are prepared.
     #[cfg(feature = "mcp")]
-    pub mcp_config: MCPConfig,
+    pub mcp_config: MCPConfig<C>,
     /// Agents this one can hand off to.
     pub handoffs: Vec<RealtimeHandoff<C>>,
     /// Guardrails run on the assistant transcript.
@@ -187,7 +187,7 @@ impl<C: Send + Sync + 'static> RealtimeAgent<C> {
 
     /// Set how MCP tools are prepared (strict schemas, server-prefixed names).
     #[cfg(feature = "mcp")]
-    pub fn with_mcp_config(mut self, config: MCPConfig) -> Self {
+    pub fn with_mcp_config(mut self, config: MCPConfig<C>) -> Self {
         self.mcp_config = config;
         self
     }

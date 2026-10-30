@@ -46,17 +46,37 @@ impl<C> fmt::Debug for CallModelData<C> {
 pub enum ToolErrorKind {
     ApprovalRejected,
     ToolNotFound,
+    /// The tool raised and the default failure handler produced the model-visible message.
+    ToolException,
 }
 
 /// Arguments for `RunConfig::tool_error_formatter`.
-#[derive(Debug, Clone, PartialEq)]
-pub struct ToolErrorFormatterArgs {
+///
+/// `error` is only set for [`ToolErrorKind::ToolException`] and can carry sensitive data;
+/// return only application-approved details from a formatter.
+pub struct ToolErrorFormatterArgs<'a, C> {
     pub kind: ToolErrorKind,
     /// Tool runtime (`function`, `mcp`, ...).
     pub tool_type: String,
     pub tool_name: String,
     pub call_id: String,
     pub default_message: String,
+    /// The active run context.
+    pub run_context: &'a RunContext<C>,
+    /// The original error, for [`ToolErrorKind::ToolException`].
+    pub error: Option<&'a crate::error::AgentsError>,
+}
+
+impl<C> fmt::Debug for ToolErrorFormatterArgs<'_, C> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ToolErrorFormatterArgs")
+            .field("kind", &self.kind)
+            .field("tool_type", &self.tool_type)
+            .field("tool_name", &self.tool_name)
+            .field("call_id", &self.call_id)
+            .field("default_message", &self.default_message)
+            .finish_non_exhaustive()
+    }
 }
 
 /// SDK-side execution settings for local function tools.
@@ -94,30 +114,63 @@ pub const OUTPUT_GUARDRAIL_BLOCKED_TOOL_OUTPUT: &str = "Output withheld by an ou
 
 /// Data passed to an output guardrail blocked-message formatter. It never includes the
 /// rejected output or the guardrail's `output_info`.
-#[derive(Debug, Clone)]
-pub struct OutputGuardrailBlockedMessageArgs {
+pub struct OutputGuardrailBlockedMessageArgs<'a, C> {
     /// The SDK default placeholder.
     pub default_message: String,
     /// The guardrail that tripped.
     pub guardrail_name: String,
     /// The agent whose output was blocked.
-    pub agent_name: String,
+    pub agent: &'a Arc<Agent<C>>,
+    /// The active run context.
+    pub run_context: &'a RunContext<C>,
+}
+
+impl<C> OutputGuardrailBlockedMessageArgs<'_, C> {
+    /// Name of the agent whose output was blocked.
+    pub fn agent_name(&self) -> &str {
+        &self.agent.name
+    }
+}
+
+impl<C> fmt::Debug for OutputGuardrailBlockedMessageArgs<'_, C> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OutputGuardrailBlockedMessageArgs")
+            .field("default_message", &self.default_message)
+            .field("guardrail_name", &self.guardrail_name)
+            .field("agent", &self.agent.name)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Formats the blocked-output placeholder.
-pub type BlockedMessageFormatter =
-    Arc<dyn Fn(&OutputGuardrailBlockedMessageArgs) -> Option<String> + Send + Sync>;
+///
+/// Keep it synchronous: it runs after a terminal tool output is rejected but before every
+/// replay and persistence owner is rebuilt with the data-free replacement.
+pub type BlockedMessageFormatter<C> =
+    Arc<dyn for<'a> Fn(&OutputGuardrailBlockedMessageArgs<'a, C>) -> Option<String> + Send + Sync>;
 
 /// The placeholder kept in history for a terminal tool output blocked by an output guardrail.
-#[derive(Clone)]
-pub enum OutputGuardrailBlockedMessage {
+pub enum OutputGuardrailBlockedMessage<C> {
     /// A fixed non-empty message.
     Text(String),
     /// A formatter; returning `None` or an empty string uses the default.
-    Formatter(BlockedMessageFormatter),
+    Formatter(BlockedMessageFormatter<C>),
 }
 
-impl fmt::Debug for OutputGuardrailBlockedMessage {
+impl<C> Clone for OutputGuardrailBlockedMessage<C> {
+    fn clone(&self) -> Self {
+        match self {
+            OutputGuardrailBlockedMessage::Text(t) => {
+                OutputGuardrailBlockedMessage::Text(t.clone())
+            }
+            OutputGuardrailBlockedMessage::Formatter(f) => {
+                OutputGuardrailBlockedMessage::Formatter(f.clone())
+            }
+        }
+    }
+}
+
+impl<C> fmt::Debug for OutputGuardrailBlockedMessage<C> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             OutputGuardrailBlockedMessage::Text(t) => f.debug_tuple("Text").field(t).finish(),
@@ -141,7 +194,8 @@ type SessionInputCallback = Arc<
 >;
 type CallModelInputFilter<C> =
     Arc<dyn Fn(CallModelData<C>) -> BoxFuture<'static, Result<ModelInputData>> + Send + Sync>;
-type ToolErrorFormatter = Arc<dyn Fn(&ToolErrorFormatterArgs) -> Option<String> + Send + Sync>;
+type ToolErrorFormatter<C> =
+    Arc<dyn for<'a> Fn(&ToolErrorFormatterArgs<'a, C>) -> Option<String> + Send + Sync>;
 /// Maps the normalized transcript to the input of the next agent when nesting handoff history.
 pub type HandoffHistoryMapper = Arc<dyn Fn(Vec<InputItem>) -> Vec<InputItem> + Send + Sync>;
 
@@ -152,7 +206,7 @@ pub struct RunConfig<C> {
     /// Function tool / handoff name collision handling.
     pub tool_name_collision_policy: ToolNameCollisionPolicy,
     /// Placeholder kept for a terminal tool output blocked by an output guardrail.
-    pub output_guardrail_blocked_message: Option<OutputGuardrailBlockedMessage>,
+    pub output_guardrail_blocked_message: Option<OutputGuardrailBlockedMessage<C>>,
     /// Resolves model names (default: [`MultiProvider`]).
     pub model_provider: Arc<dyn ModelProvider>,
     /// Settings overlaid on each agent's settings.
@@ -188,7 +242,7 @@ pub struct RunConfig<C> {
     /// Edit model input right before the call.
     pub call_model_input_filter: Option<CallModelInputFilter<C>>,
     /// Customize model-visible tool error messages.
-    pub tool_error_formatter: Option<ToolErrorFormatter>,
+    pub tool_error_formatter: Option<ToolErrorFormatter<C>>,
     /// Session retrieval settings.
     pub session_settings: Option<SessionSettings>,
     /// Reasoning item id handling.
@@ -378,7 +432,7 @@ impl<C: Send + Sync + 'static> RunConfig<C> {
     /// Customize model-visible tool error messages.
     pub fn with_tool_error_formatter<F>(mut self, f: F) -> Self
     where
-        F: Fn(&ToolErrorFormatterArgs) -> Option<String> + Send + Sync + 'static,
+        F: for<'a> Fn(&ToolErrorFormatterArgs<'a, C>) -> Option<String> + Send + Sync + 'static,
     {
         self.tool_error_formatter = Some(Arc::new(f));
         self
@@ -411,7 +465,7 @@ impl<C: Send + Sync + 'static> RunConfig<C> {
     /// Set the placeholder kept for terminal tool outputs blocked by an output guardrail.
     pub fn with_output_guardrail_blocked_message(
         mut self,
-        message: OutputGuardrailBlockedMessage,
+        message: OutputGuardrailBlockedMessage<C>,
     ) -> Self {
         self.output_guardrail_blocked_message = Some(message);
         self

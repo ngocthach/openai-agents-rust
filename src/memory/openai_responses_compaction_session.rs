@@ -212,11 +212,19 @@ fn normalize_output_items(output: &[Value]) -> Result<Vec<InputItem>> {
 /// Walks both backwards, consuming exchange digests as it goes: items the exchange contains but
 /// storage does not are skipped, while a stored item that is missing or out of order ends the
 /// match. `session_items.len()` means nothing matched.
-fn match_model_exchange_suffix(session_items: &[InputItem], model_exchange: &[String]) -> usize {
+fn match_model_exchange_suffix(
+    session_items: &[InputItem],
+    model_exchange: &[String],
+    ignore_ids_for_matching: bool,
+) -> usize {
     let mut remaining = model_exchange.len();
     let mut matched = 0usize;
     for item in session_items.iter().rev() {
-        let digest = compaction_item_digest(item);
+        let digest = if ignore_ids_for_matching {
+            compaction_item_digest(&crate::run_internal::strip_item_id(item.clone()))
+        } else {
+            compaction_item_digest(item)
+        };
         let mut found = false;
         while remaining > 0 {
             remaining -= 1;
@@ -339,6 +347,12 @@ impl OpenAIResponsesCompactionSession {
             return Err(unwrappable_session_error());
         }
         Ok(Self::new(session_id, underlying))
+    }
+
+    /// Whether item ids must be ignored when matching stored history against the model
+    /// exchange, inherited from the wrapped store. Port of `_ignore_ids_for_matching`.
+    fn ignore_ids_for_matching(&self) -> bool {
+        self.underlying.manages_history_remotely()
     }
 
     /// Fail when the wrapped store manages its own history on the provider's servers.
@@ -518,7 +532,13 @@ impl OpenAIResponsesCompactionSession {
                 // the older part summarized away by a chain that never contained it.
                 let bounded = self.underlying.get_items(Some(window)).await?;
                 let complete = bounded.len() < window;
-                if !complete || match_model_exchange_suffix(&bounded, model_exchange) > 0 {
+                if !complete
+                    || match_model_exchange_suffix(
+                        &bounded,
+                        model_exchange,
+                        self.ignore_ids_for_matching(),
+                    ) > 0
+                {
                     log::warn!(
                         "Skipped automatic compaction because the stored history could not be \
                          fully matched to the latest model exchange and this store cannot \
@@ -537,7 +557,11 @@ impl OpenAIResponsesCompactionSession {
                 ));
             }
 
-            suffix_start = match_model_exchange_suffix(&found.items, model_exchange);
+            suffix_start = match_model_exchange_suffix(
+                &found.items,
+                model_exchange,
+                self.ignore_ids_for_matching(),
+            );
             if suffix_start == found.items.len() {
                 log::warn!(
                     "Skipped automatic compaction because the stored history could not be \
@@ -938,29 +962,35 @@ mod tests {
         ];
 
         // The whole history was sent to the model, so everything is replaceable.
-        assert_eq!(match_model_exchange_suffix(&stored, &exchange(&stored)), 0);
+        assert_eq!(
+            match_model_exchange_suffix(&stored, &exchange(&stored), false),
+            0
+        );
 
         // Only the last turn was part of the exchange: the older turn is retained.
         assert_eq!(
-            match_model_exchange_suffix(&stored, &exchange(&stored[2..])),
+            match_model_exchange_suffix(&stored, &exchange(&stored[2..]), false),
             2
         );
 
         // Items the exchange holds but storage does not are skipped over.
         let mut padded = exchange(&stored[2..]);
         padded.insert(1, compaction_item_digest(&InputItem::assistant("dropped")));
-        assert_eq!(match_model_exchange_suffix(&stored, &padded), 2);
+        assert_eq!(match_model_exchange_suffix(&stored, &padded, false), 2);
 
         // Nothing in common means nothing is replaceable.
         assert_eq!(
-            match_model_exchange_suffix(&stored, &exchange(&[InputItem::user("unrelated")])),
+            match_model_exchange_suffix(&stored, &exchange(&[InputItem::user("unrelated")]), false),
             stored.len()
         );
-        assert_eq!(match_model_exchange_suffix(&stored, &[]), stored.len());
+        assert_eq!(
+            match_model_exchange_suffix(&stored, &[], false),
+            stored.len()
+        );
 
         // A reordered tail is rejected rather than matched out of order.
         let reordered = exchange(&[stored[3].clone(), stored[2].clone()]);
-        assert_eq!(match_model_exchange_suffix(&stored, &reordered), 3);
+        assert_eq!(match_model_exchange_suffix(&stored, &reordered, false), 3);
     }
 
     #[test]

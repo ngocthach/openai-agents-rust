@@ -26,7 +26,7 @@ pub(crate) struct ToolEnv<'a, C> {
     pub ctx: &'a RunContext<C>,
     pub agent: &'a Arc<Agent<C>>,
     pub hooks: Option<&'a Arc<dyn RunHooks<C>>>,
-    pub config: &'a RunConfig<C>,
+    pub config: &'a Arc<RunConfig<C>>,
 }
 
 /// The outcome of one function tool call.
@@ -41,6 +41,8 @@ pub(crate) enum ToolOutcome {
 pub(crate) struct ToolExecResult {
     pub call: FunctionCall,
     pub tool_name: String,
+    pub qualified_tool_name: String,
+    pub custom_data: Option<Value>,
     pub outcome: ToolOutcome,
     pub input_guardrail_results: Vec<ToolInputGuardrailResult>,
     pub output_guardrail_results: Vec<ToolOutputGuardrailResult>,
@@ -48,6 +50,7 @@ pub(crate) struct ToolExecResult {
 
 fn format_tool_error<C>(
     config: &RunConfig<C>,
+    ctx: &RunContext<C>,
     kind: ToolErrorKind,
     tool_name: &str,
     call_id: &str,
@@ -55,22 +58,27 @@ fn format_tool_error<C>(
 ) -> String {
     format_tool_error_for(
         config,
+        ctx,
         kind,
         "function",
         tool_name,
         call_id,
         default_message,
+        None,
     )
 }
 
 /// Apply the run's tool error formatter for a tool of the given runtime type.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn format_tool_error_for<C>(
     config: &RunConfig<C>,
+    ctx: &RunContext<C>,
     kind: ToolErrorKind,
     tool_type: &str,
     tool_name: &str,
     call_id: &str,
     default_message: String,
+    error: Option<&AgentsError>,
 ) -> String {
     if let Some(f) = &config.tool_error_formatter {
         let args = ToolErrorFormatterArgs {
@@ -79,6 +87,8 @@ pub(crate) fn format_tool_error_for<C>(
             tool_name: tool_name.to_string(),
             call_id: call_id.to_string(),
             default_message: default_message.clone(),
+            run_context: ctx,
+            error,
         };
         if let Some(m) = f(&args) {
             return m;
@@ -90,11 +100,13 @@ pub(crate) fn format_tool_error_for<C>(
 /// Model-visible output for a tool the model called but the agent does not have.
 pub(crate) fn tool_not_found_message<C>(
     config: &RunConfig<C>,
+    ctx: &RunContext<C>,
     name: &str,
     call_id: &str,
 ) -> String {
     format_tool_error(
         config,
+        ctx,
         ToolErrorKind::ToolNotFound,
         name,
         call_id,
@@ -155,10 +167,15 @@ pub(crate) async fn execute_function_tool<C: Send + Sync + 'static>(
 ) -> Result<ToolExecResult> {
     let mut input_results = Vec::new();
     let mut output_results = Vec::new();
-    let tool_ctx = ToolContext::from_call(env.ctx.clone(), &env.agent.name, &call);
+    let tool_ctx = ToolContext::from_call(env.ctx.clone(), &env.agent.name, &call)
+        .with_namespace(tool.namespace.clone())
+        .with_agent(env.agent.clone())
+        .with_run_config(env.config.clone());
     let finish = |outcome: ToolOutcome, i: Vec<_>, o: Vec<_>| ToolExecResult {
         call: call.clone(),
         tool_name: tool.name.clone(),
+        qualified_tool_name: tool.qualified_name(),
+        custom_data: None,
         outcome,
         input_guardrail_results: i,
         output_guardrail_results: o,
@@ -204,6 +221,7 @@ pub(crate) async fn execute_function_tool<C: Send + Sync + 'static>(
                     .unwrap_or_else(|| {
                         format_tool_error(
                             env.config,
+                            env.ctx,
                             ToolErrorKind::ApprovalRejected,
                             &tool.name,
                             &call.call_id,
@@ -308,11 +326,27 @@ pub(crate) async fn execute_function_tool<C: Send + Sync + 'static>(
                 );
                 match (&tool.failure_error_function, propagate) {
                     (Some(f), false) => {
-                        let msg = f(env.ctx, &e);
+                        let mut msg = f(env.ctx, &e);
+                        if tool.uses_default_failure_error_function {
+                            // Keep the default failure policy identity: approving model
+                            // feedback must not opt the original error into handled traces.
+                            msg = format_tool_error_for(
+                                env.config,
+                                env.ctx,
+                                ToolErrorKind::ToolException,
+                                "function",
+                                &tool.qualified_name(),
+                                &call.call_id,
+                                msg,
+                                Some(&e),
+                            );
+                        }
                         if let Some(s) = scope::current_span() {
-                            s.set_error(
+                            crate::tracing::record_tool_error_on_span(
+                                &s,
                                 "Error running tool (non-fatal)",
-                                Some(json!({"tool_name": tool.name, "error": e.to_string()})),
+                                &e,
+                                env.config.trace_include_sensitive_data,
                             );
                         }
                         ToolOutput::Text(msg)
@@ -371,11 +405,35 @@ pub(crate) async fn execute_function_tool<C: Send + Sync + 'static>(
                 }
             });
         }
-        Err(e) => span.set_error("Error running tool", Some(json!({"error": e.to_string()}))),
+        Err(e) => crate::tracing::record_tool_error_on_span(
+            &span,
+            "Error running tool",
+            e,
+            env.config.trace_include_sensitive_data,
+        ),
         _ => {}
     }
     span.finish();
-    Ok(finish(outcome?, input_results, output_results))
+    let outcome = outcome?;
+    // SDK-only data the tool body attached plus whatever the extractor produces; the
+    // extractor wins on conflicting keys. Port of `maybe_extract_custom_data` +
+    // `merge_custom_data`.
+    let extracted = match (&tool.custom_data_extractor, &outcome) {
+        (Some(extractor), ToolOutcome::Output { output, item }) => {
+            let ctx = crate::tool::FunctionToolCustomDataContext {
+                tool_context: &tool_ctx,
+                tool: &tool,
+                output,
+                raw_item: item,
+            };
+            extractor(&ctx).await
+        }
+        _ => None,
+    };
+    let custom_data = crate::tool::merge_custom_data(&[tool_ctx.custom_data(), extracted])?;
+    let mut result = finish(outcome, input_results, output_results);
+    result.custom_data = custom_data;
+    Ok(result)
 }
 
 /// Execute tool calls concurrently (bounded by `max_function_tool_concurrency`), preserving
@@ -393,10 +451,17 @@ pub(crate) async fn execute_function_tools<C: Send + Sync + 'static>(
         .max_function_tool_concurrency
         .unwrap_or(runs.len())
         .max(1);
-    let results: Vec<Result<ToolExecResult>> = futures::stream::iter(runs)
+    // `buffered` yields in call order, so the first error seen is the failure with the lowest
+    // tool-call order. Returning there drops the stream, which cancels every sibling still in
+    // flight instead of letting it run to completion. Port of the `_FunctionToolBatchExecutor`
+    // failure arbitration (`_select_function_tool_failure` + `_cancel_function_tool_tasks`).
+    let stream = futures::stream::iter(runs)
         .map(|(call, tool)| Box::pin(execute_function_tool(env, call, tool)))
-        .buffered(limit)
-        .collect()
-        .await;
-    results.into_iter().collect()
+        .buffered(limit);
+    let mut stream = std::pin::pin!(stream);
+    let mut results = Vec::new();
+    while let Some(result) = stream.next().await {
+        results.push(result?);
+    }
+    Ok(results)
 }

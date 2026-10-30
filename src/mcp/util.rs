@@ -283,6 +283,28 @@ pub fn to_function_tool<C: Send + Sync + 'static>(
     convert_to_strict: bool,
     agent_name: &str,
 ) -> FunctionTool<C> {
+    to_function_tool_with_failure(
+        server,
+        tool,
+        exposed_name,
+        convert_to_strict,
+        agent_name,
+        Some(Arc::new(crate::tool::default_tool_error_function::<C>)),
+    )
+}
+
+/// [`to_function_tool`] with the agent's MCP failure formatter.
+///
+/// `failure_error_function` is the agent's `MCPConfig::failure_error_function`; `None`
+/// re-raises MCP tool errors instead of reporting them to the model.
+pub fn to_function_tool_with_failure<C: Send + Sync + 'static>(
+    server: Arc<dyn MCPServer>,
+    tool: &MCPTool,
+    exposed_name: String,
+    convert_to_strict: bool,
+    agent_name: &str,
+    failure_error_function: Option<crate::tool::ToolErrorFn<C>>,
+) -> FunctionTool<C> {
     let (schema, strict) = prepare_schema(&tool.input_schema, convert_to_strict);
     let srv = server.clone();
     let mcp_tool = tool.clone();
@@ -302,13 +324,17 @@ pub fn to_function_tool<C: Send + Sync + 'static>(
     f.mcp_server_name = Some(get_mcp_server_log_name(server.name()));
     f.needs_approval =
         NeedsApproval::Static(server.config().require_approval.requires(agent_name, tool));
+    f = match failure_error_function {
+        Some(handler) => f.with_failure_error_function(move |ctx, e| handler(ctx, e)),
+        None => f.without_failure_error_function(),
+    };
     f
 }
 
 /// List the (filtered) tools of every server and convert them to function tools.
 pub async fn get_all_function_tools<C: Send + Sync + 'static>(
     servers: &[Arc<dyn MCPServer>],
-    config: &MCPConfig,
+    config: &MCPConfig<C>,
     _ctx: &RunContext<C>,
     agent_name: &str,
 ) -> Result<Vec<Tool<C>>> {
@@ -321,7 +347,7 @@ pub async fn get_all_function_tools<C: Send + Sync + 'static>(
 /// never shadows one of them.
 pub async fn get_all_function_tools_with_reserved<C: Send + Sync + 'static>(
     servers: &[Arc<dyn MCPServer>],
-    config: &MCPConfig,
+    config: &MCPConfig<C>,
     _ctx: &RunContext<C>,
     agent_name: &str,
     reserved: &HashSet<String>,
@@ -386,12 +412,13 @@ pub async fn get_all_function_tools_with_reserved<C: Send + Sync + 'static>(
                     "Duplicate tool names found across MCP servers: {exposed}. Set include_server_in_tool_names to disambiguate."
                 )));
             }
-            out.push(Tool::Function(Arc::new(to_function_tool(
+            out.push(Tool::Function(Arc::new(to_function_tool_with_failure(
                 server.clone(),
                 t,
                 exposed,
                 config.convert_schemas_to_strict,
                 agent_name,
+                config.failure_error_function.clone(),
             ))));
         }
     }

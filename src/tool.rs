@@ -239,6 +239,10 @@ into_tool_output_display!(bool, i32, i64, u32, u64, f32, f64, usize);
 pub struct FunctionToolResult {
     /// Tool name.
     pub tool_name: String,
+    /// Namespaced tool name (`namespace.name`), equal to `tool_name` when there is none.
+    pub qualified_tool_name: String,
+    /// SDK-only data attached by the tool or its `custom_data_extractor`.
+    pub custom_data: Option<Value>,
     /// Call id.
     pub call_id: String,
     /// The output.
@@ -357,6 +361,63 @@ impl<C> From<bool> for NeedsApproval<C> {
 /// Function converting a tool failure into a model-visible message.
 pub type ToolErrorFn<C> = Arc<dyn Fn(&RunContext<C>, &AgentsError) -> String + Send + Sync>;
 
+/// What a function-tool custom-data extractor receives.
+/// Mirrors `agents.tool.FunctionToolCustomDataContext`.
+pub struct FunctionToolCustomDataContext<'a, C> {
+    /// The tool invocation context.
+    pub tool_context: &'a ToolContext<C>,
+    /// The tool that was invoked.
+    pub tool: &'a FunctionTool<C>,
+    /// The model-visible tool output.
+    pub output: &'a ToolOutput,
+    /// The raw output item that will be replayed to the model.
+    pub raw_item: &'a Value,
+}
+
+impl<C> fmt::Debug for FunctionToolCustomDataContext<'_, C> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FunctionToolCustomDataContext")
+            .field("tool", &self.tool.name)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Produces SDK-only data to attach to a tool output item.
+/// Mirrors `agents.util._custom_data.CustomDataExtractor`.
+pub type CustomDataExtractor<C> = Arc<
+    dyn for<'a> Fn(&FunctionToolCustomDataContext<'a, C>) -> BoxFuture<'static, Option<Value>>
+        + Send
+        + Sync,
+>;
+
+/// Return a JSON-object copy of custom tool-output data, or `None` when it is empty.
+/// Port of `normalize_custom_data`.
+pub fn normalize_custom_data(value: Option<Value>) -> Result<Option<Value>> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Object(map)) if map.is_empty() => Ok(None),
+        Some(Value::Object(map)) => Ok(Some(Value::Object(map))),
+        Some(_) => Err(AgentsError::user(
+            "custom_data_extractor must return a JSON object or None.",
+        )),
+    }
+}
+
+/// Merge custom-data objects; later values win. Port of `merge_custom_data`.
+pub fn merge_custom_data(values: &[Option<Value>]) -> Result<Option<Value>> {
+    let mut merged = serde_json::Map::new();
+    for value in values {
+        if let Some(Value::Object(map)) = normalize_custom_data(value.clone())? {
+            merged.extend(map);
+        }
+    }
+    if merged.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(Value::Object(merged)))
+    }
+}
+
 /// The default message sent to the model when a tool fails. It does not expose the error.
 pub fn default_tool_error_function<C>(_ctx: &RunContext<C>, _error: &AgentsError) -> String {
     "An error occurred while running the tool. Please try again.".to_string()
@@ -394,10 +455,18 @@ pub struct FunctionTool<C> {
     pub defer_loading: bool,
     /// Error formatter; `None` re-raises tool errors.
     pub failure_error_function: Option<ToolErrorFn<C>>,
+    /// Whether `failure_error_function` is still the SDK default. When it is, the run's
+    /// `tool_error_formatter` gets a `tool_exception` chance to rewrite the message.
+    pub(crate) uses_default_failure_error_function: bool,
     /// Timeout message formatter.
     pub timeout_error_function: Option<ToolErrorFn<C>>,
     /// Programmatic callers allowed to invoke this tool (Responses API only).
     pub allowed_callers: Option<Vec<String>>,
+    /// Attaches SDK-only data to the tool output item.
+    pub custom_data_extractor: Option<CustomDataExtractor<C>>,
+    /// Strict JSON object schema of the tool's output, sent as `output_schema` on the
+    /// Responses API. Mirrors `FunctionTool.output_json_schema`.
+    pub output_json_schema: Option<Value>,
     invoke: InvokeFn<C>,
     pub(crate) is_agent_tool: bool,
     pub(crate) mcp_server_name: Option<String>,
@@ -420,8 +489,11 @@ impl<C> Clone for FunctionTool<C> {
             tool_output_guardrails: self.tool_output_guardrails.clone(),
             defer_loading: self.defer_loading,
             failure_error_function: self.failure_error_function.clone(),
+            uses_default_failure_error_function: self.uses_default_failure_error_function,
             timeout_error_function: self.timeout_error_function.clone(),
             allowed_callers: self.allowed_callers.clone(),
+            custom_data_extractor: self.custom_data_extractor.clone(),
+            output_json_schema: self.output_json_schema.clone(),
             invoke: self.invoke.clone(),
             is_agent_tool: self.is_agent_tool,
             mcp_server_name: self.mcp_server_name.clone(),
@@ -476,20 +548,26 @@ impl<C: Send + Sync + 'static> FunctionTool<C> {
         let invoke: InvokeFn<C> = Arc::new(move |ctx, args_json| {
             let f = f.clone();
             Box::pin(async move {
+                // The payload is tool data, and a serde error echoes the offending value, so
+                // neither reaches the message unless the logging policy allows model and tool
+                // data. Mirrors `validate_json`'s `should_redact` branch, which drops the
+                // payload *and* the parser detail.
+                let invalid_json = |payload: &str, e: serde_json::Error, tool_name: &str| {
+                    if crate::logger::may_log_model_data(true) {
+                        AgentsError::model_behavior(format!(
+                            "Invalid JSON when parsing {payload} for tool {tool_name}: {e}"
+                        ))
+                    } else {
+                        AgentsError::model_behavior(format!(
+                            "Invalid JSON when parsing input for tool {tool_name}"
+                        ))
+                    }
+                };
                 let args: Args = if args_json.trim().is_empty() {
-                    serde_json::from_str("{}").map_err(|e| {
-                        AgentsError::model_behavior(format!(
-                            "Invalid JSON input for tool {}: {e}",
-                            ctx.tool_name
-                        ))
-                    })?
+                    serde_json::from_str("{}").map_err(|e| invalid_json("{}", e, &ctx.tool_name))?
                 } else {
-                    serde_json::from_str(&args_json).map_err(|e| {
-                        AgentsError::model_behavior(format!(
-                            "Invalid JSON input for tool {}: {e}",
-                            ctx.tool_name
-                        ))
-                    })?
+                    serde_json::from_str(&args_json)
+                        .map_err(|e| invalid_json(&args_json, e, &ctx.tool_name))?
                 };
                 let out = f(ctx, args).await?;
                 Ok(out.into_tool_output())
@@ -560,11 +638,14 @@ impl<C: Send + Sync + 'static> FunctionTool<C> {
             tool_output_guardrails: Vec::new(),
             defer_loading: false,
             failure_error_function: Some(Arc::new(default_tool_error_function::<C>)),
+            uses_default_failure_error_function: true,
             timeout_error_function: None,
             invoke,
             is_agent_tool: false,
             mcp_server_name: None,
             allowed_callers: None,
+            custom_data_extractor: None,
+            output_json_schema: None,
             namespace: None,
             namespace_description: None,
         }
@@ -642,12 +723,14 @@ impl<C: Send + Sync + 'static> FunctionTool<C> {
         F: Fn(&RunContext<C>, &AgentsError) -> String + Send + Sync + 'static,
     {
         self.failure_error_function = Some(Arc::new(f));
+        self.uses_default_failure_error_function = false;
         self
     }
 
     /// Re-raise tool errors instead of sending a message to the model.
     pub fn without_failure_error_function(mut self) -> Self {
         self.failure_error_function = None;
+        self.uses_default_failure_error_function = false;
         self
     }
 
@@ -666,6 +749,35 @@ impl<C: Send + Sync + 'static> FunctionTool<C> {
     /// Hide the tool until loaded via hosted tool search.
     pub fn with_defer_loading(mut self, defer: bool) -> Self {
         self.defer_loading = defer;
+        self
+    }
+
+    /// Declare the tool's output as a strict JSON object schema, so a programmatic caller
+    /// knows its shape. Mirrors `function_tool(output_json_schema=...)`.
+    ///
+    /// Returns an error when the schema is not a JSON object schema or cannot be made strict.
+    pub fn with_output_json_schema(mut self, schema: Value) -> Result<Self> {
+        if schema.get("type").and_then(Value::as_str) != Some("object") {
+            return Err(AgentsError::user(
+                "Function tool output_json_schema must define a JSON object schema.",
+            ));
+        }
+        let strict = crate::strict_schema::ensure_strict_json_schema(&schema).map_err(|e| {
+            AgentsError::user(format!(
+                "Function tool output_json_schema must define a strict JSON object schema: {e}"
+            ))
+        })?;
+        self.output_json_schema = Some(strict);
+        Ok(self)
+    }
+
+    /// Attach SDK-only data to this tool's output items.
+    pub fn with_custom_data_extractor<F, Fut>(mut self, f: F) -> Self
+    where
+        F: for<'a> Fn(&FunctionToolCustomDataContext<'a, C>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Option<Value>> + Send + 'static,
+    {
+        self.custom_data_extractor = Some(Arc::new(move |ctx| Box::pin(f(ctx))));
         self
     }
 
@@ -729,6 +841,7 @@ impl<C> FunctionTool<C> {
             namespace: self.namespace.clone(),
             namespace_description: self.namespace_description.clone(),
             allowed_callers: self.allowed_callers.clone(),
+            output_json_schema: self.output_json_schema.clone(),
         }
     }
 }

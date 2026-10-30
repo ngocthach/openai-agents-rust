@@ -33,6 +33,48 @@ pub struct HandoffInputData {
 /// A function that rewrites the input the next agent receives.
 pub type HandoffInputFilter = Arc<dyn Fn(HandoffInputData) -> HandoffInputData + Send + Sync>;
 
+/// Maps the transcript of a handoff to the input of the next agent.
+pub type HandoffHistoryMapper = crate::run_config::HandoffHistoryMapper;
+
+pub use crate::run_internal::history::{
+    DEFAULT_HISTORY_END, DEFAULT_HISTORY_START, default_handoff_history_mapper,
+    get_conversation_history_wrappers, reset_conversation_history_wrappers,
+    set_conversation_history_wrappers,
+};
+
+/// Summarize the previous transcript for the next agent, forwarding verbatim the items the
+/// summary does not already cover. Port of `agents.handoffs.history.nest_handoff_history`.
+///
+/// The transcript is built from `input_history`, `pre_handoff_items` and `new_items`; any
+/// existing `input_items` override is ignored. Tool arguments and outputs can remain in the
+/// generated summary text, so sanitize the source fields (or the returned `input_history`)
+/// when they may carry sensitive data.
+pub fn nest_handoff_history(
+    data: HandoffInputData,
+    history_mapper: Option<&HandoffHistoryMapper>,
+) -> HandoffInputData {
+    let pre_count = data.pre_handoff_items.len();
+    let mut items = data.pre_handoff_items.clone();
+    items.extend(data.new_items.clone());
+    let normalized = crate::run_internal::history::normalize_handoff_items(&items, pre_count);
+    let input_history = match history_mapper {
+        Some(m) => {
+            let mut transcript = data.input_history.clone();
+            transcript.extend(normalized.into_iter().map(|(item, _)| item));
+            m(transcript)
+        }
+        None => crate::run_internal::history::build_ordered_history(data.input_history, normalized),
+    };
+    HandoffInputData {
+        input_history,
+        pre_handoff_items: Vec::new(),
+        // The mapped history is the exact model input; `new_items` stays unchanged for the
+        // session history.
+        new_items: data.new_items,
+        input_items: Some(Vec::new()),
+    }
+}
+
 type InvokeFn<C> =
     Arc<dyn Fn(RunContext<C>, String) -> BoxFuture<'static, Result<Arc<Agent<C>>>> + Send + Sync>;
 
@@ -328,7 +370,7 @@ mod tests {
         let billing =
             Arc::new(Agent::<()>::new("Billing agent").with_handoff_description("Billing"));
         let h = handoff(billing);
-        assert_eq!(h.tool_name, "transfer_to_Billing_agent");
+        assert_eq!(h.tool_name, "transfer_to_billing_agent");
         assert!(h.tool_description.contains("Billing agent agent"));
         let a = h.invoke(RunContext::new(()), "{}".into()).await.unwrap();
         assert_eq!(a.name, "Billing agent");

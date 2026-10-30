@@ -148,11 +148,13 @@ async fn approval_gate<C: Send + Sync + 'static>(
                 .unwrap_or_else(|| {
                     format_tool_error_for(
                         env.config,
+                        env.ctx,
                         ToolErrorKind::ApprovalRejected,
                         tool_type,
                         tool_name,
                         &call_id,
                         DEFAULT_APPROVAL_REJECTION_MESSAGE.to_string(),
+                        None,
                     )
                 });
             Gate::Rejected(message)
@@ -373,7 +375,9 @@ async fn run_computer<C: Send + Sync + 'static>(
     span.start();
     let tool_enum = Tool::Computer(tool.clone());
     let fc = approval_call(&raw, tool.name(), String::new());
-    let tool_ctx = ToolContext::from_call(env.ctx.clone(), &env.agent.name, &fc);
+    let tool_ctx = ToolContext::from_call(env.ctx.clone(), &env.agent.name, &fc)
+        .with_agent(env.agent.clone())
+        .with_run_config(env.config.clone());
     let run = async {
         let computer = tool.resolve().await?;
         start_hooks(env, &tool_ctx, &tool_enum).await;
@@ -389,9 +393,11 @@ async fn run_computer<C: Send + Sync + 'static>(
     let image_url = match scope::with_span(span.clone(), Box::pin(run)).await {
         Ok(u) => u,
         Err(e) => {
-            span.set_error(
+            crate::tracing::record_tool_error_on_span(
+                &span,
                 "Error running tool",
-                Some(json!({"tool_name": "computer", "error": e.to_string()})),
+                &e,
+                env.config.trace_include_sensitive_data,
             );
             span.finish();
             return Err(e);
@@ -454,7 +460,9 @@ async fn run_shell<C: Send + Sync + 'static>(
     let span = tool_span(env, &tool.name, Some(action_json));
     span.start();
     let tool_enum = Tool::Shell(tool.clone());
-    let tool_ctx = ToolContext::from_call(env.ctx.clone(), &env.agent.name, &fc);
+    let tool_ctx = ToolContext::from_call(env.ctx.clone(), &env.agent.name, &fc)
+        .with_agent(env.agent.clone())
+        .with_run_config(env.config.clone());
     let requested_max = data.action.max_output_length;
     let run = async {
         start_hooks(env, &tool_ctx, &tool_enum).await;
@@ -504,9 +512,11 @@ async fn run_shell<C: Send + Sync + 'static>(
                 status = "failed";
                 let msg = e.to_string();
                 if let Some(s) = scope::current_span() {
-                    s.set_error(
+                    crate::tracing::record_tool_error_on_span(
+                        &s,
                         "Error running tool",
-                        Some(json!({"tool_name": tool.name, "error": msg})),
+                        &msg,
+                        env.config.trace_include_sensitive_data,
                     );
                 }
                 log_tool_error("Shell executor failed", &msg);
@@ -572,7 +582,9 @@ async fn run_local_shell<C: Send + Sync + 'static>(
         tool.name(),
         raw.get("action").map(Value::to_string).unwrap_or_default(),
     );
-    let tool_ctx = ToolContext::from_call(env.ctx.clone(), &env.agent.name, &fc);
+    let tool_ctx = ToolContext::from_call(env.ctx.clone(), &env.agent.name, &fc)
+        .with_agent(env.agent.clone())
+        .with_run_config(env.config.clone());
     let tool_enum = Tool::LocalShell(tool.clone());
     start_hooks(env, &tool_ctx, &tool_enum).await;
     let result = (tool.executor)(LocalShellCommandRequest {
@@ -643,7 +655,9 @@ async fn run_apply_patch<C: Send + Sync + 'static>(
     let span = tool_span(env, &tool.name, Some(ops_json));
     span.start();
     let tool_enum = Tool::ApplyPatch(tool.clone());
-    let tool_ctx = ToolContext::from_call(env.ctx.clone(), &env.agent.name, &fc);
+    let tool_ctx = ToolContext::from_call(env.ctx.clone(), &env.agent.name, &fc)
+        .with_agent(env.agent.clone())
+        .with_run_config(env.config.clone());
     let run = async {
         start_hooks(env, &tool_ctx, &tool_enum).await;
         let mut status = ApplyPatchStatus::Completed;
@@ -671,9 +685,11 @@ async fn run_apply_patch<C: Send + Sync + 'static>(
                 status = ApplyPatchStatus::Failed;
                 let msg = e.to_string();
                 if let Some(s) = scope::current_span() {
-                    s.set_error(
+                    crate::tracing::record_tool_error_on_span(
+                        &s,
                         "Error running tool",
-                        Some(json!({"tool_name": tool.name, "error": msg})),
+                        &msg,
+                        env.config.trace_include_sensitive_data,
                     );
                 }
                 log_tool_error("Apply patch editor failed", &msg);
@@ -748,7 +764,9 @@ async fn run_custom<C: Send + Sync + 'static>(
     let span = tool_span(env, &tool.name, Some(input.clone()));
     span.start();
     let tool_enum = Tool::Custom(tool.clone());
-    let tool_ctx = ToolContext::from_call(env.ctx.clone(), &env.agent.name, &fc);
+    let tool_ctx = ToolContext::from_call(env.ctx.clone(), &env.agent.name, &fc)
+        .with_agent(env.agent.clone())
+        .with_run_config(env.config.clone());
     let run = async {
         start_hooks(env, &tool_ctx, &tool_enum).await;
         let text = match tool.invoke(tool_ctx.clone(), input.clone()).await {
@@ -756,9 +774,11 @@ async fn run_custom<C: Send + Sync + 'static>(
             Err(e) => {
                 let msg = e.to_string();
                 if let Some(s) = scope::current_span() {
-                    s.set_error(
+                    crate::tracing::record_tool_error_on_span(
+                        &s,
                         "Error running tool",
-                        Some(json!({"tool_name": tool.name, "error": msg})),
+                        &msg,
+                        env.config.trace_include_sensitive_data,
                     );
                 }
                 log_tool_error("Custom tool failed", &msg);

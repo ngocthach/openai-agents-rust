@@ -163,7 +163,7 @@ async fn handoff_switches_agents() {
     let triage = Agent::<()>::new("Triage")
         .with_handoff(handoff(history.clone()))
         .with_model_instance(model.clone());
-    model.add_turn(vec![function_call("transfer_to_History_Tutor", "{}")]);
+    model.add_turn(vec![function_call("transfer_to_history_tutor", "{}")]);
     model.add_turn(vec![assistant_message("Washington")]);
     let result = Runner::run(&triage, "First president?").await.unwrap();
     assert_eq!(result.last_agent.name, "History Tutor");
@@ -178,7 +178,7 @@ async fn handoff_switches_agents() {
         ]
     );
     let first = &model.calls()[0];
-    assert_eq!(first.handoffs[0].name, "transfer_to_History_Tutor");
+    assert_eq!(first.handoffs[0].name, "transfer_to_history_tutor");
     let second = &model.calls()[1];
     let out = second.input.last().unwrap();
     assert_eq!(out.0["output"], r#"{"assistant":"History Tutor"}"#);
@@ -196,7 +196,7 @@ async fn handoff_input_filter_and_nested_history() {
             ))
             .with_model_instance(model.clone());
     model.add_turn(vec![function_call("get_weather", r#"{"city":"X"}"#)]);
-    model.add_turn(vec![function_call("transfer_to_B", "{}")]);
+    model.add_turn(vec![function_call("transfer_to_b", "{}")]);
     model.add_turn(vec![assistant_message("done")]);
     Runner::run(&a, "hi").await.unwrap();
     let last = model.last_call().unwrap();
@@ -216,7 +216,7 @@ async fn handoff_input_filter_and_nested_history() {
     let a = Agent::<()>::new("A")
         .with_handoff(handoff(b))
         .with_model_instance(model.clone());
-    model.add_turn(vec![function_call("transfer_to_B", "{}")]);
+    model.add_turn(vec![function_call("transfer_to_b", "{}")]);
     model.add_turn(vec![assistant_message("ok")]);
     let opts = RunOptions::new(()).run_config(RunConfig::new().with_nest_handoff_history(true));
     Runner::run_with_options(&a, "question", opts)
@@ -1006,7 +1006,7 @@ async fn tool_name_collisions_follow_policy() {
     use openai_agents_sdk::run_config::ToolNameCollisionPolicy;
     let model = setup();
     let other = Arc::new(Agent::<()>::new("B"));
-    let dup = FunctionTool::<()>::new_no_args("transfer_to_B", "Dup", |_c| async { Ok("x") });
+    let dup = FunctionTool::<()>::new_no_args("transfer_to_b", "Dup", |_c| async { Ok("x") });
     let agent = Agent::<()>::new("A")
         .with_tool(dup)
         .with_handoff(handoff(other))

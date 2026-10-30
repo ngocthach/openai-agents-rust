@@ -155,10 +155,11 @@ async fn mcp_approvals_and_prefixed_names() {
     model.add_turn(vec![function_call("mcp_ops__add", r#"{"a":1,"b":2}"#)]);
     let agent = Agent::<()>::new("Ops")
         .with_mcp_server(server.clone())
-        .with_mcp_config(MCPConfig {
-            convert_schemas_to_strict: true,
-            include_server_in_tool_names: true,
-        })
+        .with_mcp_config(
+            MCPConfig::default()
+                .with_convert_schemas_to_strict(true)
+                .with_include_server_in_tool_names(true),
+        )
         .with_model_instance(model.clone());
     let r = Runner::run(&agent, "add").await.unwrap();
     assert_eq!(r.interruptions.len(), 1);

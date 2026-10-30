@@ -1,8 +1,12 @@
 //! The agent loop. Port of `agents.run_internal`.
 
-mod history;
+pub(crate) mod history;
+mod items;
 mod local_tools;
 mod model_call;
+mod oai_conversation;
+pub(crate) mod prompt_cache_key;
+mod tool_caller;
 mod tools;
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -36,9 +40,12 @@ use crate::run_error_handlers::{
 use crate::run_state::{CURRENT_SCHEMA_VERSION, RunState};
 use crate::stream_events::{RunItemStreamEventName, StreamEvent};
 use crate::tool::{FunctionTool, HostedMCPTool, MCPToolApprovalRequest, Tool, ToolOutput};
-use crate::tool_guardrails::{ToolInputGuardrailResult, ToolOutputGuardrailResult};
+use crate::tool_guardrails::{
+    ToolGuardrailBehavior, ToolInputGuardrailResult, ToolOutputGuardrailResult,
+};
 use crate::tracing::{self as tr, Span, SpanData, scope};
 
+pub use prompt_cache_key::resolve_run_grouping_id;
 pub(crate) use tools::ToolEnv;
 
 /// Sends stream events from the run task to the streamed result.
@@ -70,13 +77,15 @@ struct ProcessedResponse<C> {
     tools_used: Vec<String>,
     last_message: Option<MessageOutput>,
     has_tool_activity: bool,
+    /// Position of each tool call id in the model response, used to order the outputs.
+    call_positions: HashMap<String, usize>,
 }
 
 struct RunLoop<C> {
     starting_agent: Arc<Agent<C>>,
     current_agent: Arc<Agent<C>>,
     ctx: RunContext<C>,
-    config: RunConfig<C>,
+    config: Arc<RunConfig<C>>,
     hooks: Option<Arc<dyn RunHooks<C>>>,
     error_handlers: RunErrorHandlers<C>,
     max_turns: Option<usize>,
@@ -113,6 +122,18 @@ struct RunLoop<C> {
     trace_id: Option<String>,
     /// Index in `generated_items` where the current turn's items start.
     turn_start: usize,
+    /// Index in the tool guardrail result lists where the current turn's results start.
+    turn_tool_input_guardrail_start: usize,
+    turn_tool_output_guardrail_start: usize,
+    /// Metadata of the nested `Agent::as_tool` invocation that started this run, if any.
+    agent_tool_invocation: Option<crate::result::AgentToolInvocation>,
+    /// Whether a handoff filter or nested history made model history differ from the public
+    /// history, so `to_input_list(Normalized)` should replay the model view.
+    model_history_diverged: bool,
+    /// What a server-managed conversation already holds.
+    server_conversation: oai_conversation::ServerConversationTracker,
+    /// The one prompt cache key this run generates, reused across turns.
+    prompt_cache_key: prompt_cache_key::PromptCacheKeyResolver,
 }
 
 fn find_agent<C>(start: &Arc<Agent<C>>, name: &str) -> Option<Arc<Agent<C>>> {
@@ -134,6 +155,33 @@ fn find_agent<C>(start: &Arc<Agent<C>>, name: &str) -> Option<Arc<Agent<C>>> {
     None
 }
 
+/// Names shared by two distinct agents in the graph reachable from `start`. A run state
+/// identifies its agent by name, so such a graph cannot be resumed unambiguously.
+/// Mirrors Python's `_has_ambiguous_hook_identities` check.
+fn ambiguous_agent_names<C>(start: &Arc<Agent<C>>) -> Vec<String> {
+    let mut seen_ptrs = HashSet::new();
+    let mut by_name: HashMap<String, usize> = HashMap::new();
+    let mut queue = VecDeque::from([start.clone()]);
+    while let Some(a) = queue.pop_front() {
+        if !seen_ptrs.insert(Arc::as_ptr(&a) as usize) {
+            continue;
+        }
+        *by_name.entry(a.name.clone()).or_default() += 1;
+        for h in &a.handoffs {
+            if let Some(t) = h.agent.as_ref() {
+                queue.push_back(t.clone());
+            }
+        }
+    }
+    let mut names: Vec<String> = by_name
+        .into_iter()
+        .filter(|(_, count)| *count > 1)
+        .map(|(name, _)| name)
+        .collect();
+    names.sort();
+    names
+}
+
 fn strip_reasoning_id(item: InputItem, policy: ReasoningItemIdPolicy) -> InputItem {
     if policy == ReasoningItemIdPolicy::Omit && item.item_type() == Some("reasoning") {
         let mut v = item.0;
@@ -141,6 +189,15 @@ fn strip_reasoning_id(item: InputItem, policy: ReasoningItemIdPolicy) -> InputIt
             m.remove("id");
         }
         return InputItem(v);
+    }
+    item
+}
+
+/// Drop the provider-assigned item id, so a store that owns its history can still match a
+/// replayed item against what it holds. Port of `digest_input_item(ignore_ids_for_matching)`.
+pub(crate) fn strip_item_id(mut item: InputItem) -> InputItem {
+    if let Value::Object(map) = &mut item.0 {
+        map.remove("id");
     }
     item
 }
@@ -241,6 +298,7 @@ fn match_local_call<C>(
     tools: &[Tool<C>],
     v: &Value,
     ty: &str,
+    agent_name: &str,
 ) -> Result<Option<local_tools::LocalCall<C>>> {
     use local_tools::LocalCall;
     let missing = |what: &str| {
@@ -253,26 +311,51 @@ fn match_local_call<C>(
             Tool::Computer(c) => Some(c.clone()),
             _ => None,
         }) {
-            Some(c) => Ok(Some(LocalCall::Computer(v.clone(), c))),
+            Some(c) => {
+                tool_caller::ensure_tool_caller_allowed(v, None, c.name(), agent_name)?;
+                Ok(Some(LocalCall::Computer(v.clone(), c)))
+            }
             None => missing("ComputerTool"),
         },
         // Hosted shells are executed by OpenAI: only local shell tools run here.
-        "shell_call" => Ok(tools.iter().find_map(|t| match t {
-            Tool::Shell(s) if s.is_local() => Some(LocalCall::Shell(v.clone(), s.clone())),
+        "shell_call" => match tools.iter().find_map(|t| match t {
+            Tool::Shell(s) if s.is_local() => Some(s.clone()),
             _ => None,
-        })),
+        }) {
+            Some(s) => {
+                tool_caller::ensure_tool_caller_allowed(
+                    v,
+                    s.allowed_callers.as_deref(),
+                    &s.name,
+                    agent_name,
+                )?;
+                Ok(Some(LocalCall::Shell(v.clone(), s)))
+            }
+            None => Ok(None),
+        },
         "local_shell_call" => match tools.iter().find_map(|t| match t {
             Tool::LocalShell(s) => Some(s.clone()),
             _ => None,
         }) {
-            Some(s) => Ok(Some(LocalCall::LocalShell(v.clone(), s))),
+            Some(s) => {
+                tool_caller::ensure_tool_caller_allowed(v, None, s.name(), agent_name)?;
+                Ok(Some(LocalCall::LocalShell(v.clone(), s)))
+            }
             None => missing("LocalShellTool"),
         },
         "apply_patch_call" => match tools.iter().find_map(|t| match t {
             Tool::ApplyPatch(a) => Some(a.clone()),
             _ => None,
         }) {
-            Some(a) => Ok(Some(LocalCall::ApplyPatch(v.clone(), a))),
+            Some(a) => {
+                tool_caller::ensure_tool_caller_allowed(
+                    v,
+                    a.allowed_callers.as_deref(),
+                    &a.name,
+                    agent_name,
+                )?;
+                Ok(Some(LocalCall::ApplyPatch(v.clone(), a)))
+            }
             None => missing("ApplyPatchTool"),
         },
         "custom_tool_call" => {
@@ -281,7 +364,15 @@ fn match_local_call<C>(
                 Tool::Custom(c) if c.name == name => Some(c.clone()),
                 _ => None,
             }) {
-                Some(c) => Ok(Some(LocalCall::Custom(v.clone(), c))),
+                Some(c) => {
+                    tool_caller::ensure_tool_caller_allowed(
+                        v,
+                        c.allowed_callers.as_deref(),
+                        &c.name,
+                        agent_name,
+                    )?;
+                    Ok(Some(LocalCall::Custom(v.clone(), c)))
+                }
                 None => Err(AgentsError::model_behavior(format!(
                     "Custom tool {name} not found"
                 ))),
@@ -289,6 +380,34 @@ fn match_local_call<C>(
         }
         _ => Ok(None),
     }
+}
+
+/// Rebuild a blocked tool output from allowlisted fields only.
+/// Port of `blocked_function_output_payload`.
+fn blocked_tool_output_payload(raw_item: &Value, message: &str) -> Value {
+    let mut sanitized = json!({
+        "type": raw_item
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("function_call_output"),
+        "output": message,
+    });
+    for key in ["call_id", "id", "status"] {
+        if let Some(v) = raw_item.get(key).and_then(Value::as_str) {
+            sanitized[key] = Value::String(v.to_string());
+        }
+    }
+    // Only a direct caller survives sanitization; a program caller would reattach the
+    // blocked item to a transcript this run must not replay.
+    if raw_item
+        .get("caller")
+        .and_then(|c| c.get("type"))
+        .and_then(Value::as_str)
+        == Some("direct")
+    {
+        sanitized["caller"] = json!({"type": "direct"});
+    }
+    sanitized
 }
 
 fn call_id_of(item: &RunItem) -> Option<String> {
@@ -341,13 +460,14 @@ pub(crate) async fn run_loop<C: Send + Sync + 'static>(
         conversation_id,
         session,
         shares_parent_context,
+        agent_tool_invocation,
     } = options;
 
     let mut lp = RunLoop {
         starting_agent: starting_agent.clone(),
         current_agent: starting_agent.clone(),
         ctx: context,
-        config: run_config,
+        config: Arc::new(run_config),
         hooks,
         error_handlers,
         max_turns,
@@ -358,6 +478,10 @@ pub(crate) async fn run_loop<C: Send + Sync + 'static>(
         session_input: Vec::new(),
         generated_items: Vec::new(),
         model_items: Vec::new(),
+        agent_tool_invocation,
+        model_history_diverged: false,
+        server_conversation: Default::default(),
+        prompt_cache_key: Default::default(),
         model_responses: Vec::new(),
         current_turn: 0,
         input_guardrail_results: Vec::new(),
@@ -379,6 +503,8 @@ pub(crate) async fn run_loop<C: Send + Sync + 'static>(
         agent_span: None,
         trace_id: None,
         turn_start: 0,
+        turn_tool_input_guardrail_start: 0,
+        turn_tool_output_guardrail_start: 0,
     };
 
     let server_managed = lp.conversation_id.is_some()
@@ -387,6 +513,19 @@ pub(crate) async fn run_loop<C: Send + Sync + 'static>(
     if lp.session.is_some() && server_managed {
         return Err(AgentsError::user(
             "Session persistence cannot be combined with conversation_id, previous_response_id, or auto_previous_response_id.",
+        ));
+    }
+    // Rejected output cannot be removed from a server-managed conversation, so a blocked
+    // terminal output would stay in the provider's history. Port of
+    // `validate_output_guardrails_with_server_managed_conversation`.
+    if server_managed
+        && (!lp.starting_agent.output_guardrails.is_empty()
+            || !lp.config.output_guardrails.is_empty())
+    {
+        return Err(AgentsError::user(
+            "Output guardrails cannot be combined with conversation_id, previous_response_id, \
+             or auto_previous_response_id because rejected output cannot be removed from \
+             server-managed conversation history.",
         ));
     }
 
@@ -400,38 +539,33 @@ pub(crate) async fn run_loop<C: Send + Sync + 'static>(
         }
     }
 
-    // Tracing: reuse the current trace or start a new one.
-    let existing = scope::current_trace();
-    let created = if existing.is_none() {
-        let mut b = tr::trace(lp.config.workflow_name.clone()).disabled(lp.config.tracing_disabled);
-        if let Some(id) = lp.config.trace_id.clone().or_else(|| lp.trace_id.clone()) {
-            b = b.trace_id(id);
-        }
-        if let Some(g) = &lp.config.group_id {
-            b = b.group_id(g.clone());
-        }
-        let mut metadata = lp.config.trace_metadata.clone();
-        if let Some(h) = crate::models::resolve_openai_harness_id(lp.config.model_provider.as_ref())
-            && !metadata
-                .as_ref()
-                .is_some_and(|m| m.contains_key("agent_harness_id"))
-        {
-            metadata
-                .get_or_insert_with(Default::default)
-                .insert("agent_harness_id".into(), Value::String(h));
-        }
-        if let Some(m) = metadata {
-            b = b.metadata(m);
-        }
-        if let Some(k) = &lp.config.tracing_api_key {
-            b = b.tracing_api_key(k.clone());
-        }
-        Some(b.build())
-    } else {
-        None
-    };
-    let trace = created.clone().or(existing).expect("trace");
+    // Tracing: reuse the current trace, or start one. A run with tracing turned off always
+    // gets its own disabled trace so it cannot export spans into an enabled outer trace.
+    let mut metadata = lp.config.trace_metadata.clone();
+    if let Some(h) = crate::models::resolve_openai_harness_id(lp.config.model_provider.as_ref())
+        && !metadata
+            .as_ref()
+            .is_some_and(|m| m.contains_key("agent_harness_id"))
+    {
+        metadata
+            .get_or_insert_with(Default::default)
+            .insert("agent_harness_id".into(), Value::String(h));
+    }
+    let created = tr::create_trace_for_run(
+        lp.config.workflow_name.clone(),
+        lp.config.trace_id.clone().or_else(|| lp.trace_id.clone()),
+        lp.config.group_id.clone(),
+        metadata,
+        lp.config.tracing_api_key.clone(),
+        lp.config.tracing_disabled,
+    );
+    let trace = created
+        .clone()
+        .or_else(scope::current_trace)
+        .expect("trace");
     lp.trace_id = Some(trace.trace_id().to_string());
+    // A disabled run must not see the caller's span either, or its children would attach to it.
+    let mask = lp.config.tracing_disabled.then(tr::masked_run_span);
 
     let body = async {
         let task_span = if lp.config.include_task_and_turn_spans && !lp.config.tracing_disabled {
@@ -465,7 +599,12 @@ pub(crate) async fn run_loop<C: Send + Sync + 'static>(
                 }
             });
             if let Err(e) = &res {
-                s.set_error("Run failed", Some(json!({"error": e.to_string()})));
+                s.set_error(
+                    "Run failed",
+                    Some(json!({
+                        "error": tr::model_error_text(e, lp.config.trace_include_sensitive_data)
+                    })),
+                );
             }
             s.finish();
         }
@@ -473,6 +612,12 @@ pub(crate) async fn run_loop<C: Send + Sync + 'static>(
             s.finish();
         }
         res
+    };
+    let body = async {
+        match mask {
+            Some(span) => scope::with_span(span, Box::pin(body)).await,
+            None => body.await,
+        }
     };
     match created {
         Some(t) => t.run(body).await,
@@ -492,6 +637,14 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
             return Err(AgentsError::user(
                 "This run state already finished; start a new run instead.",
             ));
+        }
+        let ambiguous = ambiguous_agent_names(&self.starting_agent);
+        if !ambiguous.is_empty() {
+            return Err(AgentsError::user(format!(
+                "Cannot resume a run whose agent graph has same-named agents ({}). \
+                 Use unique agent names before starting a resumable run.",
+                ambiguous.join(", ")
+            )));
         }
         let agent =
             find_agent(&self.starting_agent, &state.current_agent_name).ok_or_else(|| {
@@ -536,6 +689,24 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
         self.auto_previous_response_id |= state.auto_previous_response_id;
         self.server_sent_items = state.server_sent_items.min(self.model_items.len());
         self.server_input_sent = state.server_input_sent;
+        self.server_conversation.hydrate_from_state(
+            &state.server_conversation,
+            &state.original_input,
+            &state.generated_items,
+            &state.model_responses,
+            state.server_input_sent,
+        );
+        self.server_conversation
+            .set_sent_initial_input(state.server_input_sent);
+        self.prompt_cache_key = prompt_cache_key::PromptCacheKeyResolver::from_generated_key(
+            state.generated_prompt_cache_key.clone(),
+        );
+        for (agent_name, tools) in &state.tool_use_tracker {
+            self.tools_used
+                .entry(agent_name.clone())
+                .or_default()
+                .extend(tools.iter().cloned());
+        }
         self.session_saved_items = state.session_saved_items.min(self.generated_items.len());
         self.input_saved_to_session = state.input_saved_to_session;
         self.pending_input = state.pending_input.clone();
@@ -589,11 +760,34 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
     }
 
     async fn run(&mut self) -> Result<RunResult<C>> {
-        match self.run_inner().await {
+        let outcome = self.run_inner().await;
+        self.dispose_computers().await;
+        match outcome {
             Ok(r) => Ok(r),
             Err(e) => {
                 let details = self.run_details();
                 Err(e.with_run_data(details))
+            }
+        }
+    }
+
+    /// Tear down the computers this run created. Port of `dispose_resolved_computers`.
+    async fn dispose_computers(&self) {
+        let mut seen: HashSet<usize> = HashSet::new();
+        let mut queue = VecDeque::from([self.starting_agent.clone(), self.current_agent.clone()]);
+        while let Some(agent) = queue.pop_front() {
+            if !seen.insert(Arc::as_ptr(&agent) as usize) {
+                continue;
+            }
+            for tool in agent.tools.iter() {
+                if let Tool::Computer(c) = tool {
+                    c.dispose().await;
+                }
+            }
+            for h in &agent.handoffs {
+                if let Some(t) = h.agent.as_ref() {
+                    queue.push_back(t.clone());
+                }
             }
         }
     }
@@ -691,7 +885,15 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
                         }
                     });
                     if let Err(e) = &res {
-                        turn_span.set_error("Turn failed", Some(json!({"error": e.to_string()})));
+                        turn_span.set_error(
+                            "Turn failed",
+                            Some(json!({
+                                "error": tr::model_error_text(
+                                    e,
+                                    self.config.trace_include_sensitive_data,
+                                )
+                            })),
+                        );
                     }
                     turn_span.finish();
                     res?
@@ -870,7 +1072,8 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
                 f(&crate::run_config::OutputGuardrailBlockedMessageArgs {
                     default_message: default.clone(),
                     guardrail_name: tripped.guardrail_name.clone(),
-                    agent_name: agent.name.clone(),
+                    agent,
+                    run_context: &self.ctx,
                 })
                 .filter(|m| !m.is_empty())
                 .unwrap_or(default.clone())
@@ -886,12 +1089,27 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
         }
         let mut tripped = tripped;
         sanitize(&mut tripped);
+        // Tool guardrails saw the blocked payload too; their `output_info` and any rejection
+        // message must not keep it. Port of `_data_free_tool_output_guardrail_results`.
+        let tool_output_start = self
+            .turn_tool_output_guardrail_start
+            .min(self.tool_output_guardrail_results.len());
+        for r in &mut self.tool_output_guardrail_results[tool_output_start..] {
+            r.output.output_info = Value::String(message.clone());
+            if let ToolGuardrailBehavior::RejectContent { message: m } = &mut r.output.behavior {
+                *m = message.clone();
+            }
+        }
+        // Rebuild the blocked tool items from allowlisted fields instead of overwriting the
+        // payload in place, so no part of the rejected output survives in the raw item.
+        // Port of `blocked_function_call_payload` / `blocked_function_output_payload`.
         let redact = |items: &mut [RunItem], from: usize| {
             for item in items.iter_mut().skip(from) {
-                if let RunItemKind::ToolCallOutput { raw_item, output } = &mut item.kind {
-                    if raw_item.get("output").is_some() {
-                        raw_item["output"] = Value::String(message.clone());
-                    }
+                if let RunItemKind::ToolCallOutput {
+                    raw_item, output, ..
+                } = &mut item.kind
+                {
+                    *raw_item = blocked_tool_output_payload(raw_item, &message);
                     *output = Value::String(message.clone());
                 }
             }
@@ -954,6 +1172,18 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
             trace_id: self.trace_id.clone(),
             context: None,
             turn_start_index: self.turn_start,
+            tool_use_tracker: self
+                .tools_used
+                .iter()
+                .map(|(agent, tools)| {
+                    let mut names: Vec<String> = tools.clone();
+                    names.sort();
+                    names.dedup();
+                    (agent.clone(), names)
+                })
+                .collect(),
+            generated_prompt_cache_key: self.prompt_cache_key.generated_key(),
+            server_conversation: self.server_conversation.state(),
         };
         RunResult {
             input: self.original_input.clone(),
@@ -967,6 +1197,9 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
             tool_output_guardrail_results: self.tool_output_guardrail_results.clone(),
             context_wrapper: self.ctx.clone(),
             interruptions,
+            agent_tool_invocation: self.agent_tool_invocation.clone(),
+            model_input_items: self.model_items.clone(),
+            replay_from_model_input_items: self.model_history_diverged,
             state,
         }
     }
@@ -981,6 +1214,7 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
         }
         let new: Vec<InputItem> = items_to_input(&self.generated_items[self.session_saved_items..]);
         items.extend(new);
+        let items = items::deduplicate_input_items_preferring_latest(items);
         if !items.is_empty() {
             session.add_items(items).await?;
         }
@@ -1006,12 +1240,20 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
         let mut model_exchange = Vec::new();
         if session.wants_model_exchange() {
             let policy = self.config.reasoning_item_id_policy;
+            // A store that owns its history assigns its own item ids, so matching on them
+            // would never find the replayed item. Port of `_ignore_ids_for_matching`.
+            let ignore_ids = session.manages_history_remotely();
             for item in self
                 .model_prefix
                 .iter()
                 .cloned()
                 .chain(items_to_input(&self.model_items))
             {
+                let item = if ignore_ids {
+                    strip_item_id(item)
+                } else {
+                    item
+                };
                 let stripped = crate::memory::compaction_item_digest(&strip_reasoning_id(
                     item.clone(),
                     policy,
@@ -1066,7 +1308,7 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
         }
     }
 
-    fn resolve_settings(&self, agent: &Agent<C>, model: &Arc<dyn Model>) -> ModelSettings {
+    fn resolve_settings(&mut self, agent: &Agent<C>, model: &Arc<dyn Model>) -> ModelSettings {
         let base = if agent.model_settings_explicit {
             agent.model_settings.clone()
         } else {
@@ -1085,31 +1327,44 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
         {
             s.tool_choice = None;
         }
+        // One generated key per run, grouped by conversation, session, trace group or run.
+        // Port of `PromptCacheKeyResolver` + `model_settings_with_prompt_cache_key`.
+        let key = self.prompt_cache_key.resolve(
+            &s,
+            model,
+            self.conversation_id.as_deref(),
+            self.session.as_ref(),
+            self.config.group_id.as_deref(),
+        );
+        prompt_cache_key::apply_prompt_cache_key(&mut s, key.as_deref());
         s
     }
 
     fn build_model_input(&mut self) -> Vec<InputItem> {
         let policy = self.config.reasoning_item_id_policy;
+        // Orphan pruning applies only to runner-generated history: a caller who passes an
+        // unanswered call in the run input gets it back verbatim, like Python.
         if self.server_managed() {
-            let mut input = Vec::new();
-            if !self.server_input_sent {
-                input.extend(self.model_prefix.clone());
-            }
-            input.extend(
-                items_to_input(
-                    &self.model_items[self.server_sent_items.min(self.model_items.len())..],
-                )
+            // Deltas are chosen by server identity and content fingerprint, not by an index
+            // cursor, so a retry or a resumed state cannot resend or skip an item.
+            let prefix = self.model_prefix.clone();
+            let mut input = self.server_conversation.take_initial_input(&prefix);
+            // Decide on the raw item: stripping the reasoning id first would hide the
+            // server identity the tracker matches on.
+            let generated: Vec<InputItem> = items_to_input(&self.model_items)
                 .into_iter()
-                .map(|i| strip_reasoning_id(i, policy)),
-            );
+                .filter(|i| self.server_conversation.needs_send(i))
+                .map(|i| strip_reasoning_id(i, policy))
+                .collect();
+            input.extend(items::drop_orphan_function_calls(generated));
             input
         } else {
             let mut input = self.model_prefix.clone();
-            input.extend(
-                items_to_input(&self.model_items)
-                    .into_iter()
-                    .map(|i| strip_reasoning_id(i, policy)),
-            );
+            let generated: Vec<InputItem> = items_to_input(&self.model_items)
+                .into_iter()
+                .map(|i| strip_reasoning_id(i, policy))
+                .collect();
+            input.extend(items::drop_orphan_function_calls(generated));
             input
         }
     }
@@ -1177,6 +1432,8 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
         }
 
         self.turn_start = self.generated_items.len();
+        self.turn_tool_input_guardrail_start = self.tool_input_guardrail_results.len();
+        self.turn_tool_output_guardrail_start = self.tool_output_guardrail_results.len();
         let first_turn = self.current_turn == 1 && !self.is_resumed;
         if first_turn {
             self.load_session_history().await?;
@@ -1229,6 +1486,10 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
             input = r.input;
             instructions = r.instructions;
         }
+        input = items::deduplicate_input_items_preferring_latest(input);
+        // Hooks and tools see exactly what the model is about to see.
+        self.ctx.set_turn_input(input.clone());
+        let sent_input = input.clone();
 
         let mut tool_specs: Vec<ToolSpec> = Vec::with_capacity(tools.len());
         for t in &tools {
@@ -1327,6 +1588,8 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
             {
                 self.previous_response_id = Some(id.clone());
             }
+            self.server_conversation.mark_input_as_sent(&sent_input);
+            self.server_conversation.track_server_items(&response);
             self.server_sent_items = self.model_items.len();
         }
         Box::pin(self.execute_side_effects(&agent, processed)).await
@@ -1367,6 +1630,7 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
             tools_used: Vec::new(),
             last_message: None,
             has_tool_activity: false,
+            call_positions: HashMap::new(),
         };
         let function_map: HashMap<String, &Arc<FunctionTool<C>>> = tools
             .iter()
@@ -1382,8 +1646,59 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
             })
             .collect();
         let name = agent.name.clone();
+        let programmatic_tool_present = tools
+            .iter()
+            .any(|t| matches!(t, Tool::ProgrammaticToolCalling(_)));
+        let server_managed = self.server_managed();
+        // Pre-step items only: this response's own program items are collected as the loop
+        // walks its output, so including them here would reject their own children.
+        let pre_step = self.turn_start.min(self.generated_items.len());
+        let history_raw: Vec<Value> = self.generated_items[..pre_step]
+            .iter()
+            .map(|i| i.to_input_item().0)
+            .collect();
+        let (mut program_call_ids, mut completed_program_call_ids) =
+            tool_caller::collect_program_parent_state(&history_raw, server_managed);
+        let response_raw: Vec<Value> = response.output.iter().map(OutputItem::to_value).collect();
+        let (_, response_completed_program_call_ids) =
+            tool_caller::collect_program_parent_state(&response_raw, false);
+        // One response must never schedule the same tool call twice. Port of
+        // `_dedupe_processed_response_invocations` / `_dedupe_tool_call_items`.
+        let mut seen_invocations: HashSet<(String, String)> = HashSet::new();
 
         for out in &response.output {
+            let raw_out = out.to_value();
+            let out_type = out.item_type();
+            let is_program_owned = raw_out
+                .get("caller")
+                .and_then(|c| c.get("type"))
+                .and_then(Value::as_str)
+                == Some("program");
+            if (out_type == "program" || out_type == "program_output" || is_program_owned)
+                && !programmatic_tool_present
+            {
+                processed
+                    .tools_used
+                    .push("programmatic_tool_calling".into());
+                self.tools_used
+                    .entry(agent.name.clone())
+                    .or_default()
+                    .extend(processed.tools_used.iter().cloned());
+                return Err(AgentsError::model_behavior(format!(
+                    "Model produced {out_type} item without a programmatic_tool_calling tool."
+                )));
+            }
+            if is_program_owned {
+                let mut completed = completed_program_call_ids.clone();
+                completed.extend(response_completed_program_call_ids.iter().cloned());
+                tool_caller::ensure_programmatic_tool_call_parent(
+                    &raw_out,
+                    programmatic_tool_present,
+                    &program_call_ids,
+                    &completed,
+                    &agent.name,
+                )?;
+            }
             match out {
                 OutputItem::Message(m) => {
                     processed.last_message = Some(m.clone());
@@ -1411,6 +1726,11 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
                 OutputItem::FunctionCall(fc) => {
                     processed.has_tool_activity = true;
                     if let Some(h) = handoff_map.get(fc.name.as_str()) {
+                        if !seen_invocations
+                            .insert(("handoff_call".to_string(), fc.call_id.clone()))
+                        {
+                            continue;
+                        }
                         if append {
                             let item = RunItem::new(
                                 name.clone(),
@@ -1424,6 +1744,17 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
                             processed.handoffs.push((fc.clone(), (*h).clone()));
                         }
                     } else if let Some(t) = function_map.get(&function_lookup_name(fc)) {
+                        if !seen_invocations
+                            .insert(("function_call".to_string(), fc.call_id.clone()))
+                        {
+                            continue;
+                        }
+                        tool_caller::ensure_tool_caller_allowed(
+                            &raw_out,
+                            t.allowed_callers.as_deref(),
+                            &t.name,
+                            &agent.name,
+                        )?;
                         if append {
                             let item = RunItem::new(
                                 name.clone(),
@@ -1434,6 +1765,8 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
                             self.push_item(item, Some(RunItemStreamEventName::ToolCalled));
                         }
                         processed.tools_used.push(fc.name.clone());
+                        let next = processed.call_positions.len();
+                        processed.call_positions.insert(fc.call_id.clone(), next);
                         if !skip.contains(&fc.call_id) {
                             processed.functions.push((fc.clone(), (*t).clone()));
                         }
@@ -1459,6 +1792,7 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
                                     );
                                     let msg = tools::tool_not_found_message(
                                         &self.config,
+                                        &self.ctx,
                                         &fc.name,
                                         &fc.call_id,
                                     );
@@ -1469,6 +1803,7 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
                                         RunItemKind::ToolCallOutput {
                                             raw_item: raw,
                                             output: out.to_json_value(),
+                                            custom_data: None,
                                         },
                                     );
                                     self.push_item(item, Some(RunItemStreamEventName::ToolOutput));
@@ -1479,7 +1814,118 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
                 }
                 OutputItem::Other(v) => {
                     let ty = v.get("type").and_then(Value::as_str).unwrap_or_default();
-                    if let Some(local) = match_local_call(tools, v, ty)? {
+                    if ty == "program" {
+                        let Some(call_id) = v
+                            .get("call_id")
+                            .and_then(Value::as_str)
+                            .filter(|s| !s.is_empty())
+                        else {
+                            return Err(AgentsError::model_behavior(
+                                "Model produced program item without a valid call_id.",
+                            ));
+                        };
+                        program_call_ids.insert(call_id.to_string());
+                        if append {
+                            let item = RunItem::new(
+                                name.clone(),
+                                RunItemKind::ToolCall {
+                                    raw_item: v.clone(),
+                                },
+                            );
+                            self.push_item(item, Some(RunItemStreamEventName::ToolCalled));
+                        }
+                        processed
+                            .tools_used
+                            .push("programmatic_tool_calling".into());
+                        continue;
+                    }
+                    if ty == "program_output" {
+                        let call_id = v
+                            .get("call_id")
+                            .and_then(Value::as_str)
+                            .filter(|s| program_call_ids.contains(*s))
+                            .ok_or_else(|| {
+                                AgentsError::model_behavior(
+                                    "Model produced program_output item that does not match a \
+                                     parent program item.",
+                                )
+                            })?
+                            .to_string();
+                        if completed_program_call_ids.contains(&call_id) {
+                            return Err(AgentsError::model_behavior(
+                                "Model produced program_output item whose parent program is \
+                                 already completed.",
+                            ));
+                        }
+                        let status = v.get("status").and_then(Value::as_str).unwrap_or_default();
+                        if status != "completed" && status != "incomplete" {
+                            return Err(AgentsError::model_behavior(
+                                "Model produced program_output item without a valid status.",
+                            ));
+                        }
+                        let Some(result) = v.get("result").and_then(Value::as_str) else {
+                            return Err(AgentsError::model_behavior(
+                                "Model produced program_output item without a string result.",
+                            ));
+                        };
+                        if append {
+                            let item = RunItem::new(
+                                name.clone(),
+                                RunItemKind::ToolCallOutput {
+                                    raw_item: v.clone(),
+                                    output: Value::String(result.to_string()),
+                                    custom_data: None,
+                                },
+                            );
+                            self.push_item(item, Some(RunItemStreamEventName::ToolOutput));
+                        }
+                        if status == "completed" {
+                            completed_program_call_ids.insert(call_id);
+                        }
+                        processed
+                            .tools_used
+                            .push("programmatic_tool_calling".into());
+                        continue;
+                    }
+                    if ty == "compaction" {
+                        if append {
+                            let mut raw = v.clone();
+                            if let Value::Object(m) = &mut raw {
+                                m.remove("created_by");
+                            }
+                            // Python emits no stream event for compaction items.
+                            self.push_item(
+                                RunItem::new(
+                                    name.clone(),
+                                    RunItemKind::Compaction { raw_item: raw },
+                                ),
+                                None,
+                            );
+                        }
+                        continue;
+                    }
+                    if ty == "tool_search_call" || ty == "tool_search_output" {
+                        tool_caller::ensure_tool_caller_allowed(
+                            v,
+                            None,
+                            "tool_search",
+                            &agent.name,
+                        )?;
+                        if ty == "tool_search_call"
+                            && v.get("execution").and_then(Value::as_str) == Some("client")
+                        {
+                            return Err(AgentsError::model_behavior(
+                                "Client-executed tool_search calls are not supported by the \
+                                 standard agent runner. Handle the tool_search_call yourself \
+                                 and return a matching tool_search_output item with the same \
+                                 call_id.",
+                            ));
+                        }
+                    }
+                    if let Some(local) = match_local_call(tools, v, ty, &agent.name)? {
+                        if !seen_invocations.insert((ty.to_string(), local_tools::call_id_of(v))) {
+                            continue;
+                        }
                         processed.has_tool_activity = true;
                         if append {
                             let item = RunItem::new(
@@ -1491,6 +1937,10 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
                             self.push_item(item, Some(RunItemStreamEventName::ToolCalled));
                         }
                         processed.tools_used.push(local.tool_name());
+                        let next = processed.call_positions.len();
+                        processed
+                            .call_positions
+                            .insert(local_tools::call_id_of(v), next);
                         if !skip.contains(&local_tools::call_id_of(v)) {
                             processed.local_calls.push(local);
                         }
@@ -1503,6 +1953,7 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
                                 RunItemKind::ToolCallOutput {
                                     raw_item: v.clone(),
                                     output: v.get("output").cloned().unwrap_or(Value::Null),
+                                    custom_data: None,
                                 },
                             );
                             self.push_item(item, Some(RunItemStreamEventName::ToolOutput));
@@ -1552,6 +2003,7 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
                                     RunItemKind::ToolCallOutput {
                                         raw_item: v.clone(),
                                         output: Value::Null,
+                                        custom_data: None,
                                     },
                                 );
                                 self.push_item(
@@ -1575,7 +2027,9 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
                                 );
                                 self.push_item(item, Some(event));
                             }
-                            if ty.ends_with("_call") {
+                            // `tool_search_call` is deliberately excluded from tool-use
+                            // tracking so it never resets `tool_choice`.
+                            if ty.ends_with("_call") && ty != "tool_search_call" {
                                 processed.tools_used.push(ty.to_string());
                             }
                         }
@@ -1595,10 +2049,13 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
     async fn execute_side_effects(
         &mut self,
         agent: &Arc<Agent<C>>,
-        processed: ProcessedResponse<C>,
+        mut processed: ProcessedResponse<C>,
     ) -> Result<NextStep<C>> {
         let mut interruptions: Vec<ToolApprovalItem> = Vec::new();
         let ran_functions = !processed.functions.is_empty();
+        let outputs_start = self.generated_items.len();
+        let model_outputs_start = self.model_items.len();
+        let call_positions = std::mem::take(&mut processed.call_positions);
 
         // Function tools.
         let results = {
@@ -1616,6 +2073,7 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
                 .extend(r.input_guardrail_results);
             self.tool_output_guardrail_results
                 .extend(r.output_guardrail_results);
+            let custom_data = r.custom_data.clone();
             match r.outcome {
                 tools::ToolOutcome::Output { output, item } => {
                     let ri = RunItem::new(
@@ -1623,11 +2081,14 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
                         RunItemKind::ToolCallOutput {
                             raw_item: item,
                             output: output.to_json_value(),
+                            custom_data: custom_data.clone(),
                         },
                     );
                     self.push_item(ri.clone(), Some(RunItemStreamEventName::ToolOutput));
                     function_results.push(crate::tool::FunctionToolResult {
                         tool_name: r.tool_name,
+                        qualified_tool_name: r.qualified_tool_name,
+                        custom_data: r.custom_data,
                         call_id: r.call.call_id.clone(),
                         output,
                         run_item: Some(ri),
@@ -1754,7 +2215,11 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
                 local_tools::LocalOutcome::Output { raw_item, output } => {
                     let ri = RunItem::new(
                         agent.name.clone(),
-                        RunItemKind::ToolCallOutput { raw_item, output },
+                        RunItemKind::ToolCallOutput {
+                            raw_item,
+                            output,
+                            custom_data: None,
+                        },
                     );
                     self.push_item(ri, Some(RunItemStreamEventName::ToolOutput));
                 }
@@ -1770,6 +2235,19 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
                 }
             }
         }
+
+        // Tool outputs are appended in phase order (function, hosted MCP, local); replay them
+        // in the order the model asked for them. Port of `order_current_turn_tool_outputs`.
+        items::order_current_turn_tool_outputs(
+            &mut self.generated_items,
+            outputs_start,
+            &call_positions,
+        );
+        items::order_current_turn_tool_outputs(
+            &mut self.model_items,
+            model_outputs_start,
+            &call_positions,
+        );
 
         if !interruptions.is_empty() {
             return Ok(NextStep::Interruption(interruptions));
@@ -1789,7 +2267,10 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
                 }
                 ToolUseBehavior::StopAtTools(s) => function_results
                     .iter()
-                    .find(|r| s.stop_at_tool_names.contains(&r.tool_name))
+                    .find(|r| {
+                        s.stop_at_tool_names.contains(&r.tool_name)
+                            || s.stop_at_tool_names.contains(&r.qualified_tool_name)
+                    })
                     .map(|r| r.output.to_json_value()),
                 ToolUseBehavior::Custom(f) => {
                     let r = f(self.ctx.clone(), function_results.clone()).await?;
@@ -1920,6 +2401,7 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
                 RunItemKind::ToolCallOutput {
                     raw_item: raw.0,
                     output: Value::String("Multiple handoffs detected, ignoring this one.".into()),
+                    custom_data: None,
                 },
             );
             self.push_item(ri, Some(RunItemStreamEventName::ToolOutput));
@@ -1937,7 +2419,9 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
             Err(e) => {
                 span.set_error(
                     "Error invoking handoff",
-                    Some(json!({"error": e.to_string()})),
+                    Some(json!({
+                        "error": tr::model_error_text(&e, self.config.trace_include_sensitive_data)
+                    })),
                 );
                 span.finish();
                 return Err(e);
@@ -1997,16 +2481,26 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
             self.session_saved_items = self.session_saved_items.min(generated.len());
             self.generated_items = generated;
             self.model_items = model_items;
+            self.model_history_diverged = true;
         } else if handoff
             .nest_handoff_history
             .unwrap_or(self.config.nest_handoff_history)
             && !self.server_managed()
         {
-            let mut transcript = self.model_prefix.clone();
-            transcript.extend(items_to_input(&self.model_items));
+            // Model history can be shorter than the public history after an earlier filter,
+            // so anchor the pre-handoff split at its tail.
+            let model_pre_count = self
+                .model_items
+                .len()
+                .saturating_sub(self.generated_items.len() - pre_handoff_count);
+            let normalized = history::normalize_handoff_items(&self.model_items, model_pre_count);
             self.model_prefix = match &self.config.handoff_history_mapper {
-                Some(m) => m(transcript),
-                None => vec![history::build_summary_message(&transcript)],
+                Some(m) => {
+                    let mut transcript = self.model_prefix.clone();
+                    transcript.extend(normalized.into_iter().map(|(item, _)| item));
+                    m(transcript)
+                }
+                None => history::build_ordered_history(self.model_prefix.clone(), normalized),
             };
             self.model_items.clear();
             self.server_sent_items = 0;

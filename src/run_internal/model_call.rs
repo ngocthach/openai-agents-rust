@@ -88,6 +88,8 @@ pub(crate) async fn call_model<C: Send + Sync + 'static>(
     let stateful = request.previous_response_id.is_some() || request.conversation_id.is_some();
     let mut attempt: u32 = 0;
     let mut locked_attempts: u32 = 0;
+    // Every attempt that failed still consumed a model request.
+    let mut failed_attempts: u64 = 0;
     loop {
         let mut started = false;
         let result = match sink {
@@ -101,9 +103,13 @@ pub(crate) async fn call_model<C: Send + Sync + 'static>(
             None => with_timeout(settings.timeout, model.get_response(request.clone())).await,
         };
         let err = match result {
-            Ok(r) => return Ok(r),
+            Ok(mut r) => {
+                r.usage.apply_retry_attempt_usage(failed_attempts);
+                return Ok(r);
+            }
             Err(e) => e,
         };
+        failed_attempts += 1;
         if started {
             return Err(err);
         }
@@ -142,7 +148,10 @@ pub(crate) async fn call_model<C: Send + Sync + 'static>(
                 .delay
                 .map(|d| Duration::from_secs_f64(d.max(0.0)))
                 .unwrap_or_else(|| retry.delay_for_attempt(attempt));
-            log::warn!("Retrying model call (attempt {attempt}) after error: {err}");
+            crate::logger::log_model_action_warning(
+                &format!("Retrying model call (attempt {attempt}) after error"),
+                &err,
+            );
             tokio::time::sleep(delay).await;
             continue;
         }
@@ -150,7 +159,10 @@ pub(crate) async fn call_model<C: Send + Sync + 'static>(
             return Err(err);
         }
         attempt += 1;
-        log::warn!("Retrying model call (attempt {attempt}) after error: {err}");
+        crate::logger::log_model_action_warning(
+            &format!("Retrying model call (attempt {attempt}) after error"),
+            &err,
+        );
         tokio::time::sleep(retry.delay_for_attempt(attempt)).await;
     }
 }

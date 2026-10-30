@@ -532,8 +532,15 @@ pub enum RunItemKind {
     #[serde(rename = "tool_call_item")]
     ToolCall { raw_item: Value },
     /// A tool call output. `raw_item` is the wire item; `output` is the tool's return value.
+    /// `custom_data` is SDK-only data attached by a `custom_data_extractor`: it is never part
+    /// of `raw_item` and is not replayed to the model.
     #[serde(rename = "tool_call_output_item")]
-    ToolCallOutput { raw_item: Value, output: Value },
+    ToolCallOutput {
+        raw_item: Value,
+        output: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        custom_data: Option<Value>,
+    },
     /// A tool call that paused for approval.
     #[serde(rename = "tool_approval_item")]
     ToolApproval {
@@ -559,6 +566,9 @@ pub enum RunItemKind {
     /// A hosted MCP approval response.
     #[serde(rename = "mcp_approval_response_item")]
     MCPApprovalResponse { raw_item: Value },
+    /// A compaction item produced by `responses.compact`.
+    #[serde(rename = "compaction_item")]
+    Compaction { raw_item: Value },
 }
 
 /// An item generated during a run, tagged with the agent that produced it.
@@ -593,6 +603,7 @@ impl RunItem {
             RunItemKind::MCPListTools { .. } => "mcp_list_tools_item",
             RunItemKind::MCPApprovalRequest { .. } => "mcp_approval_request_item",
             RunItemKind::MCPApprovalResponse { .. } => "mcp_approval_response_item",
+            RunItemKind::Compaction { .. } => "compaction_item",
         }
     }
 
@@ -611,7 +622,8 @@ impl RunItem {
             RunItemKind::HandoffOutput { raw_item, .. } => raw_item.clone(),
             RunItemKind::MCPListTools { raw_item }
             | RunItemKind::MCPApprovalRequest { raw_item }
-            | RunItemKind::MCPApprovalResponse { raw_item } => InputItem(raw_item.clone()),
+            | RunItemKind::MCPApprovalResponse { raw_item }
+            | RunItemKind::Compaction { raw_item } => InputItem(raw_item.clone()),
         }
     }
 
@@ -634,6 +646,14 @@ impl RunItem {
                 raw_item: raw_item.clone(),
                 tool_name: tool_name.clone(),
             }),
+            _ => None,
+        }
+    }
+
+    /// SDK-only custom data attached to a tool output item.
+    pub fn custom_data(&self) -> Option<&Value> {
+        match &self.kind {
+            RunItemKind::ToolCallOutput { custom_data, .. } => custom_data.as_ref(),
             _ => None,
         }
     }
@@ -767,15 +787,23 @@ impl ItemHelpers {
                 Value::Array(parts.iter().map(ToolOutputPart::to_input_content).collect())
             }
         };
-        let mut item = json!({
+        let item = json!({
             "type": "function_call_output",
             "call_id": call.call_id,
             "output": converted,
         });
-        if let Some(caller) = call.extra.get("caller") {
-            item["caller"] = caller.clone();
+        Self::copy_tool_call_caller(&call.to_value(), item)
+    }
+
+    /// Copy a program caller relationship from a tool call onto its output item.
+    /// Port of `ItemHelpers.copy_tool_call_caller`.
+    pub fn copy_tool_call_caller(tool_call: &Value, mut output_item: Value) -> Value {
+        if let Some(caller) = tool_call.get("caller")
+            && !caller.is_null()
+        {
+            output_item["caller"] = caller.clone();
         }
-        item
+        output_item
     }
 }
 

@@ -93,7 +93,9 @@ impl ModelRetryNormalizedError {
 
 /// Parse `retry-after-ms` / `retry-after` (seconds or an HTTP date) into seconds. Delays outside
 /// 0..=60 seconds are ignored, matching the OpenAI SDK.
-fn parse_retry_after(headers: &std::collections::BTreeMap<String, String>) -> Option<f64> {
+pub(crate) fn parse_retry_after(
+    headers: &std::collections::BTreeMap<String, String>,
+) -> Option<f64> {
     let delay = if let Some(ms) = headers
         .get("retry-after-ms")
         .and_then(|v| v.trim().parse::<f64>().ok())
@@ -499,11 +501,30 @@ pub mod retry_policies {
     }
 }
 
+/// A WebSocket request that was sent but never acknowledged: the server may have accepted it,
+/// so replaying it could duplicate the response.
+pub(crate) const AMBIGUOUS_WEBSOCKET_REPLAY_MESSAGE: &str =
+    "Responses websocket connection closed before a terminal response event.";
+
 /// Retry advice for OpenAI HTTP models (mirrors the OpenAI SDK's own retry rules).
 pub fn get_openai_retry_advice(request: &ModelRetryAdviceRequest<'_>) -> Option<ModelRetryAdvice> {
     let error = request.error;
     let normalized = ModelRetryNormalizedError::from_error(error);
     let reason = Some(error.to_string());
+    // The request may have been accepted, so the SDK will not automatically retry it.
+    if normalized
+        .message
+        .as_deref()
+        .is_some_and(|m| m.starts_with(AMBIGUOUS_WEBSOCKET_REPLAY_MESSAGE))
+    {
+        return Some(ModelRetryAdvice {
+            suggested: Some(false),
+            replay_safety: Some(ReplaySafety::Unsafe),
+            reason,
+            normalized: Some(normalized),
+            ..Default::default()
+        });
+    }
     let stateful = request.previous_response_id.is_some() || request.conversation_id.is_some();
     if let AgentsError::ApiError {
         headers: Some(h), ..

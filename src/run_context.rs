@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::items::ToolApprovalItem;
+use crate::items::{InputItem, ToolApprovalItem};
 use crate::usage::Usage;
 
 /// Approval decisions for one tool identity (`agent name` + `tool name`).
@@ -30,6 +30,15 @@ pub struct ApprovalRecord {
     /// Rejection message for a sticky rejection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sticky_rejection_message: Option<String>,
+}
+
+/// The decision recorded for one tool call.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ApprovalStatus {
+    /// `Some(true)` approved, `Some(false)` rejected, `None` undecided.
+    pub approved: Option<bool>,
+    /// The model-visible rejection message, when one was recorded.
+    pub rejection_message: Option<String>,
 }
 
 /// Serializable approval decisions keyed by tool identity (`agent` + `tool`).
@@ -76,9 +85,7 @@ impl ApprovalsState {
         }
     }
 
-    /// `Some(true)` approved, `Some(false)` rejected, `None` undecided.
-    pub fn status(&self, agent: &str, tool_name: &str, call_id: &str) -> Option<bool> {
-        let rec = self.0.get(&approval_key(agent, tool_name))?;
+    fn record_status(rec: &ApprovalRecord, call_id: &str) -> Option<bool> {
         if rec.rejected_call_ids.contains(call_id) {
             return Some(false);
         }
@@ -94,13 +101,33 @@ impl ApprovalsState {
         None
     }
 
+    /// `Some(true)` approved, `Some(false)` rejected, `None` undecided.
+    ///
+    /// Decisions recorded without an owning agent (Python's agent-agnostic `approvals`
+    /// bucket, and snapshots written before it bound function tools to their agent) apply to
+    /// every agent and are consulted when the agent-specific record is undecided.
+    pub fn status(&self, agent: &str, tool_name: &str, call_id: &str) -> Option<bool> {
+        self.0
+            .get(&approval_key(agent, tool_name))
+            .and_then(|rec| Self::record_status(rec, call_id))
+            .or_else(|| {
+                self.0
+                    .get(&approval_key("", tool_name))
+                    .and_then(|rec| Self::record_status(rec, call_id))
+            })
+    }
+
     /// Custom rejection message for a call.
     pub fn rejection_message(&self, agent: &str, tool_name: &str, call_id: &str) -> Option<String> {
-        let rec = self.0.get(&approval_key(agent, tool_name))?;
-        rec.rejection_messages
-            .get(call_id)
-            .cloned()
-            .or_else(|| rec.sticky_rejection_message.clone())
+        let message = |key: String| {
+            self.0.get(&key).and_then(|rec| {
+                rec.rejection_messages
+                    .get(call_id)
+                    .cloned()
+                    .or_else(|| rec.sticky_rejection_message.clone())
+            })
+        };
+        message(approval_key(agent, tool_name)).or_else(|| message(approval_key("", tool_name)))
     }
 
     /// Merge decisions from another state.
@@ -138,6 +165,8 @@ impl ApprovalsState {
 #[derive(Default)]
 struct Inner {
     usage: Usage,
+    /// The input list of the turn currently being executed.
+    turn_input: Vec<InputItem>,
     approvals: ApprovalsState,
     /// Serialized nested `Agent::as_tool` run states awaiting approval, keyed by tool call id.
     nested_states: BTreeMap<String, Value>,
@@ -267,6 +296,32 @@ impl<C> RunContext<C> {
         self.lock()
             .approvals
             .rejection_message(agent, tool_name, call_id)
+    }
+
+    /// The input list of the turn currently being executed, as the model sees it. Empty
+    /// before the first model call. Mirrors `RunContextWrapper.turn_input`.
+    pub fn turn_input(&self) -> Vec<InputItem> {
+        self.lock().turn_input.clone()
+    }
+
+    /// Replace the current turn's input list.
+    pub fn set_turn_input(&self, input: Vec<InputItem>) {
+        self.lock().turn_input = input;
+    }
+
+    /// Approval status plus the rejection message for a tool call, in one lookup.
+    /// Mirrors `RunContextWrapper.get_approval_status`.
+    pub fn get_approval_status(
+        &self,
+        agent: &str,
+        tool_name: &str,
+        call_id: &str,
+    ) -> ApprovalStatus {
+        let inner = self.lock();
+        ApprovalStatus {
+            approved: inner.approvals.status(agent, tool_name, call_id),
+            rejection_message: inner.approvals.rejection_message(agent, tool_name, call_id),
+        }
     }
 
     /// Export approval state (for `RunState`).

@@ -21,6 +21,76 @@ use crate::tool_guardrails::{ToolInputGuardrailResult, ToolOutputGuardrailResult
 use crate::usage::Usage;
 use crate::util::BoxFuture;
 
+/// How [`RunResult::to_input_list_with`] builds the replay list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ToInputListMode {
+    /// Keep the full converted history of `new_items` (the historical behavior).
+    #[default]
+    PreserveAll,
+    /// Prefer the canonical continuation input when a handoff filter or nested history
+    /// rewrote model history; identical to [`ToInputListMode::PreserveAll`] otherwise.
+    Normalized,
+}
+
+/// Immutable metadata about a nested `Agent::as_tool` invocation.
+/// Mirrors `agents.result.AgentToolInvocation`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentToolInvocation {
+    /// The nested tool name exposed to the model.
+    pub tool_name: String,
+    /// The tool call id of the nested invocation.
+    pub tool_call_id: String,
+    /// The raw JSON arguments of the nested invocation.
+    pub tool_arguments: String,
+}
+
+/// Escape C0, DEL and C1 controls, keeping tabs and line breaks.
+/// Port of `_escape_terminal_controls`.
+pub(crate) fn escape_terminal_controls(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        let code = c as u32;
+        let escape =
+            (code <= 0x08) || (0x0b..=0x1f).contains(&code) || (0x7f..=0x9f).contains(&code);
+        if escape {
+            out.push_str(&format!("\\x{code:02x}"));
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn indent(text: &str, level: usize) -> String {
+    let normalized = escape_terminal_controls(&text.replace("\r\n", "\n"));
+    let pad = "  ".repeat(level);
+    normalized
+        .lines()
+        .map(|line| format!("{pad}{line}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn final_output_str(final_output: Option<&Value>) -> String {
+    match final_output {
+        None => "None".to_string(),
+        Some(Value::String(s)) => s.clone(),
+        Some(other) => serde_json::to_string_pretty(other).unwrap_or_else(|_| other.to_string()),
+    }
+}
+
+fn final_output_kind(final_output: Option<&Value>) -> &'static str {
+    match final_output {
+        None => "NoneType",
+        Some(Value::String(_)) => "str",
+        Some(Value::Bool(_)) => "bool",
+        Some(Value::Number(_)) => "number",
+        Some(Value::Array(_)) => "list",
+        Some(Value::Object(_)) => "dict",
+        Some(Value::Null) => "NoneType",
+    }
+}
+
 /// The result of a completed (or paused) run.
 pub struct RunResult<C> {
     /// The input of the run (after any handoff input filter rewrites).
@@ -42,6 +112,14 @@ pub struct RunResult<C> {
     pub context_wrapper: RunContext<C>,
     /// Pending approvals.
     pub interruptions: Vec<ToolApprovalItem>,
+    /// Metadata of the nested `Agent::as_tool` invocation that produced this result, when it
+    /// was produced by one.
+    pub agent_tool_invocation: Option<AgentToolInvocation>,
+    /// Items as the model saw them, which differ from `new_items` once a handoff input filter
+    /// or nested handoff history rewrote model history.
+    pub(crate) model_input_items: Vec<RunItem>,
+    /// Whether model history diverged from the public history during this run.
+    pub(crate) replay_from_model_input_items: bool,
     pub(crate) state: RunState,
 }
 
@@ -76,14 +154,52 @@ impl<C> RunResult<C> {
 
     /// Input items for the next turn: the run input plus generated items.
     pub fn to_input_list(&self) -> Vec<InputItem> {
+        self.to_input_list_with(ToInputListMode::PreserveAll)
+    }
+
+    /// Input items for the next turn, choosing which history view to replay.
+    /// Mirrors `RunResultBase.to_input_list(mode=...)`.
+    pub fn to_input_list_with(&self, mode: ToInputListMode) -> Vec<InputItem> {
+        let source = match mode {
+            ToInputListMode::Normalized if self.replay_from_model_input_items => {
+                &self.model_input_items
+            }
+            _ => &self.new_items,
+        };
         let mut out = self.input.clone();
         out.extend(
-            self.new_items
+            source
                 .iter()
                 .filter(|i| !matches!(i.kind, RunItemKind::ToolApproval { .. }))
                 .map(RunItem::to_input_item),
         );
         out
+    }
+
+    /// A human-readable summary. Port of `pretty_print_result`.
+    pub fn pretty_print(&self) -> String {
+        let mut out = String::from("RunResult:");
+        out.push_str(&format!(
+            "\n- Last agent: Agent(name=\"{}\", ...)",
+            self.last_agent.name
+        ));
+        out.push_str(&format!(
+            "\n- Final output ({}):\n{}",
+            final_output_kind(self.final_output.as_ref()),
+            indent(&final_output_str(self.final_output.as_ref()), 2)
+        ));
+        out.push_str(&format!("\n- {} new item(s)", self.new_items.len()));
+        out.push_str(&format!("\n- {} raw response(s)", self.raw_responses.len()));
+        out.push_str(&format!(
+            "\n- {} input guardrail result(s)",
+            self.input_guardrail_results.len()
+        ));
+        out.push_str(&format!(
+            "\n- {} output guardrail result(s)",
+            self.output_guardrail_results.len()
+        ));
+        out.push_str("\n(See `RunResult` for more details)");
+        escape_terminal_controls(&out)
     }
 
     /// The id of the last model response (for `previous_response_id` chaining).
@@ -168,6 +284,8 @@ pub struct RunResultStreaming<C> {
     handle: Option<JoinHandle<()>>,
     complete: bool,
     on_complete: Option<StreamCompletionHook>,
+    max_turns: Option<usize>,
+    run_loop_error: Option<String>,
 }
 
 impl<C> fmt::Debug for RunResultStreaming<C> {
@@ -177,6 +295,12 @@ impl<C> fmt::Debug for RunResultStreaming<C> {
             .field("is_complete", &self.complete)
             .field("has_on_complete", &self.on_complete.is_some())
             .finish_non_exhaustive()
+    }
+}
+
+impl<C> fmt::Display for RunResult<C> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.pretty_print())
     }
 }
 
@@ -195,7 +319,14 @@ impl<C: Send + Sync + 'static> RunResultStreaming<C> {
             handle: Some(handle),
             complete: false,
             on_complete: None,
+            max_turns: None,
+            run_loop_error: None,
         }
+    }
+
+    /// Record the turn limit of the run, so `max_turns()` can report it before completion.
+    pub(crate) fn set_max_turns(&mut self, max_turns: Option<usize>) {
+        self.max_turns = max_turns;
     }
 
     /// Run `hook` once, when the stream finishes.
@@ -279,6 +410,7 @@ impl<C: Send + Sync + 'static> RunResultStreaming<C> {
                             None
                         }
                         Err(e) => {
+                            this.run_loop_error = Some(e.to_string());
                             // Run the hook before yielding the error: nothing obliges a consumer
                             // to poll again after one, and `while let Some(ev) = next().await`
                             // with `ev?` returns immediately. The hook is a no-op if the
@@ -351,5 +483,68 @@ impl<C: Send + Sync + 'static> RunResultStreaming<C> {
     /// A resumable snapshot, once complete.
     pub fn to_state(&self) -> Option<RunState> {
         self.result.as_ref().map(RunResult::to_state)
+    }
+
+    /// Model turns completed so far.
+    pub fn current_turn(&self) -> usize {
+        self.result
+            .as_ref()
+            .map(|r| r.state.current_turn)
+            .unwrap_or(0)
+    }
+
+    /// The turn limit of the run, when one is set.
+    pub fn max_turns(&self) -> Option<usize> {
+        self.max_turns
+    }
+
+    /// The message of the error the run loop ended with, when it failed.
+    pub fn run_loop_error(&self) -> Option<&str> {
+        self.run_loop_error.as_deref()
+    }
+
+    /// A human-readable summary. Port of `pretty_print_run_result_streaming`.
+    pub fn pretty_print(&self) -> String {
+        let final_output = self.final_output();
+        let mut out = String::from("RunResultStreaming:");
+        out.push_str(&format!(
+            "\n- Current agent: Agent(name=\"{}\", ...)",
+            self.current_agent.name
+        ));
+        out.push_str(&format!("\n- Current turn: {}", self.current_turn()));
+        out.push_str(&format!(
+            "\n- Max turns: {}",
+            match self.max_turns {
+                Some(m) => m.to_string(),
+                None => "None".to_string(),
+            }
+        ));
+        out.push_str(&format!("\n- Is complete: {}", self.complete));
+        out.push_str(&format!(
+            "\n- Final output ({}):\n{}",
+            final_output_kind(final_output),
+            indent(&final_output_str(final_output), 2)
+        ));
+        let (items, responses, inputs, outputs) = match self.result.as_ref() {
+            Some(r) => (
+                r.new_items.len(),
+                r.raw_responses.len(),
+                r.input_guardrail_results.len(),
+                r.output_guardrail_results.len(),
+            ),
+            None => (0, 0, 0, 0),
+        };
+        out.push_str(&format!("\n- {items} new item(s)"));
+        out.push_str(&format!("\n- {responses} raw response(s)"));
+        out.push_str(&format!("\n- {inputs} input guardrail result(s)"));
+        out.push_str(&format!("\n- {outputs} output guardrail result(s)"));
+        out.push_str("\n(See `RunResultStreaming` for more details)");
+        escape_terminal_controls(&out)
+    }
+}
+
+impl<C: Send + Sync + 'static> fmt::Display for RunResultStreaming<C> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.pretty_print())
     }
 }

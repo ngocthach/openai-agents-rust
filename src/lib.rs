@@ -35,6 +35,7 @@ pub mod guardrail;
 pub mod handoffs;
 pub mod items;
 pub mod lifecycle;
+pub mod logger;
 #[cfg(feature = "mcp")]
 pub mod mcp;
 pub mod memory;
@@ -76,7 +77,10 @@ pub use guardrail::{
     GuardrailFunctionOutput, InputGuardrail, InputGuardrailResult, OutputGuardrail,
     OutputGuardrailResult,
 };
-pub use handoffs::{Handoff, HandoffInputData, HandoffInputFilter, handoff};
+pub use handoffs::{
+    Handoff, HandoffHistoryMapper, HandoffInputData, HandoffInputFilter, handoff,
+    nest_handoff_history,
+};
 pub use items::{
     FunctionCall, FunctionCallOutput, InputItem, ItemHelpers, MessageOutput, ModelResponse,
     OutputItem, ReasoningOutput, RunInput, RunItem, RunItemKind, ToolApprovalItem,
@@ -92,15 +96,20 @@ pub use models::{
 };
 pub use prompts::{Prompt, PromptVariable};
 pub use result::{
-    CancelMode, RunResult, RunResultStreaming, StreamCompletion, StreamCompletionHook,
+    AgentToolInvocation, CancelMode, RunResult, RunResultStreaming, StreamCompletion,
+    StreamCompletionHook, ToInputListMode,
 };
-pub use run::{DEFAULT_MAX_TURNS, IntoAgentArc, RunOptions, Runner};
+pub use run::{
+    AgentRunner, DEFAULT_MAX_TURNS, DefaultAgentRunner, IntoAgentArc, RunOptions, Runner,
+    get_default_agent_runner, set_default_agent_runner,
+};
 pub use run_config::{
     CallModelData, ModelInputData, RunConfig, ToolErrorFormatterArgs, ToolErrorKind,
     ToolExecutionConfig, ToolNotFoundBehavior,
 };
-pub use run_context::RunContext;
+pub use run_context::{ApprovalStatus, RunContext};
 pub use run_error_handlers::{RunErrorHandlerInput, RunErrorHandlerResult, RunErrorHandlers};
+pub use run_internal::resolve_run_grouping_id;
 pub use run_state::RunState;
 pub use stream_events::{RunItemStreamEventName, StreamEvent};
 pub use tool::{
@@ -118,6 +127,7 @@ pub use tracing::{
     set_tracing_disabled, set_tracing_export_api_key, trace,
 };
 pub use usage::{RequestUsage, Usage};
+pub use util::{transform_string_function_style, transform_string_function_style_with};
 
 /// Compiles the README examples as doctests.
 #[doc = include_str!("../README.md")]
