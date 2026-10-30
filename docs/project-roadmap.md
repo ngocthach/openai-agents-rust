@@ -37,6 +37,11 @@ Last updated: 2026-10-29.
 - `EncryptedSession` is Fernet-compatible with Python; compaction suffix replacement
 - `LitellmModel` / `AnyLLMModel` over OpenAI-compatible endpoints; `#[function_tool]` macro
 - Retry-after / `x-should-retry` headers on API errors; shared log redaction flags
+- Runner: Python-compatible `RunState` (schema 1.21), identity-based server conversation
+  tracking, programmatic tool calling, `allowed_callers`, prompt cache keys, MCP failure handlers
+- Tracing: pluggable `TraceProvider`, disabled-trace masking, exporter `Retry-After`, error
+  redaction (`logger` module)
+- Sandbox mount entries: S3, S3 Files, GCS, R2, Azure Blob, Box (FUSE, mountpoint, rclone)
 
 ## Differences from Python
 
@@ -45,5 +50,8 @@ Last updated: 2026-10-29.
 | LiteLLM / any-llm | Registry of OpenAI-compatible endpoints instead of the Python libraries |
 | Modal sandbox | Uses the `modal` Python package through a helper (no public REST API) |
 | `sqlx` feature | Needs Rust 1.94 (everything else builds on 1.89) |
+| any-llm providers | Providers without an OpenAI-compatible endpoint (Bedrock, Vertex, ...) are not supported |
+| `RunState` interop | Python can resume Rust snapshots except an interrupted run (no `last_processed_response`) |
+| `FunctionTool` | No `output_type` reflection; set `output_json_schema` explicitly |
 
 Module-level divergences are listed in `plans/reports/*-report.md`.

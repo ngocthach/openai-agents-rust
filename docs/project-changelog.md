@@ -1,15 +1,42 @@
 # Changelog
 
-## 0.3.0 (2026-10-29)
+## 0.3.0 (2026-10-30)
 
 Completes the port. See the 0.3.0 section of `docs/project-roadmap.md`.
 
 Breaking changes (pre-1.0):
 
-- `AgentsError::ApiError` has a `headers` field; `AgentsError::Sandbox` is a new variant.
+- Errors: `AgentsError::ApiError` has a `headers` field; `AgentsError::Sandbox` is a new variant.
 - `EncryptedSession` now uses Fernet (Python-compatible); items written by 0.2.0 are not readable.
-- `SandboxRunner::run_streamed*` returns `SandboxStreamedRun<C>`.
-- New `Session` and `Model` trait methods have default implementations.
+- New `Session`, `Model` and `ModelProvider` trait methods have default implementations;
+  `ModelProvider` is `#[async_trait]` (impls that override `close()` need the attribute).
+- Tool names are lowercased: `Agent::new("Billing Agent")` hands off through
+  `transfer_to_billing_agent`, and default `as_tool` names are lowercase.
+- `RunState` serializes Python's schema `"1.21"` envelope; older Rust `"1.0"` snapshots are
+  still read, but new snapshots cannot be read by 0.2.0.
+- Generic over the context type now: `ToolErrorFormatterArgs<'a, C>`, `MCPConfig<C>` (no longer
+  `PartialEq`), `OutputGuardrailBlockedMessage` and `BlockedMessageFormatter`.
+- `AgentAsToolOptions::on_stream` receives `AgentToolStreamEvent<C>`; `input_builder` receives
+  `&StructuredToolInput<'_>`.
+- `tracing::TraceProvider` is a trait; the default implementation is `DefaultTraceProvider`.
+- New enum variants and public struct fields (`RunItemKind::Compaction`,
+  `ToolErrorKind::ToolException`, `FunctionToolSpec::output_json_schema`, `RunState`,
+  `ToolContext`, `SandboxError`, `ErrorCode`, `SnapshotSpec`, `Entry` fields); use the builders
+  or `..Default::default()`.
+- `SandboxRunner::run_streamed*` returns `SandboxStreamedRun<C>`; `Manifest::apply` returns a
+  `MaterializationResult`.
+- Behavior:
+  - Output guardrails combined with server-managed conversations (`conversation_id` /
+    `previous_response_id`) are rejected at run start.
+  - A failing function tool cancels its sibling calls in the same batch.
+  - Server-conversation deltas are tracked by item identity instead of an index.
+  - Official OpenAI models receive a generated `prompt_cache_key` unless one is set.
+  - Chat Completions sends `tool_choice` without tools and multimodal tool output as content
+    parts; an unpaired tool output and colliding `extra_args` keys are errors.
+  - Streaming terminal-failure error text follows Python's wording.
+  - Tool error span data and invalid-JSON tool errors are redacted unless sensitive data
+    logging is allowed.
+  - Unix-local sandbox commands use the workspace root as `HOME`.
 
 ## 0.2.0 (2026-10-29)
 
