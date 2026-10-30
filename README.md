@@ -18,7 +18,7 @@ This crate is not affiliated with or endorsed by OpenAI.
 
 ```toml
 [dependencies]
-openai-agents-sdk = "0.3"
+openai-agents-sdk = "0.4"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
@@ -35,6 +35,7 @@ Optional features:
 | `macros` | `#[function_tool]` attribute macro |
 | `encrypt` | `memory::EncryptedSession` (Fernet, wire-compatible with the Python SDK) |
 | `redis` / `mongodb` / `sqlx` | `RedisSession`, `MongoDBSession`, `SqlxSession` (PostgreSQL/MySQL; needs Rust 1.94) |
+| `provider-auth` | Request signing and OAuth for Bedrock, SageMaker and Vertex AI models in `extensions::models` |
 
 `DaprSession` and `OpenAIResponsesCompactionSession` need no feature.
 

@@ -28,6 +28,12 @@ Last updated: 2026-10-29.
 - MCP legacy HTTP+SSE transport
 - Extensions: tool output trimmer, Codex tool, hosted multi-agent (experimental)
 
+## 0.4.0 (released)
+
+- Closes the remaining 0.3.0 parity rows: provider adapters (Anthropic, Bedrock, Vertex, Azure, watsonx),
+  Python-interoperable interrupted `RunState`, Docker/sandbox core rows, MCP transport options,
+  trace state reattach, realtime and cloud provider rows
+
 ## 0.3.0 (released)
 
 - Sandbox: mounts (bind, Docker volume, in-container, cloud buckets), PTY sessions, memory,
@@ -50,9 +56,9 @@ Last updated: 2026-10-29.
 | LiteLLM / any-llm | Registry of OpenAI-compatible endpoints instead of the Python libraries |
 | Modal sandbox | Uses the `modal` Python package through a helper (no public REST API) |
 | `sqlx` feature | Needs Rust 1.94 (everything else builds on 1.89) |
-| any-llm providers | Providers without an OpenAI-compatible endpoint (Bedrock, Vertex, ...) are not supported |
-| `RunState` interop | Python can resume Rust snapshots except an interrupted run (no `last_processed_response`) |
-| `FunctionTool` | No `output_type` reflection; set `output_json_schema` explicitly |
-| Daytona mounts | rclone mounts add `--allow-other` so the sandbox command user can use them |
+| `FunctionTool` | `output_type` is `with_output_type::<T>()` (schema derived with `schemars`) |
+| Modal selectors | Live `modal.Image`/`modal.Sandbox` objects are replaced by id/tag selectors |
+| Docker sandbox | Uses the Docker CLI; no raw-socket exec transport or PTY `preexec_fn` signal reset |
+| WebSocket logging | The dependency's DEBUG logs cannot be filtered from a library |
 
 Module-level divergences are listed in `plans/reports/*-report.md`.

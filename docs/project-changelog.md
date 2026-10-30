@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.4.0 (2026-10-30)
+
+Closes the parity rows left open in 0.3.0. Per-area detail is in `plans/reports/*-final-parity-report.md`.
+
+Added:
+
+- Providers: native Anthropic Messages, AWS Bedrock and SageMaker (SigV4), Vertex AI (Google OAuth),
+  Azure OpenAI, watsonx.ai and more OpenAI-compatible endpoints, model listing, thinking-block
+  preservation. Signing needs the new `provider-auth` feature.
+- `RunState` interop with Python for interrupted runs (`last_processed_response`), tool-invocation
+  ledger with Python-identical digests, Python-generated fixtures in `tests/fixtures/`.
+- Sandbox: Docker labels, exposed ports, path-grant validation and resume checks, named volumes,
+  snapshot fingerprint fast path, opt-in per-agent sessions, live manifest updates, exposed-port
+  resolution for every provider, read-only path grants on raw writes.
+- MCP: unlimited retries, isolated-session retry, credential redaction, streamable HTTP options
+  (session id, timeouts, auth), message handler, per-server tool policy.
+- Tracing: trace state reattach, shutdown guard, per-processor panic isolation, `SpanBuilder`.
+- WebSocket keepalive options and replay-safety retry advice; realtime `async_tool_calls`.
+
+Breaking changes (pre-1.0):
+
+- `Agent::get_all_tools` takes `self: &Arc<Self>`; `RunState` has new fields; a reused tool call
+  id with a changed identity is a `ModelBehaviorError`.
+- `RealtimeToolErrorArgs` is an alias of the core `ToolErrorFormatterArgs`; realtime sessions end
+  on transport errors, failed tool tasks and guardrail tripwires; `RealtimeContent` variants carry
+  extra fields.
+- Chat Completions streams tool-call arguments incrementally; WebSocket transport error texts
+  changed; `ModelProvider`/`Model` gained cleanup hooks with defaults.
+- Vercel: `AllowAll`/`DenyAll` network policies use the `{mode}` wire shape; Daytona rclone mounts
+  no longer add `--allow-other` (matches Python).
+- `ModalSandboxClientOptions` gained public fields; `ErrorCode` gained variants.
+- Voice STT websocket caps messages at 1 MiB and sends keepalives every 20 s.
+- `serde_json` now preserves key order (Python dict order); `reqwest` multipart is always enabled.
+
 ## 0.3.0 (2026-10-30)
 
 Completes the port. See the 0.3.0 section of `docs/project-roadmap.md`.
