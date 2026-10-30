@@ -83,7 +83,7 @@ async fn mock_server(replies: Vec<Reply>) -> (String, Arc<Mutex<Vec<(String, Val
                     }
                     b.push_str("data: [DONE]\n\n");
                     format!(
-                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nx-request-id: req_123\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
                         b.len(),
                         b
                     )
@@ -302,4 +302,95 @@ async fn responses_stream_terminal_events_become_errors() {
         };
         assert_eq!(err.to_string(), expected);
     }
+}
+
+#[tokio::test]
+async fn streamed_responses_carry_the_http_request_id() {
+    openai_agents_sdk::set_tracing_disabled(true);
+    let (base, _) = mock_server(vec![Reply::Sse(vec![
+        json!({"type": "response.created", "response": {"id": "resp_9", "status": "in_progress", "output": []}}),
+        json!({"type": "response.output_text.delta", "item_id": "m", "output_index": 0, "content_index": 0, "delta": "Hi"}),
+        json!({"type": "response.completed", "response": {"id": "resp_9", "status": "completed",
+            "output": [{"type": "message", "id": "m", "role": "assistant",
+                        "content": [{"type": "output_text", "text": "Hi", "annotations": []}]}],
+            "usage": {"input_tokens": 3, "output_tokens": 1, "total_tokens": 4}}}),
+    ])])
+    .await;
+    let client = OpenAIClient::new("sk-test").with_base_url(base);
+    let model = OpenAIResponsesModel::new("gpt-4.1", client);
+    let mut stream = model.stream_response(Default::default()).await.unwrap();
+    let mut completed = None;
+    while let Some(ev) = stream.next().await {
+        let ev = ev.unwrap();
+        if ev["type"] == "response.completed" {
+            completed = Some(ev);
+        }
+    }
+    let completed = completed.expect("terminal event");
+    // The mock server sends `x-request-id: req_123` on every response. The streaming path has
+    // no HTTP response left to read it from, so it rides on the event (Python sets
+    // `response._request_id`) and becomes `ModelResponse::request_id`.
+    assert_eq!(
+        completed["response"][openai_agents_sdk::models::openai_responses::STREAM_REQUEST_ID_KEY],
+        "req_123"
+    );
+}
+
+#[tokio::test]
+async fn chat_completions_stream_tool_call_arguments_incrementally() {
+    openai_agents_sdk::set_tracing_disabled(true);
+    let chunks = || {
+        vec![
+            json!({"choices": [{"index": 0, "delta": {"role": "assistant", "tool_calls": [
+                {"index": 0, "id": "call_7", "type": "function",
+                 "function": {"name": "forecast", "arguments": "{\"city\":"}}]}}]}),
+            json!({"choices": [{"index": 0, "delta": {"tool_calls": [
+                {"index": 0, "function": {"arguments": "\"Hue\"}"}}]}, "finish_reason": "tool_calls"}]}),
+        ]
+    };
+    let deltas = |events: &[Value]| -> Vec<String> {
+        events
+            .iter()
+            .filter(|e| e["type"] == "response.function_call_arguments.delta")
+            .map(|e| e["delta"].as_str().unwrap_or_default().to_string())
+            .collect()
+    };
+
+    // Default (Python's `buffer_streamed_tool_calls=False`): fragments are forwarded.
+    let (base, _) = mock_server(vec![Reply::Sse(chunks())]).await;
+    let client = OpenAIClient::new("sk-test").with_base_url(base);
+    let model = OpenAIChatCompletionsModel::new("gpt-4.1", client);
+    let events: Vec<Value> = model
+        .stream_response(Default::default())
+        .await
+        .unwrap()
+        .map(|e| e.unwrap())
+        .collect()
+        .await;
+    assert_eq!(deltas(&events), ["{\"city\":", "\"Hue\"}"]);
+    let added = events
+        .iter()
+        .find(|e| e["type"] == "response.output_item.added")
+        .unwrap();
+    assert_eq!(added["item"]["name"], "forecast");
+    assert_eq!(added["item"]["arguments"], "");
+    let done = events
+        .iter()
+        .find(|e| e["type"] == "response.function_call_arguments.done")
+        .unwrap();
+    assert_eq!(done["arguments"], "{\"city\":\"Hue\"}");
+
+    // Buffered: the call surfaces once, complete.
+    let (base, _) = mock_server(vec![Reply::Sse(chunks())]).await;
+    let client = OpenAIClient::new("sk-test").with_base_url(base);
+    let model =
+        OpenAIChatCompletionsModel::new("gpt-4.1", client).with_buffer_streamed_tool_calls(true);
+    let events: Vec<Value> = model
+        .stream_response(Default::default())
+        .await
+        .unwrap()
+        .map(|e| e.unwrap())
+        .collect()
+        .await;
+    assert_eq!(deltas(&events), ["{\"city\":\"Hue\"}"]);
 }

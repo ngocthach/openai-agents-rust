@@ -49,6 +49,12 @@ pub type ShouldReplayReasoningContent =
 /// Rewrites the converted chat messages just before they are sent.
 pub type ChatMessageTransform = Arc<dyn Fn(Vec<Value>) -> Vec<Value> + Send + Sync>;
 
+/// Rewrites the whole request body just before it is sent.
+pub type ChatBodyTransform = Arc<dyn Fn(Value) -> Value + Send + Sync>;
+
+/// The default Chat Completions route.
+pub const DEFAULT_CHAT_PATH: &str = "chat/completions";
+
 /// Default replay rule: only for DeepSeek models, and only reasoning that came from DeepSeek
 /// (or predates provider tracking).
 pub fn default_should_replay_reasoning_content(ctx: &ReasoningContentReplayContext) -> bool {
@@ -79,6 +85,10 @@ pub struct ChatConversionOptions {
     pub preserve_tool_output_all_content: bool,
     /// Reject what Chat Completions cannot represent instead of warning and degrading.
     pub strict_feature_validation: bool,
+    /// Replay Anthropic interleaved-thinking blocks on the assistant message that follows a
+    /// reasoning item. Mirrors `Converter.items_to_messages(preserve_thinking_blocks=...)`,
+    /// which LiteLLM turns on whenever `reasoning.effort` is set.
+    pub preserve_thinking_blocks: bool,
 }
 
 impl std::fmt::Debug for ChatConversionOptions {
@@ -99,6 +109,10 @@ pub struct OpenAIChatCompletionsModel {
     strict_feature_validation: bool,
     preserve_tool_output_all_content: bool,
     message_transform: Option<ChatMessageTransform>,
+    preserve_thinking_blocks: bool,
+    buffer_streamed_tool_calls: bool,
+    body_transform: Option<ChatBodyTransform>,
+    chat_path: String,
     /// Each unsupported-feature warning is emitted once per model, as in Python.
     warned_unsupported: Arc<[std::sync::atomic::AtomicBool; 2]>,
 }
@@ -122,6 +136,10 @@ impl OpenAIChatCompletionsModel {
             strict_feature_validation: false,
             preserve_tool_output_all_content: false,
             message_transform: None,
+            preserve_thinking_blocks: false,
+            buffer_streamed_tool_calls: false,
+            body_transform: None,
+            chat_path: DEFAULT_CHAT_PATH.to_string(),
             warned_unsupported: Arc::new([
                 std::sync::atomic::AtomicBool::new(false),
                 std::sync::atomic::AtomicBool::new(false),
@@ -142,6 +160,38 @@ impl OpenAIChatCompletionsModel {
         F: Fn(Vec<Value>) -> Vec<Value> + Send + Sync + 'static,
     {
         self.message_transform = Some(Arc::new(f));
+        self
+    }
+
+    /// Emit each streamed function tool call once, complete, instead of forwarding the
+    /// provider's argument fragments as `response.function_call_arguments.delta` events.
+    /// Mirrors `buffer_streamed_tool_calls`; off by default, as in Python.
+    pub fn with_buffer_streamed_tool_calls(mut self, buffer: bool) -> Self {
+        self.buffer_streamed_tool_calls = buffer;
+        self
+    }
+
+    /// Replay Anthropic interleaved-thinking blocks (see
+    /// [`ChatConversionOptions::preserve_thinking_blocks`]).
+    pub fn with_preserve_thinking_blocks(mut self, preserve: bool) -> Self {
+        self.preserve_thinking_blocks = preserve;
+        self
+    }
+
+    /// Rewrite the whole request body just before it is sent. Providers whose endpoint is
+    /// OpenAI-shaped except for a couple of envelope keys (watsonx's `model_id`/`project_id`,
+    /// for example) are reached this way instead of through a second model implementation.
+    pub fn with_body_transform<F>(mut self, f: F) -> Self
+    where
+        F: Fn(Value) -> Value + Send + Sync + 'static,
+    {
+        self.body_transform = Some(Arc::new(f));
+        self
+    }
+
+    /// Use a different route than `chat/completions` (relative to the client base URL).
+    pub fn with_chat_path(mut self, path: impl Into<String>) -> Self {
+        self.chat_path = path.into();
         self
     }
 
@@ -212,6 +262,15 @@ impl OpenAIChatCompletionsModel {
         Ok(())
     }
 
+    /// [`Self::build_request_body`] with the provider body transform applied.
+    pub fn transformed_body(&self, req: &ModelRequest, stream: bool) -> Result<Value> {
+        let body = self.build_request_body(req, stream)?;
+        Ok(match &self.body_transform {
+            Some(f) => f(body),
+            None => body,
+        })
+    }
+
     /// Build the JSON request body.
     pub fn build_request_body(&self, req: &ModelRequest, stream: bool) -> Result<Value> {
         self.validate_responses_only_features(req)?;
@@ -225,6 +284,14 @@ impl OpenAIChatCompletionsModel {
                 should_replay_reasoning_content: self.should_replay_reasoning_content.clone(),
                 preserve_tool_output_all_content: self.preserve_tool_output_all_content,
                 strict_feature_validation: self.strict_feature_validation,
+                // Claude's interleaved thinking needs the signed blocks replayed whenever the
+                // caller asked for reasoning, exactly as LiteLLM does.
+                preserve_thinking_blocks: self.preserve_thinking_blocks
+                    && req
+                        .model_settings
+                        .reasoning
+                        .as_ref()
+                        .is_some_and(|r| r.effort.is_some()),
             },
         )?;
         if let Some(transform) = &self.message_transform {
@@ -585,6 +652,36 @@ fn text_of(content: &Value) -> String {
     }
 }
 
+/// Attach replayed Anthropic thinking blocks to an assistant message.
+/// Port of `apply_pending_thinking_blocks`.
+///
+/// A native block list (LiteLLM's `thinking_blocks` field) keeps the complete signed sequence,
+/// including empty and redacted blocks, and travels in its own key. Blocks reconstructed from a
+/// stored reasoning item instead go in front of the message content, which is the shape the
+/// older stored items were replayed as.
+fn apply_pending_thinking_blocks(
+    asst: &mut Map<String, Value>,
+    pending: &mut Option<(Vec<Value>, bool)>,
+) {
+    let Some((blocks, native)) = pending.take() else {
+        return;
+    };
+    if blocks.is_empty() {
+        return;
+    }
+    if native {
+        asst.insert("thinking_blocks".into(), Value::Array(blocks));
+        return;
+    }
+    let mut parts = blocks;
+    match asst.get("content") {
+        Some(Value::String(text)) => parts.push(json!({"type": "text", "text": text})),
+        Some(Value::Array(existing)) => parts.extend(existing.iter().cloned()),
+        _ => {}
+    }
+    asst.insert("content".into(), Value::Array(parts));
+}
+
 /// Convert Responses-format input items to Chat Completions messages.
 pub fn items_to_messages(items: &[InputItem], system: Option<&str>) -> Result<Vec<Value>> {
     items_to_messages_with(items, system, &ChatConversionOptions::default())
@@ -600,6 +697,8 @@ pub fn items_to_messages_with(
     // Reasoning waiting to be attached to the next assistant message.
     let mut pending_reasoning_content: Option<String> = None;
     let mut pending_reasoning: Option<String> = None;
+    // Anthropic thinking blocks waiting to be replayed: (blocks, came from a native field).
+    let mut pending_thinking: Option<(Vec<Value>, bool)> = None;
     if let Some(s) = system {
         result.push(json!({"role": "system", "content": s}));
     }
@@ -616,15 +715,18 @@ pub fn items_to_messages_with(
             result.push(Value::Object(a));
         }
     }
-    let apply_reasoning =
-        |asst: &mut Map<String, Value>, rc: &mut Option<String>, r: &mut Option<String>| {
-            if let Some(text) = rc.take() {
-                asst.insert("reasoning_content".into(), Value::String(text));
-            }
-            if let Some(text) = r.take() {
-                asst.insert("reasoning".into(), Value::String(text));
-            }
-        };
+    let apply_reasoning = |asst: &mut Map<String, Value>,
+                           rc: &mut Option<String>,
+                           r: &mut Option<String>,
+                           tb: &mut Option<(Vec<Value>, bool)>| {
+        if let Some(text) = rc.take() {
+            asst.insert("reasoning_content".into(), Value::String(text));
+        }
+        if let Some(text) = r.take() {
+            asst.insert("reasoning".into(), Value::String(text));
+        }
+        apply_pending_thinking_blocks(asst, tb);
+    };
     for item in items {
         let v = &item.0;
         let ty = v.get("type").and_then(Value::as_str);
@@ -634,6 +736,7 @@ pub fn items_to_messages_with(
                 flush(&mut result, &mut current);
                 pending_reasoning_content = None;
                 pending_reasoning = None;
+                pending_thinking = None;
                 let content = v.get("content").cloned().unwrap_or(Value::Null);
                 let converted = match (&content, role) {
                     (Value::Array(parts), "user") => {
@@ -679,6 +782,7 @@ pub fn items_to_messages_with(
                     &mut asst,
                     &mut pending_reasoning_content,
                     &mut pending_reasoning,
+                    &mut pending_thinking,
                 );
                 current = Some(asst);
             }
@@ -686,6 +790,7 @@ pub fn items_to_messages_with(
                 flush(&mut result, &mut current);
                 pending_reasoning_content = None;
                 pending_reasoning = None;
+                pending_thinking = None;
                 let provider_data = v
                     .get("provider_data")
                     .and_then(Value::as_object)
@@ -739,6 +844,58 @@ pub fn items_to_messages_with(
                             pending_reasoning_content = Some(t.join("\n"));
                         }
                     }
+                    // Claude interleaved thinking: replay the signed blocks on the next
+                    // assistant message. Items may come from another provider, so only an
+                    // item whose model matches (or that carries no other provider metadata)
+                    // counts as Claude's own.
+                    let lower = model.to_lowercase();
+                    let origin_unknown = provider_data.keys().all(|k| k == "thinking_blocks");
+                    if options.preserve_thinking_blocks
+                        && (lower.contains("claude") || lower.contains("anthropic"))
+                        && (*model == item_model || origin_unknown)
+                    {
+                        let native = provider_data
+                            .get("thinking_blocks")
+                            .and_then(Value::as_array)
+                            .filter(|b| !b.is_empty() && b.iter().all(Value::is_object));
+                        if let Some(blocks) = native {
+                            pending_reasoning = None;
+                            pending_thinking = Some((blocks.clone(), true));
+                        } else if provider_data
+                            .get(REASONING_FIELD_KEY)
+                            .and_then(Value::as_str)
+                            != Some("reasoning")
+                        {
+                            let mut signatures: VecDeque<&str> = v
+                                .get("encrypted_content")
+                                .and_then(Value::as_str)
+                                .map(|c| c.split('\n').collect())
+                                .unwrap_or_default();
+                            let blocks: Vec<Value> = v
+                                .get("content")
+                                .and_then(Value::as_array)
+                                .into_iter()
+                                .flatten()
+                                .filter(|p| {
+                                    p.get("type").and_then(Value::as_str) == Some("reasoning_text")
+                                })
+                                .map(|p| {
+                                    let mut block = json!({
+                                        "type": "thinking",
+                                        "thinking": p.get("text").cloned()
+                                            .unwrap_or_else(|| Value::String(String::new())),
+                                    });
+                                    if let Some(sig) = signatures.pop_front() {
+                                        block["signature"] = Value::String(sig.to_string());
+                                    }
+                                    block
+                                })
+                                .collect();
+                            if !blocks.is_empty() {
+                                pending_thinking = Some((blocks, false));
+                            }
+                        }
+                    }
                 }
             }
             (Some("function_call"), _) => {
@@ -749,8 +906,13 @@ pub fn items_to_messages_with(
                     m.insert("tool_calls".into(), Value::Array(Vec::new()));
                     m
                 });
-                apply_reasoning(asst, &mut pending_reasoning_content, &mut pending_reasoning);
-                let call = json!({
+                apply_reasoning(
+                    asst,
+                    &mut pending_reasoning_content,
+                    &mut pending_reasoning,
+                    &mut pending_thinking,
+                );
+                let mut call = json!({
                     "id": v.get("call_id").cloned().unwrap_or(Value::Null),
                     "type": "function",
                     "function": {
@@ -758,6 +920,17 @@ pub fn items_to_messages_with(
                         "arguments": v.get("arguments").cloned().unwrap_or(Value::String("{}".into())),
                     }
                 });
+                // Gemini rejects a replayed tool call whose thought signature was dropped.
+                if options
+                    .model
+                    .as_deref()
+                    .is_some_and(|m| m.to_lowercase().contains("gemini"))
+                    && let Some(sig) = v
+                        .pointer("/provider_data/thought_signature")
+                        .and_then(Value::as_str)
+                {
+                    call["extra_content"] = json!({"google": {"thought_signature": sig}});
+                }
                 if let Some(Value::Array(calls)) = asst.get_mut("tool_calls") {
                     calls.push(call);
                 }
@@ -766,6 +939,7 @@ pub fn items_to_messages_with(
                 flush(&mut result, &mut current);
                 pending_reasoning_content = None;
                 pending_reasoning = None;
+                pending_thinking = None;
                 let Some(call_id) = v.get("call_id").filter(|c| !c.is_null()).cloned() else {
                     return Err(AgentsError::user(
                         "Unpaired function outputs are supported by Responses but cannot be \
@@ -829,6 +1003,20 @@ pub fn items_to_messages_with(
     Ok(result)
 }
 
+/// Carry a provider's per-tool-call metadata (today: Google's thought signature) on the
+/// function call item, so it can be replayed on the next request.
+/// Port of the `extra_content` -> `provider_data` conversion in `message_to_output_items`.
+fn tool_call_provider_data(call: &Value) -> Map<String, Value> {
+    let mut extra = Map::new();
+    if let Some(sig) = call
+        .pointer("/extra_content/google/thought_signature")
+        .and_then(Value::as_str)
+    {
+        extra.insert("provider_data".into(), json!({"thought_signature": sig}));
+    }
+    extra
+}
+
 /// Parse a Chat Completions response into a `ModelResponse`.
 pub(crate) fn parse_chat_completion(
     v: &Value,
@@ -851,7 +1039,17 @@ pub(crate) fn parse_chat_completion(
         .and_then(Value::as_str)
         .filter(|_| reasoning_content.is_empty())
         .unwrap_or("");
-    if !reasoning_content.is_empty() || !reasoning.is_empty() {
+    let thinking_blocks = message
+        .get("thinking_blocks")
+        .and_then(Value::as_array)
+        .map(|b| {
+            b.iter()
+                .filter(|v| v.is_object())
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .filter(|b: &Vec<Value>| !b.is_empty());
+    if !reasoning_content.is_empty() || !reasoning.is_empty() || thinking_blocks.is_some() {
         let mut provider_data = Map::new();
         if !model.is_empty() {
             provider_data.insert("model".into(), json!(model));
@@ -859,9 +1057,38 @@ pub(crate) fn parse_chat_completion(
         let mut item = json!({"type": "reasoning", "id": FAKE_RESPONSES_ID, "summary": []});
         if !reasoning_content.is_empty() {
             item["summary"] = json!([{"type": "summary_text", "text": reasoning_content}]);
-        } else {
+        } else if !reasoning.is_empty() {
             item["content"] = json!([{"type": "reasoning_text", "text": reasoning}]);
             provider_data.insert(REASONING_FIELD_KEY.into(), json!("reasoning"));
+        }
+        // Claude's signed interleaved-thinking blocks must survive a round trip verbatim, so
+        // keep the whole sequence and also the normalized text/signature view.
+        if let Some(blocks) = thinking_blocks {
+            let mut text = String::new();
+            let mut last_signature: Option<String> = None;
+            for block in &blocks {
+                if block.get("type").and_then(Value::as_str) != Some("thinking") {
+                    continue;
+                }
+                text.push_str(block.get("thinking").and_then(Value::as_str).unwrap_or(""));
+                if let Some(sig) = block.get("signature").and_then(Value::as_str) {
+                    last_signature = Some(sig.to_string());
+                }
+            }
+            provider_data.insert("thinking_blocks".into(), Value::Array(blocks));
+            if !text.is_empty() {
+                let content = item
+                    .get_mut("content")
+                    .and_then(Value::as_array_mut)
+                    .map(std::mem::take)
+                    .unwrap_or_default();
+                let mut content = content;
+                content.push(json!({"type": "reasoning_text", "text": text}));
+                item["content"] = Value::Array(content);
+            }
+            if let Some(sig) = &last_signature {
+                item["encrypted_content"] = json!(sig);
+            }
         }
         if !provider_data.is_empty() {
             item["provider_data"] = Value::Object(provider_data);
@@ -912,7 +1139,7 @@ pub(crate) fn parse_chat_completion(
                     .unwrap_or("{}")
                     .to_string(),
                 status: None,
-                extra: Map::new(),
+                extra: tool_call_provider_data(c),
             }));
         }
     }
@@ -950,8 +1177,21 @@ struct StreamState {
     refusal: String,
     message_started: bool,
     tool_calls: BTreeMap<u64, (String, String, String)>,
+    /// Hold streamed tool-call deltas back and emit each call once, complete.
+    buffer_tool_calls: bool,
+    /// Output indices are handed out in announcement order, so a message that starts after a
+    /// tool call cannot take the index that call already used.
+    next_output_index: usize,
+    reasoning_index: Option<usize>,
+    message_output_index: Option<usize>,
+    /// Chat Completions tool-call index -> Responses output index, once announced.
+    call_indexes: BTreeMap<u64, usize>,
     /// Streamed reasoning: (summary text, reasoning text, summary part open).
     reasoning: Option<(String, String, bool)>,
+    /// The ordered Anthropic thinking-block sequence, rebuilt from the streamed deltas.
+    /// Text and signatures cannot be flattened: each block carries its own signature and a
+    /// `redacted_thinking` block carries neither.
+    thinking_blocks: Vec<Value>,
     usage: Option<Value>,
     finished: bool,
     model: String,
@@ -961,7 +1201,13 @@ struct StreamState {
 
 impl StreamState {
     fn message_index(&self) -> usize {
-        usize::from(self.reasoning.is_some())
+        self.message_output_index.unwrap_or(0)
+    }
+
+    fn take_output_index(&mut self) -> usize {
+        let index = self.next_output_index;
+        self.next_output_index += 1;
+        index
     }
 
     fn reasoning_provider_data(&self, reasoning_field: bool) -> Value {
@@ -978,17 +1224,20 @@ impl StreamState {
             return;
         }
         self.reasoning = Some((String::new(), String::new(), false));
+        let index = self.take_output_index();
+        self.reasoning_index = Some(index);
         let mut item = json!({"type": "reasoning", "id": FAKE_RESPONSES_ID, "summary": [],
             "provider_data": self.reasoning_provider_data(reasoning_field)});
         if reasoning_field {
             item["content"] = json!([{"type": "reasoning_text", "text": ""}]);
         }
         self.pending.push_back(Ok(json!({
-            "type": "response.output_item.added", "output_index": 0, "item": item,
+            "type": "response.output_item.added", "output_index": index, "item": item,
         })));
     }
 
     fn close_summary_part(&mut self) {
+        let reasoning_index = self.reasoning_index.unwrap_or(0);
         if let Some((summary, _, open)) = &mut self.reasoning
             && *open
         {
@@ -996,11 +1245,11 @@ impl StreamState {
             let text = summary.clone();
             self.pending.push_back(Ok(json!({
                 "type": "response.reasoning_summary_text.done", "item_id": FAKE_RESPONSES_ID,
-                "output_index": 0, "summary_index": 0, "text": text,
+                "output_index": reasoning_index, "summary_index": 0, "text": text,
             })));
             self.pending.push_back(Ok(json!({
                 "type": "response.reasoning_summary_part.done", "item_id": FAKE_RESPONSES_ID,
-                "output_index": 0, "summary_index": 0,
+                "output_index": reasoning_index, "summary_index": 0,
                 "part": {"type": "summary_text", "text": text},
             })));
         }
@@ -1012,7 +1261,8 @@ impl StreamState {
         }
         self.close_summary_part();
         self.message_started = true;
-        let index = self.message_index();
+        let index = self.take_output_index();
+        self.message_output_index = Some(index);
         self.pending.push_back(Ok(json!({
             "type": "response.output_item.added",
             "output_index": index,
@@ -1027,6 +1277,65 @@ impl StreamState {
         })));
     }
 
+    /// Fold one streamed thinking delta into the ordered block sequence.
+    ///
+    /// Anthropic streams a thinking block as a run of text deltas terminated by a single
+    /// signature delta, so a signature both belongs to the block being accumulated and ends it.
+    /// A `redacted_thinking` block arrives whole and is kept verbatim.
+    /// Port of `StreamingState.accumulate_thinking_block`.
+    fn accumulate_thinking_block(&mut self, block: &Value) {
+        let Some(block) = block.as_object() else {
+            return;
+        };
+        let block_type = block
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("thinking");
+        if block_type == "redacted_thinking" {
+            self.thinking_blocks.push(Value::Object(block.clone()));
+            return;
+        }
+        if block_type != "thinking" {
+            return;
+        }
+        let thinking = block.get("thinking").and_then(Value::as_str).unwrap_or("");
+        let signature = block.get("signature").and_then(Value::as_str).unwrap_or("");
+        let metadata: Vec<(&String, &Value)> = block
+            .iter()
+            .filter(|(k, _)| !matches!(k.as_str(), "type" | "thinking" | "signature"))
+            .collect();
+        if thinking.is_empty() && signature.is_empty() && metadata.is_empty() {
+            return;
+        }
+        let reopen = self.thinking_blocks.last().is_some_and(|b| {
+            b.get("type").and_then(Value::as_str) == Some("thinking")
+                && b.get("signature").is_none()
+        });
+        if !reopen {
+            self.thinking_blocks
+                .push(json!({"type": "thinking", "thinking": ""}));
+        }
+        let current = self
+            .thinking_blocks
+            .last_mut()
+            .and_then(Value::as_object_mut)
+            .expect("open thinking block");
+        for (k, v) in metadata {
+            current.insert(k.clone(), v.clone());
+        }
+        if !thinking.is_empty() {
+            let existing = current
+                .get("thinking")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            current.insert("thinking".into(), json!(format!("{existing}{thinking}")));
+        }
+        if !signature.is_empty() {
+            current.insert("signature".into(), json!(signature));
+        }
+    }
+
     fn handle_chunk(&mut self, chunk: &Value) {
         if let Some(u) = chunk.get("usage").filter(|u| !u.is_null()) {
             self.usage = Some(u.clone());
@@ -1038,6 +1347,7 @@ impl StreamState {
             && !rc.is_empty()
         {
             self.start_reasoning(false);
+            let reasoning_index = self.reasoning_index.unwrap_or(0);
             if let Some((summary, _, open)) = &mut self.reasoning
                 && !self.message_started
             {
@@ -1045,29 +1355,38 @@ impl StreamState {
                     *open = true;
                     self.pending.push_back(Ok(json!({
                         "type": "response.reasoning_summary_part.added",
-                        "item_id": FAKE_RESPONSES_ID, "output_index": 0, "summary_index": 0,
+                        "item_id": FAKE_RESPONSES_ID, "output_index": reasoning_index, "summary_index": 0,
                         "part": {"type": "summary_text", "text": ""},
                     })));
                 }
                 summary.push_str(rc);
                 self.pending.push_back(Ok(json!({
                     "type": "response.reasoning_summary_text.delta",
-                    "item_id": FAKE_RESPONSES_ID, "output_index": 0, "summary_index": 0,
+                    "item_id": FAKE_RESPONSES_ID, "output_index": reasoning_index, "summary_index": 0,
                     "delta": rc,
                 })));
+            }
+        }
+        if let Some(blocks) = delta.get("thinking_blocks").and_then(Value::as_array)
+            && !blocks.is_empty()
+        {
+            self.start_reasoning(false);
+            for block in blocks {
+                self.accumulate_thinking_block(block);
             }
         }
         if let Some(r) = delta.get("reasoning").and_then(Value::as_str)
             && !r.is_empty()
         {
             self.start_reasoning(true);
+            let reasoning_index = self.reasoning_index.unwrap_or(0);
             if let Some((_, text, _)) = &mut self.reasoning
                 && !self.message_started
             {
                 text.push_str(r);
                 self.pending.push_back(Ok(json!({
                     "type": "response.reasoning_text.delta",
-                    "item_id": FAKE_RESPONSES_ID, "output_index": 0, "content_index": 0,
+                    "item_id": FAKE_RESPONSES_ID, "output_index": reasoning_index, "content_index": 0,
                     "delta": r,
                 })));
             }
@@ -1120,7 +1439,7 @@ impl StreamState {
             })));
         }
         if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
-            for c in calls {
+            for c in calls.clone() {
                 let idx = c.get("index").and_then(Value::as_u64).unwrap_or(0);
                 let entry = self.tool_calls.entry(idx).or_default();
                 // The id and the name are assigned, never appended: a provider that repeats
@@ -1137,33 +1456,84 @@ impl StreamState {
                     entry.1.clear();
                     entry.1.push_str(n);
                 }
-                if let Some(a) = c.pointer("/function/arguments").and_then(Value::as_str) {
-                    entry.2.push_str(a);
+                let arguments = c
+                    .pointer("/function/arguments")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                entry.2.push_str(&arguments);
+                if self.buffer_tool_calls {
+                    continue;
+                }
+                // Announce the call as soon as its id and name are known, then forward each
+                // argument fragment, as Python does when tool-call buffering is off.
+                let (id, name) = (entry.0.clone(), entry.1.clone());
+                if !self.call_indexes.contains_key(&idx) {
+                    if id.is_empty() || name.is_empty() {
+                        continue;
+                    }
+                    let output_index = self.take_output_index();
+                    self.call_indexes.insert(idx, output_index);
+                    self.pending.push_back(Ok(json!({
+                        "type": "response.output_item.added", "output_index": output_index,
+                        "item": {"type": "function_call", "id": FAKE_RESPONSES_ID,
+                                 "call_id": id, "name": name, "arguments": ""},
+                    })));
+                }
+                if !arguments.is_empty() {
+                    let output_index = self.call_indexes[&idx];
+                    self.pending.push_back(Ok(json!({
+                        "type": "response.function_call_arguments.delta",
+                        "item_id": FAKE_RESPONSES_ID, "output_index": output_index,
+                        "delta": arguments,
+                    })));
                 }
             }
         }
     }
 
     fn finish(&mut self) {
-        let mut output: Vec<Value> = Vec::new();
+        let mut slots: BTreeMap<usize, Value> = BTreeMap::new();
         self.close_summary_part();
-        if let Some((summary, text, _)) = self.reasoning.clone() {
+        let reasoning_index = self.reasoning_index.unwrap_or(0);
+        if let Some((summary, mut text, _)) = self.reasoning.clone() {
             let reasoning_field = summary.is_empty() && !text.is_empty();
             let mut item = json!({"type": "reasoning", "id": FAKE_RESPONSES_ID,
                 "summary": if summary.is_empty() { json!([]) }
                            else { json!([{"type": "summary_text", "text": summary}]) },
                 "provider_data": self.reasoning_provider_data(reasoning_field)});
+            if !self.thinking_blocks.is_empty() {
+                let mut thinking_text = String::new();
+                let mut last_signature: Option<String> = None;
+                for block in &self.thinking_blocks {
+                    if block.get("type").and_then(Value::as_str) != Some("thinking") {
+                        continue;
+                    }
+                    thinking_text
+                        .push_str(block.get("thinking").and_then(Value::as_str).unwrap_or(""));
+                    if let Some(sig) = block.get("signature").and_then(Value::as_str) {
+                        last_signature = Some(sig.to_string());
+                    }
+                }
+                item["provider_data"]["thinking_blocks"] = json!(self.thinking_blocks);
+                if let Some(sig) = &last_signature {
+                    item["encrypted_content"] = json!(sig);
+                }
+                if text.is_empty() {
+                    text = thinking_text;
+                }
+            }
             if !text.is_empty() {
                 item["content"] = json!([{"type": "reasoning_text", "text": text}]);
                 self.pending.push_back(Ok(json!({
                     "type": "response.reasoning_text.done", "item_id": FAKE_RESPONSES_ID,
-                    "output_index": 0, "content_index": 0, "text": text,
+                    "output_index": reasoning_index, "content_index": 0, "text": text,
                 })));
             }
             self.pending.push_back(Ok(json!({
-                "type": "response.output_item.done", "output_index": 0, "item": item.clone(),
+                "type": "response.output_item.done", "output_index": reasoning_index, "item": item.clone(),
             })));
-            output.push(item);
+            slots.insert(reasoning_index, item);
         }
         let mi = self.message_index();
         if self.message_started {
@@ -1196,26 +1566,38 @@ impl StreamState {
             self.pending.push_back(Ok(json!({
                 "type": "response.output_item.done", "output_index": mi, "item": item.clone(),
             })));
-            output.push(item);
+            slots.insert(mi, item);
         }
-        for (id, name, args) in self.tool_calls.values() {
-            let output_index = output.len();
+        let calls: Vec<(u64, (String, String, String))> = self
+            .tool_calls
+            .iter()
+            .map(|(k, v)| (*k, v.clone()))
+            .collect();
+        for (idx, (id, name, args)) in calls {
             let args = if args.is_empty() {
                 "{}".to_string()
             } else {
-                args.clone()
+                args
             };
-            let added = json!({
-                "type": "function_call", "id": FAKE_RESPONSES_ID, "call_id": id,
-                "name": name, "arguments": "",
-            });
-            self.pending.push_back(Ok(json!({
-                "type": "response.output_item.added", "output_index": output_index, "item": added,
-            })));
-            self.pending.push_back(Ok(json!({
-                "type": "response.function_call_arguments.delta",
-                "item_id": FAKE_RESPONSES_ID, "output_index": output_index, "delta": args,
-            })));
+            let announced = self.call_indexes.get(&idx).copied();
+            let output_index = match announced {
+                Some(i) => i,
+                None => {
+                    let output_index = self.take_output_index();
+                    self.call_indexes.insert(idx, output_index);
+                    self.pending.push_back(Ok(json!({
+                        "type": "response.output_item.added", "output_index": output_index,
+                        "item": {"type": "function_call", "id": FAKE_RESPONSES_ID,
+                                 "call_id": id, "name": name, "arguments": ""},
+                    })));
+                    self.pending.push_back(Ok(json!({
+                        "type": "response.function_call_arguments.delta",
+                        "item_id": FAKE_RESPONSES_ID, "output_index": output_index,
+                        "delta": args,
+                    })));
+                    output_index
+                }
+            };
             self.pending.push_back(Ok(json!({
                 "type": "response.function_call_arguments.done",
                 "item_id": FAKE_RESPONSES_ID, "output_index": output_index, "arguments": args,
@@ -1227,8 +1609,9 @@ impl StreamState {
             self.pending.push_back(Ok(json!({
                 "type": "response.output_item.done", "output_index": output_index, "item": item.clone(),
             })));
-            output.push(item);
+            slots.insert(output_index, item);
         }
+        let output: Vec<Value> = slots.into_values().collect();
         let usage = self.usage.as_ref().map(|u| {
             let parsed = Usage::from_chat_usage(u);
             json!({
@@ -1261,14 +1644,18 @@ impl Model for OpenAIChatCompletionsModel {
         self.client.is_openai_api()
     }
 
+    fn is_chat_completions(&self) -> bool {
+        true
+    }
+
     async fn get_response(&self, request: ModelRequest) -> Result<ModelResponse> {
-        let body = self.build_request_body(&request, false)?;
+        let body = self.transformed_body(&request, false)?;
         let span = self.start_span(&request, &body);
         let result = async {
             let (value, request_id) = self
                 .client
                 .post_json(
-                    "chat/completions",
+                    &self.chat_path,
                     &body,
                     request.model_settings.extra_headers.as_ref(),
                     request.model_settings.extra_query.as_ref(),
@@ -1299,12 +1686,12 @@ impl Model for OpenAIChatCompletionsModel {
     }
 
     async fn stream_response(&self, request: ModelRequest) -> Result<ResponseEventStream> {
-        let body = self.build_request_body(&request, true)?;
+        let body = self.transformed_body(&request, true)?;
         let span = self.start_span(&request, &body);
         let (inner, _) = match self
             .client
             .post_sse(
-                "chat/completions",
+                &self.chat_path,
                 &body,
                 request.model_settings.extra_headers.as_ref(),
                 request.model_settings.extra_query.as_ref(),
@@ -1333,7 +1720,13 @@ impl Model for OpenAIChatCompletionsModel {
             refusal: String::new(),
             message_started: false,
             tool_calls: BTreeMap::new(),
+            buffer_tool_calls: self.buffer_streamed_tool_calls,
+            next_output_index: 0,
+            reasoning_index: None,
+            message_output_index: None,
+            call_indexes: BTreeMap::new(),
             reasoning: None,
+            thinking_blocks: Vec::new(),
             usage: None,
             finished: false,
             model: self.model.clone(),
@@ -1445,7 +1838,13 @@ mod tests {
             refusal: String::new(),
             message_started: false,
             tool_calls: BTreeMap::new(),
+            buffer_tool_calls: false,
+            next_output_index: 0,
+            reasoning_index: None,
+            message_output_index: None,
+            call_indexes: BTreeMap::new(),
             reasoning: None,
+            thinking_blocks: Vec::new(),
             usage: None,
             finished: false,
             model: "m".into(),
@@ -1488,7 +1887,13 @@ mod tests {
             refusal: String::new(),
             message_started: false,
             tool_calls: BTreeMap::new(),
+            buffer_tool_calls: false,
+            next_output_index: 0,
+            reasoning_index: None,
+            message_output_index: None,
+            call_indexes: BTreeMap::new(),
             reasoning: None,
+            thinking_blocks: Vec::new(),
             usage: None,
             finished: false,
             model: "deepseek-reasoner".into(),
@@ -1557,7 +1962,13 @@ mod tests {
             refusal: String::new(),
             message_started: false,
             tool_calls: BTreeMap::new(),
+            buffer_tool_calls: false,
+            next_output_index: 0,
+            reasoning_index: None,
+            message_output_index: None,
+            call_indexes: BTreeMap::new(),
             reasoning: None,
+            thinking_blocks: Vec::new(),
             usage: None,
             finished: false,
             model: model.into(),

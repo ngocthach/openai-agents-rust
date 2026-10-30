@@ -4,7 +4,8 @@
 //! tracing backend can take over trace and span lifecycle events entirely.
 
 use std::fmt;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::panic::AssertUnwindSafe;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 
 use super::processors::{BackendSpanExporter, BatchTraceProcessor, TracingProcessor};
@@ -37,13 +38,16 @@ pub trait TraceProvider: Send + Sync + fmt::Debug {
 /// The built-in provider: holds the registered processors and the global disabled flag.
 pub struct DefaultTraceProvider {
     processors: RwLock<Option<Vec<Arc<dyn TracingProcessor>>>>,
-    disabled: AtomicBool,
+    /// Set by [`TraceProvider::set_disabled`]; takes precedence over the environment.
+    manual_disabled: RwLock<Option<bool>>,
+    /// `OPENAI_AGENTS_DISABLE_TRACING`, read once on first use (`u8`: 0 unknown, 1 off, 2 on).
+    env_disabled: AtomicU8,
 }
 
 impl fmt::Debug for DefaultTraceProvider {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("DefaultTraceProvider")
-            .field("disabled", &self.disabled.load(Ordering::Relaxed))
+            .field("disabled", &self.is_disabled())
             .finish_non_exhaustive()
     }
 }
@@ -120,7 +124,21 @@ impl DefaultTraceProvider {
     pub fn new() -> Self {
         DefaultTraceProvider {
             processors: RwLock::new(None),
-            disabled: AtomicBool::new(env_disabled()),
+            manual_disabled: RwLock::new(None),
+            env_disabled: AtomicU8::new(0),
+        }
+    }
+
+    /// `OPENAI_AGENTS_DISABLE_TRACING`, read once and then cached, as in Python.
+    fn env_disabled_cached(&self) -> bool {
+        match self.env_disabled.load(Ordering::Relaxed) {
+            0 => {
+                let value = env_disabled();
+                self.env_disabled
+                    .store(if value { 2 } else { 1 }, Ordering::Relaxed);
+                value
+            }
+            v => v == 2,
         }
     }
 
@@ -140,11 +158,14 @@ impl DefaultTraceProvider {
 
 impl TraceProvider for DefaultTraceProvider {
     fn is_disabled(&self) -> bool {
-        self.disabled.load(Ordering::Relaxed)
+        match *self.manual_disabled.read().expect("provider poisoned") {
+            Some(manual) => manual,
+            None => self.env_disabled_cached(),
+        }
     }
 
     fn set_disabled(&self, disabled: bool) {
-        self.disabled.store(disabled, Ordering::Relaxed);
+        *self.manual_disabled.write().expect("provider poisoned") = Some(disabled);
     }
 
     fn set_processors(&self, processors: Vec<Arc<dyn TracingProcessor>>) {
@@ -160,34 +181,49 @@ impl TraceProvider for DefaultTraceProvider {
 
     fn on_trace_start(&self, trace: &Trace) {
         for p in self.processors() {
-            p.on_trace_start(trace);
+            isolate("on_trace_start", &p, || p.on_trace_start(trace));
         }
     }
     fn on_trace_end(&self, trace: &Trace) {
         for p in self.processors() {
-            p.on_trace_end(trace);
+            isolate("on_trace_end", &p, || p.on_trace_end(trace));
         }
     }
     fn on_span_start(&self, span: &Span) {
         for p in self.processors() {
-            p.on_span_start(span);
+            isolate("on_span_start", &p, || p.on_span_start(span));
         }
     }
     fn on_span_end(&self, span: &Span) {
         for p in self.processors() {
-            p.on_span_end(span);
+            isolate("on_span_end", &p, || p.on_span_end(span));
         }
     }
 
     fn force_flush(&self) {
         for p in self.processors() {
-            p.force_flush();
+            isolate("force_flush", &p, || p.force_flush());
         }
     }
 
     fn shutdown(&self) {
         for p in self.processors() {
-            p.shutdown();
+            isolate("shutdown", &p, || p.shutdown());
         }
+    }
+}
+
+/// Run one processor callback, keeping a panic inside it from stopping the other processors.
+///
+/// Port of the per-processor `try/except` in `SynchronousMultiTracingProcessor`. A Rust
+/// processor signals failure by panicking rather than by raising, so the isolation is
+/// `catch_unwind`; the diagnostic names the processor the way `_processor_diagnostic_extra`
+/// does. Under `panic = "abort"` the process still aborts — nothing can catch that.
+fn isolate(action: &str, processor: &Arc<dyn TracingProcessor>, f: impl FnOnce()) {
+    if std::panic::catch_unwind(AssertUnwindSafe(f)).is_err() {
+        log::error!(
+            target: crate::logger::LOG_TARGET,
+            "Error in trace processor during {action} (trace_processor: {processor:?})"
+        );
     }
 }

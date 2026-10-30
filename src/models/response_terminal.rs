@@ -17,7 +17,7 @@ fn detail(out: &mut Vec<String>, key: &str, value: Option<&Value>) {
 
 /// Describe a `response.failed` / `response.incomplete` event.
 pub fn format_response_terminal_failure(event_type: &str, response: Option<&Value>) -> String {
-    let message = format!("Responses stream ended with terminal event `{event_type}`.");
+    let message = format!("{TERMINAL_PREFIX}{event_type}`.");
     let Some(response) = response.filter(|r| !r.is_null()) else {
         return message;
     };
@@ -38,7 +38,7 @@ pub fn format_response_terminal_failure(event_type: &str, response: Option<&Valu
 
 /// Describe an `error` / `response.error` event.
 pub fn format_response_error_event(event_type: &str, event: &Value) -> String {
-    let message = format!("Responses stream ended with terminal event `{event_type}`.");
+    let message = format!("{TERMINAL_PREFIX}{event_type}`.");
     // The OpenAI stream sends the fields at the top level; some gateways nest them under
     // `error`, so fall back to that shape.
     let source = event
@@ -64,6 +64,20 @@ pub fn response_terminal_failure_error(event_type: &str, response: Option<&Value
 /// The error raised for an `error` / `response.error` stream event.
 pub fn response_error_event_failure_error(event_type: &str, event: &Value) -> AgentsError {
     AgentsError::model_behavior(format_response_error_event(event_type, event))
+}
+
+/// Prefix shared by every terminal-failure message this module builds.
+const TERMINAL_PREFIX: &str = "Responses stream ended with terminal event `";
+
+/// Whether the already-queued stream events should be delivered to the consumer before this
+/// error is raised. Port of `_should_drain_stream_events_before_raising`.
+///
+/// Python marks the exception object itself; Rust's `AgentsError` carries no attributes, so the
+/// marker is the message shape every terminal-failure error here has. A streaming run result
+/// should drain its event queue before surfacing such an error, so the caller still sees the
+/// output the model produced before the stream failed.
+pub fn should_drain_stream_events_before_raising(error: &AgentsError) -> bool {
+    matches!(error, AgentsError::ModelBehaviorError { message, .. } if message.starts_with(TERMINAL_PREFIX))
 }
 
 /// Whether `event_type` ends a Responses stream in failure.

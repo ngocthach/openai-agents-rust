@@ -33,13 +33,69 @@ pub trait TracingProcessor: Send + Sync + fmt::Debug {
     fn force_flush(&self) {}
 }
 
+/// The live trace or span an [`ExportItem`] was built from.
+#[derive(Debug, Clone)]
+pub enum ExportedObject {
+    /// A trace, from `on_trace_start`.
+    Trace(Trace),
+    /// A finished span, from `on_span_end`.
+    Span(Span),
+}
+
 /// A trace or span ready for export.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// `payload` is the wire format; `object` is the live object it came from, so a custom
+/// exporter can read typed span data (`SpanData`, the recorded error, the parent id) instead of
+/// re-parsing JSON. It is `None` for items an application built by hand.
+#[derive(Debug, Clone, Default)]
 pub struct ExportItem {
     /// The exported payload (`object: trace` or `object: trace.span`).
     pub payload: Value,
     /// Per-trace API key override.
     pub api_key: Option<String>,
+    /// The live object behind `payload`. Mirrors Python's `TracingExporter.export(items)`
+    /// receiving `Trace | Span` rather than dictionaries.
+    pub object: Option<ExportedObject>,
+}
+
+/// Two items are the same when they export the same payload under the same key; the live
+/// object is a view on that payload, not extra state.
+impl PartialEq for ExportItem {
+    fn eq(&self, other: &Self) -> bool {
+        self.payload == other.payload && self.api_key == other.api_key
+    }
+}
+
+impl ExportItem {
+    /// An item carrying only a payload (no live object).
+    pub fn new(payload: Value, api_key: Option<String>) -> Self {
+        ExportItem {
+            payload,
+            api_key,
+            object: None,
+        }
+    }
+
+    /// The span this item came from, when it is a span.
+    pub fn span(&self) -> Option<&Span> {
+        match &self.object {
+            Some(ExportedObject::Span(s)) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// The trace this item came from, when it is a trace.
+    pub fn trace(&self) -> Option<&Trace> {
+        match &self.object {
+            Some(ExportedObject::Trace(t)) => Some(t),
+            _ => None,
+        }
+    }
+
+    /// The typed span data, when this item is a span.
+    pub fn span_data(&self) -> Option<super::span_data::SpanData> {
+        self.span().map(Span::data)
+    }
 }
 
 /// Sends batches of exported items somewhere. Called on the processor's background thread.
@@ -641,6 +697,7 @@ impl TracingProcessor for BatchTraceProcessor {
             self.send(Message::Item(ExportItem {
                 payload,
                 api_key: trace.tracing_api_key().map(str::to_string),
+                object: Some(ExportedObject::Trace(trace.clone())),
             }));
         }
     }
@@ -656,6 +713,7 @@ impl TracingProcessor for BatchTraceProcessor {
             self.send(Message::Item(ExportItem {
                 payload,
                 api_key: span.tracing_api_key().map(str::to_string),
+                object: Some(ExportedObject::Span(span.clone())),
             }));
         }
     }

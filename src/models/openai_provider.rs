@@ -21,10 +21,13 @@ pub struct OpenAIProvider {
     use_responses: Option<bool>,
     agent_harness_id: Option<String>,
     strict_feature_validation: bool,
+    buffer_streamed_tool_calls: bool,
     #[cfg(feature = "websocket")]
     websocket_base_url: Option<String>,
     #[cfg(feature = "websocket")]
-    use_responses_websocket: bool,
+    use_responses_websocket: Option<bool>,
+    #[cfg(feature = "websocket")]
+    websocket_options: super::openai_responses_ws::OpenAIResponsesWebSocketOptions,
     #[cfg(feature = "websocket")]
     websocket_models: WebsocketModelCache,
 }
@@ -52,7 +55,17 @@ impl OpenAIProvider {
     /// when done.
     #[cfg(feature = "websocket")]
     pub fn with_responses_websocket(mut self, enabled: bool) -> Self {
-        self.use_responses_websocket = enabled;
+        self.use_responses_websocket = Some(enabled);
+        self
+    }
+
+    /// Low-level WebSocket connection options for the models this provider hands out.
+    #[cfg(feature = "websocket")]
+    pub fn with_websocket_options(
+        mut self,
+        options: super::openai_responses_ws::OpenAIResponsesWebSocketOptions,
+    ) -> Self {
+        self.websocket_options = options;
         self
     }
 
@@ -68,6 +81,13 @@ impl OpenAIProvider {
     /// `conversation_id`, `prompt`) instead of warning and ignoring them.
     pub fn with_strict_feature_validation(mut self, strict: bool) -> Self {
         self.strict_feature_validation = strict;
+        self
+    }
+
+    /// Make Chat Completions models emit each streamed tool call once, complete, instead of
+    /// forwarding the provider's argument fragments. Mirrors `buffer_streamed_tool_calls`.
+    pub fn with_buffer_streamed_tool_calls(mut self, buffer: bool) -> Self {
+        self.buffer_streamed_tool_calls = buffer;
         self
     }
 
@@ -112,6 +132,12 @@ impl OpenAIProvider {
         self.use_responses
             .unwrap_or_else(|| default_openai_api() == OpenAIApi::Responses)
     }
+
+    #[cfg(feature = "websocket")]
+    fn use_responses_websocket(&self) -> bool {
+        self.use_responses_websocket
+            .unwrap_or_else(super::get_use_responses_websocket_by_default)
+    }
 }
 
 #[async_trait::async_trait]
@@ -132,14 +158,15 @@ impl ModelProvider for OpenAIProvider {
             .unwrap_or_else(get_default_model);
         let client = self.client();
         #[cfg(feature = "websocket")]
-        if self.use_responses_websocket && self.use_responses() {
+        if self.use_responses_websocket() && self.use_responses() {
             let mut cache = self.websocket_models.lock().expect("poisoned");
             let model = cache
                 .entry((name.clone(), explicit))
                 .or_insert_with(|| {
                     let mut model =
                         super::openai_responses_ws::OpenAIResponsesWSModel::new(name, client)
-                            .with_explicit(explicit);
+                            .with_explicit(explicit)
+                            .with_websocket_options(self.websocket_options.clone());
                     if let Some(url) = self.websocket_base_url() {
                         model = model.with_websocket_base_url(url);
                     }
@@ -148,6 +175,14 @@ impl ModelProvider for OpenAIProvider {
                 .clone();
             return Ok(model);
         }
+        #[cfg(not(feature = "websocket"))]
+        if super::get_use_responses_websocket_by_default() && self.use_responses() {
+            log::warn!(
+                target: crate::logger::LOG_TARGET,
+                "The Responses WebSocket transport is selected but the `websocket` cargo feature \
+                 is off; falling back to HTTP."
+            );
+        }
         if self.use_responses() {
             Ok(Arc::new(
                 OpenAIResponsesModel::new(name, client).with_explicit(explicit),
@@ -155,7 +190,8 @@ impl ModelProvider for OpenAIProvider {
         } else {
             Ok(Arc::new(
                 OpenAIChatCompletionsModel::new(name, client)
-                    .with_strict_feature_validation(self.strict_feature_validation),
+                    .with_strict_feature_validation(self.strict_feature_validation)
+                    .with_buffer_streamed_tool_calls(self.buffer_streamed_tool_calls),
             ))
         }
     }

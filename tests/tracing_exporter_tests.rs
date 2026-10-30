@@ -64,6 +64,7 @@ fn mock_ingest(replies: Vec<(u16, &'static str)>) -> (String, Arc<AtomicUsize>) 
 
 fn one_span() -> Vec<ExportItem> {
     vec![ExportItem {
+        object: None,
         payload: json!({"object": "trace.span", "id": "span_1"}),
         api_key: Some("sk-test".into()),
     }]

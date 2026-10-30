@@ -164,6 +164,24 @@ pub trait Model: Send + Sync + fmt::Debug {
         false
     }
 
+    /// Whether this model talks to the Chat Completions API.
+    ///
+    /// Chat Completions owns its released warn-and-ignore behaviour for an output guardrail
+    /// that trips on a server-managed conversation, so the runner does not reject that
+    /// combination for it. Mirrors the `isinstance(..., OpenAIChatCompletionsModel)` test in
+    /// `validate_output_guardrails_with_server_managed_conversation`.
+    fn is_chat_completions(&self) -> bool {
+        false
+    }
+
+    /// Release run-scoped resources after the runner finished using this model for `owner`.
+    ///
+    /// Mirrors `Model._cleanup_on_run_end`. `owner` is the id installed by
+    /// [`model_run_context`](crate::models::run_context::model_run_context) for the run that is
+    /// ending; a model holding per-run state must release it only when the state belongs to
+    /// that run. The default does nothing.
+    async fn cleanup_on_run_end(&self, _owner: crate::models::run_context::ModelRunOwner) {}
+
     /// Release resources held by the model.
     async fn close(&self) {}
 }

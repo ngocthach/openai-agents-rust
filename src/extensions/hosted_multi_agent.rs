@@ -29,6 +29,7 @@ use crate::models::interface::{Model, ModelRequest, ResponseEventStream};
 use crate::models::openai_client::OpenAIClient;
 use crate::models::openai_responses::{OpenAIResponsesModel, parse_response};
 use crate::models::openai_responses_ws::websocket_url;
+use crate::models::response_terminal::terminal_failure_error;
 use crate::tool_context::ToolContext;
 
 const BETA_ID: &str = "responses_multi_agent=v1";
@@ -184,6 +185,8 @@ struct PendingInjection {
 }
 
 struct Active {
+    /// The run that opened this paused response, so another run cannot resume it.
+    owner: Option<crate::models::run_context::ModelRunOwner>,
     socket: Ws,
     response_id: Option<String>,
     response_template: Option<Value>,
@@ -435,11 +438,22 @@ impl OpenAIHostedMultiAgentModel {
     /// Run one logical model turn, sending Responses-style events to `tx`.
     async fn run_turn(&self, request: ModelRequest, tx: mpsc::Sender<Result<Value>>) -> Result<()> {
         let frame = self.build_frame(&request)?;
+        let owner = crate::models::run_context::get_model_run_owner();
         let mut guard = self.active.clone().lock_owned().await;
+        if let Some(active) = guard.as_ref()
+            && active.owner.is_some()
+            && active.owner != owner
+        {
+            return Err(AgentsError::user(
+                "OpenAIHostedMultiAgentModel already has a paused response owned by another \
+                 agent run. Use a separate model instance for concurrent runs.",
+            ));
+        }
         if guard.is_none() {
             let mut socket = self.connect(&request).await?;
             send(&mut socket, &frame).await?;
             *guard = Some(Active {
+                owner,
                 socket,
                 response_id: None,
                 response_template: None,
@@ -624,23 +638,7 @@ impl OpenAIHostedMultiAgentModel {
                         }
                         event["response"] = r;
                     }
-                    let err = match ty.as_str() {
-                        "response.failed" | "response.incomplete" => {
-                            let r = event.get("response").cloned().unwrap_or(Value::Null);
-                            parse_response(&r, None, false).err().unwrap_or_else(|| {
-                                AgentsError::model_behavior(format!("Stream ended with {ty}"))
-                            })
-                        }
-                        _ => {
-                            let msg = event
-                                .pointer("/error/message")
-                                .or_else(|| event.get("message"))
-                                .and_then(Value::as_str)
-                                .unwrap_or("unknown error");
-                            AgentsError::other(format!("Hosted multi-agent {ty}: {msg}"))
-                        }
-                    };
-                    return Err(err);
+                    return Err(terminal_failure_error(&ty, &event));
                 }
                 _ => {}
             }
@@ -740,6 +738,15 @@ impl Model for OpenAIHostedMultiAgentModel {
 
     fn model_name(&self) -> Option<String> {
         Some(self.inner.model().to_string())
+    }
+
+    async fn cleanup_on_run_end(&self, owner: crate::models::run_context::ModelRunOwner) {
+        let mut guard = self.active.lock().await;
+        if guard.as_ref().is_some_and(|a| a.owner == Some(owner))
+            && let Some(mut a) = guard.take()
+        {
+            let _ = a.socket.close(None).await;
+        }
     }
 
     async fn close(&self) {

@@ -395,13 +395,35 @@ pub(crate) fn parse_response(
             .and_then(Value::as_str)
             .filter(|id| *id != FAKE_RESPONSES_ID)
             .map(str::to_string),
-        request_id,
+        // On the streaming path the HTTP response is long gone by the time the terminal event
+        // arrives, so the id travels on the event itself (Python sets `response._request_id`).
+        request_id: request_id.or_else(|| {
+            v.get(STREAM_REQUEST_ID_KEY)
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        }),
         raw_usage: if preserve_raw_usage {
             usage_v.cloned()
         } else {
             None
         },
     })
+}
+
+/// Key carrying the HTTP request id on a streamed `response` object.
+/// The Rust equivalent of Python's private `response._request_id` attribute.
+pub const STREAM_REQUEST_ID_KEY: &str = "_request_id";
+
+/// Attach the SSE response's `x-request-id` to a stream event's `response` object, so the
+/// terminal event can carry it into [`ModelResponse::request_id`].
+/// Port of `_ResponseStreamWithRequestId._attach_request_id`.
+pub fn attach_stream_request_id(event: &mut Value, request_id: Option<&str>) {
+    let Some(request_id) = request_id else { return };
+    if let Some(response) = event.get_mut("response").and_then(Value::as_object_mut) {
+        response
+            .entry(STREAM_REQUEST_ID_KEY)
+            .or_insert_with(|| Value::String(request_id.to_string()));
+    }
 }
 
 pub(crate) fn finish_response_span(span: &Span, resp: &ModelResponse, include_data: bool) {
@@ -468,7 +490,7 @@ impl Model for OpenAIResponsesModel {
         let span = response_span(request.tracing.is_disabled());
         span.start();
         let include_data = request.tracing.include_data();
-        let (stream, _request_id) = match self
+        let (stream, request_id) = match self
             .client
             .post_sse(
                 "responses",
@@ -490,7 +512,8 @@ impl Model for OpenAIResponsesModel {
         let mapped = stream.map(move |ev| {
             let span = &guard.0;
             match ev {
-                Ok(event) => {
+                Ok(mut event) => {
+                    attach_stream_request_id(&mut event, request_id.as_deref());
                     let ty = event
                         .get("type")
                         .and_then(Value::as_str)
@@ -539,6 +562,25 @@ impl Model for OpenAIResponsesModel {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_streamed_response_falls_back_to_the_event_request_id() {
+        let mut event = serde_json::json!({
+            "type": "response.completed",
+            "response": {"id": "resp_1", "status": "completed", "output": []},
+        });
+        super::attach_stream_request_id(&mut event, Some("req_abc"));
+        let parsed = super::parse_response(&event["response"], None, false).unwrap();
+        assert_eq!(parsed.request_id.as_deref(), Some("req_abc"));
+        // An explicit id (the non-streaming path) still wins.
+        let parsed =
+            super::parse_response(&event["response"], Some("req_http".into()), false).unwrap();
+        assert_eq!(parsed.request_id.as_deref(), Some("req_http"));
+        // Nothing is attached when the response carried no request id.
+        let mut bare = serde_json::json!({"response": {"id": "r", "status": "completed"}});
+        super::attach_stream_request_id(&mut bare, None);
+        assert!(bare["response"].get(super::STREAM_REQUEST_ID_KEY).is_none());
+    }
+
     use super::*;
     use crate::agent_output::AgentOutputSchema;
     use crate::model_settings::ModelSettings;

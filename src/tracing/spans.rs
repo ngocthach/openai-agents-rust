@@ -26,6 +26,8 @@ struct TraceInner {
     metadata: Option<Map<String, Value>>,
     tracing_api_key: Option<String>,
     disabled: bool,
+    /// Rebuilt from persisted state: processors are not notified again.
+    reattached: bool,
     started: AtomicBool,
     finished: AtomicBool,
 }
@@ -60,9 +62,37 @@ impl Trace {
             metadata,
             tracing_api_key,
             disabled,
+            reattached: false,
             started: AtomicBool::new(false),
             finished: AtomicBool::new(false),
         }))
+    }
+
+    /// A trace rebuilt from persisted state: it keeps the same id and metadata but never
+    /// re-emits trace start/end events. Port of `ReattachedTrace`.
+    pub(crate) fn reattached(
+        name: String,
+        trace_id: String,
+        group_id: Option<String>,
+        metadata: Option<Map<String, Value>>,
+        tracing_api_key: Option<String>,
+    ) -> Self {
+        Trace(Arc::new(TraceInner {
+            trace_id,
+            name,
+            group_id,
+            metadata,
+            tracing_api_key,
+            disabled: false,
+            reattached: true,
+            started: AtomicBool::new(false),
+            finished: AtomicBool::new(false),
+        }))
+    }
+
+    /// Whether this trace was rebuilt from persisted state.
+    pub fn is_reattached(&self) -> bool {
+        self.0.reattached
     }
 
     /// The trace id (`trace_<32 hex>`).
@@ -100,7 +130,10 @@ impl Trace {
         if self.0.disabled || self.0.started.swap(true, Ordering::SeqCst) {
             return;
         }
-        provider().on_trace_start(self);
+        if !self.0.reattached {
+            provider().on_trace_start(self);
+        }
+        super::trace_state::mark_trace_id_started(&self.0.trace_id);
     }
 
     /// Finish the trace (notifies processors once).
@@ -111,7 +144,9 @@ impl Trace {
         {
             return;
         }
-        provider().on_trace_end(self);
+        if !self.0.reattached {
+            provider().on_trace_end(self);
+        }
     }
 
     /// Start the trace, run `fut` with it as the current trace, then finish it.
@@ -135,12 +170,25 @@ impl Trace {
             "metadata": self.0.metadata,
         }))
     }
+
+    /// Serialize trace metadata for persistence or transport. Mirrors `Trace.to_json`;
+    /// the tracing API key is left out unless `include_tracing_api_key` is set.
+    pub fn to_json(&self, include_tracing_api_key: bool) -> Option<Value> {
+        let mut payload = self.export()?;
+        if include_tracing_api_key && let Some(key) = &self.0.tracing_api_key {
+            payload["tracing_api_key"] = Value::String(key.clone());
+        }
+        Some(payload)
+    }
 }
 
 struct SpanState {
     started_at: Option<String>,
     ended_at: Option<String>,
     data: SpanData,
+    /// The `metadata` slot Python's agent/task/turn span data carries. Like Python, it is
+    /// never part of the exported payload; it is there for processors that read span data.
+    data_metadata: Option<Map<String, Value>>,
     error: Option<SpanError>,
 }
 
@@ -171,11 +219,12 @@ impl fmt::Debug for Span {
 }
 
 impl Span {
-    pub(crate) fn new(
+    pub(crate) fn with_id(
         trace: Option<&Trace>,
         parent: Option<&Span>,
         data: SpanData,
         disabled: bool,
+        span_id: Option<String>,
     ) -> Self {
         let (trace_id, api_key, meta) = match (parent, trace) {
             (Some(p), _) => (
@@ -196,7 +245,7 @@ impl Span {
             || trace.map(|t| t.is_disabled()).unwrap_or(false);
         Span(Arc::new(SpanInner {
             trace_id,
-            span_id: gen_span_id(),
+            span_id: span_id.unwrap_or_else(gen_span_id),
             parent_id: parent.map(|p| p.0.span_id.clone()),
             disabled,
             tracing_api_key: api_key,
@@ -205,6 +254,7 @@ impl Span {
                 started_at: None,
                 ended_at: None,
                 data,
+                data_metadata: None,
                 error: None,
             }),
         }))
@@ -258,6 +308,24 @@ impl Span {
     /// The recorded error, if any.
     pub fn error(&self) -> Option<SpanError> {
         self.0.state.lock().expect("span poisoned").error.clone()
+    }
+
+    /// The span-data metadata slot (Python's `AgentSpanData.metadata` and friends).
+    ///
+    /// It is deliberately not exported, exactly as in Python; a custom processor can read it
+    /// to correlate a span with application state.
+    pub fn data_metadata(&self) -> Option<Map<String, Value>> {
+        self.0
+            .state
+            .lock()
+            .expect("span poisoned")
+            .data_metadata
+            .clone()
+    }
+
+    /// Set the span-data metadata slot.
+    pub fn set_data_metadata(&self, metadata: Option<Map<String, Value>>) {
+        self.0.state.lock().expect("span poisoned").data_metadata = metadata;
     }
 
     /// Mutate the span data.

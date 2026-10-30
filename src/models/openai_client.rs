@@ -36,6 +36,24 @@ pub fn is_official_openai_base_url(base_url: &str, websocket: bool) -> bool {
     host.eq_ignore_ascii_case(OPENAI_HOST)
 }
 
+/// Signs or otherwise authenticates each outgoing request.
+///
+/// The Rust stand-in for the per-provider auth any-llm performs inside each provider class:
+/// AWS SigV4, an Azure `api-key` header, a refreshed Google OAuth bearer. The hook runs after
+/// the client's own headers are built and before the request is sent, and sees the final URL
+/// (query string included) and the exact request body, which is what a signature covers.
+#[async_trait::async_trait]
+pub trait RequestAuth: Send + Sync + fmt::Debug {
+    /// Add (or replace) authentication headers for one request.
+    async fn authorize(
+        &self,
+        method: &str,
+        url: &str,
+        body: Option<&[u8]>,
+        headers: &mut HeaderMap,
+    ) -> Result<()>;
+}
+
 /// Async client for the OpenAI REST API (or any compatible endpoint).
 #[derive(Clone)]
 pub struct OpenAIClient {
@@ -45,6 +63,15 @@ pub struct OpenAIClient {
     organization: Option<String>,
     project: Option<String>,
     default_headers: HashMap<String, String>,
+    /// Header names removed after every other source was applied. Python's `Omit`.
+    omitted_headers: Vec<String>,
+    /// Query parameters added to every request. Mirrors `AsyncOpenAI.default_query`.
+    default_query: HashMap<String, String>,
+    auth: Option<std::sync::Arc<dyn RequestAuth>>,
+    /// Sends `Authorization: Bearer <key>`, unless a provider wants another header.
+    send_bearer_auth: bool,
+    /// Base URL for websocket endpoints. Unset means "derive it from `base_url`".
+    websocket_base_url: Option<String>,
 }
 
 impl fmt::Debug for OpenAIClient {
@@ -100,6 +127,11 @@ impl OpenAIClient {
             organization: env("OPENAI_ORG_ID"),
             project: env("OPENAI_PROJECT_ID"),
             default_headers: HashMap::new(),
+            omitted_headers: Vec::new(),
+            default_query: HashMap::new(),
+            auth: None,
+            send_bearer_auth: true,
+            websocket_base_url: None,
         }
     }
 
@@ -133,6 +165,37 @@ impl OpenAIClient {
         self
     }
 
+    /// Remove a header that would otherwise be sent (the client's own, a default header or a
+    /// per-request extra header). The equivalent of passing OpenAI's `Omit` for that key.
+    pub fn without_header(mut self, name: impl Into<String>) -> Self {
+        self.omitted_headers.push(name.into());
+        self
+    }
+
+    /// Add a query parameter sent on every request. Mirrors `AsyncOpenAI.default_query`.
+    pub fn with_default_query(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.default_query.insert(name.into(), value.into());
+        self
+    }
+
+    /// The query parameters sent on every request.
+    pub fn default_query(&self) -> &HashMap<String, String> {
+        &self.default_query
+    }
+
+    /// Authenticate each request through `auth` (AWS SigV4, a Google OAuth bearer, ...)
+    /// instead of, or in addition to, the bearer header.
+    pub fn with_request_auth(mut self, auth: std::sync::Arc<dyn RequestAuth>) -> Self {
+        self.auth = Some(auth);
+        self
+    }
+
+    /// Stop sending `Authorization: Bearer <key>` (for providers that use another header).
+    pub fn with_bearer_auth(mut self, enabled: bool) -> Self {
+        self.send_bearer_auth = enabled;
+        self
+    }
+
     /// Use a custom `reqwest::Client` (proxies, timeouts, TLS settings).
     pub fn with_http_client(mut self, http: reqwest::Client) -> Self {
         self.http = http;
@@ -142,6 +205,64 @@ impl OpenAIClient {
     /// The explicitly configured API key, if any.
     pub(crate) fn explicit_api_key(&self) -> Option<String> {
         self.api_key.clone()
+    }
+
+    /// Route websocket endpoints at `url` instead of the scheme-swapped HTTP base URL.
+    /// Mirrors `AsyncOpenAI(websocket_base_url=...)`.
+    pub fn with_websocket_base_url(mut self, url: impl Into<String>) -> Self {
+        self.websocket_base_url = Some(url.into());
+        self
+    }
+
+    /// The base URL websocket endpoints are built from.
+    ///
+    /// Defaults to [`base_url`](Self::base_url) with `http`/`https` swapped for `ws`/`wss`,
+    /// which is what the OpenAI clients do when no explicit websocket base URL is set.
+    pub fn websocket_base_url(&self) -> String {
+        if let Some(url) = &self.websocket_base_url {
+            return url.clone();
+        }
+        let base = self.base_url.trim_end_matches('/');
+        match base.split_once("://") {
+            Some(("https", rest)) => format!("wss://{rest}"),
+            Some(("http", rest)) => format!("ws://{rest}"),
+            _ => base.to_string(),
+        }
+    }
+
+    /// The absolute websocket URL of `path`, with the default query parameters applied.
+    pub fn websocket_url(&self, path: &str) -> String {
+        let base = self.websocket_base_url();
+        let url = format!(
+            "{}/{}",
+            base.trim_end_matches('/'),
+            path.trim_start_matches('/')
+        );
+        if self.default_query.is_empty() {
+            return url;
+        }
+        let mut params: Vec<(&str, &str)> = self
+            .default_query
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        params.sort_unstable();
+        let separator = if url.contains('?') { '&' } else { '?' };
+        let query = params
+            .iter()
+            .map(|(k, v)| format!("{}={}", url_encode(k), url_encode(v)))
+            .collect::<Vec<_>>()
+            .join("&");
+        format!("{url}{separator}{query}")
+    }
+
+    /// The handshake headers for a websocket connection to `url`, with the client's
+    /// [`RequestAuth`] hook applied. A websocket handshake is a `GET`, so the hook sees the
+    /// same method the server does and no body.
+    pub async fn websocket_headers(&self, url: &str) -> Result<HeaderMap> {
+        let mut headers = self.headers(None)?;
+        self.authorize("GET", url, None, &mut headers).await?;
+        Ok(headers)
     }
 
     /// The base URL.
@@ -176,7 +297,9 @@ impl OpenAIClient {
 
     pub(crate) fn headers(&self, extra: Option<&HashMap<String, String>>) -> Result<HeaderMap> {
         let mut h = HeaderMap::new();
-        if let Some(key) = self.api_key() {
+        if self.send_bearer_auth
+            && let Some(key) = self.api_key()
+        {
             h.insert(
                 AUTHORIZATION,
                 HeaderValue::from_str(&format!("Bearer {key}"))
@@ -202,7 +325,54 @@ impl OpenAIClient {
                 insert_header(&mut h, k, v)?;
             }
         }
+        for name in &self.omitted_headers {
+            if let Ok(name) = HeaderName::from_bytes(name.as_bytes()) {
+                h.remove(name);
+            }
+        }
         Ok(h)
+    }
+
+    /// The absolute URL of `path`, with the default and per-request query parameters applied.
+    fn url_with_query(&self, path: &str, extra: Option<&HashMap<String, String>>) -> String {
+        let mut params: Vec<(&str, &str)> = self
+            .default_query
+            .iter()
+            .filter(|(k, _)| extra.is_none_or(|e| !e.contains_key(*k)))
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        params.extend(
+            extra
+                .into_iter()
+                .flatten()
+                .map(|(k, v)| (k.as_str(), v.as_str())),
+        );
+        let url = self.url(path);
+        if params.is_empty() {
+            return url;
+        }
+        params.sort_unstable();
+        let separator = if url.contains('?') { '&' } else { '?' };
+        let query = params
+            .iter()
+            .map(|(k, v)| format!("{}={}", url_encode(k), url_encode(v)))
+            .collect::<Vec<_>>()
+            .join("&");
+        format!("{url}{separator}{query}")
+    }
+
+    /// Run the client's [`RequestAuth`] hook over a request that is about to be sent.
+    pub(crate) async fn authorize(
+        &self,
+        method: &str,
+        url: &str,
+        body: Option<&[u8]>,
+        headers: &mut HeaderMap,
+    ) -> Result<()> {
+        match &self.auth {
+            Some(auth) => auth.authorize(method, url, body, headers).await,
+            None => Ok(()),
+        }
     }
 
     async fn check(resp: reqwest::Response) -> Result<(reqwest::Response, Option<String>)> {
@@ -247,14 +417,13 @@ impl OpenAIClient {
         extra_headers: Option<&HashMap<String, String>>,
         extra_query: Option<&HashMap<String, String>>,
     ) -> Result<(Value, Option<String>)> {
-        let mut req = self
-            .http
-            .post(self.url(path))
-            .headers(self.headers(extra_headers)?)
-            .json(body);
-        if let Some(q) = extra_query {
-            req = req.query(q);
-        }
+        let url = self.url_with_query(path, extra_query);
+        let payload = serde_json::to_vec(body)?;
+        let mut headers = self.headers(extra_headers)?;
+        insert_header(&mut headers, "Content-Type", "application/json")?;
+        self.authorize("POST", &url, Some(&payload), &mut headers)
+            .await?;
+        let req = self.http.post(url).headers(headers).body(payload);
         let (resp, request_id) = Self::check(req.send().await?).await?;
         let value = resp.json::<Value>().await?;
         Ok((value, request_id))
@@ -262,21 +431,24 @@ impl OpenAIClient {
 
     /// GET a JSON resource.
     pub async fn get_json(&self, path: &str, query: &[(&str, String)]) -> Result<Value> {
-        let req = self
-            .http
-            .get(self.url(path))
-            .headers(self.headers(None)?)
-            .query(query);
+        let extra: HashMap<String, String> = query
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), v.clone()))
+            .collect();
+        let url = self.url_with_query(path, Some(&extra));
+        let mut headers = self.headers(None)?;
+        self.authorize("GET", &url, None, &mut headers).await?;
+        let req = self.http.get(url).headers(headers);
         let (resp, _) = Self::check(req.send().await?).await?;
         Ok(resp.json::<Value>().await?)
     }
 
     /// DELETE a resource.
     pub async fn delete(&self, path: &str) -> Result<Value> {
-        let req = self
-            .http
-            .delete(self.url(path))
-            .headers(self.headers(None)?);
+        let url = self.url_with_query(path, None);
+        let mut headers = self.headers(None)?;
+        self.authorize("DELETE", &url, None, &mut headers).await?;
+        let req = self.http.delete(url).headers(headers);
         let (resp, _) = Self::check(req.send().await?).await?;
         let text = resp.text().await?;
         Ok(serde_json::from_str(&text).unwrap_or(Value::Null))
@@ -290,18 +462,86 @@ impl OpenAIClient {
         extra_headers: Option<&HashMap<String, String>>,
         extra_query: Option<&HashMap<String, String>>,
     ) -> Result<(BoxStream<'static, Result<Value>>, Option<String>)> {
-        let mut req = self
-            .http
-            .post(self.url(path))
-            .headers(self.headers(extra_headers)?)
-            .header("Accept", "text/event-stream")
-            .json(body);
-        if let Some(q) = extra_query {
-            req = req.query(q);
-        }
+        let url = self.url_with_query(path, extra_query);
+        let payload = serde_json::to_vec(body)?;
+        let mut headers = self.headers(extra_headers)?;
+        insert_header(&mut headers, "Content-Type", "application/json")?;
+        insert_header(&mut headers, "Accept", "text/event-stream")?;
+        self.authorize("POST", &url, Some(&payload), &mut headers)
+            .await?;
+        let req = self.http.post(url).headers(headers).body(payload);
         let (resp, request_id) = Self::check(req.send().await?).await?;
         Ok((sse_stream(resp.bytes_stream()), request_id))
     }
+
+    /// POST a `multipart/form-data` body and parse the JSON response.
+    ///
+    /// The `RequestAuth` hook sees the request without a body: a multipart body is streamed,
+    /// so there are no bytes to sign at this point.
+    ///
+    /// Uses reqwest's multipart support.
+    #[cfg(feature = "voice")]
+    pub async fn post_multipart(
+        &self,
+        path: &str,
+        form: reqwest::multipart::Form,
+    ) -> Result<(Value, Option<String>)> {
+        let url = self.url_with_query(path, None);
+        let mut headers = self.headers(None)?;
+        // `reqwest` sets `Content-Type` itself, with the generated boundary.
+        headers.remove(reqwest::header::CONTENT_TYPE);
+        self.authorize("POST", &url, None, &mut headers).await?;
+        let req = self.http.post(url).headers(headers).multipart(form);
+        let (resp, request_id) = Self::check(req.send().await?).await?;
+        let value = resp.json::<Value>().await?;
+        Ok((value, request_id))
+    }
+
+    /// POST a JSON body and stream the raw response bytes, for endpoints that answer with
+    /// binary content such as `/audio/speech`.
+    pub async fn post_bytes_stream(
+        &self,
+        path: &str,
+        body: &Value,
+        extra_headers: Option<&HashMap<String, String>>,
+    ) -> Result<(BoxStream<'static, Result<bytes::Bytes>>, Option<String>)> {
+        let url = self.url_with_query(path, None);
+        let payload = serde_json::to_vec(body)?;
+        let mut headers = self.headers(extra_headers)?;
+        insert_header(&mut headers, "Content-Type", "application/json")?;
+        self.authorize("POST", &url, Some(&payload), &mut headers)
+            .await?;
+        let req = self.http.post(url).headers(headers).body(payload);
+        let (resp, request_id) = Self::check(req.send().await?).await?;
+        let stream = resp
+            .bytes_stream()
+            .map(|chunk| chunk.map_err(AgentsError::from));
+        Ok((Box::pin(stream), request_id))
+    }
+
+    /// List the models the endpoint exposes (`GET /models`), newest first as returned.
+    ///
+    /// any-llm exposes a `list_models` per provider; every OpenAI-compatible endpoint answers
+    /// the same route, so the registry-based adapters get it for free.
+    pub async fn list_models(&self) -> Result<Vec<Value>> {
+        let body = self.get_json("models", &[]).await?;
+        Ok(match body.get("data") {
+            Some(Value::Array(items)) => items.clone(),
+            _ => Vec::new(),
+        })
+    }
+}
+
+/// Percent-encode a query component.
+fn url_encode(s: &str) -> String {
+    s.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
 }
 
 fn insert_header(h: &mut HeaderMap, k: &str, v: &str) -> Result<()> {
