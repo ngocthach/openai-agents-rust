@@ -355,6 +355,7 @@ async fn compaction_session_sends_previous_response_id_and_replaces_history() {
     inner.add_items(long_history()).await.unwrap();
 
     let session = OpenAIResponsesCompactionSession::new("s1", inner.clone())
+        .unwrap()
         .with_client(OpenAIClient::new("sk-test").with_base_url(base));
 
     let usage = session
@@ -394,6 +395,7 @@ async fn compaction_session_declines_below_the_threshold_and_honours_force() {
         .await
         .unwrap();
     let session = OpenAIResponsesCompactionSession::new("s1", inner.clone())
+        .unwrap()
         .with_client(OpenAIClient::new("sk-test").with_base_url(base));
 
     let declined = session
@@ -434,6 +436,7 @@ async fn compaction_over_an_encrypted_store_sends_plaintext_and_rewrites_envelop
         .unwrap();
 
     let session = OpenAIResponsesCompactionSession::new("s1", encrypted.clone())
+        .unwrap()
         .with_client(OpenAIClient::new("sk-test").with_base_url(base))
         .with_compaction_mode(CompactionMode::Input);
 
@@ -478,6 +481,7 @@ async fn runner_triggers_compaction_after_a_run() {
     inner.add_items(long_history()).await.unwrap();
     let session = Arc::new(
         OpenAIResponsesCompactionSession::new("s1", inner.clone())
+            .unwrap()
             .with_client(OpenAIClient::new("sk-test").with_base_url(base)),
     );
 
@@ -727,6 +731,7 @@ async fn compaction_retains_history_when_another_writer_appends_mid_request() {
     });
 
     let session = OpenAIResponsesCompactionSession::new("s1", racing)
+        .unwrap()
         .with_client(OpenAIClient::new("sk-test").with_base_url(base));
 
     let usage = session
@@ -756,6 +761,7 @@ async fn compaction_skips_without_a_response_id_and_defers_for_local_tool_output
     let inner = Arc::new(InMemorySession::new("s1"));
     inner.add_items(long_history()).await.unwrap();
     let session = OpenAIResponsesCompactionSession::new("s1", inner.clone())
+        .unwrap()
         .with_client(OpenAIClient::new("sk-test").with_base_url(base));
 
     // No response id: there is nothing to compact against, so no request is sent.
@@ -885,6 +891,7 @@ async fn compaction_replaces_only_the_suffix_the_model_exchange_covers() {
     inner.add_items(history).await.unwrap();
 
     let session = OpenAIResponsesCompactionSession::new("s1", inner.clone())
+        .unwrap()
         .with_client(OpenAIClient::new("sk-test").with_base_url(base))
         .with_should_trigger_compaction(|_| true);
 
@@ -936,6 +943,7 @@ async fn compaction_retains_history_it_cannot_match_or_safely_split() {
     // Nothing in the stored tail belongs to the exchange: no request, no change.
     let (base, captured) = mock_openai(vec![]).await;
     let session = OpenAIResponsesCompactionSession::new("s1", inner.clone())
+        .unwrap()
         .with_client(OpenAIClient::new("sk-test").with_base_url(base))
         .with_should_trigger_compaction(|_| true);
     let usage = session
@@ -980,6 +988,7 @@ async fn compaction_refuses_to_split_a_pending_tool_call() {
     inner.add_items(history.clone()).await.unwrap();
 
     let session = OpenAIResponsesCompactionSession::new("s1", inner.clone())
+        .unwrap()
         .with_client(OpenAIClient::new("sk-test").with_base_url(base))
         .with_should_trigger_compaction(|_| true);
 
@@ -1229,6 +1238,7 @@ async fn runner_compacts_only_what_the_run_loaded_from_a_limited_session() {
 
     let session = Arc::new(
         OpenAIResponsesCompactionSession::new("s1", inner.clone())
+            .unwrap()
             .with_client(OpenAIClient::new("sk-test").with_base_url(base))
             .with_should_trigger_compaction(|_| true),
     );
@@ -1309,6 +1319,7 @@ async fn stores_without_the_snapshot_hook_require_complete_coverage() {
     let (base, captured) = mock_openai(vec![compaction_reply("Recap")]).await;
     let session =
         OpenAIResponsesCompactionSession::new("s1", Arc::new(HookLessSession(inner.clone())))
+            .unwrap()
             .with_client(OpenAIClient::new("sk-test").with_base_url(base))
             .with_should_trigger_compaction(|_| true);
 
@@ -1512,14 +1523,13 @@ async fn compaction_session_refuses_a_server_managed_store() {
         "conv_1",
         OpenAIClient::new("sk-test"),
     ));
-    let err = OpenAIResponsesCompactionSession::try_new("s1", remote.clone())
+    let err = OpenAIResponsesCompactionSession::new("s1", remote.clone())
         .expect_err("wrapping a server-managed store must be rejected");
     assert!(err.to_string().contains("manages its own history"), "{err}");
 
     // The infallible constructor still refuses to operate on one.
-    let session = OpenAIResponsesCompactionSession::new("s1", remote);
-    assert!(session.get_items(None).await.is_err());
-    assert!(session.add_items(vec![InputItem::user("x")]).await.is_err());
+    // The wrapped store is rejected at construction, so there is no wrapper to fail later.
+    assert!(OpenAIResponsesCompactionSession::new("s1", remote).is_err());
 }
 
 #[cfg(feature = "sqlite")]
@@ -1601,6 +1611,7 @@ async fn whole_history_compaction_reads_past_the_stores_own_limit() {
     let (base, captured) = mock_openai(vec![compaction_reply("Recap")]).await;
     let session =
         OpenAIResponsesCompactionSession::new("s1", Arc::new(HookLessSession(inner.clone())))
+            .unwrap()
             .with_client(OpenAIClient::new("sk-test").with_base_url(base))
             .with_should_trigger_compaction(|_| true);
 
@@ -1629,4 +1640,360 @@ async fn whole_history_compaction_reads_past_the_stores_own_limit() {
         Some("Recap")
     );
     assert!(kept.len() < 4, "history should have shrunk: {kept:?}");
+}
+
+#[tokio::test]
+async fn compaction_refuses_a_history_over_the_rollback_budget() {
+    let inner = Arc::new(InMemorySession::new("s1"));
+    inner.add_items(long_history()).await.unwrap();
+
+    // Nothing is sent: the budget is checked before the compaction request.
+    let session = OpenAIResponsesCompactionSession::new("s1", inner.clone())
+        .unwrap()
+        .with_max_rollback_items(2)
+        .unwrap()
+        .with_client(OpenAIClient::new("sk-test").with_base_url("http://127.0.0.1:1"));
+    let err = session
+        .run_compaction(OpenAIResponsesCompactionArgs {
+            response_id: Some("resp_1".into()),
+            store: Some(true),
+            force: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("max_rollback_items"), "{err}");
+    // The history was retained.
+    assert_eq!(
+        inner.get_items(Some(usize::MAX)).await.unwrap().len(),
+        long_history().len()
+    );
+
+    // A budget of zero is rejected outright, as in Python.
+    assert!(
+        OpenAIResponsesCompactionSession::new("s1", inner)
+            .unwrap()
+            .with_max_rollback_items(0)
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn compaction_within_the_rollback_budget_still_runs() {
+    let (base, captured) = mock_openai(vec![compaction_reply("Recap")]).await;
+    let inner = Arc::new(InMemorySession::new("s1"));
+    inner.add_items(long_history()).await.unwrap();
+
+    let session = OpenAIResponsesCompactionSession::new("s1", inner.clone())
+        .unwrap()
+        .with_max_rollback_items(long_history().len())
+        .unwrap()
+        .with_client(OpenAIClient::new("sk-test").with_base_url(base));
+    session
+        .run_compaction(OpenAIResponsesCompactionArgs {
+            response_id: Some("resp_1".into()),
+            store: Some(true),
+            force: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(captured.lock().unwrap().len(), 1);
+    let kept = inner.get_items(Some(usize::MAX)).await.unwrap();
+    assert_eq!(
+        kept.last().unwrap().text_content().as_deref(),
+        Some("Recap")
+    );
+}
+
+#[cfg(all(feature = "encrypt", feature = "sqlite"))]
+#[tokio::test]
+async fn a_pop_that_cannot_authenticate_leaves_the_envelope_in_place() {
+    use openai_agents_sdk::memory::SqliteSession;
+
+    let store = Arc::new(SqliteSession::in_memory("s1").unwrap());
+    let writer = EncryptedSession::new("s1", store.clone(), TEST_KEY, 600).unwrap();
+    writer
+        .add_items(vec![InputItem::user("a"), InputItem::user("b")])
+        .await
+        .unwrap();
+
+    // Another key cannot authenticate the stored envelopes.
+    let other_key = "fedcba9876543210fedcba9876543210";
+    let intruder = EncryptedSession::new("s1", store.clone(), other_key, 600).unwrap();
+    let err = intruder.pop_item().await.unwrap_err();
+    assert!(err.to_string().contains("authenticate"), "{err}");
+    // SQLite claims and authenticates in one transaction, so nothing was removed.
+    assert_eq!(store.get_items(Some(usize::MAX)).await.unwrap().len(), 2);
+
+    // With the right key the pop succeeds and the history shrinks.
+    assert_eq!(
+        writer
+            .pop_item()
+            .await
+            .unwrap()
+            .unwrap()
+            .text_content()
+            .as_deref(),
+        Some("b")
+    );
+    assert_eq!(store.get_items(Some(usize::MAX)).await.unwrap().len(), 1);
+}
+
+#[cfg(all(feature = "encrypt", feature = "sqlite"))]
+#[tokio::test]
+async fn a_successful_replacement_reclaims_expired_envelopes() {
+    use openai_agents_sdk::memory::SqliteSession;
+
+    let store = Arc::new(SqliteSession::in_memory("s1").unwrap());
+    // A one-second TTL: these two are expired by the time the snapshot is taken.
+    let expiring = EncryptedSession::new("s1", store.clone(), TEST_KEY, 1).unwrap();
+    expiring
+        .add_items(vec![InputItem::user("old a"), InputItem::user("old b")])
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(2200)).await;
+    expiring
+        .add_items(vec![InputItem::user("fresh")])
+        .await
+        .unwrap();
+
+    // Expired envelopes are not history, but their rows are still there.
+    assert_eq!(expiring.get_items(None).await.unwrap().len(), 1);
+    assert_eq!(store.get_items(Some(usize::MAX)).await.unwrap().len(), 3);
+
+    let snapshot = expiring.compaction_snapshot(10).await.unwrap().unwrap();
+    assert_eq!(snapshot.items.len(), 1);
+    let replaced = expiring
+        .replace_compaction_suffix(&snapshot.handles, vec![InputItem::user("summary")])
+        .await
+        .unwrap();
+    assert!(replaced);
+
+    // The expired prefix was physically reclaimed along with the replaced suffix.
+    assert_eq!(store.get_items(Some(usize::MAX)).await.unwrap().len(), 1);
+    let left = expiring.get_items(None).await.unwrap();
+    assert_eq!(left.len(), 1);
+    assert_eq!(left[0].text_content().as_deref(), Some("summary"));
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn advanced_sqlite_reads_any_branch_and_reserves_branch_ids() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("branches.db");
+    let session = AdvancedSqliteSession::open("u1", &path).unwrap();
+    session
+        .add_items(vec![
+            InputItem::user("first question"),
+            InputItem::assistant("first answer"),
+        ])
+        .await
+        .unwrap();
+    session
+        .add_items(vec![
+            InputItem::user("second question"),
+            InputItem::assistant("second answer"),
+        ])
+        .await
+        .unwrap();
+
+    let branch = session
+        .create_branch_from_turn(2, Some("alt"))
+        .await
+        .unwrap();
+    assert_eq!(branch, "alt");
+    session
+        .add_items(vec![InputItem::user("different follow-up")])
+        .await
+        .unwrap();
+
+    // The current branch is "alt", but "main" is readable without switching to it.
+    assert_eq!(session.current_branch(), "alt");
+    let main_items = session
+        .get_items_for_branch(None, Some("main"))
+        .await
+        .unwrap();
+    assert_eq!(main_items.len(), 4);
+    assert_eq!(
+        main_items.last().unwrap().text_content().as_deref(),
+        Some("second answer")
+    );
+    let alt_items = session.get_items_for_branch(None, None).await.unwrap();
+    assert_eq!(
+        alt_items.last().unwrap().text_content().as_deref(),
+        Some("different follow-up")
+    );
+
+    // A branch id is reserved for good, so it cannot be taken again.
+    session.switch_to_branch("main").await.unwrap();
+    let err = session
+        .create_branch_from_turn(2, Some("alt"))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("already been used"), "{err}");
+
+    // Clearing the session does not release the reservation.
+    session.clear_session().await.unwrap();
+    session
+        .add_items(vec![InputItem::user("q1"), InputItem::assistant("a1")])
+        .await
+        .unwrap();
+    session
+        .add_items(vec![InputItem::user("q2")])
+        .await
+        .unwrap();
+    let err = session
+        .create_branch_from_turn(2, Some("alt"))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("already been used"), "{err}");
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn another_instance_clearing_the_session_resets_a_stale_branch_pointer() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("generations.db");
+    let session = AdvancedSqliteSession::open("u1", &path).unwrap();
+    session
+        .add_items(vec![InputItem::user("q1"), InputItem::assistant("a1")])
+        .await
+        .unwrap();
+    session
+        .add_items(vec![InputItem::user("q2")])
+        .await
+        .unwrap();
+    session
+        .create_branch_from_turn(2, Some("side"))
+        .await
+        .unwrap();
+    assert_eq!(session.current_branch(), "side");
+
+    // A separate instance on the same file clears the session, deleting every branch.
+    let other = AdvancedSqliteSession::open("u1", &path).unwrap();
+    other.clear_session().await.unwrap();
+
+    // The first instance notices the bumped generation and falls back to `main` instead of
+    // writing into a branch that no longer exists.
+    assert!(session.get_items(None).await.unwrap().is_empty());
+    assert_eq!(session.current_branch(), "main");
+    session
+        .add_items(vec![InputItem::user("q3")])
+        .await
+        .unwrap();
+    assert_eq!(
+        other
+            .get_items_for_branch(None, Some("main"))
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn structure_tables_reject_a_second_base_table_pair() {
+    use openai_agents_sdk::memory::SqliteSession;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("owned.db");
+    let owner = AdvancedSqliteSession::open("u1", &path).unwrap();
+    owner.add_items(vec![InputItem::user("hi")]).await.unwrap();
+
+    // A pair that did not claim the file cannot borrow its structure tables.
+    let other_pair =
+        SqliteSession::with_tables("u1", &path, "other_sessions", "other_messages").unwrap();
+    let err = AdvancedSqliteSession::from_session(other_pair).unwrap_err();
+    assert!(err.to_string().contains("already belongs to"), "{err}");
+
+    // Opening the claimed file without creating tables is fine for the owning pair.
+    AdvancedSqliteSession::open_with("u2", &path, false).unwrap();
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn opening_an_unclaimed_file_without_creating_tables_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("fresh.db");
+    let err = AdvancedSqliteSession::open_with("u1", &path, false).unwrap_err();
+    assert!(
+        err.to_string().contains("create_tables") || err.to_string().contains("missing"),
+        "{err}"
+    );
+}
+
+#[cfg(feature = "sqlx")]
+#[tokio::test]
+async fn sqlx_session_round_trips_on_sqlite() {
+    use openai_agents_sdk::memory::{SqlxDialect, SqlxSession};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("sqlx.db");
+    let url = format!("sqlite://{}?mode=rwc", path.display());
+    assert_eq!(SqlxDialect::from_url(&url).unwrap(), SqlxDialect::Sqlite);
+
+    let session = SqlxSession::from_url("u1", &url, true).await.unwrap();
+    session
+        .add_items(vec![
+            InputItem::user("a"),
+            InputItem::assistant("b"),
+            InputItem::user("c"),
+        ])
+        .await
+        .unwrap();
+    assert_eq!(session.get_items(None).await.unwrap().len(), 3);
+    assert_eq!(
+        session.get_items(Some(1)).await.unwrap()[0]
+            .text_content()
+            .as_deref(),
+        Some("c")
+    );
+    assert_eq!(
+        session
+            .pop_item()
+            .await
+            .unwrap()
+            .unwrap()
+            .text_content()
+            .as_deref(),
+        Some("c")
+    );
+
+    // Atomic suffix replacement works on this dialect too.
+    let snapshot = session.compaction_snapshot(10).await.unwrap().unwrap();
+    assert_eq!(snapshot.items.len(), 2);
+    assert!(
+        session
+            .replace_compaction_suffix(&snapshot.handles[1..], vec![InputItem::assistant("recap")])
+            .await
+            .unwrap()
+    );
+    let left: Vec<String> = session
+        .get_items(None)
+        .await
+        .unwrap()
+        .iter()
+        .filter_map(|i| i.text_content())
+        .collect();
+    assert_eq!(left, ["a", "recap"]);
+
+    session.clear_session().await.unwrap();
+    assert!(session.get_items(None).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn an_uninitialized_conversations_session_reports_why_it_has_no_id() {
+    use openai_agents_sdk::memory::OpenAIConversationsSession;
+
+    let session = OpenAIConversationsSession::with_client(OpenAIClient::new("sk-test"));
+    assert_eq!(session.session_id(), "");
+    let err = session.try_session_id().unwrap_err();
+    assert!(err.to_string().contains("not yet available"), "{err}");
+
+    let resumed =
+        OpenAIConversationsSession::from_conversation_id("conv_123", OpenAIClient::new("sk-test"));
+    assert_eq!(resumed.try_session_id().unwrap(), "conv_123");
 }

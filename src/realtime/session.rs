@@ -108,8 +108,8 @@ enum ToolInputVerdict {
     Allow,
     /// Skip the tool and send this message to the model instead.
     Reject(String),
-    /// The named guardrail tripped its wire.
-    Raise(String),
+    /// The guardrail tripped its wire; the session ends with this error.
+    Raise(Box<AgentsError>),
 }
 
 /// A tool call waiting for a human decision.
@@ -119,6 +119,18 @@ struct PendingToolCall<C> {
     tool: Arc<FunctionTool<C>>,
     approval_item: ToolApprovalItem,
     identity: InvocationIdentity,
+}
+
+/// A tool call admitted by the duplicate-call checks, and what is left to do for it.
+enum AdmittedCall<C> {
+    /// Route the call to a tool, a handoff or a not-found answer.
+    Dispatch {
+        agent: Arc<RealtimeAgent<C>>,
+        tools: Vec<Arc<FunctionTool<C>>>,
+        handoffs: Vec<RealtimeHandoff<C>>,
+    },
+    /// The call already ran; resend the output the transport never accepted.
+    ResendCachedOutput,
 }
 
 /// Mutable session state. Guards are never held across an `await`.
@@ -163,6 +175,10 @@ struct SessionInner<C> {
     closed: AtomicBool,
     pump: Mutex<Option<JoinHandle<()>>>,
     guardrail_tasks: Mutex<Vec<JoinHandle<()>>>,
+    /// Tool calls running on their own task, with `async_tool_calls` on.
+    tool_tasks: Mutex<Vec<JoinHandle<()>>>,
+    /// The failure that ends the session, kept until the caller takes it.
+    stored_error: Mutex<Option<AgentsError>>,
     /// Monotonic counter of output responses, readable from a transport send-boundary check.
     latest_generation: Arc<AtomicU64>,
 }
@@ -289,6 +305,8 @@ impl<C: Send + Sync + 'static> RealtimeSession<C> {
             closed: AtomicBool::new(false),
             pump: Mutex::new(None),
             guardrail_tasks: Mutex::new(Vec::new()),
+            tool_tasks: Mutex::new(Vec::new()),
+            stored_error: Mutex::new(None),
             latest_generation: Arc::new(AtomicU64::new(0)),
         });
 
@@ -375,7 +393,10 @@ impl<C: Send + Sync + 'static> RealtimeSession<C> {
     ///
     /// With `always`, later calls to the same tool by the same agent are approved automatically.
     /// The call runs before this future resolves, so `tool_start` and `tool_end` are already
-    /// queued when it returns.
+    /// queued when it returns; this is true whatever
+    /// [`RealtimeRunConfig::async_tool_calls`](crate::realtime::RealtimeRunConfig) says, because
+    /// that setting governs the transport event loop and this `Result` is the caller's only
+    /// report of the failure.
     pub async fn approve_tool_call(&self, call_id: &str, always: bool) -> Result<()> {
         let Some(pending) = self.inner.take_pending_and_reserve(call_id) else {
             return Ok(());
@@ -415,9 +436,40 @@ impl<C: Send + Sync + 'static> RealtimeSession<C> {
     }
 
     /// Wait for the next session event, or `None` once the session is closed and drained.
+    ///
+    /// A transport failure or a failed tool task ends the session: the matching
+    /// [`RealtimeSessionEvent::Error`] is delivered, then this closes the session and returns
+    /// `None`. The failure itself is available from [`RealtimeSession::take_error`]. This is
+    /// where the Python SDK raises its stored exception out of `__aiter__`.
     pub async fn recv(&self) -> Option<RealtimeSessionEvent<C>> {
-        let mut events = self.events.lock().await;
-        events.recv().await
+        let event = {
+            let mut events = self.events.lock().await;
+            events.recv().await
+        };
+        if event.is_none() && self.has_stored_error() {
+            let _ = self.close().await;
+        }
+        event
+    }
+
+    fn has_stored_error(&self) -> bool {
+        self.inner
+            .stored_error
+            .lock()
+            .expect("realtime session poisoned")
+            .is_some()
+    }
+
+    /// Take the failure that ended the session, if there was one.
+    ///
+    /// Set by a transport exception or by a tool call that failed on its own task; the Rust
+    /// equivalent of the exception Python's `__aiter__` raises.
+    pub fn take_error(&self) -> Option<AgentsError> {
+        self.inner
+            .stored_error
+            .lock()
+            .expect("realtime session poisoned")
+            .take()
     }
 
     /// The session events as an async stream.
@@ -444,6 +496,15 @@ impl<C: Send + Sync + 'static> RealtimeSession<C> {
         for task in self
             .inner
             .guardrail_tasks
+            .lock()
+            .expect("realtime session poisoned")
+            .drain(..)
+        {
+            task.abort();
+        }
+        for task in self
+            .inner
+            .tool_tasks
             .lock()
             .expect("realtime session poisoned")
             .drain(..)
@@ -622,6 +683,23 @@ impl<C: Send + Sync + 'static> SessionInner<C> {
         });
     }
 
+    /// Report a failure and end the event stream, as Python's `_stored_exception` does.
+    ///
+    /// The error event is queued first, then the sender is dropped, so a caller still receives
+    /// every event already queued before `recv` returns `None`.
+    fn end_with_error(&self, error: AgentsError) {
+        let message = error.to_string();
+        {
+            let mut stored = self.stored_error.lock().expect("realtime session poisoned");
+            if stored.is_some() {
+                return;
+            }
+            *stored = Some(error);
+        }
+        self.emit_error(message);
+        *self.sender.lock().expect("realtime session poisoned") = None;
+    }
+
     fn emit_history_updated(&self) {
         let history = {
             self.state
@@ -706,7 +784,7 @@ impl<C: Send + Sync + 'static> SessionInner<C> {
                     Some(context) => format!("{context}: {message}"),
                     None => message,
                 };
-                self.emit_error(message);
+                self.end_with_error(AgentsError::other(message));
             }
             RealtimeModelEvent::FunctionCall(call) => {
                 if let Err(error) = self.handle_tool_call(call).await {
@@ -926,8 +1004,15 @@ impl<C: Send + Sync + 'static> SessionInner<C> {
         }
     }
 
-    /// Route a model tool call to a function tool, a handoff, or an error.
-    async fn handle_tool_call(&self, call: RealtimeModelToolCallEvent) -> Result<()> {
+    /// Reserve a model tool call against the duplicate-call checks.
+    ///
+    /// The reservation is synchronous so that two calls arriving back to back are admitted in
+    /// arrival order even when the work itself runs on its own task. `None` means the call needs
+    /// no further work.
+    fn admit_tool_call(
+        &self,
+        call: &RealtimeModelToolCallEvent,
+    ) -> Result<Option<AdmittedCall<C>>> {
         let (agent, tools, handoffs) = {
             let state = self.state.lock().expect("realtime session poisoned");
             (
@@ -950,12 +1035,30 @@ impl<C: Send + Sync + 'static> SessionInner<C> {
             arguments: call.arguments.clone(),
         };
         match self.begin_invocation(&call.call_id, &identity)? {
-            InvocationAdmission::Proceed => {}
-            InvocationAdmission::Ignore => return Ok(()),
-            InvocationAdmission::ResendCachedOutput => {
-                return self.resend_pending_output(&call).await;
-            }
+            InvocationAdmission::Proceed => Ok(Some(AdmittedCall::Dispatch {
+                agent,
+                tools,
+                handoffs,
+            })),
+            InvocationAdmission::Ignore => Ok(None),
+            InvocationAdmission::ResendCachedOutput => Ok(Some(AdmittedCall::ResendCachedOutput)),
         }
+    }
+
+    /// Run a call that [`SessionInner::admit_tool_call`] admitted.
+    async fn run_admitted_tool_call(
+        &self,
+        call: RealtimeModelToolCallEvent,
+        admitted: AdmittedCall<C>,
+    ) -> Result<()> {
+        let AdmittedCall::Dispatch {
+            agent,
+            tools,
+            handoffs,
+        } = admitted
+        else {
+            return self.resend_pending_output(&call).await;
+        };
 
         let result = self
             .dispatch_tool_call(call.clone(), agent, tools, handoffs)
@@ -966,6 +1069,35 @@ impl<C: Send + Sync + 'static> SessionInner<C> {
             .active_tool_invocations
             .remove(&call.call_id);
         result
+    }
+
+    /// Route a model tool call to a function tool, a handoff, or an error.
+    ///
+    /// With `RealtimeRunConfig::async_tool_calls` the work runs on its own task, so the session's
+    /// event loop keeps delivering audio and transcript events while the tool runs; the
+    /// duplicate-call reservation still happens inline, in arrival order.
+    async fn handle_tool_call(self: &Arc<Self>, call: RealtimeModelToolCallEvent) -> Result<()> {
+        let Some(admitted) = self.admit_tool_call(&call)? else {
+            return Ok(());
+        };
+
+        if !self.run_config.async_tool_calls {
+            if let Err(error) = self.run_admitted_tool_call(call, admitted).await {
+                self.end_with_error(error);
+            }
+            return Ok(());
+        }
+
+        let inner = self.clone();
+        let task = tokio::spawn(async move {
+            if let Err(error) = inner.run_admitted_tool_call(call, admitted).await {
+                inner.end_with_error(error);
+            }
+        });
+        let mut tasks = self.tool_tasks.lock().expect("realtime session poisoned");
+        tasks.retain(|task| !task.is_finished());
+        tasks.push(task);
+        Ok(())
     }
 
     /// Decide whether a tool call may run, mirroring the realtime duplicate-call checks.
@@ -1079,12 +1211,7 @@ impl<C: Send + Sync + 'static> SessionInner<C> {
                                         )
                                         .await;
                                 }
-                                ToolInputVerdict::Raise(name) => {
-                                    self.emit_error(format!(
-                                        "Tool input guardrail {name} triggered tripwire"
-                                    ));
-                                    return Ok(());
-                                }
+                                ToolInputVerdict::Raise(error) => return Err(*error),
                             }
                         }
                         {
@@ -1164,13 +1291,19 @@ impl<C: Send + Sync + 'static> SessionInner<C> {
                     agent_name: agent_name.to_string(),
                 })
                 .await?;
-            match output.behavior {
+            match output.behavior.clone() {
                 ToolGuardrailBehavior::Allow => {}
                 ToolGuardrailBehavior::RejectContent { message } => {
                     return Ok(ToolInputVerdict::Reject(message));
                 }
                 ToolGuardrailBehavior::RaiseException => {
-                    return Ok(ToolInputVerdict::Raise(guardrail.name.clone()));
+                    return Ok(ToolInputVerdict::Raise(Box::new(
+                        AgentsError::ToolInputGuardrailTripwireTriggered {
+                            guardrail_name: guardrail.name.clone(),
+                            output: Box::new(output),
+                            run_data: None,
+                        },
+                    )));
                 }
             }
         }
@@ -1198,10 +1331,7 @@ impl<C: Send + Sync + 'static> SessionInner<C> {
                     .complete_tool_call(&agent, &tool, &call, ToolOutput::Text(message))
                     .await;
             }
-            ToolInputVerdict::Raise(name) => {
-                self.emit_error(format!("Tool input guardrail {name} triggered tripwire"));
-                return Ok(());
-            }
+            ToolInputVerdict::Raise(error) => return Err(*error),
         }
 
         for hooks in self.hooks_for(&agent) {
@@ -1263,18 +1393,18 @@ impl<C: Send + Sync + 'static> SessionInner<C> {
                     output: output.clone(),
                 })
                 .await?;
-            match checked.behavior {
+            match checked.behavior.clone() {
                 ToolGuardrailBehavior::Allow => {}
                 ToolGuardrailBehavior::RejectContent { message } => {
                     output = ToolOutput::Text(message);
                     break;
                 }
                 ToolGuardrailBehavior::RaiseException => {
-                    self.emit_error(format!(
-                        "Tool output guardrail {} triggered tripwire",
-                        guardrail.name
-                    ));
-                    return Ok(());
+                    return Err(AgentsError::ToolOutputGuardrailTripwireTriggered {
+                        guardrail_name: guardrail.name.clone(),
+                        output: Box::new(checked),
+                        run_data: None,
+                    });
                 }
             }
         }
@@ -1447,7 +1577,8 @@ impl<C: Send + Sync + 'static> SessionInner<C> {
             tool_name: tool_name.to_string(),
             call_id: call_id.to_string(),
             default_message: default_message.to_string(),
-            run_context: self.context.clone(),
+            run_context: &self.context,
+            error: None,
         };
         formatter(&args).unwrap_or_else(|| default_message.to_string())
     }

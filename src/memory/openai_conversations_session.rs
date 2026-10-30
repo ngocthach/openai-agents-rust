@@ -78,6 +78,24 @@ impl OpenAIConversationsSession {
         *self.id_view.write().expect("session poisoned") = view;
     }
 
+    /// The conversation id, or an error while the conversation has not been created yet.
+    ///
+    /// Port of Python's `session_id` property, which raises `ValueError` on an uninitialized
+    /// session. [`Session::session_id`] returns `&str` and so cannot fail; it keeps reporting
+    /// `""` for an uninitialized session, and this is the fallible form that says why.
+    /// [`OpenAIConversationsSession::conversation_id`] creates the conversation instead.
+    pub fn try_session_id(&self) -> Result<String> {
+        let id = *self.id_view.read().expect("session poisoned");
+        if id.is_empty() {
+            return Err(AgentsError::user(
+                "Session ID not yet available. The session is lazily initialized on first API \
+                 call. Call get_items(), add_items() with a non-empty list, or a similar method \
+                 first.",
+            ));
+        }
+        Ok(id.to_string())
+    }
+
     /// The conversation id, creating the conversation if needed.
     pub async fn conversation_id(&self) -> Result<String> {
         let mut guard = self.conversation_id.lock().await;
@@ -177,6 +195,9 @@ fn strip_server_fields(mut v: Value) -> Value {
 #[async_trait]
 impl Session for OpenAIConversationsSession {
     /// The conversation id, or `""` while the conversation has not been created yet.
+    ///
+    /// Python raises instead; [`OpenAIConversationsSession::try_session_id`] is the fallible
+    /// form, since this signature cannot report an error.
     fn session_id(&self) -> &str {
         *self.id_view.read().expect("session poisoned")
     }

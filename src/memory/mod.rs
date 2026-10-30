@@ -82,6 +82,48 @@ pub type SessionInputCallback = std::sync::Arc<
         + Sync,
 >;
 
+/// Run a session mutation to completion even if the caller is dropped.
+///
+/// Mirrors `agents.memory.session.await_session_mutation`. Once this future has been polled
+/// once the mutation runs on its own task, so dropping the caller — a cancelled `select!`
+/// branch, an elapsed `timeout` — cannot abort a half-written mutation. Wrappers that must not
+/// leave a store half-updated (compaction's replacement, the encrypted wrapper's writes) route
+/// their mutations through it.
+///
+/// Difference from Python: `asyncio` can defer a cancellation request until the operation
+/// settles and then raise it, while dropping a Rust future is not awaitable. The mutation still
+/// completes, but a dropped caller never observes its outcome; as in Python, a caller that goes
+/// away must not assume the write was rolled back.
+///
+/// This provides no timeout, transaction, retry or mutual exclusion.
+pub async fn await_session_mutation<T>(
+    mutation: impl Future<Output = Result<T>> + Send + 'static,
+) -> Result<T>
+where
+    T: Send + 'static,
+{
+    tokio::spawn(mutation)
+        .await
+        .map_err(|e| crate::error::AgentsError::other(format!("session mutation failed: {e}")))?
+}
+
+/// Decides whether a stored item at the head of the history may be physically reclaimed during
+/// a successful [`Session::replace_compaction_suffix_pruning`].
+///
+/// Mirrors the `prune_prefix` callable Python's encrypted snapshot passes down. The predicate
+/// sees the item exactly as the store holds it — for an encrypted store, the envelope rather
+/// than its plaintext.
+pub type PrunePrefix = std::sync::Arc<dyn Fn(&InputItem) -> bool + Send + Sync>;
+
+/// Rejects a claimed item before its removal is committed, mirroring the `validate` callback of
+/// Python's `SQLiteSession._pop_item_with_validation`.
+pub type PopValidator = Box<dyn Fn(&InputItem) -> Result<()> + Send + Sync>;
+
+/// How many of the oldest rows one prefix-reclamation round reads at a time. Bounds the memory
+/// a single round uses; the loop keeps going while whole batches are reclaimable.
+#[allow(dead_code)]
+pub(crate) const PRUNE_PREFIX_BATCH: i64 = 256;
+
 /// Settings controlling how history is retrieved.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionSettings {
@@ -211,6 +253,23 @@ pub trait Session: Send + Sync + fmt::Debug {
     /// Remove and return the most recent item.
     async fn pop_item(&self) -> Result<Option<InputItem>>;
 
+    /// Remove and return the most recent item, rejecting it before the removal is committed.
+    ///
+    /// `validate` runs on the claimed item inside whatever transaction owns the removal. An
+    /// `Err` rolls that removal back, leaving the item and its position untouched, and is
+    /// returned to the caller. Stores that cannot claim and validate atomically keep the
+    /// default, which pops first and so *does* remove an item `validate` rejects — exactly the
+    /// split Python draws between its native `SQLiteSession` and every other backend.
+    ///
+    /// Port of `SQLiteSession._pop_item_with_validation`.
+    async fn pop_item_validated(&self, validate: PopValidator) -> Result<Option<InputItem>> {
+        let item = self.pop_item().await?;
+        if let Some(item) = &item {
+            validate(item)?;
+        }
+        Ok(item)
+    }
+
     /// Remove all items.
     async fn clear_session(&self) -> Result<()>;
 
@@ -256,6 +315,25 @@ pub trait Session: Send + Sync + fmt::Debug {
         _items: Vec<InputItem>,
     ) -> Result<bool> {
         Ok(false)
+    }
+
+    /// [`Session::replace_compaction_suffix`], additionally reclaiming a contiguous prefix of
+    /// items `prune_prefix` accepts.
+    ///
+    /// The scan starts at the oldest stored item and stops at the first item the predicate
+    /// rejects or that the store cannot read, so a rejected item always keeps everything after
+    /// it. Reclamation happens in the same transaction as the replacement and only when the
+    /// replacement succeeds, so a store that returns `false` deletes nothing. Stores that
+    /// cannot do this keep the default, which ignores the predicate.
+    ///
+    /// Port of the `prune_prefix` argument of `SQLiteSession._get_compaction_snapshot`.
+    async fn replace_compaction_suffix_pruning(
+        &self,
+        handles: &[SnapshotHandle],
+        items: Vec<InputItem>,
+        _prune_prefix: PrunePrefix,
+    ) -> Result<bool> {
+        self.replace_compaction_suffix(handles, items).await
     }
 }
 
@@ -398,5 +476,35 @@ mod tests {
         );
         s.clear_session().await.unwrap();
         assert!(s.get_items(None).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_shielded_mutation_outlives_its_caller() {
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let session = Arc::new(InMemorySession::new("s1"));
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let (store, release) = (session.clone(), gate.clone());
+        let mutation = await_session_mutation(async move {
+            release.notified().await;
+            store.add_items(vec![InputItem::user("a")]).await
+        });
+
+        // The caller goes away before the write can land.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), mutation)
+                .await
+                .is_err()
+        );
+        gate.notify_one();
+
+        for _ in 0..200 {
+            if session.get_items(None).await.unwrap().len() == 1 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("the mutation was aborted together with its caller");
     }
 }

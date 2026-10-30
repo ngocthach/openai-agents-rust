@@ -27,7 +27,7 @@ use crate::tracing::transcription_span;
 use crate::util::gen_hex32;
 use crate::voice::input::{AudioInput, StreamedAudioInput, pcm16_to_bytes};
 use crate::voice::model::{STTModel, STTModelSettings, StreamedTranscriptionSession};
-use crate::voice::models::{check_response, request_headers, request_url};
+use crate::voice::models::request_headers;
 use crate::voice::result::get_trace_error;
 
 /// How long to wait for a session event before assuming the session is done.
@@ -36,6 +36,66 @@ const EVENT_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(1000);
 const SESSION_CREATION_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long to wait for the `session.updated` event.
 const SESSION_UPDATE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Keepalive and frame-size settings for the realtime transcription websocket.
+///
+/// Python's voice STT session calls `websockets.connect` without overriding them, so the
+/// defaults here are that library's: a ping every 20 seconds, 20 seconds to answer it, and a
+/// 1 MiB limit on an incoming message. `tokio_tungstenite` sends no pings of its own, so the
+/// keepalive is driven from the event loop. The same three knobs are
+/// `OpenAIResponsesWebSocketOptions` on the Responses transport.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct VoiceWebSocketOptions {
+    /// Seconds between keepalive pings. `None` disables the keepalive.
+    pub ping_interval: Option<f64>,
+    /// Seconds to wait for the pong answering a keepalive ping.
+    pub ping_timeout: Option<f64>,
+    /// Maximum size of an incoming message, in bytes. `None` means no limit.
+    pub max_size: Option<usize>,
+}
+
+impl Default for VoiceWebSocketOptions {
+    fn default() -> Self {
+        VoiceWebSocketOptions {
+            ping_interval: Some(20.0),
+            ping_timeout: Some(20.0),
+            max_size: Some(1 << 20),
+        }
+    }
+}
+
+impl VoiceWebSocketOptions {
+    /// Seconds between keepalive pings (`None` disables them).
+    pub fn with_ping_interval(mut self, seconds: Option<f64>) -> Self {
+        self.ping_interval = seconds;
+        self
+    }
+
+    /// Seconds to wait for the pong answering a keepalive ping.
+    pub fn with_ping_timeout(mut self, seconds: Option<f64>) -> Self {
+        self.ping_timeout = seconds;
+        self
+    }
+
+    /// Maximum size of an incoming message, in bytes (`None` means no limit).
+    pub fn with_max_size(mut self, bytes: Option<usize>) -> Self {
+        self.max_size = bytes;
+        self
+    }
+
+    /// The websocket configuration these settings imply.
+    fn websocket_config(&self) -> tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+        // Python's `max_size` caps a whole message, and `websockets` applies it per frame too.
+        tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
+            .max_message_size(self.max_size)
+            .max_frame_size(self.max_size)
+    }
+}
+
+/// Seconds as a [`Duration`], clamped at zero.
+fn seconds(value: f64) -> Duration {
+    Duration::try_from_secs_f64(value.max(0.0)).unwrap_or(Duration::ZERO)
+}
 
 /// Models that take a list of candidate languages instead of a single one.
 const MULTI_LANGUAGE_MODELS: [&str; 2] = ["gpt-transcribe", "gpt-live-transcribe"];
@@ -52,6 +112,7 @@ pub struct OpenAISTTModel {
     model: String,
     client: OpenAIClient,
     http: reqwest::Client,
+    websocket: VoiceWebSocketOptions,
 }
 
 impl OpenAISTTModel {
@@ -61,6 +122,7 @@ impl OpenAISTTModel {
             model: model.into(),
             client,
             http: crate::util::http_client(),
+            websocket: VoiceWebSocketOptions::default(),
         }
     }
 
@@ -68,6 +130,17 @@ impl OpenAISTTModel {
     pub fn with_http_client(mut self, http: reqwest::Client) -> Self {
         self.http = http;
         self
+    }
+
+    /// Set the keepalive and frame-size settings of the streamed transcription websocket.
+    pub fn with_websocket_options(mut self, options: VoiceWebSocketOptions) -> Self {
+        self.websocket = options;
+        self
+    }
+
+    /// The keepalive and frame-size settings of the streamed transcription websocket.
+    pub fn websocket_options(&self) -> &VoiceWebSocketOptions {
+        &self.websocket
     }
 }
 
@@ -150,6 +223,7 @@ impl STTModel for OpenAISTTModel {
             audio,
             trace_include_sensitive_data,
             trace_include_sensitive_audio_data,
+            self.websocket,
         )
         .await?;
         Ok(Box::new(session))
@@ -186,14 +260,12 @@ impl OpenAISTTModel {
             form = form.text("temperature", temperature.to_string());
         }
 
-        let response = self
-            .http
-            .post(request_url(&self.client, "/audio/transcriptions"))
-            .headers(request_headers(&self.client)?)
-            .multipart(form)
-            .send()
+        // Goes through the shared client so the `RequestAuth` hook, the default query and
+        // the OpenAI error mapping apply here as they do to every other request.
+        let (body, _request_id) = self
+            .client
+            .post_multipart("/audio/transcriptions", form)
             .await?;
-        let body: Value = check_response(response).await?.json().await?;
         body.get("text")
             .and_then(Value::as_str)
             .map(str::to_string)
@@ -305,6 +377,7 @@ impl OpenAISTTTranscriptionSession {
         audio: mpsc::UnboundedReceiver<Option<Vec<i16>>>,
         trace_include_sensitive_data: bool,
         trace_include_sensitive_audio_data: bool,
+        options: VoiceWebSocketOptions,
     ) -> Result<Self> {
         let turn_detection = settings
             .turn_detection
@@ -317,9 +390,13 @@ impl OpenAISTTTranscriptionSession {
             .map_err(|e| AgentsError::user(format!("Invalid transcription websocket URL: {e}")))?;
         request.headers_mut().extend(request_headers(client)?);
         crate::util::ensure_crypto_provider();
-        let (ws, _) = tokio_tungstenite::connect_async(request)
-            .await
-            .map_err(|e| websocket_error(format!("Could not open the STT websocket: {e}")))?;
+        let (ws, _) = tokio_tungstenite::connect_async_with_config(
+            request,
+            Some(options.websocket_config()),
+            false,
+        )
+        .await
+        .map_err(|e| websocket_error(format!("Could not open the STT websocket: {e}")))?;
         let (sink, mut stream) = ws.split();
 
         wait_for_event(
@@ -395,10 +472,13 @@ impl OpenAISTTTranscriptionSession {
         let event_task = {
             let tracing = tracing.clone();
             let closing = closing.clone();
+            let sink = sink.clone();
             tokio::spawn(async move {
                 scope
                     .enter(handle_events(
                         stream,
+                        sink,
+                        options,
                         tracing,
                         turns_tx,
                         final_commit_id,
@@ -485,7 +565,36 @@ fn websocket_url(client: &OpenAIClient) -> String {
         Some(("http", rest)) => format!("ws://{rest}"),
         _ => base.to_string(),
     };
-    format!("{base}/realtime?intent=transcription")
+    // Python merges the client's `default_query` into the handshake URL and then forces
+    // `intent=transcription`, so a default `intent` cannot hijack the session type.
+    let mut params: Vec<(String, String)> = client
+        .default_query()
+        .iter()
+        .filter(|(name, _)| name.as_str() != "intent")
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect();
+    params.sort_unstable();
+    params.push(("intent".to_string(), "transcription".to_string()));
+    let query = params
+        .iter()
+        .map(|(name, value)| format!("{}={}", url_encode(name), url_encode(value)))
+        .collect::<Vec<_>>()
+        .join("&");
+    format!("{base}/realtime?{query}")
+}
+
+/// Percent-encode one query component.
+fn url_encode(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(*byte as char)
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
 }
 
 /// An [`AgentsError`] for a failed STT websocket, Python's `STTWebsocketConnectionError`.
@@ -581,9 +690,84 @@ async fn stream_audio(
     }
 }
 
+/// What the event loop got while waiting for the next session event.
+enum NextEvent {
+    /// A frame the event loop should interpret.
+    Message(Message),
+    /// The peer closed the socket.
+    Closed,
+    /// Reading failed, or the peer stopped answering the keepalive.
+    Failed(String),
+    /// No event arrived within [`EVENT_INACTIVITY_TIMEOUT`].
+    Inactive,
+}
+
+/// Await the next session event, sending keepalive pings while nothing arrives.
+///
+/// `websockets` runs its keepalive on a background task; tungstenite has none, so the ping is
+/// driven from this loop. Pongs do not extend the inactivity deadline, so a silent but
+/// answering peer still ends the session on time.
+async fn next_event(
+    stream: &mut SplitStream<WsStream>,
+    sink: &WsSink,
+    options: &VoiceWebSocketOptions,
+) -> NextEvent {
+    let deadline = tokio::time::Instant::now() + EVENT_INACTIVITY_TIMEOUT;
+    let mut awaiting_pong = false;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return NextEvent::Inactive;
+        }
+        let keepalive = if awaiting_pong {
+            options.ping_timeout
+        } else {
+            options.ping_interval
+        }
+        .filter(|_| options.ping_interval.is_some())
+        .map(seconds);
+        let wait = keepalive.map_or(remaining, |k| remaining.min(k));
+        match tokio::time::timeout(wait, stream.next()).await {
+            Err(_) => {
+                if tokio::time::Instant::now() >= deadline {
+                    return NextEvent::Inactive;
+                }
+                if awaiting_pong {
+                    return NextEvent::Failed(
+                        "Timeout waiting for the STT websocket keepalive pong".to_string(),
+                    );
+                }
+                if options.ping_interval.is_some() {
+                    if sink
+                        .lock()
+                        .await
+                        .send(Message::Ping(bytes::Bytes::new()))
+                        .await
+                        .is_err()
+                    {
+                        return NextEvent::Failed(
+                            "Could not send the STT websocket keepalive ping".to_string(),
+                        );
+                    }
+                    awaiting_pong = true;
+                }
+            }
+            Ok(None) => return NextEvent::Closed,
+            Ok(Some(Err(error))) => {
+                return NextEvent::Failed(format!("STT websocket read failed: {error}"));
+            }
+            Ok(Some(Ok(Message::Pong(_)))) => awaiting_pong = false,
+            Ok(Some(Ok(message))) => return NextEvent::Message(message),
+        }
+    }
+}
+
 /// Turn websocket events into transcription turns.
+#[allow(clippy::too_many_arguments)]
 async fn handle_events(
     mut stream: SplitStream<WsStream>,
+    sink: WsSink,
+    options: VoiceWebSocketOptions,
     tracing: Arc<SessionTracing>,
     turns: mpsc::UnboundedSender<Result<String>>,
     final_commit_id: Arc<Mutex<Option<String>>>,
@@ -592,8 +776,8 @@ async fn handle_events(
     let mut pending_transcripts: HashSet<String> = HashSet::new();
     let mut input_cleared = false;
     loop {
-        let message = match tokio::time::timeout(EVENT_INACTIVITY_TIMEOUT, stream.next()).await {
-            Err(_) => {
+        let message = match next_event(&mut stream, &sink, &options).await {
+            NextEvent::Inactive => {
                 if final_commit_id.lock().expect("poisoned").is_some() {
                     let _ = turns.send(Err(websocket_error(
                         "Timeout waiting for final transcription",
@@ -602,7 +786,7 @@ async fn handle_events(
                 // No new events for a while: assume the session is done.
                 break;
             }
-            Ok(None) => {
+            NextEvent::Closed => {
                 let committed = final_commit_id.lock().expect("poisoned").is_some();
                 if !closing.load(Ordering::SeqCst)
                     && committed
@@ -614,13 +798,11 @@ async fn handle_events(
                 }
                 break;
             }
-            Ok(Some(Err(error))) => {
-                let _ = turns.send(Err(websocket_error(format!(
-                    "STT websocket read failed: {error}"
-                ))));
+            NextEvent::Failed(message) => {
+                let _ = turns.send(Err(websocket_error(message)));
                 break;
             }
-            Ok(Some(Ok(message))) => message,
+            NextEvent::Message(message) => message,
         };
         if matches!(message, Message::Close(_)) {
             break;
@@ -721,6 +903,18 @@ mod tests {
         assert_eq!(
             websocket_url(&local),
             "ws://127.0.0.1:1234/v1/realtime?intent=transcription"
+        );
+    }
+
+    #[test]
+    fn the_handshake_url_carries_the_client_default_query() {
+        let client = OpenAIClient::new("sk-test")
+            .with_base_url("https://example.test/v1")
+            .with_default_query("api-version", "2024 preview")
+            .with_default_query("intent", "ignored");
+        assert_eq!(
+            websocket_url(&client),
+            "wss://example.test/v1/realtime?api-version=2024%20preview&intent=transcription"
         );
     }
 

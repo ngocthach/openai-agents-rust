@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use crate::models::OpenAIClient;
 use crate::voice::model::{STTModel, TTSModel, VoiceModelProvider};
+use crate::voice::models::openai_stt::VoiceWebSocketOptions;
 use crate::voice::models::{OpenAISTTModel, OpenAITTSModel};
 
 /// The speech-to-text model used when none is given.
@@ -17,6 +18,8 @@ pub const DEFAULT_TTS_MODEL: &str = "gpt-4o-mini-tts";
 pub struct OpenAIVoiceModelProvider {
     client: OpenAIClient,
     http: Option<reqwest::Client>,
+    agent_harness_id: Option<String>,
+    websocket: VoiceWebSocketOptions,
 }
 
 impl OpenAIVoiceModelProvider {
@@ -49,16 +52,45 @@ impl OpenAIVoiceModelProvider {
         self
     }
 
+    /// Set the keepalive and frame-size settings of the streamed transcription websocket.
+    pub fn with_websocket_options(mut self, options: VoiceWebSocketOptions) -> Self {
+        self.websocket = options;
+        self
+    }
+
+    /// Set the OpenAI agent harness id. Python's `agent_registration`.
+    pub fn with_agent_harness_id(mut self, harness_id: impl Into<String>) -> Self {
+        self.agent_harness_id = Some(harness_id.into());
+        self
+    }
+
     /// The OpenAI client used by the models this provider creates.
     pub fn client(&self) -> &OpenAIClient {
         &self.client
+    }
+
+    /// The resolved agent harness id: this provider's, the global default, then
+    /// `OPENAI_AGENT_HARNESS_ID`.
+    ///
+    /// Like Python's `OpenAIVoiceModelProvider.agent_registration`, nothing in the voice
+    /// pipeline reads it; the harness id reaches trace metadata through the *run's* model
+    /// provider (see [`set_default_openai_harness`](crate::models::set_default_openai_harness)).
+    pub fn agent_harness_id(&self) -> Option<String> {
+        // The default and environment tiers live behind `resolve_openai_harness_id`, which
+        // reads the explicit id off a `ModelProvider`; hand it one carrying this id.
+        let mut probe = crate::models::OpenAIProvider::default();
+        if let Some(id) = &self.agent_harness_id {
+            probe = probe.with_agent_harness_id(id.clone());
+        }
+        crate::models::resolve_openai_harness_id(&probe)
     }
 }
 
 impl VoiceModelProvider for OpenAIVoiceModelProvider {
     fn get_stt_model(&self, model_name: Option<&str>) -> Arc<dyn STTModel> {
         let model =
-            OpenAISTTModel::new(model_name.unwrap_or(DEFAULT_STT_MODEL), self.client.clone());
+            OpenAISTTModel::new(model_name.unwrap_or(DEFAULT_STT_MODEL), self.client.clone())
+                .with_websocket_options(self.websocket);
         Arc::new(match &self.http {
             Some(http) => model.with_http_client(http.clone()),
             None => model,
@@ -88,5 +120,11 @@ mod tests {
             provider.get_stt_model(Some("whisper-1")).model_name(),
             "whisper-1"
         );
+    }
+
+    #[test]
+    fn resolves_the_configured_agent_harness_id() {
+        let provider = OpenAIVoiceModelProvider::new().with_agent_harness_id("  harness-1  ");
+        assert_eq!(provider.agent_harness_id().as_deref(), Some("harness-1"));
     }
 }

@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 #[cfg(feature = "mcp")]
 use crate::agent::MCPConfig;
-use crate::error::Result;
+use crate::error::{AgentsError, Result};
 use crate::guardrail::OutputGuardrail;
 use crate::prompts::Prompt;
 use crate::realtime::config::RealtimeSessionModelSettings;
@@ -250,24 +250,42 @@ impl<C> RealtimeAgent<C> {
     /// The function tools declared on this agent, skipping hosted tools, which realtime models
     /// reject.
     ///
-    /// This does not include MCP tools; use [`RealtimeAgent::get_all_tools`] for those.
+    /// This does not include MCP tools; use [`RealtimeAgent::get_all_tools`] for those, which
+    /// also rejects a hosted tool instead of skipping it.
     pub fn function_tools(&self) -> Vec<Arc<FunctionTool<C>>> {
         self.tools
             .iter()
             .filter_map(|tool| tool.as_function().cloned())
             .collect()
     }
+
+    /// Fail when the agent declares a tool a realtime session cannot run.
+    ///
+    /// Port of the `Tool {name} is unsupported. Must be a function tool.` check in
+    /// `_tools_to_session_tools`.
+    fn reject_hosted_tools(&self) -> Result<()> {
+        for tool in &self.tools {
+            if tool.as_function().is_none() {
+                return Err(AgentsError::user(format!(
+                    "Tool {} is unsupported. Must be a function tool.",
+                    tool.name()
+                )));
+            }
+        }
+        Ok(())
+    }
 }
 
 impl<C: Send + Sync + 'static> RealtimeAgent<C> {
     /// Every enabled tool the model may call, including the tools of this agent's MCP servers.
     ///
-    /// MCP tools come first, as in [`crate::Agent::get_all_tools`], and hosted tools are skipped
-    /// because realtime models accept function tools only.
+    /// MCP tools come first, as in [`crate::Agent::get_all_tools`]. A hosted tool is an error:
+    /// realtime models accept function tools only.
     pub async fn get_all_tools(
         &self,
         context: &RunContext<C>,
     ) -> Result<Vec<Arc<FunctionTool<C>>>> {
+        self.reject_hosted_tools()?;
         let mut tools: Vec<Arc<FunctionTool<C>>> = Vec::new();
 
         #[cfg(feature = "mcp")]

@@ -117,19 +117,371 @@ pub struct SessionUsage {
 /// Aggregated usage columns as SQLite returns them: `SUM` is `NULL` over an empty set.
 type UsageTotals = (Option<i64>, Option<i64>, Option<i64>, Option<i64>, i64);
 
+/// The branch this instance reads and writes, and the clear generation it was chosen under.
+///
+/// Another process (or another instance on the same file) can clear this session, which deletes
+/// every branch. The generation stored in `session_clear_generations` is bumped by each clear,
+/// so an instance whose captured generation is stale knows its branch pointer names a branch
+/// that no longer exists and falls back to `main`. Port of Python's `_branch_state`.
+#[derive(Debug, Clone)]
+struct BranchState {
+    branch: String,
+    generation: i64,
+}
+
 /// Everything a blocking database closure needs about the session.
 #[derive(Debug, Clone)]
 struct Ctx {
     session_id: String,
     sessions_table: String,
     messages_table: String,
-    branch: Arc<Mutex<String>>,
+    branch: Arc<Mutex<BranchState>>,
 }
 
 impl Ctx {
     fn branch_id(&self) -> String {
-        self.branch.lock().expect("branch poisoned").clone()
+        self.branch.lock().expect("branch poisoned").branch.clone()
     }
+
+    fn generation(&self) -> i64 {
+        self.branch.lock().expect("branch poisoned").generation
+    }
+
+    fn set_branch(&self, branch: String, generation: i64) {
+        *self.branch.lock().expect("branch poisoned") = BranchState { branch, generation };
+    }
+}
+
+/// Create the cross-process branch-id reservation table and backfill this session's branches.
+///
+/// Reservations outlive the rows of a branch, so a branch id that was used once cannot be
+/// handed out again — not even after `clear_session`, and not to a second process racing for
+/// the same name. Port of `_ensure_branch_reservations_table`.
+fn ensure_branch_reservations(conn: &Connection, ctx: &Ctx) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS branch_reservations (
+            session_id TEXT NOT NULL,
+            branch_id TEXT NOT NULL,
+            PRIMARY KEY (session_id, branch_id)
+         );",
+    )
+    .map_err(sql_err)?;
+    let missing: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM message_structure ms
+             WHERE ms.session_id = ?
+               AND NOT EXISTS (
+                   SELECT 1 FROM branch_reservations br
+                   WHERE br.session_id = ms.session_id AND br.branch_id = ms.branch_id
+               )
+             LIMIT 1",
+            params![ctx.session_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(sql_err)?;
+    if missing.is_some() {
+        conn.execute(
+            "INSERT OR IGNORE INTO branch_reservations (session_id, branch_id)
+             SELECT DISTINCT session_id, branch_id FROM message_structure WHERE session_id = ?",
+            params![ctx.session_id],
+        )
+        .map_err(sql_err)?;
+    }
+    Ok(())
+}
+
+/// Create the durable clear-generation table and seed this session's row.
+///
+/// Port of `_ensure_session_clear_generations_table`.
+fn ensure_clear_generations(conn: &Connection, ctx: &Ctx) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS session_clear_generations (
+            session_id TEXT PRIMARY KEY,
+            generation INTEGER NOT NULL DEFAULT 0
+         );",
+    )
+    .map_err(sql_err)?;
+    conn.execute(
+        "INSERT OR IGNORE INTO session_clear_generations (session_id, generation) VALUES (?, 0)",
+        params![ctx.session_id],
+    )
+    .map_err(sql_err)?;
+    Ok(())
+}
+
+/// The durable clear generation of this session, or 0 when nothing recorded one yet.
+fn stored_generation(conn: &Connection, ctx: &Ctx) -> Result<i64> {
+    conn.query_row(
+        "SELECT generation FROM session_clear_generations WHERE session_id = ?",
+        params![ctx.session_id],
+        |r| r.get(0),
+    )
+    .optional()
+    .map_err(sql_err)
+    .map(|g| g.unwrap_or(0))
+}
+
+/// Reset a stale branch pointer after another instance cleared this session.
+///
+/// Port of `_refresh_branch_after_external_clear`.
+fn refresh_branch_after_external_clear(
+    conn: &Connection,
+    ctx: &Ctx,
+    initialize: bool,
+) -> Result<()> {
+    if initialize {
+        ensure_clear_generations(conn, ctx)?;
+    } else {
+        let exists: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master
+                 WHERE type = 'table' AND name = 'session_clear_generations'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(sql_err)?;
+        if exists.is_none() {
+            return Ok(());
+        }
+    }
+    let generation = stored_generation(conn, ctx)?;
+    if generation != ctx.generation() {
+        ctx.set_branch(MAIN_BRANCH.to_string(), generation);
+    }
+    Ok(())
+}
+
+/// The branch a read should use: the requested one, or the current one after synchronizing an
+/// external clear. Port of `_resolve_read_branch`.
+fn resolve_read_branch(conn: &Connection, ctx: &Ctx, branch_id: Option<String>) -> Result<String> {
+    if let Some(branch_id) = branch_id {
+        return Ok(branch_id);
+    }
+    refresh_branch_after_external_clear(conn, ctx, false)?;
+    Ok(ctx.branch_id())
+}
+
+/// Claim `branch_id`, or generate an unused one. Port of `_reserve_branch_id`.
+///
+/// The insert is the claim: `INSERT OR IGNORE` on the reservation table's primary key succeeds
+/// for exactly one writer, so two processes picking the same name cannot both proceed.
+fn reserve_branch_id(
+    tx: &rusqlite::Transaction<'_>,
+    ctx: &Ctx,
+    requested: Option<String>,
+    from_turn_number: i64,
+) -> Result<String> {
+    let claim = |branch_id: &str| -> Result<bool> {
+        let inserted = tx
+            .execute(
+                "INSERT OR IGNORE INTO branch_reservations (session_id, branch_id) VALUES (?, ?)",
+                params![ctx.session_id, branch_id],
+            )
+            .map_err(sql_err)?;
+        Ok(inserted == 1)
+    };
+    if let Some(branch_id) = requested {
+        if !claim(&branch_id)? {
+            return Err(AgentsError::user(format!(
+                "Branch ID '{branch_id}' has already been used. Choose a new branch ID."
+            )));
+        }
+        return Ok(branch_id);
+    }
+    let base = format!(
+        "branch_from_turn_{from_turn_number}_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    );
+    let mut branch_id = base.clone();
+    let mut suffix = 1u32;
+    loop {
+        if claim(&branch_id)? {
+            return Ok(branch_id);
+        }
+        suffix += 1;
+        branch_id = format!("{base}_{suffix}");
+    }
+}
+
+/// Point the session at `branch_id` unless a clear committed since `generation` was captured.
+///
+/// Returns `false` when it did; the clear's reset to `main` wins, because the branch this call
+/// selected no longer exists. Port of `_commit_branch_pointer`.
+fn commit_branch_pointer(
+    conn: &Connection,
+    ctx: &Ctx,
+    branch_id: String,
+    generation: i64,
+) -> Result<bool> {
+    let durable = stored_generation(conn, ctx)?;
+    if durable != generation {
+        ctx.set_branch(MAIN_BRANCH.to_string(), durable);
+        return Ok(false);
+    }
+    ctx.set_branch(branch_id, durable);
+    Ok(true)
+}
+
+/// Compare two table names the way SQLite compares identifiers.
+///
+/// SQLite folds identifiers with ASCII rules only, so it is asked directly rather than having
+/// the rule reimplemented: Rust's `to_lowercase` would equate names SQLite keeps distinct.
+/// Port of `_identifiers_equal`.
+fn identifiers_equal(conn: &Connection, left: &str, right: &str) -> Result<bool> {
+    conn.query_row("SELECT ? = ? COLLATE NOCASE", params![left, right], |r| {
+        r.get::<_, i64>(0)
+    })
+    .map(|v| v != 0)
+    .map_err(sql_err)
+}
+
+/// Ask SQLite which table object a configured identifier selects.
+///
+/// A SQLite authorizer reports the table every read touches, so running `SELECT * FROM <ident>
+/// LIMIT 0` names the table the identifier actually resolves to, after quoting and
+/// case-folding. Port of `_resolve_table_identifier`.
+fn resolve_table_identifier(conn: &Connection, identifier: &str) -> Result<String> {
+    let seen: Arc<Mutex<std::collections::BTreeSet<String>>> = Arc::default();
+    let collector = Arc::clone(&seen);
+    conn.authorizer(Some(
+        move |ctx: rusqlite::hooks::AuthContext<'_>| -> rusqlite::hooks::Authorization {
+            if let rusqlite::hooks::AuthAction::Read { table_name, .. } = ctx.action {
+                collector
+                    .lock()
+                    .expect("authorizer poisoned")
+                    .insert(table_name.to_string());
+            }
+            rusqlite::hooks::Authorization::Allow
+        },
+    ))
+    .map_err(sql_err)?;
+    let probe = conn.execute_batch(&format!("SELECT * FROM {identifier} LIMIT 0"));
+    conn.authorizer::<fn(rusqlite::hooks::AuthContext<'_>) -> rusqlite::hooks::Authorization>(None)
+        .map_err(sql_err)?;
+    probe.map_err(sql_err)?;
+    let mut tables = Arc::try_unwrap(seen)
+        .unwrap_or_else(|shared| Mutex::new(shared.lock().expect("authorizer poisoned").clone()))
+        .into_inner()
+        .expect("authorizer poisoned");
+    if tables.len() != 1 {
+        return Err(AgentsError::user(format!(
+            "The configured table identifier '{identifier}' is ambiguous."
+        )));
+    }
+    Ok(tables.pop_first().expect("exactly one table"))
+}
+
+/// The base tables the structure tables must belong to, after SQLite resolved the configured
+/// identifiers. Port of `_resolve_base_table_owners`.
+fn resolve_base_table_owners(conn: &Connection, ctx: &Ctx) -> Result<(String, String)> {
+    let missing = || {
+        AgentsError::user(
+            "The configured base tables are missing. Create an AdvancedSqliteSession with \
+             create_tables set to initialize and claim the database before opening it without \
+             table creation.",
+        )
+    };
+    let sessions_table =
+        resolve_table_identifier(conn, &ctx.sessions_table).map_err(|_| missing())?;
+    let messages_table =
+        resolve_table_identifier(conn, &ctx.messages_table).map_err(|_| missing())?;
+
+    let mut stmt = conn
+        .prepare(&format!(
+            "PRAGMA foreign_key_list({m})",
+            m = ctx.messages_table
+        ))
+        .map_err(sql_err)?;
+    // `table`, `from`, `to` of each foreign key of the messages table.
+    let keys: Vec<(String, String, Option<String>)> = stmt
+        .query_map([], |r| Ok((r.get(2)?, r.get(3)?, r.get(4)?)))
+        .map_err(sql_err)?
+        .filter_map(std::result::Result::ok)
+        .collect();
+    drop(stmt);
+    let mut owners = Vec::new();
+    for (table, from, to) in keys {
+        if identifiers_equal(conn, &from, "session_id")?
+            && to
+                .as_deref()
+                .is_some_and(|to| to.eq_ignore_ascii_case("session_id"))
+        {
+            owners.push(table);
+        }
+    }
+    let found = match owners.as_slice() {
+        [one] if identifiers_equal(conn, one, &sessions_table)? => {
+            return Ok((sessions_table, messages_table));
+        }
+        [one] => one.clone(),
+        _ => "ambiguous ownership".to_string(),
+    };
+    Err(AgentsError::user(format!(
+        "The configured messages table '{messages_table}' belongs to sessions table '{found}', \
+         not to the configured '{sessions_table}'. Give each sessions_table/messages_table pair \
+         its own db_path."
+    )))
+}
+
+/// Require that the structure tables in this database file belong to the configured base-table
+/// pair. Port of `_claim_structure_tables`.
+///
+/// `message_structure` and `turn_usage` are not named after the base tables, so one database
+/// file can only hold the structure rows of one pair; `CREATE TABLE IF NOT EXISTS` keeps the
+/// first pair's foreign keys. Without this check a second pair would join `message_structure`
+/// against the wrong messages table and read back the other pair's rows.
+fn claim_structure_tables(conn: &Connection, ctx: &Ctx) -> Result<()> {
+    let (sessions_table, messages_table) = resolve_base_table_owners(conn, ctx)?;
+    for (table, columns) in [
+        ("message_structure", &["session_id", "message_id"][..]),
+        ("turn_usage", &["session_id"][..]),
+    ] {
+        let mut stmt = conn
+            .prepare(&format!("PRAGMA foreign_key_list({table})"))
+            .map_err(sql_err)?;
+        let keys: Vec<(String, String, Option<String>)> = stmt
+            .query_map([], |r| Ok((r.get(2)?, r.get(3)?, r.get(4)?)))
+            .map_err(sql_err)?
+            .filter_map(std::result::Result::ok)
+            .collect();
+        drop(stmt);
+        for column in columns {
+            let (expected_table, expected_column) = match *column {
+                "session_id" => (&sessions_table, "session_id"),
+                _ => (&messages_table, "id"),
+            };
+            let matching: Vec<&(String, String, Option<String>)> = keys
+                .iter()
+                .filter(|(_, from, _)| from.eq_ignore_ascii_case(column))
+                .collect();
+            let [key] = matching.as_slice() else {
+                return Err(AgentsError::user(format!(
+                    "The `{table}` table does not record exactly one owner foreign key for each \
+                     required base-table column. Create an AdvancedSqliteSession with \
+                     create_tables set to create and claim the structure tables before opening \
+                     the database without them."
+                )));
+            };
+            let target = key.2.as_deref().unwrap_or_default();
+            if !identifiers_equal(conn, &key.0, expected_table)?
+                || !target.eq_ignore_ascii_case(expected_column)
+            {
+                return Err(AgentsError::user(format!(
+                    "The `{table}` table already belongs to '{}({target})', not to the \
+                     configured '{expected_table}({expected_column})'. Structure tables are \
+                     shared per database file, so give each sessions_table/messages_table pair \
+                     its own db_path.",
+                    key.0
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The message type recorded for an item in `message_structure`.
@@ -190,43 +542,76 @@ fn is_user_message(item: &InputItem) -> bool {
 /// History reads and writes are scoped to the current branch, so branching off an earlier turn
 /// forks the conversation while the underlying message rows stay shared.
 ///
+/// Three further tables keep the session safe to share:
+///
+/// - `branch_reservations`: every branch id ever used, so two processes cannot create the same
+///   branch and a cleared id is never handed out again.
+/// - `session_clear_generations`: a counter bumped by every `clear_session`, so an instance
+///   whose branch was deleted by another process falls back to `main` instead of writing into a
+///   branch that no longer exists.
+/// - the foreign keys of `message_structure` and `turn_usage` record which base-table pair owns
+///   the file; a session configured with a different pair is rejected rather than silently
+///   reading the other pair's rows.
+///
 /// # Differences from the Python SDK
 ///
-/// The table-ownership claims, cross-process branch-id reservations and clear-generation
-/// bookkeeping of the Python implementation are not ported: this session assumes it is the only
-/// writer of the structure tables for its database. `store_run_usage` is called explicitly with
-/// a run's [`Usage`] rather than hooked into the runner.
+/// `store_run_usage` is called explicitly with a run's [`Usage`] rather than hooked into the
+/// runner.
 #[derive(Debug, Clone)]
 pub struct AdvancedSqliteSession {
     base: SqliteSession,
-    branch: Arc<Mutex<String>>,
+    branch: Arc<Mutex<BranchState>>,
 }
 
 impl AdvancedSqliteSession {
     /// An in-memory session (lost when the last clone is dropped).
     pub fn in_memory(session_id: impl Into<String>) -> Result<Self> {
-        Self::from_base(SqliteSession::in_memory(session_id)?)
+        Self::from_base(SqliteSession::in_memory(session_id)?, true)
     }
 
-    /// A file-backed session.
+    /// A file-backed session, creating the structure tables if they are missing.
     pub fn open(
         session_id: impl Into<String>,
         db_path: impl AsRef<std::path::Path>,
     ) -> Result<Self> {
-        Self::from_base(SqliteSession::open(session_id, db_path)?)
+        Self::from_base(SqliteSession::open(session_id, db_path)?, true)
+    }
+
+    /// A file-backed session that only creates the structure tables when `create_tables` is set.
+    ///
+    /// With `create_tables` cleared the database must already hold structure tables claimed by
+    /// this session's base-table pair; an unclaimed or foreign file is rejected, so a pair
+    /// cannot open a file and have another pair claim it underneath. Port of Python's
+    /// `create_tables` constructor parameter, whose default is the same `false`.
+    pub fn open_with(
+        session_id: impl Into<String>,
+        db_path: impl AsRef<std::path::Path>,
+        create_tables: bool,
+    ) -> Result<Self> {
+        Self::from_base(SqliteSession::open(session_id, db_path)?, create_tables)
     }
 
     /// Extend an existing [`SqliteSession`] with the structure and usage tables.
     pub fn from_session(base: SqliteSession) -> Result<Self> {
-        Self::from_base(base)
+        Self::from_base(base, true)
     }
 
-    fn from_base(base: SqliteSession) -> Result<Self> {
+    /// Extend an existing [`SqliteSession`], creating the structure tables only when asked.
+    ///
+    /// See [`AdvancedSqliteSession::open_with`].
+    pub fn from_session_with(base: SqliteSession, create_tables: bool) -> Result<Self> {
+        Self::from_base(base, create_tables)
+    }
+
+    fn from_base(base: SqliteSession, create_tables: bool) -> Result<Self> {
         let session = AdvancedSqliteSession {
             base,
-            branch: Arc::new(Mutex::new(MAIN_BRANCH.to_string())),
+            branch: Arc::new(Mutex::new(BranchState {
+                branch: MAIN_BRANCH.to_string(),
+                generation: 0,
+            })),
         };
-        session.init_structure_tables()?;
+        session.init_structure_tables(create_tables)?;
         Ok(session)
     }
 
@@ -245,9 +630,14 @@ impl AdvancedSqliteSession {
         }
     }
 
-    fn init_structure_tables(&self) -> Result<()> {
+    fn init_structure_tables(&self, create_tables: bool) -> Result<()> {
         let ctx = self.ctx();
         let conn = self.base.connection().lock().expect("sqlite poisoned");
+        if !create_tables {
+            claim_structure_tables(&conn, &ctx)?;
+            refresh_branch_after_external_clear(&conn, &ctx, false)?;
+            return Ok(());
+        }
         conn.execute_batch(&format!(
             "CREATE TABLE IF NOT EXISTS message_structure (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -291,7 +681,12 @@ impl AdvancedSqliteSession {
             s = ctx.sessions_table,
             m = ctx.messages_table
         ))
-        .map_err(sql_err)
+        .map_err(sql_err)?;
+        // Validate the owner-bearing tables before anything else consumes them.
+        claim_structure_tables(&conn, &ctx)?;
+        ensure_branch_reservations(&conn, &ctx)?;
+        ensure_clear_generations(&conn, &ctx)?;
+        refresh_branch_after_external_clear(&conn, &ctx, false)
     }
 
     async fn blocking<T, F>(&self, f: F) -> Result<T>
@@ -309,34 +704,92 @@ impl AdvancedSqliteSession {
         .map_err(|e| AgentsError::other(format!("SQLite task failed: {e}")))?
     }
 
+    /// History of one branch, the current branch when `branch_id` is `None`.
+    ///
+    /// Port of Python's `get_items(limit, branch_id=...)`, which can read a branch other than
+    /// the one the session is on. Reading the current branch first synchronizes an external
+    /// clear, so a branch another process deleted falls back to `main`.
+    pub async fn get_items_for_branch(
+        &self,
+        limit: Option<usize>,
+        branch_id: Option<&str>,
+    ) -> Result<Vec<InputItem>> {
+        let limit = super::resolve_session_limit(limit, self.session_settings().as_ref());
+        let requested = branch_id.map(str::to_string);
+        self.blocking(move |conn, ctx| {
+            let branch = resolve_read_branch(conn, ctx, requested)?;
+            let rows: Vec<String> = match limit {
+                Some(0) => Vec::new(),
+                Some(n) => {
+                    let mut stmt = conn
+                        .prepare(&format!(
+                            "SELECT m.message_data FROM {m} m
+                             JOIN message_structure s ON m.id = s.message_id
+                             WHERE m.session_id = ? AND s.branch_id = ?
+                             ORDER BY s.sequence_number DESC LIMIT ?",
+                            m = ctx.messages_table
+                        ))
+                        .map_err(sql_err)?;
+                    let mut v: Vec<String> = stmt
+                        .query_map(params![ctx.session_id, branch, n as i64], |r| r.get(0))
+                        .map_err(sql_err)?
+                        .filter_map(std::result::Result::ok)
+                        .collect();
+                    v.reverse();
+                    v
+                }
+                None => {
+                    let mut stmt = conn
+                        .prepare(&format!(
+                            "SELECT m.message_data FROM {m} m
+                             JOIN message_structure s ON m.id = s.message_id
+                             WHERE m.session_id = ? AND s.branch_id = ?
+                             ORDER BY s.sequence_number ASC",
+                            m = ctx.messages_table
+                        ))
+                        .map_err(sql_err)?;
+                    stmt.query_map(params![ctx.session_id, branch], |r| r.get(0))
+                        .map_err(sql_err)?
+                        .filter_map(std::result::Result::ok)
+                        .collect()
+                }
+            };
+            Ok(rows
+                .into_iter()
+                .filter_map(|r| serde_json::from_str(&r).ok().map(InputItem))
+                .collect())
+        })
+        .await
+    }
+
     /// The branch the session currently reads and writes.
     pub fn current_branch(&self) -> String {
-        self.branch.lock().expect("branch poisoned").clone()
+        self.branch.lock().expect("branch poisoned").branch.clone()
     }
 
     /// Switch to an existing branch.
     pub async fn switch_to_branch(&self, branch_id: impl Into<String>) -> Result<()> {
         let branch_id = branch_id.into();
         let target = branch_id.clone();
-        let exists = self
-            .blocking(move |conn, ctx| {
-                let count: i64 = conn
-                    .query_row(
-                        "SELECT COUNT(*) FROM message_structure WHERE session_id = ? AND branch_id = ?",
-                        params![ctx.session_id, target],
-                        |r| r.get(0),
-                    )
-                    .map_err(sql_err)?;
-                Ok(count > 0)
-            })
-            .await?;
-        if !exists && branch_id != MAIN_BRANCH {
-            return Err(AgentsError::user(format!(
-                "Branch '{branch_id}' does not exist in this session"
-            )));
-        }
-        *self.branch.lock().expect("branch poisoned") = branch_id;
-        Ok(())
+        self.blocking(move |conn, ctx| {
+            refresh_branch_after_external_clear(conn, ctx, true)?;
+            let generation = ctx.generation();
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM message_structure WHERE session_id = ? AND branch_id = ?",
+                    params![ctx.session_id, target],
+                    |r| r.get(0),
+                )
+                .map_err(sql_err)?;
+            if count == 0 && target != MAIN_BRANCH {
+                return Err(AgentsError::user(format!(
+                    "Branch '{target}' does not exist in this session"
+                )));
+            }
+            commit_branch_pointer(conn, ctx, target, generation)?;
+            Ok(())
+        })
+        .await
     }
 
     /// All branches of this session, oldest first.
@@ -385,8 +838,17 @@ impl AdvancedSqliteSession {
         let requested = branch_name.map(str::to_string);
         let branch_id = self
             .blocking(move |conn, ctx| {
+                // Take SQLite's write reservation before claiming the branch id, so a session
+                // in another process cannot pass the same check concurrently.
+                let tx = rusqlite::Transaction::new_unchecked(
+                    conn,
+                    rusqlite::TransactionBehavior::Immediate,
+                )
+                .map_err(sql_err)?;
+                ensure_branch_reservations(&tx, ctx)?;
+                refresh_branch_after_external_clear(&tx, ctx, true)?;
                 let source = ctx.branch_id();
-                let tx = conn.unchecked_transaction().map_err(sql_err)?;
+                let generation = ctx.generation();
                 let has_user_message: i64 = tx
                     .query_row(
                         "SELECT COUNT(*) FROM message_structure
@@ -401,28 +863,9 @@ impl AdvancedSqliteSession {
                         "Turn {turn_number} does not contain a user message in branch '{source}'"
                     )));
                 }
-                let branch_count: i64 = tx
-                    .query_row(
-                        "SELECT COUNT(DISTINCT branch_id) FROM message_structure WHERE session_id = ?",
-                        params![ctx.session_id],
-                        |r| r.get(0),
-                    )
-                    .map_err(sql_err)?;
-                let branch_id = requested.unwrap_or_else(|| {
-                    format!("branch_{}_from_turn_{turn_number}", branch_count + 1)
-                });
-                let taken: i64 = tx
-                    .query_row(
-                        "SELECT COUNT(*) FROM message_structure WHERE session_id = ? AND branch_id = ?",
-                        params![ctx.session_id, branch_id],
-                        |r| r.get(0),
-                    )
-                    .map_err(sql_err)?;
-                if taken > 0 {
-                    return Err(AgentsError::user(format!(
-                        "Branch '{branch_id}' already exists in this session"
-                    )));
-                }
+                // The reservation is the claim: it outlives the branch's rows, so a cleared
+                // id is never reused and two processes cannot both take the same name.
+                let branch_id = reserve_branch_id(&tx, ctx, requested, turn_number)?;
                 let seq_start: i64 = tx
                     .query_row(
                         "SELECT COALESCE(MAX(sequence_number), 0) FROM message_structure
@@ -444,10 +887,10 @@ impl AdvancedSqliteSession {
                 )
                 .map_err(sql_err)?;
                 tx.commit().map_err(sql_err)?;
+                commit_branch_pointer(conn, ctx, branch_id.clone(), generation)?;
                 Ok(branch_id)
             })
             .await?;
-        *self.branch.lock().expect("branch poisoned") = branch_id.clone();
         Ok(branch_id)
     }
 
@@ -508,7 +951,8 @@ impl AdvancedSqliteSession {
         })
         .await?;
         if is_current {
-            *self.branch.lock().expect("branch poisoned") = MAIN_BRANCH.to_string();
+            let generation = self.branch.lock().expect("branch poisoned").generation;
+            self.ctx().set_branch(MAIN_BRANCH.to_string(), generation);
         }
         Ok(())
     }
@@ -904,53 +1348,8 @@ impl Session for AdvancedSqliteSession {
     }
 
     async fn get_items(&self, limit: Option<usize>) -> Result<Vec<InputItem>> {
-        let limit = super::resolve_session_limit(limit, self.session_settings().as_ref());
-        self.blocking(move |conn, ctx| {
-            let branch = ctx.branch_id();
-            let rows: Vec<String> = match limit {
-                Some(0) => Vec::new(),
-                Some(n) => {
-                    let mut stmt = conn
-                        .prepare(&format!(
-                            "SELECT m.message_data FROM {m} m
-                             JOIN message_structure s ON m.id = s.message_id
-                             WHERE m.session_id = ? AND s.branch_id = ?
-                             ORDER BY s.sequence_number DESC LIMIT ?",
-                            m = ctx.messages_table
-                        ))
-                        .map_err(sql_err)?;
-                    let mut v: Vec<String> = stmt
-                        .query_map(params![ctx.session_id, branch, n as i64], |r| r.get(0))
-                        .map_err(sql_err)?
-                        .filter_map(std::result::Result::ok)
-                        .collect();
-                    v.reverse();
-                    v
-                }
-                None => {
-                    let mut stmt = conn
-                        .prepare(&format!(
-                            "SELECT m.message_data FROM {m} m
-                             JOIN message_structure s ON m.id = s.message_id
-                             WHERE m.session_id = ? AND s.branch_id = ?
-                             ORDER BY s.sequence_number ASC",
-                            m = ctx.messages_table
-                        ))
-                        .map_err(sql_err)?;
-                    stmt.query_map(params![ctx.session_id, branch], |r| r.get(0))
-                        .map_err(sql_err)?
-                        .filter_map(std::result::Result::ok)
-                        .collect()
-                }
-            };
-            Ok(rows
-                .into_iter()
-                .filter_map(|r| serde_json::from_str(&r).ok().map(InputItem))
-                .collect())
-        })
-        .await
+        self.get_items_for_branch(limit, None).await
     }
-
     async fn add_items(&self, items: Vec<InputItem>) -> Result<()> {
         if items.is_empty() {
             return Ok(());
@@ -1123,6 +1522,10 @@ impl Session for AdvancedSqliteSession {
     async fn clear_session(&self) -> Result<()> {
         self.blocking(move |conn, ctx| {
             let tx = conn.unchecked_transaction().map_err(sql_err)?;
+            // Back-fill the reservations before deleting their only durable evidence, so the
+            // branch ids this session used stay reserved after the clear.
+            ensure_branch_reservations(&tx, ctx)?;
+            ensure_clear_generations(&tx, ctx)?;
             for sql in [
                 "DELETE FROM message_structure WHERE session_id = ?".to_string(),
                 "DELETE FROM turn_usage WHERE session_id = ?".to_string(),
@@ -1137,11 +1540,22 @@ impl Session for AdvancedSqliteSession {
             ] {
                 tx.execute(&sql, params![ctx.session_id]).map_err(sql_err)?;
             }
-            tx.commit().map_err(sql_err)
+            // Bumping the generation invalidates any in-flight switch or branch creation that
+            // captured the pre-clear value, in this process or another one.
+            tx.execute(
+                "UPDATE session_clear_generations SET generation = generation + 1
+                 WHERE session_id = ?",
+                params![ctx.session_id],
+            )
+            .map_err(sql_err)?;
+            let generation = stored_generation(&tx, ctx)?;
+            tx.commit().map_err(sql_err)?;
+            // Still under the connection lock, so no other operation sees a cleared session
+            // whose pointer still names a deleted branch.
+            ctx.set_branch(MAIN_BRANCH.to_string(), generation);
+            Ok(())
         })
-        .await?;
-        *self.branch.lock().expect("branch poisoned") = MAIN_BRANCH.to_string();
-        Ok(())
+        .await
     }
 }
 

@@ -35,12 +35,31 @@
 //! # }
 //! ```
 
+//! # Differences from the Python SDK
+//!
+//! - **Vendored binary.** Python falls back to `vendor/<target-triple>/codex/codex` shipped in
+//!   the wheel. This crate ships no binaries, so [`find_codex_path`] stops at `CODEX_PATH`, a
+//!   `PATH` lookup, then the bare name `codex`.
+//! - **Run-context thread id.** Python's `use_run_context_thread_id` writes the thread id onto an
+//!   arbitrary context object with `setattr`/mapping access and derives a key from the tool name.
+//!   `RunContext<C>` hands out `&C` and has no key namespace, so
+//!   [`CodexToolOptions::with_thread_id_store`] takes the reader and writer closures instead.
+//! - **Mapping input forms.** Python accepts mappings and keyword arguments for every options
+//!   type (`coerce_*`), and `_DictLike` lets events and items be indexed like dicts. Rust uses
+//!   typed structs with builder methods; events and items implement `Serialize`/`Deserialize` and
+//!   expose `to_value()`.
+//! - **Duplicate-tool fail-fast.** Python marks the tool with `_is_codex_tool` and `Agent`
+//!   rejects two Codex tools sharing a name. `FunctionTool` has no marker slot, so the check is
+//!   not performed; give each tool a unique name.
+
 pub mod client;
 pub mod events;
 pub mod exec;
 pub mod items;
 pub mod options;
 pub mod output_schema;
+mod py_json;
+mod span_budget;
 pub mod thread;
 pub mod thread_options;
 pub mod tool;
@@ -48,7 +67,11 @@ pub mod turn_options;
 
 pub use client::Codex;
 pub use events::{ThreadError, ThreadEvent, Usage};
-pub use exec::{CodexExec, CodexExecArgs, CodexLineStream, build_command_args, find_codex_path};
+pub use exec::{
+    CodexExec, CodexExecArgs, CodexLineStream, DEFAULT_SUBPROCESS_STREAM_LIMIT_BYTES,
+    MAX_SUBPROCESS_STREAM_LIMIT_BYTES, MIN_SUBPROCESS_STREAM_LIMIT_BYTES,
+    SUBPROCESS_STREAM_LIMIT_ENV, build_command_args, find_codex_path,
+};
 pub use items::{FileUpdateChange, McpToolCallError, McpToolCallResult, ThreadItem, TodoItem};
 pub use options::CodexOptions;
 pub use output_schema::{
@@ -59,6 +82,8 @@ pub use thread::{Input, RunResult, RunStreamedResult, StreamedTurn, Thread, Turn
 pub use thread_options::{
     ApprovalMode, ModelReasoningEffort, SandboxMode, ThreadOptions, WebSearchMode,
 };
+#[doc(no_inline)]
+pub use tokio_util::sync::CancellationToken;
 pub use tool::{
     CODEX_TOOL_NAME_PREFIX, CodexToolOptions, CodexToolResult, CodexToolStreamEvent,
     DEFAULT_CODEX_TOOL_DESCRIPTION, DEFAULT_CODEX_TOOL_NAME, DEFAULT_SPAN_DATA_MAX_CHARS,

@@ -52,6 +52,11 @@ if [ -n "$events" ] && [ -f "$events" ]; then
   cat "$events"
 fi
 
+# Keep the process alive (replacing this shell, so a kill reaches it) to exercise cancellation.
+if [ -n "$FAKE_CODEX_SLEEP" ]; then
+  exec sleep "$FAKE_CODEX_SLEEP"
+fi
+
 exit_code="${FAKE_CODEX_EXIT:-0}"
 if [ "$exit_code" -ne 0 ]; then
   printf 'fake codex failure\n' >&2

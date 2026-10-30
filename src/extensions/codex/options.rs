@@ -21,6 +21,11 @@ pub struct CodexOptions {
     /// inherited.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub env: Option<BTreeMap<String, String>>,
+    /// Largest JSONL line the Codex CLI may emit, in bytes. `None` reads
+    /// `OPENAI_AGENTS_CODEX_SUBPROCESS_STREAM_LIMIT_BYTES` and then falls back to 8 MiB. Must be
+    /// between 64 KiB and 64 MiB; the value is validated when a turn starts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_subprocess_stream_limit_bytes: Option<usize>,
 }
 
 impl CodexOptions {
@@ -44,6 +49,12 @@ impl CodexOptions {
     /// Set the API key passed to the Codex CLI.
     pub fn with_api_key(mut self, api_key: impl Into<String>) -> Self {
         self.api_key = Some(api_key.into());
+        self
+    }
+
+    /// Cap the size of one JSONL line read from the Codex CLI.
+    pub fn with_codex_subprocess_stream_limit_bytes(mut self, limit: usize) -> Self {
+        self.codex_subprocess_stream_limit_bytes = Some(limit);
         self
     }
 

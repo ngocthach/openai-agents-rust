@@ -301,22 +301,23 @@ impl Session for MongoDBSession {
 
     async fn pop_item(&self) -> Result<Option<InputItem>> {
         self.ensure_indexes().await?;
-        let generation = self.generation().await?;
-        let mut filter = self.message_filter(generation);
+        let mut generation = self.generation().await?;
 
-        // Sweep exhausted markers left behind by an earlier pop whose cleanup failed.
-        let mut sweep = filter.clone();
+        // Sweep exhausted markers left behind by an earlier pop whose cleanup failed. Markers
+        // are never claimable or model-visible, so a failed sweep must not block a valid claim.
+        let mut sweep = self.message_filter(generation);
         sweep.insert("message_data", Bson::Array(Vec::new()));
         let _ = self.messages.delete_many(sweep).await;
 
-        filter.insert("message_data", doc! {"$ne": []});
         loop {
+            let mut filter = self.message_filter(generation);
+            filter.insert("message_data", doc! {"$ne": []});
             // Claim the newest item atomically by trimming it off the batch array. The claim
             // leaves an empty marker so a concurrent pop cannot claim the same item.
             let claimed = self
                 .messages
                 .find_one_and_update(
-                    filter.clone(),
+                    filter,
                     vec![doc! {"$set": {"message_data": {"$cond": [
                         {"$isArray": "$message_data"},
                         {"$slice": ["$message_data", {"$subtract": [{"$size": "$message_data"}, 1]}]},
@@ -328,8 +329,27 @@ impl Session for MongoDBSession {
                 .await
                 .map_err(mongo_err)?;
             let Some(doc) = claimed else {
+                // Nothing left in this generation. A `clear_session` that committed while the
+                // claim was in flight moved the history to a new one, so look there instead of
+                // reporting an empty session.
+                let current = self.generation().await?;
+                if current != generation {
+                    generation = current;
+                    continue;
+                }
                 return Ok(None);
             };
+            // The claim succeeded, but a `clear_session` may have committed between reading the
+            // generation and the claim. The claimed document then belongs to history that is no
+            // longer visible, so it is discarded rather than returned.
+            let current = self.generation().await?;
+            if current != generation {
+                if let Some(id) = doc.get("_id") {
+                    let _ = self.messages.delete_one(doc! {"_id": id.clone()}).await;
+                }
+                generation = current;
+                continue;
+            }
             let raw = document_items(&doc);
             let Some(last) = raw.last() else {
                 continue;

@@ -98,6 +98,20 @@ def main() -> None:
         response = {"ok": True}
     elif op == "snapshot_filesystem":
         response = {"image_id": f"im-{request.get('sandbox_id')}"}
+    elif op == "snapshot_directory":
+        response = {"image_id": f"dir-{request.get('sandbox_id')}"}
+    elif op == "mount_image":
+        state.setdefault("mounted", []).append(
+            {"path": request.get("path"), "image_id": request.get("image_id")}
+        )
+        response = {"ok": True}
+    elif op == "tunnels":
+        response = {
+            "tunnels": {
+                "8080": {"host": "tunnel.modal.host", "port": 443},
+                "9000": {"host": "plain.modal.host", "port": 31000},
+            }
+        }
     elif op == "pty":
         # The PTY bridge writes raw bytes instead of a JSON response.
         sys.stdout.write(f"pty: {' '.join(request.get('argv') or [])}\n")

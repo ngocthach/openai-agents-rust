@@ -669,8 +669,160 @@ async fn a_custom_parameters_schema_may_carry_extra_fields() {
     assert_eq!(fake.stdin(1), "look");
 }
 
+#[tokio::test]
+async fn the_tool_result_is_byte_identical_to_pythons_json_dumps() {
+    openai_agents_sdk::tracing::set_tracing_disabled(true);
+    let events = concat!(
+        r#"{"type":"thread.started","thread_id":"thread-1"}"#,
+        "\n",
+        r#"{"type":"item.completed","item":{"id":"agent-1","type":"agent_message","text":"Terminé ✅"}}"#,
+        "\n",
+        r#"{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":1,"output_tokens":5}}"#,
+        "\n",
+    );
+    let fake = FakeCodex::with_events(events, None);
+    let tool: FunctionTool<()> =
+        codex_tool(CodexToolOptions::new().with_codex(fake.client())).unwrap();
+
+    let model = Arc::new(FakeModel::new());
+    model.add_turn(vec![codex_text_call("Translate it")]);
+    model.add_turn(vec![assistant_message("done")]);
+    let agent = Agent::<()>::new("Dev")
+        .with_tool(tool)
+        .with_model_instance(model.clone());
+
+    let result = Runner::run(&agent, "Run codex").await.unwrap();
+    let outputs = tool_outputs(&result.new_items);
+    assert_eq!(
+        outputs[0].as_str().expect("tool output string"),
+        "{\"thread_id\": \"thread-1\", \"response\": \"Termin\\u00e9 \\u2705\", \
+         \"usage\": {\"input_tokens\": 10, \"cached_input_tokens\": 1, \"output_tokens\": 5}}"
+    );
+}
+
+#[tokio::test]
+async fn a_cancellation_token_kills_the_codex_process() {
+    let fake = FakeCodex::with_events(EVENTS, None).with_env("FAKE_CODEX_SLEEP", "60");
+    let thread = fake.client().start_thread(None);
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let mut stream = thread
+        .run_streamed("hang", Some(TurnOptions::new().with_cancel(cancel.clone())))
+        .await
+        .expect("stream");
+
+    assert!(matches!(
+        stream.next_event().await.expect("event").expect("ok"),
+        ThreadEvent::ThreadStarted { .. }
+    ));
+    cancel.cancel();
+
+    let mut last = None;
+    while let Some(event) = stream.next_event().await {
+        last = Some(event);
+    }
+    let error = last.expect("a final item").unwrap_err();
+    assert!(
+        error.to_string().starts_with("Codex exec exited with code"),
+        "unexpected error: {error}"
+    );
+}
+
+#[tokio::test]
+async fn a_line_over_the_subprocess_stream_limit_fails_the_turn() {
+    let events = format!(
+        "{}\n{}\n",
+        r#"{"type":"thread.started","thread_id":"thread-1"}"#,
+        format_args!(
+            r#"{{"type":"item.completed","item":{{"id":"a","type":"agent_message","text":"{}"}}}}"#,
+            "x".repeat(100_000)
+        ),
+    );
+    let fake = FakeCodex::with_events(&events, None);
+    let codex = Codex::new(
+        fake.options()
+            .with_codex_subprocess_stream_limit_bytes(65536),
+    );
+    let mut stream = codex
+        .start_thread(None)
+        .run_streamed("hi", None)
+        .await
+        .expect("stream");
+
+    assert!(matches!(
+        stream.next_event().await.expect("event").expect("ok"),
+        ThreadEvent::ThreadStarted { .. }
+    ));
+    let error = stream.next_event().await.expect("event").unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "Codex stdout exceeded the 65536 byte subprocess stream limit: Separator is not found, \
+         and chunk exceed the limit"
+    );
+}
+
+#[tokio::test]
+async fn an_out_of_range_subprocess_stream_limit_is_rejected() {
+    let fake = FakeCodex::new();
+    let codex = Codex::new(
+        fake.options()
+            .with_codex_subprocess_stream_limit_bytes(1024),
+    );
+    let error = codex
+        .start_thread(None)
+        .run_streamed("hi", None)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "codex_subprocess_stream_limit_bytes must be between 65536 and 67108864 bytes."
+    );
+}
+
 #[test]
 fn codex_tool_rejects_names_without_the_codex_prefix() {
     let error = codex_tool(CodexToolOptions::<()>::new().with_name("review")).unwrap_err();
     assert!(error.to_string().contains("must be \"codex\""));
+}
+
+#[tokio::test]
+async fn two_codex_tools_sharing_a_name_fail_fast() {
+    openai_agents_sdk::tracing::set_tracing_disabled(true);
+    let fake = FakeCodex::new();
+    // A Codex tool owns per-instance state, so a name collision would silently route calls to
+    // the wrong instance. Port of `_validate_codex_tool_name_collisions`.
+    let a: FunctionTool<()> =
+        codex_tool(CodexToolOptions::new().with_codex(fake.client())).unwrap();
+    let b: FunctionTool<()> =
+        codex_tool(CodexToolOptions::new().with_codex(fake.client())).unwrap();
+    let agent = Arc::new(Agent::<()>::new("Dev").with_tool(a).with_tool(b));
+    let err = agent
+        .get_all_tools(&openai_agents_sdk::RunContext::new(()))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("Duplicate Codex tool names found: codex"),
+        "{err}"
+    );
+    assert!(err.contains("codex_tool(name=...)"), "{err}");
+}
+
+#[tokio::test]
+async fn codex_tools_with_distinct_names_are_accepted() {
+    openai_agents_sdk::tracing::set_tracing_disabled(true);
+    let fake = FakeCodex::new();
+    let a: FunctionTool<()> =
+        codex_tool(CodexToolOptions::new().with_codex(fake.client())).unwrap();
+    let b: FunctionTool<()> = codex_tool(
+        CodexToolOptions::new()
+            .with_codex(fake.client())
+            .with_name("codex_review"),
+    )
+    .unwrap();
+    let agent = Arc::new(Agent::<()>::new("Dev").with_tool(a).with_tool(b));
+    let tools = agent
+        .get_all_tools(&openai_agents_sdk::RunContext::new(()))
+        .await
+        .unwrap();
+    assert_eq!(tools.len(), 2);
 }

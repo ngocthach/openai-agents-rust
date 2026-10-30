@@ -3,7 +3,6 @@
 //!
 //! The speech models are scripted so the example runs offline; swap them for
 //! `OpenAIVoiceModelProvider` (or drop both `with_*_model` calls) to speak to the real API.
-#[cfg(feature = "voice")]
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     use std::sync::Arc;
@@ -60,11 +59,4 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Received {samples} audio samples");
     flush_traces_async().await;
     Ok(())
-}
-
-#[cfg(not(feature = "voice"))]
-fn main() {
-    eprintln!(
-        "This example needs the `voice` feature: cargo run --example voice_static --features voice"
-    );
 }

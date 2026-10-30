@@ -1,0 +1,346 @@
+{
+  "$schemaVersion": "1.21",
+  "auto_previous_response_id": false,
+  "context": {
+    "approvals": {},
+    "context": null,
+    "context_meta": {
+      "omitted": false,
+      "original_type": "none",
+      "requires_deserializer": false,
+      "serialized_via": "none"
+    },
+    "tool_invocations": {
+      "call_weather_2": {
+        "approval_scope": "ebfaafc0dd470214bab3421e81676cb703ed4adbebb486804c7298f6ed89cf6a",
+        "completed": true,
+        "executed": true,
+        "fingerprint": "f07244af175e1dca685d61ba486a403c0f209b6db5e567071cd86c51778bb2c1",
+        "type": "function_call"
+      }
+    },
+    "usage": {
+      "input_tokens": 75,
+      "input_tokens_details": [
+        {
+          "cache_write_tokens": 0,
+          "cached_tokens": 0
+        }
+      ],
+      "output_tokens": 13,
+      "output_tokens_details": [
+        {
+          "reasoning_tokens": 0
+        }
+      ],
+      "request_usage_entries": [
+        {
+          "input_tokens": 31,
+          "input_tokens_details": {
+            "cache_write_tokens": 0,
+            "cached_tokens": 0
+          },
+          "output_tokens": 9,
+          "output_tokens_details": {
+            "reasoning_tokens": 0
+          },
+          "total_tokens": 40
+        },
+        {
+          "input_tokens": 44,
+          "input_tokens_details": {
+            "cache_write_tokens": 0,
+            "cached_tokens": 0
+          },
+          "output_tokens": 4,
+          "output_tokens_details": {
+            "reasoning_tokens": 0
+          },
+          "total_tokens": 48
+        }
+      ],
+      "requests": 2,
+      "total_tokens": 88
+    }
+  },
+  "conversation_id": null,
+  "current_agent": {
+    "name": "Guarded Agent"
+  },
+  "current_step": null,
+  "current_turn": 2,
+  "current_turn_persisted_item_count": 0,
+  "generated_items": [
+    {
+      "agent": {
+        "name": "Guarded Agent"
+      },
+      "description": "Look up the weather for a city.",
+      "raw_item": {
+        "arguments": "{\"city\":\"Lisbon\"}",
+        "call_id": "call_weather_2",
+        "id": "fc_weather_2",
+        "name": "get_weather",
+        "type": "function_call"
+      },
+      "tool_name": "get_weather",
+      "tool_origin": {
+        "type": "function"
+      },
+      "type": "tool_call_item"
+    },
+    {
+      "agent": {
+        "name": "Guarded Agent"
+      },
+      "output": "The weather in Lisbon is sunny.",
+      "raw_item": {
+        "call_id": "call_weather_2",
+        "output": "The weather in Lisbon is sunny.",
+        "type": "function_call_output"
+      },
+      "tool_origin": {
+        "type": "function"
+      },
+      "type": "tool_call_output_item"
+    },
+    {
+      "agent": {
+        "name": "Guarded Agent"
+      },
+      "raw_item": {
+        "content": [
+          {
+            "annotations": [],
+            "logprobs": [],
+            "text": "Sunny in Lisbon.",
+            "type": "output_text"
+          }
+        ],
+        "id": "msg_guardrails_1",
+        "role": "assistant",
+        "status": "completed",
+        "type": "message"
+      },
+      "type": "message_output_item"
+    }
+  ],
+  "generated_prompt_cache_key": null,
+  "generated_session_item_indexes": [
+    0,
+    1,
+    2
+  ],
+  "input_guardrail_results": [
+    {
+      "guardrail": {
+        "name": "length_guardrail",
+        "type": "input"
+      },
+      "output": {
+        "outputInfo": {
+          "checked": "input"
+        },
+        "tripwireTriggered": false
+      }
+    }
+  ],
+  "last_model_response": {
+    "output": [
+      {
+        "content": [
+          {
+            "annotations": [],
+            "logprobs": [],
+            "text": "Sunny in Lisbon.",
+            "type": "output_text"
+          }
+        ],
+        "id": "msg_guardrails_1",
+        "role": "assistant",
+        "status": "completed",
+        "type": "message"
+      }
+    ],
+    "request_id": null,
+    "response_id": "resp_guardrails_2",
+    "usage": {
+      "input_tokens": 44,
+      "input_tokens_details": [
+        {
+          "cache_write_tokens": 0,
+          "cached_tokens": 0
+        }
+      ],
+      "output_tokens": 4,
+      "output_tokens_details": [
+        {
+          "reasoning_tokens": 0
+        }
+      ],
+      "request_usage_entries": [],
+      "requests": 1,
+      "total_tokens": 48
+    }
+  },
+  "last_processed_response": null,
+  "max_turns": 10,
+  "model_responses": [
+    {
+      "output": [
+        {
+          "arguments": "{\"city\":\"Lisbon\"}",
+          "call_id": "call_weather_2",
+          "id": "fc_weather_2",
+          "name": "get_weather",
+          "type": "function_call"
+        }
+      ],
+      "request_id": null,
+      "response_id": "resp_guardrails_1",
+      "usage": {
+        "input_tokens": 31,
+        "input_tokens_details": [
+          {
+            "cache_write_tokens": 0,
+            "cached_tokens": 0
+          }
+        ],
+        "output_tokens": 9,
+        "output_tokens_details": [
+          {
+            "reasoning_tokens": 0
+          }
+        ],
+        "request_usage_entries": [],
+        "requests": 1,
+        "total_tokens": 40
+      }
+    },
+    {
+      "output": [
+        {
+          "content": [
+            {
+              "annotations": [],
+              "logprobs": [],
+              "text": "Sunny in Lisbon.",
+              "type": "output_text"
+            }
+          ],
+          "id": "msg_guardrails_1",
+          "role": "assistant",
+          "status": "completed",
+          "type": "message"
+        }
+      ],
+      "request_id": null,
+      "response_id": "resp_guardrails_2",
+      "usage": {
+        "input_tokens": 44,
+        "input_tokens_details": [
+          {
+            "cache_write_tokens": 0,
+            "cached_tokens": 0
+          }
+        ],
+        "output_tokens": 4,
+        "output_tokens_details": [
+          {
+            "reasoning_tokens": 0
+          }
+        ],
+        "request_usage_entries": [],
+        "requests": 1,
+        "total_tokens": 48
+      }
+    }
+  ],
+  "nested_history_owned_session_item_refs": [],
+  "no_active_agent_run": true,
+  "original_input": "Weather in Lisbon?",
+  "output_guardrail_results": [
+    {
+      "agent": {
+        "name": "Guarded Agent"
+      },
+      "agentOutput": "Sunny in Lisbon.",
+      "guardrail": {
+        "name": "politeness_guardrail",
+        "type": "output"
+      },
+      "output": {
+        "outputInfo": {
+          "checked": "output"
+        },
+        "tripwireTriggered": false
+      }
+    }
+  ],
+  "pending_input": [],
+  "previous_response_id": null,
+  "reasoning_item_id_policy": null,
+  "session_items": [
+    {
+      "agent": {
+        "name": "Guarded Agent"
+      },
+      "description": "Look up the weather for a city.",
+      "raw_item": {
+        "arguments": "{\"city\":\"Lisbon\"}",
+        "call_id": "call_weather_2",
+        "id": "fc_weather_2",
+        "name": "get_weather",
+        "type": "function_call"
+      },
+      "tool_name": "get_weather",
+      "tool_origin": {
+        "type": "function"
+      },
+      "type": "tool_call_item"
+    },
+    {
+      "agent": {
+        "name": "Guarded Agent"
+      },
+      "output": "The weather in Lisbon is sunny.",
+      "raw_item": {
+        "call_id": "call_weather_2",
+        "output": "The weather in Lisbon is sunny.",
+        "type": "function_call_output"
+      },
+      "tool_origin": {
+        "type": "function"
+      },
+      "type": "tool_call_output_item"
+    },
+    {
+      "agent": {
+        "name": "Guarded Agent"
+      },
+      "raw_item": {
+        "content": [
+          {
+            "annotations": [],
+            "logprobs": [],
+            "text": "Sunny in Lisbon.",
+            "type": "output_text"
+          }
+        ],
+        "id": "msg_guardrails_1",
+        "role": "assistant",
+        "status": "completed",
+        "type": "message"
+      },
+      "type": "message_output_item"
+    }
+  ],
+  "tool_input_guardrail_results": [],
+  "tool_output_guardrail_results": [],
+  "tool_use_tracker": {
+    "Guarded Agent": [
+      "get_weather"
+    ]
+  },
+  "trace": null
+}

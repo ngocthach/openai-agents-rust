@@ -5,7 +5,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 
 use super::{CompactionSnapshot, Session, SessionSettings, SnapshotHandle};
 use crate::error::{AgentsError, Result};
@@ -234,26 +234,48 @@ impl Session for SqliteSession {
     }
 
     async fn pop_item(&self) -> Result<Option<InputItem>> {
+        self.pop_item_validated(Box::new(|_| Ok(()))).await
+    }
+
+    /// Claim the newest row and run `validate` on it inside the transaction that owns its
+    /// removal, so a rejected item keeps its row id and its position.
+    ///
+    /// A row whose JSON no longer parses is dropped and the search continues, as in Python.
+    async fn pop_item_validated(&self, validate: super::PopValidator) -> Result<Option<InputItem>> {
         self.blocking(move |conn, s| {
-            let row: Option<(i64, String)> = conn
-                .query_row(
-                    &format!(
-                        "SELECT id, message_data FROM {} WHERE session_id = ? ORDER BY id DESC LIMIT 1",
-                        s.messages_table
-                    ),
-                    params![s.session_id],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
+            loop {
+                let tx = conn.unchecked_transaction().map_err(sql_err)?;
+                let row: Option<(i64, String)> = tx
+                    .query_row(
+                        &format!(
+                            "SELECT id, message_data FROM {} WHERE session_id = ? \
+                             ORDER BY id DESC LIMIT 1",
+                            s.messages_table
+                        ),
+                        params![s.session_id],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .optional()
+                    .map_err(sql_err)?;
+                let Some((id, data)) = row else {
+                    return Ok(None);
+                };
+                tx.execute(
+                    &format!("DELETE FROM {} WHERE id = ?", s.messages_table),
+                    params![id],
                 )
-                .ok();
-            let Some((id, data)) = row else {
-                return Ok(None);
-            };
-            conn.execute(
-                &format!("DELETE FROM {} WHERE id = ?", s.messages_table),
-                params![id],
-            )
-            .map_err(sql_err)?;
-            Ok(serde_json::from_str(&data).ok().map(InputItem))
+                .map_err(sql_err)?;
+                let Ok(value) = serde_json::from_str(&data) else {
+                    // Corrupted row: commit its removal and keep looking for a readable item.
+                    tx.commit().map_err(sql_err)?;
+                    continue;
+                };
+                let item = InputItem(value);
+                // An `Err` here drops the transaction, which rolls the deletion back.
+                validate(&item)?;
+                tx.commit().map_err(sql_err)?;
+                return Ok(Some(item));
+            }
         })
         .await
     }
@@ -305,6 +327,18 @@ impl Session for SqliteSession {
         handles: &[SnapshotHandle],
         items: Vec<InputItem>,
     ) -> Result<bool> {
+        self.replace_compaction_suffix_pruning(handles, items, Arc::new(|_: &InputItem| false))
+            .await
+    }
+
+    /// Replace the tail and, in the same transaction, delete the leading run of items
+    /// `prune_prefix` accepts, in bounded batches.
+    async fn replace_compaction_suffix_pruning(
+        &self,
+        handles: &[SnapshotHandle],
+        items: Vec<InputItem>,
+        prune_prefix: super::PrunePrefix,
+    ) -> Result<bool> {
         let handles: Vec<String> = handles.iter().map(|h| h.0.clone()).collect();
         self.blocking(move |conn, s| {
             let tx = conn.unchecked_transaction().map_err(sql_err)?;
@@ -328,6 +362,9 @@ impl Session for SqliteSession {
                     .any(|(id, handle)| id.to_string() != *handle)
             {
                 return Ok(false);
+            }
+            if let Some(&first) = tail.first() {
+                prune_prefix_before(&tx, s, first, prune_prefix.as_ref())?;
             }
             for id in &tail {
                 tx.execute(
@@ -358,6 +395,65 @@ impl Session for SqliteSession {
             Ok(true)
         })
         .await
+    }
+}
+
+use super::PRUNE_PREFIX_BATCH;
+
+/// Delete the leading run of rows before `before_id` that `prune_prefix` accepts.
+///
+/// Stops at the first row the predicate rejects or whose JSON does not parse, so a retained row
+/// always keeps everything after it. Port of the `prune_prefix` loop in Python's
+/// `SQLiteSession._get_compaction_snapshot.replace_suffix`.
+pub(super) fn prune_prefix_before(
+    tx: &rusqlite::Transaction<'_>,
+    s: &SqliteSession,
+    before_id: i64,
+    prune_prefix: &(dyn Fn(&InputItem) -> bool + Send + Sync),
+) -> Result<()> {
+    loop {
+        let mut stmt = tx
+            .prepare(&format!(
+                "SELECT id, message_data FROM {} WHERE session_id = ? AND id < ? \
+                 ORDER BY id LIMIT ?",
+                s.messages_table
+            ))
+            .map_err(sql_err)?;
+        let batch: Vec<(i64, String)> = stmt
+            .query_map(params![s.session_id, before_id, PRUNE_PREFIX_BATCH], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .map_err(sql_err)?
+            .filter_map(std::result::Result::ok)
+            .collect();
+        drop(stmt);
+        let mut expired_end: Option<i64> = None;
+        for (id, data) in &batch {
+            let Ok(value) = serde_json::from_str(data) else {
+                break;
+            };
+            if !prune_prefix(&InputItem(value)) {
+                break;
+            }
+            expired_end = Some(*id);
+        }
+        let Some(expired_end) = expired_end else {
+            return Ok(());
+        };
+        tx.execute(
+            &format!(
+                "DELETE FROM {} WHERE session_id = ? AND id <= ?",
+                s.messages_table
+            ),
+            params![s.session_id, expired_end],
+        )
+        .map_err(sql_err)?;
+        // A partially reclaimed batch, or one that did not fill, means the run ended here.
+        if batch.last().map(|(id, _)| *id) != Some(expired_end)
+            || (batch.len() as i64) < PRUNE_PREFIX_BATCH
+        {
+            return Ok(());
+        }
     }
 }
 
@@ -435,5 +531,88 @@ mod tests {
         reopened.clear_session().await.unwrap();
         assert!(reopened.get_items(None).await.unwrap().is_empty());
         assert_eq!(other.get_items(None).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_rejected_pop_leaves_the_row_in_place() {
+        let s = SqliteSession::in_memory("u1").unwrap();
+        s.add_items(vec![InputItem::user("a"), InputItem::user("b")])
+            .await
+            .unwrap();
+
+        let err = s
+            .pop_item_validated(Box::new(|_| Err(AgentsError::other("unauthenticated"))))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("unauthenticated"), "{err}");
+        // The claim was rolled back, so both rows and their order survive.
+        let left = s.get_items(None).await.unwrap();
+        assert_eq!(left.len(), 2);
+        assert_eq!(left[1].text_content().as_deref(), Some("b"));
+
+        let popped = s
+            .pop_item_validated(Box::new(|_| Ok(())))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(popped.text_content().as_deref(), Some("b"));
+        assert_eq!(s.get_items(None).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_successful_replacement_reclaims_the_accepted_prefix() {
+        let s = SqliteSession::in_memory("u1").unwrap();
+        s.add_items(vec![
+            InputItem::user("a"),
+            InputItem::user("b"),
+            InputItem::user("c"),
+            InputItem::user("d"),
+        ])
+        .await
+        .unwrap();
+        let snapshot = s.compaction_snapshot(10).await.unwrap().unwrap();
+        assert_eq!(snapshot.handles.len(), 4);
+
+        // Accepts "a" and "b"; "c" stops the scan, so "a" and "b" go and "c" stays.
+        let prune: super::super::PrunePrefix = Arc::new(|item: &InputItem| {
+            matches!(item.text_content().as_deref(), Some("a" | "b" | "c"))
+                && item.text_content().as_deref() != Some("c")
+        });
+        let replaced = s
+            .replace_compaction_suffix_pruning(
+                &snapshot.handles[3..],
+                vec![InputItem::user("summary")],
+                prune,
+            )
+            .await
+            .unwrap();
+        assert!(replaced);
+
+        let left: Vec<String> = s
+            .get_items(None)
+            .await
+            .unwrap()
+            .iter()
+            .filter_map(|i| i.text_content())
+            .collect();
+        assert_eq!(left, ["c", "summary"]);
+    }
+
+    #[tokio::test]
+    async fn a_refused_replacement_reclaims_nothing() {
+        let s = SqliteSession::in_memory("u1").unwrap();
+        s.add_items(vec![InputItem::user("a"), InputItem::user("b")])
+            .await
+            .unwrap();
+        let snapshot = s.compaction_snapshot(10).await.unwrap().unwrap();
+        s.add_items(vec![InputItem::user("c")]).await.unwrap();
+
+        let prune: super::super::PrunePrefix = Arc::new(|_: &InputItem| true);
+        let replaced = s
+            .replace_compaction_suffix_pruning(&snapshot.handles, Vec::new(), prune)
+            .await
+            .unwrap();
+        assert!(!replaced);
+        assert_eq!(s.get_items(None).await.unwrap().len(), 3);
     }
 }

@@ -7,6 +7,7 @@ use serde_json::Value;
 
 use crate::guardrail::OutputGuardrail;
 use crate::prompts::Prompt;
+use crate::run_config::{ToolErrorFormatterArgs, ToolErrorKind};
 
 /// The realtime model used when no model name is configured.
 ///
@@ -576,47 +577,23 @@ pub struct RealtimeToolExecutionConfig {
 }
 
 /// Why the SDK is answering a tool call itself rather than running the tool.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RealtimeToolErrorKind {
-    /// A reviewer rejected the call.
-    ApprovalRejected,
-    /// The model called a tool the session does not have.
-    ToolNotFound,
-}
+///
+/// The realtime session reuses the core [`ToolErrorKind`], as Python's realtime config reuses
+/// `agents.run_config.ToolErrorFormatter`. Only `ApprovalRejected` and `ToolNotFound` reach a
+/// realtime formatter; `ToolException` is produced by the core runner.
+pub type RealtimeToolErrorKind = ToolErrorKind;
 
 /// What a [`RealtimeToolErrorFormatter`] is given.
-pub struct RealtimeToolErrorArgs<C> {
-    /// Why the SDK is answering the call.
-    pub kind: RealtimeToolErrorKind,
-    /// Tool runtime, currently always `function`.
-    pub tool_type: String,
-    /// Name of the tool the model called.
-    pub tool_name: String,
-    /// The call id being answered.
-    pub call_id: String,
-    /// The message the SDK would send without a formatter.
-    pub default_message: String,
-    /// The session's run context.
-    pub run_context: crate::run_context::RunContext<C>,
-}
-
-impl<C> fmt::Debug for RealtimeToolErrorArgs<C> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("RealtimeToolErrorArgs")
-            .field("kind", &self.kind)
-            .field("tool_type", &self.tool_type)
-            .field("tool_name", &self.tool_name)
-            .field("call_id", &self.call_id)
-            .field("default_message", &self.default_message)
-            .finish_non_exhaustive()
-    }
-}
+///
+/// An alias of the core [`ToolErrorFormatterArgs`], so one formatter can serve both a
+/// [`crate::RunConfig`] and a [`RealtimeRunConfig`].
+pub type RealtimeToolErrorArgs<'a, C> = ToolErrorFormatterArgs<'a, C>;
 
 /// Formats the model-visible message for a tool call the SDK answers itself.
 ///
 /// Returning `None` keeps the default message.
 pub type RealtimeToolErrorFormatter<C> =
-    std::sync::Arc<dyn Fn(&RealtimeToolErrorArgs<C>) -> Option<String> + Send + Sync>;
+    std::sync::Arc<dyn for<'a> Fn(&ToolErrorFormatterArgs<'a, C>) -> Option<String> + Send + Sync>;
 
 /// Configuration for a whole realtime run.
 pub struct RealtimeRunConfig<C> {
@@ -628,6 +605,12 @@ pub struct RealtimeRunConfig<C> {
     pub guardrails_settings: RealtimeGuardrailsSettings,
     /// Disable tracing for this run.
     pub tracing_disabled: bool,
+    /// Whether a function tool call delivered by the transport runs on its own task.
+    ///
+    /// `true` (the default, as in Python) keeps the session's event loop free while a tool runs,
+    /// so audio, transcript and interrupt events are still delivered. `false` awaits each call
+    /// inside the event loop, which serializes tool calls with every other transport event.
+    pub async_tool_calls: bool,
     /// Local tool execution settings.
     pub tool_execution: RealtimeToolExecutionConfig,
     /// Whether base64 audio is kept in the session history.
@@ -645,6 +628,7 @@ impl<C> Default for RealtimeRunConfig<C> {
             output_guardrails: Vec::new(),
             guardrails_settings: RealtimeGuardrailsSettings::default(),
             tracing_disabled: false,
+            async_tool_calls: true,
             tool_execution: RealtimeToolExecutionConfig::default(),
             history_audio_storage: RealtimeAudioStorage::default(),
             tool_error_formatter: None,
@@ -660,6 +644,7 @@ impl<C> Clone for RealtimeRunConfig<C> {
             output_guardrails: self.output_guardrails.clone(),
             guardrails_settings: self.guardrails_settings.clone(),
             tracing_disabled: self.tracing_disabled,
+            async_tool_calls: self.async_tool_calls,
             tool_execution: self.tool_execution.clone(),
             history_audio_storage: self.history_audio_storage,
             tool_error_formatter: self.tool_error_formatter.clone(),
@@ -675,6 +660,7 @@ impl<C> fmt::Debug for RealtimeRunConfig<C> {
             .field("output_guardrails", &self.output_guardrails)
             .field("guardrails_settings", &self.guardrails_settings)
             .field("tracing_disabled", &self.tracing_disabled)
+            .field("async_tool_calls", &self.async_tool_calls)
             .field("tool_execution", &self.tool_execution)
             .field("history_audio_storage", &self.history_audio_storage)
             .field(

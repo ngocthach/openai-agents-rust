@@ -37,21 +37,23 @@ pub enum SqlxDialect {
     Postgres,
     /// MySQL or MariaDB, with `?` placeholders.
     MySql,
+    /// SQLite, with `?` placeholders.
+    ///
+    /// Shares the `libsqlite3-sys` build with [`SqliteSession`](super::SqliteSession), so both
+    /// sessions can be used in one process. `SqliteSession` is the lighter choice when SQLite is
+    /// the only backend; this variant exists so one `sqlx` code path covers the three databases
+    /// Python's `SQLAlchemySession` covers.
+    Sqlite,
 }
 
 impl SqlxDialect {
     /// The dialect a connection URL selects.
-    ///
-    /// SQLite is rejected: `rusqlite` owns the `sqlite3` link in this crate, so use
-    /// [`SqliteSession`](super::SqliteSession) for SQLite instead.
     pub fn from_url(url: &str) -> Result<Self> {
         let scheme = url.split(':').next().unwrap_or_default();
         match scheme {
             "postgres" | "postgresql" => Ok(SqlxDialect::Postgres),
             "mysql" | "mariadb" => Ok(SqlxDialect::MySql),
-            "sqlite" => Err(AgentsError::user(
-                "SqlxSession does not support SQLite; use SqliteSession (feature `sqlite`) instead",
-            )),
+            "sqlite" => Ok(SqlxDialect::Sqlite),
             other => Err(AgentsError::user(format!(
                 "Unsupported database URL scheme for SqlxSession: {other}"
             ))),
@@ -62,7 +64,7 @@ impl SqlxDialect {
     pub fn placeholder(self, n: usize) -> String {
         match self {
             SqlxDialect::Postgres => format!("${n}"),
-            SqlxDialect::MySql => "?".to_string(),
+            SqlxDialect::MySql | SqlxDialect::Sqlite => "?".to_string(),
         }
     }
 }
@@ -119,6 +121,27 @@ impl Schema {
                      )"
                 ),
             ],
+            // Identical to the schema `SqliteSession` creates, so the two are interchangeable
+            // on the same file.
+            SqlxDialect::Sqlite => vec![
+                format!(
+                    "CREATE TABLE IF NOT EXISTS {s} (
+                        session_id TEXT PRIMARY KEY,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                     )"
+                ),
+                format!(
+                    "CREATE TABLE IF NOT EXISTS {m} (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        session_id TEXT NOT NULL,
+                        message_data TEXT NOT NULL,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        FOREIGN KEY (session_id) REFERENCES {s} (session_id) ON DELETE CASCADE
+                     )"
+                ),
+                format!("CREATE INDEX IF NOT EXISTS idx_{m}_session_id ON {m} (session_id, id)"),
+            ],
         }
     }
 
@@ -130,6 +153,7 @@ impl Schema {
                 "INSERT INTO {s} (session_id) VALUES ({p1}) ON CONFLICT (session_id) DO NOTHING"
             ),
             SqlxDialect::MySql => format!("INSERT IGNORE INTO {s} (session_id) VALUES ({p1})"),
+            SqlxDialect::Sqlite => format!("INSERT OR IGNORE INTO {s} (session_id) VALUES ({p1})"),
         }
     }
 
@@ -207,6 +231,28 @@ impl Schema {
         )
     }
 
+    /// The oldest rows before a given id, oldest first, bounded by a batch size.
+    fn select_prefix(&self) -> String {
+        format!(
+            "SELECT id, message_data FROM {} WHERE session_id = {} AND id < {} \
+             ORDER BY id ASC LIMIT {}",
+            self.messages_table,
+            self.dialect.placeholder(1),
+            self.dialect.placeholder(2),
+            self.dialect.placeholder(3)
+        )
+    }
+
+    /// Delete every row of this session up to and including an id.
+    fn delete_prefix(&self) -> String {
+        format!(
+            "DELETE FROM {} WHERE session_id = {} AND id <= {}",
+            self.messages_table,
+            self.dialect.placeholder(1),
+            self.dialect.placeholder(2)
+        )
+    }
+
     fn delete_messages(&self) -> String {
         format!(
             "DELETE FROM {} WHERE session_id = {}",
@@ -224,7 +270,7 @@ impl Schema {
     }
 }
 
-/// Conversation history stored in PostgreSQL or MySQL through `sqlx`.
+/// Conversation history stored in PostgreSQL, MySQL or SQLite through `sqlx`.
 ///
 /// The schema matches the Python `SQLAlchemySession`: an `agent_sessions` table keyed by
 /// `session_id` with `created_at`/`updated_at`, and an `agent_messages` table holding one JSON
@@ -233,9 +279,10 @@ impl Schema {
 ///
 /// # SQLite
 ///
-/// SQLite is intentionally unsupported. This crate already links `sqlite3` through `rusqlite`
-/// for [`SqliteSession`](super::SqliteSession), and linking it a second time through
-/// `sqlx-sqlite` is not sound; [`SqlxSession::from_url`] rejects `sqlite:` URLs.
+/// `sqlite:` URLs are supported. `sqlx-sqlite` and the `rusqlite` behind
+/// [`SqliteSession`](super::SqliteSession) resolve to the same `libsqlite3-sys`, so both link
+/// one copy of the C library and can be used in the same process. `SqliteSession` remains the
+/// lighter choice when SQLite is the only backend.
 pub struct SqlxSession {
     session_id: String,
     pool: AnyPool,
@@ -257,7 +304,7 @@ impl fmt::Debug for SqlxSession {
 impl SqlxSession {
     /// Connect to `url` and, when `create_tables` is set, create the schema if it is missing.
     ///
-    /// `url` must be a PostgreSQL or MySQL URL; see the type documentation about SQLite.
+    /// `url` must be a PostgreSQL, MySQL or SQLite URL.
     pub async fn from_url(
         session_id: impl Into<String>,
         url: &str,
@@ -482,6 +529,22 @@ impl Session for SqlxSession {
         handles: &[SnapshotHandle],
         items: Vec<InputItem>,
     ) -> Result<bool> {
+        self.replace_compaction_suffix_pruning(
+            handles,
+            items,
+            std::sync::Arc::new(|_: &InputItem| false),
+        )
+        .await
+    }
+
+    /// Replace the tail and, in the same transaction, delete the leading run of rows
+    /// `prune_prefix` accepts, in bounded batches.
+    async fn replace_compaction_suffix_pruning(
+        &self,
+        handles: &[SnapshotHandle],
+        items: Vec<InputItem>,
+        prune_prefix: super::PrunePrefix,
+    ) -> Result<bool> {
         let mut tx = self.pool.begin().await.map_err(sqlx_err)?;
         let rows = sqlx::query(AssertSqlSafe(self.schema.select_window_ids()))
             .bind(self.session_id.clone())
@@ -498,6 +561,47 @@ impl Session for SqlxSession {
                 .any(|(id, handle)| id.to_string() != handle.0)
         {
             return Ok(false);
+        }
+        if let Some(&first) = tail.first() {
+            // Stops at the first row the predicate rejects or that no longer parses, so a
+            // retained row always keeps everything after it.
+            loop {
+                let rows = sqlx::query(AssertSqlSafe(self.schema.select_prefix()))
+                    .bind(self.session_id.clone())
+                    .bind(first)
+                    .bind(super::PRUNE_PREFIX_BATCH)
+                    .fetch_all(&mut *tx)
+                    .await
+                    .map_err(sqlx_err)?;
+                let batch: Vec<(i64, String)> = rows
+                    .iter()
+                    .filter_map(|r| Some((r.try_get(0).ok()?, r.try_get(1).ok()?)))
+                    .collect();
+                let mut expired_end: Option<i64> = None;
+                for (id, data) in &batch {
+                    let Ok(value) = serde_json::from_str(data) else {
+                        break;
+                    };
+                    if !prune_prefix(&InputItem(value)) {
+                        break;
+                    }
+                    expired_end = Some(*id);
+                }
+                let Some(expired_end) = expired_end else {
+                    break;
+                };
+                sqlx::query(AssertSqlSafe(self.schema.delete_prefix()))
+                    .bind(self.session_id.clone())
+                    .bind(expired_end)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(sqlx_err)?;
+                if batch.last().map(|(id, _)| *id) != Some(expired_end)
+                    || (batch.len() as i64) < super::PRUNE_PREFIX_BATCH
+                {
+                    break;
+                }
+            }
         }
         for id in &tail {
             sqlx::query(AssertSqlSafe(self.schema.delete_message()))
@@ -565,8 +669,10 @@ mod tests {
             SqlxDialect::from_url("mysql://h/db").unwrap(),
             SqlxDialect::MySql
         );
-        let sqlite = SqlxDialect::from_url("sqlite://x.db").unwrap_err();
-        assert!(sqlite.to_string().contains("SqliteSession"));
+        assert_eq!(
+            SqlxDialect::from_url("sqlite://x.db").unwrap(),
+            SqlxDialect::Sqlite
+        );
         assert!(SqlxDialect::from_url("mssql://h/db").is_err());
     }
 
@@ -574,6 +680,7 @@ mod tests {
     fn placeholders_follow_the_dialect() {
         assert_eq!(SqlxDialect::Postgres.placeholder(2), "$2");
         assert_eq!(SqlxDialect::MySql.placeholder(2), "?");
+        assert_eq!(SqlxDialect::Sqlite.placeholder(2), "?");
     }
 
     #[test]

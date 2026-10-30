@@ -53,7 +53,7 @@ pub use model::{
 };
 pub use models::{
     DEFAULT_STT_MODEL, DEFAULT_TTS_MODEL, OpenAISTTModel, OpenAISTTTranscriptionSession,
-    OpenAITTSModel, OpenAIVoiceModelProvider,
+    OpenAITTSModel, OpenAIVoiceModelProvider, VoiceWebSocketOptions,
 };
 pub use pipeline::{VoiceInput, VoicePipeline};
 pub use pipeline_config::VoicePipelineConfig;

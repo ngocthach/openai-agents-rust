@@ -2,7 +2,7 @@
 //! Mirrors `agents.extensions.memory.encrypt_session`.
 
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
@@ -131,6 +131,24 @@ pub struct EncryptedSession {
     cipher: Fernet,
     ttl: u64,
     max_scan_items: Option<usize>,
+    last_snapshot: Mutex<Option<RawSnapshot>>,
+}
+
+/// What the last [`Session::compaction_snapshot`] hid from its caller.
+///
+/// The snapshot this session hands out omits expired envelopes, so its handles are not a
+/// contiguous range of the stored history. A replacement has to name the stored range those
+/// handles came from, including the expired rows between them, or the store would see a tail
+/// that does not match what it holds. Python captures the same three values in the closure it
+/// returns from `_get_compaction_snapshot`.
+#[derive(Debug)]
+struct RawSnapshot {
+    /// The wrapped store's handles, in order.
+    raw: Vec<SnapshotHandle>,
+    /// For each handle this session exposed, its index into `raw`.
+    positions: Vec<usize>,
+    /// Index in `raw` after the last envelope that could not be authenticated.
+    retained_boundary: usize,
 }
 
 impl fmt::Debug for EncryptedSession {
@@ -164,6 +182,7 @@ impl EncryptedSession {
             cipher,
             ttl,
             max_scan_items: None,
+            last_snapshot: Mutex::new(None),
         })
     }
 
@@ -243,6 +262,53 @@ impl EncryptedSession {
     pub fn encrypt_items(&self, items: &[InputItem]) -> Result<Vec<InputItem>> {
         items.iter().map(|i| self.wrap(i)).collect()
     }
+
+    /// True for an envelope this key authenticates whose TTL has run out.
+    ///
+    /// Authentication comes first on purpose: a token that fails it may be corrupt, future
+    /// dated or written with another key, none of which authorizes deleting it.
+    fn expiry_predicate(&self) -> super::PrunePrefix {
+        let cipher = self.cipher.clone();
+        let expired_before = now_seconds().saturating_sub(self.ttl);
+        Arc::new(move |item: &InputItem| {
+            if !is_encrypted_envelope(item) {
+                return false;
+            }
+            let Some(payload) = item.as_value().get("payload").and_then(Value::as_str) else {
+                return false;
+            };
+            cipher
+                .extract_timestamp(payload)
+                .is_ok_and(|created_at| created_at < expired_before)
+        })
+    }
+
+    /// Translate handles this session handed out back to the contiguous stored range they came
+    /// from, expired envelopes included.
+    ///
+    /// Returns `None` when the last snapshot does not end with exactly these handles, which
+    /// leaves them to be passed through unchanged; the wrapped store then rejects the
+    /// replacement because its tail does not match.
+    fn raw_handles_for(&self, handles: &[SnapshotHandle]) -> Option<Vec<SnapshotHandle>> {
+        let guard = self.last_snapshot.lock().expect("snapshot poisoned");
+        let snapshot = guard.as_ref()?;
+        let start = snapshot.positions.len().checked_sub(handles.len())?;
+        if snapshot.positions[start..]
+            .iter()
+            .zip(handles)
+            .any(|(&position, handle)| snapshot.raw.get(position) != Some(handle))
+        {
+            return None;
+        }
+        // Replacing from the very first visible item also replaces the expired envelopes before
+        // it, but never an envelope that failed authentication.
+        let raw_start = if start == 0 {
+            snapshot.retained_boundary
+        } else {
+            snapshot.positions[start]
+        };
+        Some(snapshot.raw[raw_start..].to_vec())
+    }
 }
 
 #[async_trait]
@@ -302,21 +368,47 @@ impl Session for EncryptedSession {
         }
     }
 
+    /// Encrypt and append. The write runs under [`super::await_session_mutation`], so a dropped
+    /// caller cannot leave the store holding part of a batch.
     async fn add_items(&self, items: Vec<InputItem>) -> Result<()> {
         if items.is_empty() {
             return Ok(());
         }
-        self.underlying.add_items(self.encrypt_items(&items)?).await
+        let encrypted = self.encrypt_items(&items)?;
+        let underlying = Arc::clone(&self.underlying);
+        super::await_session_mutation(async move { underlying.add_items(encrypted).await }).await
     }
 
-    /// Remove and return the most recent readable item.
+    /// Remove and return the most recent readable item, skipping expired or plaintext records.
     ///
-    /// Unreadable or expired envelopes encountered on the way are removed from the underlying
-    /// store, unlike the Python SDK's native SQLite path, which authenticates inside the
-    /// transaction. Use the correct key before popping.
+    /// Each candidate is authenticated *before* its removal is committed, through
+    /// [`Session::pop_item_validated`]. Authentication ignores the TTL, so an authenticated but
+    /// expired envelope still drains; an envelope this key cannot authenticate fails the pop and
+    /// is left in place, with its ciphertext and position unchanged, exactly as Python's native
+    /// SQLite path does. A store that cannot claim and validate atomically falls back to the
+    /// trait's default, which pops first and therefore does remove such an envelope — the same
+    /// split Python draws between `SQLiteSession` and every other backend.
     async fn pop_item(&self) -> Result<Option<InputItem>> {
         loop {
-            let Some(stored) = self.underlying.pop_item().await? else {
+            let cipher = self.cipher.clone();
+            let validate: super::PopValidator = Box::new(move |item: &InputItem| {
+                if !is_encrypted_envelope(item) {
+                    return Ok(());
+                }
+                let payload = item
+                    .as_value()
+                    .get("payload")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                // Verify without the TTL so authenticated expired items still drain.
+                cipher.extract_timestamp(payload).map(|_| ()).map_err(|_| {
+                    AgentsError::other(
+                        "EncryptedSession could not authenticate the stored item it was about to \
+                         pop; it was left in place. Use the key the session was written with",
+                    )
+                })
+            });
+            let Some(stored) = self.underlying.pop_item_validated(validate).await? else {
                 return Ok(None);
             };
             if let Some(item) = self.unwrap_item(&stored) {
@@ -340,27 +432,34 @@ impl Session for EncryptedSession {
         let Some(raw) = self.underlying.compaction_snapshot(limit).await? else {
             return Ok(None);
         };
-        let now = now_seconds();
+        let is_expired = self.expiry_predicate();
         let mut items = Vec::new();
         let mut handles = Vec::new();
+        let mut positions = Vec::new();
+        let mut retained_boundary = 0usize;
         let mut complete = raw.complete;
-        for (envelope, handle) in raw.items.iter().zip(raw.handles) {
+        for (index, (envelope, handle)) in raw.items.iter().zip(&raw.handles).enumerate() {
             if let Some(item) = self.unwrap_item(envelope) {
                 items.push(item);
-                handles.push(handle);
+                handles.push(handle.clone());
+                positions.push(index);
                 continue;
             }
-            if self
-                .envelope_timestamp(envelope)
-                .is_some_and(|created_at| created_at.saturating_add(self.ttl) < now)
-            {
+            if is_expired(envelope) {
                 // Authenticated and expired: already not part of history.
                 continue;
             }
+            retained_boundary = index + 1;
             items.clear();
             handles.clear();
+            positions.clear();
             complete = false;
         }
+        *self.last_snapshot.lock().expect("snapshot poisoned") = Some(RawSnapshot {
+            raw: raw.handles,
+            positions,
+            retained_boundary,
+        });
         Ok(Some(CompactionSnapshot {
             items,
             handles,
@@ -368,15 +467,29 @@ impl Session for EncryptedSession {
         }))
     }
 
-    /// Re-encrypt the compacted output before it reaches the wrapped store.
+    /// Re-encrypt the compacted output and reclaim the expired envelopes it supersedes.
+    ///
+    /// The handles are translated back to the stored range they were taken from, so the
+    /// expired envelopes this session hid from the snapshot are replaced along with the items
+    /// around them, and the wrapped store is asked to reclaim any contiguous prefix of
+    /// authenticated expired envelopes in the same transaction.
     async fn replace_compaction_suffix(
         &self,
         handles: &[SnapshotHandle],
         items: Vec<InputItem>,
     ) -> Result<bool> {
-        self.underlying
-            .replace_compaction_suffix(handles, self.encrypt_items(&items)?)
-            .await
+        let stored = self
+            .raw_handles_for(handles)
+            .unwrap_or_else(|| handles.to_vec());
+        let encrypted = self.encrypt_items(&items)?;
+        let prune = self.expiry_predicate();
+        let underlying = Arc::clone(&self.underlying);
+        super::await_session_mutation(async move {
+            underlying
+                .replace_compaction_suffix_pruning(&stored, encrypted, prune)
+                .await
+        })
+        .await
     }
 }
 

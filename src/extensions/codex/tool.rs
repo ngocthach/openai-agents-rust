@@ -7,7 +7,8 @@ use std::future::Future;
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
+use tokio::sync::mpsc;
 
 use crate::error::{AgentsError, Result};
 use crate::extensions::codex::client::Codex;
@@ -15,6 +16,8 @@ use crate::extensions::codex::events::{ThreadEvent, Usage};
 use crate::extensions::codex::items::ThreadItem;
 use crate::extensions::codex::options::CodexOptions;
 use crate::extensions::codex::output_schema::OutputSchema;
+use crate::extensions::codex::py_json;
+use crate::extensions::codex::span_budget::{merge_span_data, truncate_span_value};
 use crate::extensions::codex::thread::{Input, StreamedTurn, Thread, UserInput};
 use crate::extensions::codex::thread_options::{SandboxMode, ThreadOptions};
 use crate::extensions::codex::turn_options::TurnOptions;
@@ -46,11 +49,49 @@ pub struct CodexToolResult {
 }
 
 impl fmt::Display for CodexToolResult {
+    /// The exact bytes Python's `json.dumps(result.as_dict())` produces: field order, the
+    /// `", "` / `": "` separators and `ensure_ascii` escaping.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match serde_json::to_string(self) {
-            Ok(json) => f.write_str(&json),
-            Err(_) => f.write_str("{}"),
+        let (item_sep, key_sep) = py_json::DEFAULT_SEPARATORS;
+        let mut out = String::from("{");
+        py_json::write_string(&mut out, "thread_id");
+        out.push_str(key_sep);
+        match &self.thread_id {
+            Some(thread_id) => py_json::write_string(&mut out, thread_id),
+            None => out.push_str("null"),
         }
+        out.push_str(item_sep);
+        py_json::write_string(&mut out, "response");
+        out.push_str(key_sep);
+        py_json::write_string(&mut out, &self.response);
+        out.push_str(item_sep);
+        py_json::write_string(&mut out, "usage");
+        out.push_str(key_sep);
+        match &self.usage {
+            Some(usage) => {
+                // `dataclasses.asdict` keeps the declaration order of `Usage`.
+                out.push('{');
+                for (index, (key, value)) in [
+                    ("input_tokens", usage.input_tokens),
+                    ("cached_input_tokens", usage.cached_input_tokens),
+                    ("output_tokens", usage.output_tokens),
+                ]
+                .iter()
+                .enumerate()
+                {
+                    if index > 0 {
+                        out.push_str(item_sep);
+                    }
+                    py_json::write_string(&mut out, key);
+                    out.push_str(key_sep);
+                    out.push_str(&value.to_string());
+                }
+                out.push('}');
+            }
+            None => out.push_str("null"),
+        }
+        out.push('}');
+        f.write_str(&out)
     }
 }
 
@@ -119,9 +160,11 @@ pub struct CodexToolOptions<C> {
     pub skip_git_repo_check: Option<bool>,
     /// Turn options applied to every turn.
     pub default_turn_options: Option<TurnOptions>,
-    /// Character budget for command span data; `None` means no limit.
+    /// Character budget for the **whole** command span payload, measured as compact
+    /// `ensure_ascii` JSON; `None` means no limit. Long keys share what is left over.
     pub span_data_max_chars: Option<usize>,
-    /// Include commands and their output in spans.
+    /// Include commands and their output in spans. The run's
+    /// `RunConfig::trace_include_sensitive_data` can only tighten this, never loosen it.
     pub include_sensitive_span_data: bool,
     /// Reuse a single Codex thread across tool calls.
     pub persist_session: bool,
@@ -241,7 +284,7 @@ impl<C> CodexToolOptions<C> {
         self
     }
 
-    /// Set the character budget for command spans; `None` disables truncation.
+    /// Set the whole-payload character budget for command spans; `None` disables truncation.
     pub fn with_span_data_max_chars(mut self, max_chars: Option<usize>) -> Self {
         self.span_data_max_chars = max_chars;
         self
@@ -271,6 +314,11 @@ impl<C> CodexToolOptions<C> {
 
     /// Keep the Codex thread id on the run context: `get` is read before a turn and `set` is
     /// called with the id afterwards. The `thread_id` parameter is then hidden from the model.
+    ///
+    /// This replaces Python's `use_run_context_thread_id` / `run_context_thread_id_key`, which
+    /// write the id onto an arbitrary context object through `setattr` or mapping access under a
+    /// key derived from the tool name. `RunContext<C>` exposes only `&C`, so there is no generic
+    /// field to write and no key namespace to derive; the closures do the same work explicitly.
     pub fn with_thread_id_store<G, S>(mut self, get: G, set: S) -> Self
     where
         G: Fn(&C) -> Option<String> + Send + Sync + 'static,
@@ -349,9 +397,8 @@ pub fn codex_tool<C: Send + Sync + 'static>(
         .clone()
         .unwrap_or_else(|| DEFAULT_CODEX_TOOL_DESCRIPTION.to_string());
     let include_thread_id = options.thread_id_store.is_none();
-    let custom_params_schema = options.params_json_schema.is_some();
-    let params_json_schema = options
-        .params_json_schema
+    let custom_params_schema = options.params_json_schema.clone();
+    let params_json_schema = custom_params_schema
         .clone()
         .unwrap_or_else(|| codex_tool_params_schema(include_thread_id));
 
@@ -393,7 +440,7 @@ pub fn codex_tool<C: Send + Sync + 'static>(
         custom_params_schema,
     });
 
-    Ok(FunctionTool::new_raw(
+    let mut tool = FunctionTool::new_raw(
         name,
         description,
         params_json_schema,
@@ -401,7 +448,10 @@ pub fn codex_tool<C: Send + Sync + 'static>(
             let config = config.clone();
             async move { invoke(config, ctx, arguments).await }
         },
-    ))
+    );
+    // Marks the tool for `Agent`'s duplicate-Codex-tool check. Port of `_is_codex_tool`.
+    tool.mark_codex_tool();
+    Ok(tool)
 }
 
 struct ToolConfig<C> {
@@ -415,8 +465,8 @@ struct ToolConfig<C> {
     include_sensitive_span_data: bool,
     on_stream: Option<OnStreamFn>,
     thread_id_store: Option<ThreadIdStore<C>>,
-    /// A caller-provided schema may allow fields the default schema forbids.
-    custom_params_schema: bool,
+    /// The caller-provided parameters schema, which arguments are validated against.
+    custom_params_schema: Option<Value>,
 }
 
 fn resolve_tool_name(configured: Option<&str>) -> Result<String> {
@@ -513,13 +563,53 @@ fn invalid_input(message: impl fmt::Display) -> AgentsError {
     AgentsError::model_behavior(format!("Invalid JSON input for codex tool: {message}"))
 }
 
+/// Validate the arguments against a caller-supplied parameters schema.
+///
+/// Python validates against the caller's own Pydantic model; this honours the parts of a JSON
+/// schema that reject arguments outright: `required` and `additionalProperties: false`, at the
+/// top level and on the items of `inputs`.
+fn validate_against_schema(value: &Value, schema: &Value) -> Result<()> {
+    check_object_against_schema(value, schema, "field")?;
+    let item_schema = &schema["properties"]["inputs"]["items"];
+    if item_schema.is_object()
+        && let Some(items) = value.get("inputs").and_then(Value::as_array)
+    {
+        for item in items {
+            check_object_against_schema(item, item_schema, "input field")?;
+        }
+    }
+    Ok(())
+}
+
+fn check_object_against_schema(value: &Value, schema: &Value, label: &str) -> Result<()> {
+    let Some(map) = value.as_object() else {
+        return Ok(());
+    };
+    if schema["additionalProperties"] == Value::Bool(false) {
+        let properties = schema["properties"].as_object();
+        for key in map.keys() {
+            if !properties.is_some_and(|props| props.contains_key(key)) {
+                return Err(invalid_input(format!("unknown {label} \"{key}\"")));
+            }
+        }
+    }
+    if let Some(required) = schema["required"].as_array() {
+        for name in required.iter().filter_map(Value::as_str) {
+            if !map.contains_key(name) {
+                return Err(invalid_input(format!("missing {label} \"{name}\"")));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Parse and validate the tool arguments into Codex inputs and an optional thread id.
 ///
-/// `reject_extra_fields` mirrors the `additionalProperties: false` of the default schema; a custom
-/// parameters schema may carry extra fields, which are then ignored.
+/// `custom_schema` is the caller-supplied parameters schema, if any. Without one the default
+/// schema's `additionalProperties: false` is enforced directly.
 fn parse_tool_input(
     arguments: &str,
-    reject_extra_fields: bool,
+    custom_schema: Option<&Value>,
 ) -> Result<(Vec<UserInput>, Option<String>)> {
     let text = if arguments.trim().is_empty() {
         "{}"
@@ -527,8 +617,9 @@ fn parse_tool_input(
         arguments
     };
     let value: Value = serde_json::from_str(text).map_err(invalid_input)?;
-    if reject_extra_fields {
-        reject_unknown_fields(&value)?;
+    match custom_schema {
+        Some(schema) => validate_against_schema(&value, schema)?,
+        None => reject_unknown_fields(&value)?,
     }
     let raw: RawToolCallArgs = serde_json::from_value(value).map_err(invalid_input)?;
 
@@ -598,7 +689,8 @@ async fn invoke<C: Send + Sync + 'static>(
     ctx: ToolContext<C>,
     arguments: String,
 ) -> Result<ToolOutput> {
-    let (inputs, call_thread_id) = parse_tool_input(&arguments, !config.custom_params_schema)?;
+    let (inputs, call_thread_id) =
+        parse_tool_input(&arguments, config.custom_params_schema.as_ref())?;
     let call_thread_id = call_thread_id
         .or_else(|| {
             config
@@ -697,22 +789,70 @@ async fn consume_events<C: Send + Sync + 'static>(
     spans: &mut HashMap<String, Span>,
     state: &mut ConsumeState,
 ) -> Result<()> {
+    let policy = TracingPolicy::resolve(config, ctx);
+    // Buffer events so a slow `on_stream` callback cannot block the Codex stream loop.
+    let dispatcher = config.on_stream.as_ref().map(|on_stream| {
+        let (sender, mut receiver) = mpsc::unbounded_channel::<CodexToolStreamEvent>();
+        let on_stream = on_stream.clone();
+        let consumer = tokio::spawn(async move {
+            while let Some(payload) = receiver.recv().await {
+                on_stream(payload).await;
+            }
+        });
+        (sender, consumer)
+    });
+
+    let outcome = process_events(
+        config,
+        ctx,
+        &policy,
+        thread,
+        stream,
+        spans,
+        state,
+        &dispatcher,
+    )
+    .await;
+
+    if let Some((sender, consumer)) = dispatcher {
+        // Closing the channel ends the consumer once it drained every queued event.
+        drop(sender);
+        let _ = consumer.await;
+    }
+    outcome
+}
+
+type Dispatcher = Option<(
+    mpsc::UnboundedSender<CodexToolStreamEvent>,
+    tokio::task::JoinHandle<()>,
+)>;
+
+#[allow(clippy::too_many_arguments)]
+async fn process_events<C: Send + Sync + 'static>(
+    config: &ToolConfig<C>,
+    ctx: &ToolContext<C>,
+    policy: &TracingPolicy,
+    thread: &Thread,
+    stream: &mut StreamedTurn,
+    spans: &mut HashMap<String, Span>,
+    state: &mut ConsumeState,
+    dispatcher: &Dispatcher,
+) -> Result<()> {
     while let Some(event) = stream.next_event().await {
         let event = event?;
-        if let Some(on_stream) = &config.on_stream {
-            on_stream(CodexToolStreamEvent {
+        if let Some((sender, _)) = dispatcher {
+            let _ = sender.send(CodexToolStreamEvent {
                 event: event.clone(),
                 thread: thread.clone(),
                 tool_call: ctx.tool_call.clone(),
-            })
-            .await;
+            });
         }
         match event {
             ThreadEvent::ThreadStarted { thread_id } => state.thread_id = Some(thread_id),
-            ThreadEvent::ItemStarted { item } => start_item_span(config, spans, &item),
-            ThreadEvent::ItemUpdated { item } => update_item_span(config, spans, &item),
+            ThreadEvent::ItemStarted { item } => start_item_span(config, policy, spans, &item),
+            ThreadEvent::ItemUpdated { item } => update_item_span(config, policy, spans, &item),
             ThreadEvent::ItemCompleted { item } => {
-                complete_item_span(config, spans, &item);
+                complete_item_span(config, policy, spans, &item);
                 if let Some(text) = item.as_agent_message() {
                     state.final_response = text.to_string();
                 }
@@ -735,7 +875,13 @@ async fn consume_events<C: Send + Sync + 'static>(
     Ok(())
 }
 
-fn command_span_data<C>(config: &ToolConfig<C>, item: &ThreadItem) -> Option<Value> {
+/// The span updates for a command execution item, or `None` for any other item.
+/// Port of the `updates` dict shared by `_handle_item_started` and `_update_command_span`.
+fn command_span_updates(
+    policy: &TracingPolicy,
+    max_chars: Option<usize>,
+    item: &ThreadItem,
+) -> Option<Map<String, Value>> {
     let ThreadItem::CommandExecution {
         command,
         status,
@@ -746,41 +892,58 @@ fn command_span_data<C>(config: &ToolConfig<C>, item: &ThreadItem) -> Option<Val
     else {
         return None;
     };
-    let mut data = json!({"status": status, "exit_code": exit_code});
-    if config.include_sensitive_span_data {
-        let map = data.as_object_mut().expect("object");
-        map.insert("command".into(), Value::String(command.clone()));
+    let mut updates = Map::new();
+    updates.insert("status".into(), Value::String(status.clone()));
+    updates.insert(
+        "exit_code".into(),
+        exit_code.map(Value::from).unwrap_or(Value::Null),
+    );
+    if policy.include_sensitive_data {
+        updates.insert("command".into(), Value::String(command.clone()));
         if !aggregated_output.is_empty() {
-            map.insert(
+            updates.insert(
                 "output".into(),
-                Value::String(truncate_span_string(
-                    aggregated_output,
-                    config.span_data_max_chars,
-                )),
+                truncate_span_value(&Value::String(aggregated_output.clone()), max_chars),
             );
         }
     }
-    Some(data)
+    Some(updates)
+}
+
+fn apply_span_updates(span: &Span, updates: &Map<String, Value>, max_chars: Option<usize>) {
+    span.update_data(|current| {
+        if let SpanData::Custom { data, .. } = current {
+            let existing = data.as_object().cloned().unwrap_or_default();
+            *data = Value::Object(merge_span_data(&existing, updates, max_chars));
+        }
+    });
 }
 
 fn start_item_span<C>(
     config: &ToolConfig<C>,
+    policy: &TracingPolicy,
     spans: &mut HashMap<String, Span>,
     item: &ThreadItem,
 ) {
+    if policy.tracing_disabled {
+        return;
+    }
     let Some(item_id) = item.id().filter(|id| !id.is_empty()) else {
         return;
     };
-    let Some(data) = command_span_data(config, item) else {
+    let max_chars = config.span_data_max_chars;
+    let Some(updates) = command_span_updates(policy, max_chars, item) else {
         return;
     };
-    let span = custom_span("Codex command execution", data);
+    let data = merge_span_data(&Map::new(), &updates, max_chars);
+    let span = custom_span("Codex command execution", Value::Object(data));
     span.start();
     spans.insert(item_id.to_string(), span);
 }
 
 fn update_item_span<C>(
     config: &ToolConfig<C>,
+    policy: &TracingPolicy,
     spans: &mut HashMap<String, Span>,
     item: &ThreadItem,
 ) {
@@ -790,17 +953,14 @@ fn update_item_span<C>(
     let Some(span) = spans.get(item_id) else {
         return;
     };
-    if let Some(data) = command_span_data(config, item) {
-        span.update_data(|current| {
-            if let SpanData::Custom { data: existing, .. } = current {
-                merge_span_data(existing, &data);
-            }
-        });
+    if let Some(updates) = command_span_updates(policy, config.span_data_max_chars, item) {
+        apply_span_updates(span, &updates, config.span_data_max_chars);
     }
 }
 
 fn complete_item_span<C>(
     config: &ToolConfig<C>,
+    policy: &TracingPolicy,
     spans: &mut HashMap<String, Span>,
     item: &ThreadItem,
 ) {
@@ -810,12 +970,8 @@ fn complete_item_span<C>(
     let Some(span) = spans.remove(item_id) else {
         return;
     };
-    if let Some(data) = command_span_data(config, item) {
-        span.update_data(|current| {
-            if let SpanData::Custom { data: existing, .. } = current {
-                merge_span_data(existing, &data);
-            }
-        });
+    if let Some(updates) = command_span_updates(policy, config.span_data_max_chars, item) {
+        apply_span_updates(&span, &updates, config.span_data_max_chars);
     }
     if let ThreadItem::CommandExecution {
         status,
@@ -826,13 +982,13 @@ fn complete_item_span<C>(
         && status == "failed"
     {
         let mut error_data = json!({"exit_code": exit_code});
-        if config.include_sensitive_span_data && !aggregated_output.is_empty() {
+        if policy.include_sensitive_data && !aggregated_output.is_empty() {
             error_data.as_object_mut().expect("object").insert(
                 "output".into(),
-                Value::String(truncate_span_string(
-                    aggregated_output,
+                truncate_span_value(
+                    &Value::String(aggregated_output.clone()),
                     config.span_data_max_chars,
-                )),
+                ),
             );
         }
         span.set_error("Codex command execution failed.", Some(error_data));
@@ -840,42 +996,29 @@ fn complete_item_span<C>(
     span.finish();
 }
 
-/// Merge `updates` into `data`, keeping values the update does not carry.
-fn merge_span_data(data: &mut Value, updates: &Value) {
-    let (Some(target), Some(source)) = (data.as_object_mut(), updates.as_object()) else {
-        *data = updates.clone();
-        return;
-    };
-    for (key, value) in source {
-        target.insert(key.clone(), value.clone());
-    }
+/// The run's tracing policy, as `_consume_events` reads it off the `RunConfig`.
+#[derive(Debug, Clone, Copy)]
+struct TracingPolicy {
+    tracing_disabled: bool,
+    include_sensitive_data: bool,
 }
 
-/// Truncate a span value to `max_chars` characters, mirroring the Python suffix format.
-fn truncate_span_string(value: &str, max_chars: Option<usize>) -> String {
-    let Some(max_chars) = max_chars else {
-        return value.to_string();
-    };
-    if max_chars == 0 {
-        return String::new();
+impl TracingPolicy {
+    fn resolve<C>(config: &ToolConfig<C>, ctx: &ToolContext<C>) -> Self {
+        let run_config = ctx.run_config.as_ref();
+        TracingPolicy {
+            tracing_disabled: run_config.is_some_and(|rc| rc.tracing_disabled),
+            include_sensitive_data: config.include_sensitive_span_data
+                && run_config.is_none_or(|rc| rc.trace_include_sensitive_data),
+        }
     }
-    let total = value.chars().count();
-    if total <= max_chars {
-        return value.to_string();
-    }
-    let suffix = format!("... [truncated, {total} chars]");
-    let suffix_len = suffix.chars().count();
-    if max_chars <= suffix_len {
-        return value.chars().take(max_chars).collect();
-    }
-    let mut truncated: String = value.chars().take(max_chars - suffix_len).collect();
-    truncated.push_str(&suffix);
-    truncated
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use futures::stream::StreamExt;
 
     fn test_config(persist_session: bool) -> ToolConfig<()> {
         ToolConfig {
@@ -889,9 +1032,14 @@ mod tests {
             include_sensitive_span_data: true,
             on_stream: None,
             thread_id_store: None,
-            custom_params_schema: false,
+            custom_params_schema: None,
         }
     }
+
+    const PERMISSIVE: TracingPolicy = TracingPolicy {
+        tracing_disabled: false,
+        include_sensitive_data: true,
+    };
 
     #[test]
     fn resolves_tool_names() {
@@ -943,7 +1091,7 @@ mod tests {
             r#"{"inputs":[{"type":"text","text":" fix it ","path":""},
                           {"type":"local_image","path":" /a.png ","text":null}],
                 "thread_id":" thread-1 "}"#,
-            true,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -965,7 +1113,7 @@ mod tests {
             r#"{"inputs":[{"type":"video","path":"/a.mp4"}]}"#,
             r#"{"inputs":[{"type":"text","text":"hi"}],"extra":1}"#,
         ] {
-            let error = parse_tool_input(arguments, true).unwrap_err();
+            let error = parse_tool_input(arguments, None).unwrap_err();
             assert!(
                 matches!(error, AgentsError::ModelBehaviorError { .. }),
                 "expected a model behavior error for {arguments}"
@@ -982,19 +1130,80 @@ mod tests {
     fn empty_thread_id_falls_back_to_none() {
         let (_, thread_id) = parse_tool_input(
             r#"{"inputs":[{"type":"text","text":"hi"}],"thread_id":"  "}"#,
-            true,
+            None,
         )
         .unwrap();
         assert_eq!(thread_id, None);
     }
 
     #[test]
-    fn a_custom_schema_may_carry_extra_fields() {
-        let arguments = r#"{"inputs":[{"type":"text","text":"hi","note":"x"}],"extra":1}"#;
-        assert!(parse_tool_input(arguments, true).is_err());
-        let (inputs, thread_id) = parse_tool_input(arguments, false).unwrap();
+    fn a_custom_schema_validates_its_own_fields() {
+        let schema = json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "inputs": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                            "type": {"type": "string"},
+                            "text": {"type": "string"},
+                            "note": {"type": "string"}
+                        },
+                        "required": ["type", "text"]
+                    }
+                }
+            },
+            "required": ["inputs"]
+        });
+        // Fields the custom schema declares are accepted, unlike with the default schema.
+        let allowed = r#"{"inputs":[{"type":"text","text":"hi","note":"x"}]}"#;
+        assert!(parse_tool_input(allowed, None).is_err());
+        let (inputs, thread_id) = parse_tool_input(allowed, Some(&schema)).unwrap();
         assert_eq!(inputs, vec![UserInput::text("hi")]);
         assert_eq!(thread_id, None);
+
+        // `additionalProperties: false` and `required` are still enforced.
+        let extra_top_level = r#"{"inputs":[{"type":"text","text":"hi"}],"extra":1}"#;
+        assert!(
+            parse_tool_input(extra_top_level, Some(&schema))
+                .unwrap_err()
+                .to_string()
+                .contains("unknown field \"extra\"")
+        );
+        let extra_item_field = r#"{"inputs":[{"type":"text","text":"hi","rogue":1}]}"#;
+        assert!(
+            parse_tool_input(extra_item_field, Some(&schema))
+                .unwrap_err()
+                .to_string()
+                .contains("unknown input field \"rogue\"")
+        );
+        let missing_required = r#"{"inputs":[{"type":"text"}]}"#;
+        assert!(
+            parse_tool_input(missing_required, Some(&schema))
+                .unwrap_err()
+                .to_string()
+                .contains("missing input field \"text\"")
+        );
+        assert!(
+            parse_tool_input("{}", Some(&schema))
+                .unwrap_err()
+                .to_string()
+                .contains("missing field \"inputs\"")
+        );
+    }
+
+    #[test]
+    fn an_open_custom_schema_ignores_extra_fields() {
+        let schema = json!({"type": "object", "properties": {}});
+        let (inputs, _) = parse_tool_input(
+            r#"{"inputs":[{"type":"text","text":"hi","note":"x"}],"extra":1}"#,
+            Some(&schema),
+        )
+        .unwrap();
+        assert_eq!(inputs, vec![UserInput::text("hi")]);
     }
 
     #[test]
@@ -1010,7 +1219,7 @@ mod tests {
     }
 
     #[test]
-    fn serializes_the_tool_result_in_python_field_order() {
+    fn serializes_the_tool_result_like_python_json_dumps() {
         let result = CodexToolResult {
             thread_id: Some("thread-1".into()),
             response: "ok".into(),
@@ -1018,25 +1227,29 @@ mod tests {
         };
         assert_eq!(
             result.to_string(),
-            r#"{"thread_id":"thread-1","response":"ok","usage":null}"#
+            r#"{"thread_id": "thread-1", "response": "ok", "usage": null}"#
+        );
+
+        let with_usage = CodexToolResult {
+            thread_id: None,
+            // `ensure_ascii` escapes every non-ASCII character, astral ones as a surrogate pair.
+            response: "résumé ✅ 😀".into(),
+            usage: Some(Usage {
+                input_tokens: 10,
+                cached_input_tokens: 1,
+                output_tokens: 5,
+            }),
+        };
+        assert_eq!(
+            with_usage.to_string(),
+            "{\"thread_id\": null, \"response\": \
+             \"r\\u00e9sum\\u00e9 \\u2705 \\ud83d\\ude00\", \"usage\": {\"input_tokens\": 10, \
+             \"cached_input_tokens\": 1, \"output_tokens\": 5}}"
         );
     }
 
     #[test]
-    fn truncates_span_strings() {
-        assert_eq!(truncate_span_string("hello", None), "hello");
-        assert_eq!(truncate_span_string("hello", Some(0)), "");
-        assert_eq!(truncate_span_string("hello", Some(5)), "hello");
-        assert_eq!(truncate_span_string("hello", Some(3)), "hel");
-        let value = "x".repeat(100);
-        let truncated = truncate_span_string(&value, Some(40));
-        assert_eq!(truncated.chars().count(), 40);
-        assert!(truncated.ends_with("... [truncated, 100 chars]"));
-    }
-
-    #[test]
     fn merges_command_span_data() {
-        let config = test_config(false);
         let started = ThreadItem::CommandExecution {
             id: "cmd-1".into(),
             command: "pytest".into(),
@@ -1044,7 +1257,8 @@ mod tests {
             aggregated_output: String::new(),
             exit_code: None,
         };
-        let mut data = command_span_data(&config, &started).unwrap();
+        let updates = command_span_updates(&PERMISSIVE, None, &started).unwrap();
+        let data = merge_span_data(&Map::new(), &updates, None);
         assert_eq!(data["command"], "pytest");
         assert!(data.get("output").is_none());
 
@@ -1055,16 +1269,22 @@ mod tests {
             aggregated_output: "All good".into(),
             exit_code: Some(0),
         };
-        merge_span_data(&mut data, &command_span_data(&config, &completed).unwrap());
-        assert_eq!(data["status"], "completed");
-        assert_eq!(data["output"], "All good");
-        assert_eq!(data["exit_code"], 0);
+        let merged = merge_span_data(
+            &data,
+            &command_span_updates(&PERMISSIVE, None, &completed).unwrap(),
+            None,
+        );
+        assert_eq!(merged["status"], "completed");
+        assert_eq!(merged["output"], "All good");
+        assert_eq!(merged["exit_code"], 0);
     }
 
     #[test]
     fn omits_sensitive_span_data_when_disabled() {
-        let mut config = test_config(false);
-        config.include_sensitive_span_data = false;
+        let policy = TracingPolicy {
+            tracing_disabled: false,
+            include_sensitive_data: false,
+        };
         let item = ThreadItem::CommandExecution {
             id: "cmd-1".into(),
             command: "pytest".into(),
@@ -1072,9 +1292,148 @@ mod tests {
             aggregated_output: "All good".into(),
             exit_code: Some(0),
         };
-        let data = command_span_data(&config, &item).unwrap();
-        assert!(data.get("command").is_none());
-        assert!(data.get("output").is_none());
+        let updates = command_span_updates(&policy, None, &item).unwrap();
+        assert!(updates.get("command").is_none());
+        assert!(updates.get("output").is_none());
+    }
+
+    #[test]
+    fn the_run_config_decides_the_tracing_policy() {
+        use crate::run_config::RunConfig;
+        use crate::run_context::RunContext;
+
+        let config = test_config(false);
+        let bare = ToolContext::direct(RunContext::new(()), "agent", "codex", "{}");
+        let policy = TracingPolicy::resolve(&config, &bare);
+        assert!(!policy.tracing_disabled);
+        assert!(policy.include_sensitive_data);
+
+        let run_config = Arc::new(
+            RunConfig::<()>::default()
+                .with_tracing_disabled(true)
+                .with_trace_include_sensitive_data(false),
+        );
+        let restricted = bare.clone().with_run_config(run_config);
+        let policy = TracingPolicy::resolve(&config, &restricted);
+        assert!(policy.tracing_disabled);
+        assert!(!policy.include_sensitive_data);
+    }
+
+    #[test]
+    fn a_disabled_run_creates_no_command_span() {
+        let config = test_config(false);
+        let item = ThreadItem::CommandExecution {
+            id: "cmd-1".into(),
+            command: "pytest".into(),
+            status: "in_progress".into(),
+            aggregated_output: String::new(),
+            exit_code: None,
+        };
+        let mut spans = HashMap::new();
+        let disabled = TracingPolicy {
+            tracing_disabled: true,
+            include_sensitive_data: true,
+        };
+        start_item_span(&config, &disabled, &mut spans, &item);
+        assert!(spans.is_empty());
+        start_item_span(&config, &PERMISSIVE, &mut spans, &item);
+        assert_eq!(spans.len(), 1);
+    }
+
+    #[test]
+    fn the_span_budget_covers_the_whole_payload() {
+        let mut config = test_config(false);
+        config.span_data_max_chars = Some(120);
+        let item = ThreadItem::CommandExecution {
+            id: "cmd-1".into(),
+            command: "c".repeat(200),
+            status: "completed".into(),
+            aggregated_output: "o".repeat(400),
+            exit_code: Some(0),
+        };
+        let updates = command_span_updates(&PERMISSIVE, config.span_data_max_chars, &item).unwrap();
+        let data = merge_span_data(&Map::new(), &updates, config.span_data_max_chars);
+        let size = py_json::char_size(&Value::Object(data.clone()));
+        assert!(size <= 120, "payload of {size} chars exceeds the budget");
+        assert_eq!(data["status"], "completed");
+        assert!(data["command"].as_str().expect("command").len() < 200);
+    }
+
+    #[tokio::test]
+    async fn on_stream_callbacks_do_not_block_the_codex_stream() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let pulled = Arc::new(AtomicUsize::new(0));
+        let handled = Arc::new(AtomicUsize::new(0));
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let release = Arc::new(Mutex::new(Some(release_rx)));
+
+        let handled_in_callback = handled.clone();
+        let mut config = test_config(false);
+        config.on_stream = Some(Arc::new(move |_event| {
+            let handled = handled_in_callback.clone();
+            let release = release.clone();
+            Box::pin(async move {
+                // The first callback blocks until the test releases it.
+                let waiter = release.lock().expect("poisoned").take();
+                if let Some(waiter) = waiter {
+                    let _ = waiter.await;
+                }
+                handled.fetch_add(1, Ordering::SeqCst);
+            })
+        }));
+
+        let events: Vec<Result<ThreadEvent>> = (0..5)
+            .map(|index| {
+                Ok(ThreadEvent::ItemCompleted {
+                    item: ThreadItem::AgentMessage {
+                        id: format!("agent-{index}"),
+                        text: format!("message {index}"),
+                    },
+                })
+            })
+            .collect();
+        let pulled_in_stream = pulled.clone();
+        let stream = futures::stream::iter(events)
+            .inspect(move |_| {
+                pulled_in_stream.fetch_add(1, Ordering::SeqCst);
+            })
+            .boxed();
+        let mut streamed = StreamedTurn::from_events(stream);
+
+        let codex = Codex::new(CodexOptions::default());
+        let thread = codex.start_thread(None);
+        let ctx = ToolContext::direct(crate::run_context::RunContext::new(()), "a", "codex", "{}");
+        let mut spans = HashMap::new();
+        let mut state = ConsumeState {
+            final_response: String::new(),
+            usage: None,
+            thread_id: None,
+        };
+
+        let consume = tokio::spawn(async move {
+            let _ = consume_events(
+                &config,
+                &ctx,
+                &thread,
+                &mut streamed,
+                &mut spans,
+                &mut state,
+            )
+            .await;
+            state.final_response
+        });
+
+        // The producer drains the Codex stream while the first callback is still blocked.
+        while pulled.load(Ordering::SeqCst) < 5 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(handled.load(Ordering::SeqCst), 0);
+
+        release_tx.send(()).expect("release");
+        let final_response = consume.await.expect("join");
+        assert_eq!(final_response, "message 4");
+        assert_eq!(handled.load(Ordering::SeqCst), 5);
     }
 
     #[test]

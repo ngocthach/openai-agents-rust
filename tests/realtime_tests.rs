@@ -1442,6 +1442,7 @@ async fn discarding_history_audio_keeps_transcripts() {
                 vec![RealtimeContent::Audio {
                     audio: Some("AAAA".to_string()),
                     transcript: Some("hello".to_string()),
+                    extra: Default::default(),
                 }],
             )))
         );
@@ -2342,4 +2343,260 @@ async fn custom_headers_replace_the_bearer_token() {
 
     model.close().await.unwrap();
     server.abort();
+}
+
+/// A tool that blocks until the test releases it, so the event loop can be observed while it runs.
+fn gated_tool(gate: Arc<tokio::sync::Semaphore>) -> FunctionTool<()> {
+    FunctionTool::new(
+        "slow_tool",
+        "Blocks until released",
+        move |_ctx, _args: CityArgs| {
+            let gate = gate.clone();
+            async move {
+                let permit = gate.acquire().await.expect("gate open");
+                permit.forget();
+                Ok("done".to_string())
+            }
+        },
+    )
+}
+
+/// Whether `event` forwards the transcript delta the `async_tool_calls` tests emit.
+fn is_transcript_delta(event: &RealtimeSessionEvent<()>) -> bool {
+    matches!(
+        event,
+        RealtimeSessionEvent::RawModelEvent {
+            data: RealtimeModelEvent::TranscriptDelta { delta, .. },
+            ..
+        } if delta == "hi"
+    )
+}
+
+fn slow_tool_call() -> RealtimeModelEvent {
+    RealtimeModelEvent::FunctionCall(RealtimeModelToolCallEvent {
+        name: "slow_tool".to_string(),
+        call_id: "call_slow".to_string(),
+        arguments: r#"{"city":"Oslo"}"#.to_string(),
+        id: Some("fc_slow".to_string()),
+        previous_item_id: None,
+    })
+}
+
+#[tokio::test]
+async fn a_tool_call_runs_off_the_event_loop_by_default() {
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let model = Arc::new(FakeRealtimeModel::new());
+    let agent = RealtimeAgent::<()>::new("Assistant")
+        .with_tool(gated_tool(gate.clone()))
+        .into_arc();
+    let session = start_session(model.clone(), agent).await;
+
+    assert!(model.emit(slow_tool_call()));
+    assert!(model.emit(RealtimeModelEvent::TranscriptDelta {
+        item_id: "item_1".to_string(),
+        delta: "hi".to_string(),
+        response_id: "resp_1".to_string(),
+    }));
+
+    // The transcript arrives while the tool is still blocked, which is what Python's
+    // `async_tool_calls` default buys.
+    let (_, seen) = wait_for(&session, is_transcript_delta).await;
+    assert!(
+        !seen
+            .iter()
+            .any(|event| matches!(event, RealtimeSessionEvent::ToolEnd { .. })),
+        "the blocked tool must not have finished yet"
+    );
+
+    gate.add_permits(1);
+    wait_for(&session, |event| {
+        matches!(event, RealtimeSessionEvent::ToolEnd { .. })
+    })
+    .await;
+    session.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn async_tool_calls_off_serializes_a_call_with_the_event_stream() {
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let model = Arc::new(FakeRealtimeModel::new());
+    let agent = RealtimeAgent::<()>::new("Assistant")
+        .with_tool(gated_tool(gate.clone()))
+        .into_arc();
+    let config = RealtimeRunConfig::<()> {
+        async_tool_calls: false,
+        ..Default::default()
+    };
+    let session = RealtimeRunner::new(agent)
+        .with_model(model.clone())
+        .with_config(config)
+        .run(())
+        .await
+        .unwrap();
+
+    assert!(model.emit(slow_tool_call()));
+    assert!(model.emit(RealtimeModelEvent::TranscriptDelta {
+        item_id: "item_1".to_string(),
+        delta: "hi".to_string(),
+        response_id: "resp_1".to_string(),
+    }));
+    gate.add_permits(1);
+
+    // With the flag off the transcript waits behind the tool call.
+    let (_, seen) = wait_for(&session, is_transcript_delta).await;
+    assert!(
+        seen.iter()
+            .any(|event| matches!(event, RealtimeSessionEvent::ToolEnd { .. })),
+        "the tool ran before the transcript was processed"
+    );
+    session.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_transport_exception_ends_the_session() {
+    let model = Arc::new(FakeRealtimeModel::new());
+    let agent = RealtimeAgent::<()>::new("Assistant").into_arc();
+    let session = start_session(model.clone(), agent).await;
+
+    assert!(model.emit(RealtimeModelEvent::Exception {
+        message: "socket closed".to_string(),
+        context: Some("read loop".to_string()),
+    }));
+
+    // The error reaches the caller first...
+    wait_for(&session, |event| {
+        matches!(event, RealtimeSessionEvent::Error { error, .. }
+            if error["message"] == "read loop: socket closed")
+    })
+    .await;
+    // ...then the stream ends, where Python raises the stored exception.
+    let ended = tokio::time::timeout(EVENT_TIMEOUT, async {
+        while let Some(event) = session.recv().await {
+            let _ = event;
+        }
+    })
+    .await;
+    assert!(ended.is_ok(), "the session stream ended");
+    assert!(session.is_closed());
+    let error = session.take_error().expect("the failure is kept");
+    assert!(error.to_string().contains("socket closed"));
+    assert!(session.take_error().is_none(), "the failure is taken once");
+}
+
+#[tokio::test]
+async fn a_hosted_tool_on_a_realtime_agent_is_rejected() {
+    use openai_agents_sdk::tool::WebSearchTool;
+
+    let model = Arc::new(FakeRealtimeModel::new());
+    let agent = RealtimeAgent::<()>::new("Assistant")
+        .with_tool(WebSearchTool::new())
+        .into_arc();
+    let error = RealtimeRunner::new(agent)
+        .with_model(model)
+        .run(())
+        .await
+        .expect_err("realtime models accept function tools only");
+    assert!(
+        error.to_string().contains("Must be a function tool"),
+        "got {error}"
+    );
+}
+
+#[test]
+fn unknown_content_part_fields_survive_a_round_trip() {
+    let wire = json!({
+        "type": "message",
+        "item_id": "item_1",
+        "role": "assistant",
+        "content": [{"type": "audio", "transcript": "hi", "logprobs": [1, 2]}],
+        "vendor_field": "kept",
+    });
+    let item: openai_agents_sdk::realtime::RealtimeItem =
+        serde_json::from_value(wire.clone()).expect("parses");
+    assert_eq!(serde_json::to_value(&item).expect("serializes"), wire);
+}
+
+#[tokio::test]
+async fn the_tool_error_formatter_is_the_core_one() {
+    use openai_agents_sdk::{ToolErrorFormatterArgs, ToolErrorKind};
+
+    let model = Arc::new(FakeRealtimeModel::new());
+    let agent = RealtimeAgent::<()>::new("Assistant")
+        .with_tool(weather_tool())
+        .into_arc();
+    let config = RealtimeRunConfig::<()> {
+        tool_error_formatter: Some(Arc::new(|args: &ToolErrorFormatterArgs<'_, ()>| {
+            assert!(matches!(args.kind, ToolErrorKind::ToolNotFound));
+            assert!(args.error.is_none());
+            Some(format!("no tool called {}", args.tool_name))
+        })),
+        ..Default::default()
+    };
+    let session = RealtimeRunner::new(agent)
+        .with_model(model.clone())
+        .with_config(config)
+        .run(())
+        .await
+        .unwrap();
+
+    assert!(model.emit(RealtimeModelEvent::FunctionCall(
+        RealtimeModelToolCallEvent {
+            name: "missing".to_string(),
+            call_id: "call_x".to_string(),
+            arguments: "{}".to_string(),
+            id: None,
+            previous_item_id: None,
+        }
+    )));
+    wait_for(&session, |event| {
+        matches!(event, RealtimeSessionEvent::Error { .. })
+    })
+    .await;
+    assert_eq!(
+        model.tool_outputs(),
+        vec![("call_x".to_string(), "no tool called missing".to_string())]
+    );
+    session.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_tool_guardrail_tripwire_ends_the_session() {
+    let tripwire = ToolInputGuardrail::<()>::new("halt", |_data| async move {
+        Ok(ToolGuardrailFunctionOutput::raise_exception())
+    });
+    let model = Arc::new(FakeRealtimeModel::new());
+    let agent = RealtimeAgent::<()>::new("Assistant")
+        .with_tool(weather_tool().with_input_guardrail(tripwire))
+        .into_arc();
+    let session = start_session(model.clone(), agent).await;
+
+    assert!(model.emit(RealtimeModelEvent::FunctionCall(
+        RealtimeModelToolCallEvent {
+            name: "get_weather".to_string(),
+            call_id: "call_1".to_string(),
+            arguments: r#"{"city":"Oslo"}"#.to_string(),
+            id: Some("fc_1".to_string()),
+            previous_item_id: None,
+        }
+    )));
+
+    wait_for(&session, |event| {
+        matches!(event, RealtimeSessionEvent::Error { error, .. }
+            if error["message"] == "Tool input guardrail halt triggered tripwire")
+    })
+    .await;
+
+    let drained = tokio::time::timeout(EVENT_TIMEOUT, async {
+        while session.recv().await.is_some() {}
+    })
+    .await;
+    assert!(drained.is_ok(), "the failed tool task ended the stream");
+    assert!(session.is_closed());
+    assert!(
+        session
+            .take_error()
+            .is_some_and(|error| error.to_string().contains("halt")),
+        "the tripwire is kept for the caller"
+    );
+    assert!(model.tool_outputs().is_empty(), "the tool never ran");
 }

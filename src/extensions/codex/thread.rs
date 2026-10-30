@@ -123,6 +123,12 @@ impl std::fmt::Debug for StreamedTurn {
 }
 
 impl StreamedTurn {
+    /// Wrap an event stream; used by tests that do not spawn the Codex CLI.
+    #[cfg(test)]
+    pub(crate) fn from_events(events: BoxStream<'static, Result<ThreadEvent>>) -> Self {
+        StreamedTurn { events }
+    }
+
     /// The next event, or `None` once the turn ended.
     pub async fn next_event(&mut self) -> Option<Result<ThreadEvent>> {
         self.events.next().await
@@ -195,6 +201,12 @@ impl Thread {
             None => None,
         };
         let (prompt, images) = input.into().normalize();
+        // An idle timeout cancels the turn, so it needs a token even when the caller passed none.
+        let cancel = turn_options.cancel.clone().or_else(|| {
+            turn_options
+                .idle_timeout
+                .map(|_| tokio_util::sync::CancellationToken::new())
+        });
         let options = &self.thread_options;
         let args = CodexExecArgs {
             input: prompt,
@@ -211,6 +223,7 @@ impl Thread {
                 .as_ref()
                 .map(|f| f.path().to_string_lossy().into_owned()),
             model_reasoning_effort: options.model_reasoning_effort,
+            cancel,
             idle_timeout: turn_options.idle_timeout,
             network_access_enabled: options.network_access_enabled,
             web_search_mode: options.web_search_mode,

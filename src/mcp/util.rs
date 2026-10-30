@@ -5,7 +5,9 @@ use std::sync::Arc;
 
 use serde_json::{Map, Value, json};
 
-use super::logging::{get_mcp_server_log_name, resolve_mcp_tool_description_for_model};
+use super::logging::{
+    get_mcp_server_log_name, resolve_mcp_tool_description_for_model, resolve_mcp_tool_title,
+};
 use super::{MCPServer, MCPTool, ToolFilterContext};
 use crate::agent::MCPConfig;
 use crate::error::{AgentsError, Result};
@@ -276,7 +278,7 @@ pub async fn invoke_mcp_tool(
 }
 
 /// Convert one MCP tool into a function tool that calls the server.
-pub fn to_function_tool<C: Send + Sync + 'static>(
+pub async fn to_function_tool<C: Send + Sync + 'static>(
     server: Arc<dyn MCPServer>,
     tool: &MCPTool,
     exposed_name: String,
@@ -291,13 +293,16 @@ pub fn to_function_tool<C: Send + Sync + 'static>(
         agent_name,
         Some(Arc::new(crate::tool::default_tool_error_function::<C>)),
     )
+    .await
 }
 
 /// [`to_function_tool`] with the agent's MCP failure formatter.
 ///
-/// `failure_error_function` is the agent's `MCPConfig::failure_error_function`; `None`
-/// re-raises MCP tool errors instead of reporting them to the model.
-pub fn to_function_tool_with_failure<C: Send + Sync + 'static>(
+/// `failure_error_function` is the agent's `MCPConfig::failure_error_function`. The server's
+/// own [`crate::mcp::MCPToolPolicy`] wins when it set one explicitly, mirroring Python's
+/// `_get_failure_error_function` and its `_UNSET` sentinel; `None` re-raises MCP tool errors
+/// instead of reporting them to the model.
+pub async fn to_function_tool_with_failure<C: Send + Sync + 'static>(
     server: Arc<dyn MCPServer>,
     tool: &MCPTool,
     exposed_name: String,
@@ -321,13 +326,32 @@ pub fn to_function_tool_with_failure<C: Send + Sync + 'static>(
         },
     );
     f.strict_json_schema = strict;
+    f.mcp_title = resolve_mcp_tool_title(tool);
     f.mcp_server_name = Some(get_mcp_server_log_name(server.name()));
-    f.needs_approval =
-        NeedsApproval::Static(server.config().require_approval.requires(agent_name, tool));
-    f = match failure_error_function {
+    f.needs_approval = NeedsApproval::Static(
+        server
+            .config()
+            .require_approval
+            .requires(agent_name, tool)
+            .await,
+    );
+
+    let policy = server.config().tool_policy::<C>();
+    let failure = match policy {
+        Some(p) if p.failure_error_function_set => p.failure_error_function.clone(),
+        _ => failure_error_function,
+    };
+    f = match failure {
         Some(handler) => f.with_failure_error_function(move |ctx, e| handler(ctx, e)),
         None => f.without_failure_error_function(),
     };
+    if let Some(p) = policy {
+        f.tool_input_guardrails = p.tool_input_guardrails.clone();
+        f.tool_output_guardrails = p.tool_output_guardrails.clone();
+        if let Some(extractor) = &p.custom_data_extractor {
+            f.custom_data_extractor = Some(extractor.clone());
+        }
+    }
     f
 }
 
@@ -335,10 +359,10 @@ pub fn to_function_tool_with_failure<C: Send + Sync + 'static>(
 pub async fn get_all_function_tools<C: Send + Sync + 'static>(
     servers: &[Arc<dyn MCPServer>],
     config: &MCPConfig<C>,
-    _ctx: &RunContext<C>,
+    ctx: &RunContext<C>,
     agent_name: &str,
 ) -> Result<Vec<Tool<C>>> {
-    get_all_function_tools_with_reserved(servers, config, _ctx, agent_name, &HashSet::new()).await
+    get_all_function_tools_with_reserved(servers, config, ctx, agent_name, &HashSet::new()).await
 }
 
 /// Like [`get_all_function_tools`], but keeping `reserved` names free.
@@ -348,10 +372,26 @@ pub async fn get_all_function_tools<C: Send + Sync + 'static>(
 pub async fn get_all_function_tools_with_reserved<C: Send + Sync + 'static>(
     servers: &[Arc<dyn MCPServer>],
     config: &MCPConfig<C>,
-    _ctx: &RunContext<C>,
+    ctx: &RunContext<C>,
     agent_name: &str,
     reserved: &HashSet<String>,
 ) -> Result<Vec<Tool<C>>> {
+    get_all_function_tools_for_agent(servers, config, ctx, agent_name, None, reserved).await
+}
+
+/// [`get_all_function_tools_with_reserved`] with the agent itself, so a dynamic
+/// [`crate::mcp::ToolFilter`] sees `ToolFilterContext::agent` as Python's does.
+pub async fn get_all_function_tools_for_agent<C: Send + Sync + 'static>(
+    servers: &[Arc<dyn MCPServer>],
+    config: &MCPConfig<C>,
+    ctx: &RunContext<C>,
+    agent_name: &str,
+    agent: Option<Arc<crate::agent::Agent<C>>>,
+    reserved: &HashSet<String>,
+) -> Result<Vec<Tool<C>>> {
+    let run_context_any: Arc<dyn std::any::Any + Send + Sync> = Arc::new(ctx.clone());
+    let agent_any: Option<Arc<dyn std::any::Any + Send + Sync>> =
+        agent.map(|a| Arc::new(a) as Arc<dyn std::any::Any + Send + Sync>);
     let mut out = Vec::new();
     let mut batches: Vec<(usize, String, Vec<String>)> = Vec::new();
     let mut listings: Vec<Vec<MCPTool>> = Vec::new();
@@ -374,11 +414,16 @@ pub async fn get_all_function_tools_with_reserved<C: Send + Sync + 'static>(
         let fctx = ToolFilterContext {
             agent_name: agent_name.to_string(),
             server_name: server.name().to_string(),
+            run_context_any: Some(run_context_any.clone()),
+            agent_any: agent_any.clone(),
         };
-        let tools: Vec<MCPTool> = tools
-            .into_iter()
-            .filter(|t| server.config().tool_filter.allows(&fctx, t))
-            .collect();
+        let mut kept: Vec<MCPTool> = Vec::with_capacity(tools.len());
+        for t in tools {
+            if server.config().tool_filter.allows(&fctx, &t).await {
+                kept.push(t);
+            }
+        }
+        let tools = kept;
         span.update_data(|d| {
             if let SpanData::MCPListTools { result, .. } = d {
                 *result = Some(tools.iter().map(|t| t.name.clone()).collect());
@@ -412,14 +457,17 @@ pub async fn get_all_function_tools_with_reserved<C: Send + Sync + 'static>(
                     "Duplicate tool names found across MCP servers: {exposed}. Set include_server_in_tool_names to disambiguate."
                 )));
             }
-            out.push(Tool::Function(Arc::new(to_function_tool_with_failure(
-                server.clone(),
-                t,
-                exposed,
-                config.convert_schemas_to_strict,
-                agent_name,
-                config.failure_error_function.clone(),
-            ))));
+            out.push(Tool::Function(Arc::new(
+                to_function_tool_with_failure(
+                    server.clone(),
+                    t,
+                    exposed,
+                    config.convert_schemas_to_strict,
+                    agent_name,
+                    config.failure_error_function.clone(),
+                )
+                .await,
+            )));
         }
     }
     Ok(out)

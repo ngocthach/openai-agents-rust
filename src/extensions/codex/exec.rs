@@ -6,9 +6,10 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use futures::stream::{BoxStream, StreamExt};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, Lines};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdout, Command};
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 use crate::error::{AgentsError, Result};
 use crate::extensions::codex::thread_options::{
@@ -18,6 +19,15 @@ use crate::extensions::codex::thread_options::{
 /// Environment variable the Codex CLI reads to identify its caller.
 const INTERNAL_ORIGINATOR_ENV: &str = "CODEX_INTERNAL_ORIGINATOR_OVERRIDE";
 const SDK_ORIGINATOR: &str = "codex_sdk_ts";
+
+/// Environment variable overriding the per-line read limit of the Codex subprocess.
+pub const SUBPROCESS_STREAM_LIMIT_ENV: &str = "OPENAI_AGENTS_CODEX_SUBPROCESS_STREAM_LIMIT_BYTES";
+/// Default per-line read limit of the Codex subprocess (8 MiB).
+pub const DEFAULT_SUBPROCESS_STREAM_LIMIT_BYTES: usize = 8 * 1024 * 1024;
+/// Smallest accepted per-line read limit (64 KiB).
+pub const MIN_SUBPROCESS_STREAM_LIMIT_BYTES: usize = 64 * 1024;
+/// Largest accepted per-line read limit (64 MiB).
+pub const MAX_SUBPROCESS_STREAM_LIMIT_BYTES: usize = 64 * 1024 * 1024;
 
 /// A stream of raw JSONL lines emitted by the Codex CLI.
 pub type CodexLineStream = BoxStream<'static, Result<String>>;
@@ -49,6 +59,8 @@ pub struct CodexExecArgs {
     pub output_schema_file: Option<String>,
     /// Reasoning effort config.
     pub model_reasoning_effort: Option<ModelReasoningEffort>,
+    /// Kill the Codex CLI when this token is cancelled. Port of `CodexExecArgs.signal`.
+    pub cancel: Option<CancellationToken>,
     /// Abort the turn when no event arrives within this duration.
     pub idle_timeout: Option<Duration>,
     /// Sandboxed network access config.
@@ -140,18 +152,46 @@ pub fn build_command_args(args: &CodexExecArgs) -> Vec<String> {
     command_args
 }
 
-/// Resolve the `codex` executable: `CODEX_PATH`, then a `PATH` lookup, then the bare name.
-pub fn find_codex_path() -> String {
-    if let Ok(path) = std::env::var("CODEX_PATH")
-        && !path.is_empty()
+/// `true` when the path is an executable file, like `shutil.which`'s `os.access(…, X_OK)` check.
+fn is_executable_file(path: &std::path::Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
     {
-        return path;
+        use std::os::unix::fs::PermissionsExt;
+        path.metadata()
+            .map(|meta| meta.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+/// Resolve the `codex` executable: `CODEX_PATH`, then a `PATH` lookup, then the bare name.
+///
+/// Python falls back to a binary vendored in the wheel
+/// (`vendor/<target-triple>/codex/codex`); this crate ships no vendored binaries, so the bare
+/// name is returned instead and the spawn error names the missing executable.
+pub fn find_codex_path() -> String {
+    resolve_codex_path(
+        std::env::var("CODEX_PATH").ok().as_deref(),
+        std::env::var_os("PATH").as_deref(),
+    )
+}
+
+/// [`find_codex_path`] with the environment passed in, so it can be tested in parallel.
+fn resolve_codex_path(codex_path: Option<&str>, search_path: Option<&std::ffi::OsStr>) -> String {
+    if let Some(path) = codex_path.filter(|path| !path.is_empty()) {
+        return path.to_string();
     }
     let binary = if cfg!(windows) { "codex.exe" } else { "codex" };
-    if let Some(paths) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&paths) {
+    if let Some(paths) = search_path {
+        for dir in std::env::split_paths(paths) {
             let candidate = dir.join(binary);
-            if candidate.is_file() {
+            if is_executable_file(&candidate) {
                 return candidate.to_string_lossy().into_owned();
             }
         }
@@ -159,11 +199,44 @@ pub fn find_codex_path() -> String {
     binary.to_string()
 }
 
+/// Validate a per-line read limit. Port of `_validate_subprocess_stream_limit_bytes`.
+fn validate_subprocess_stream_limit_bytes(value: usize) -> Result<usize> {
+    if !(MIN_SUBPROCESS_STREAM_LIMIT_BYTES..=MAX_SUBPROCESS_STREAM_LIMIT_BYTES).contains(&value) {
+        return Err(AgentsError::user(format!(
+            "codex_subprocess_stream_limit_bytes must be between \
+             {MIN_SUBPROCESS_STREAM_LIMIT_BYTES} and {MAX_SUBPROCESS_STREAM_LIMIT_BYTES} bytes."
+        )));
+    }
+    Ok(value)
+}
+
+/// Resolve the per-line read limit from the explicit value, then `env_value`, then the default.
+/// Port of `_resolve_subprocess_stream_limit_bytes`.
+pub(crate) fn resolve_subprocess_stream_limit_bytes(
+    explicit: Option<usize>,
+    env_value: Option<&str>,
+) -> Result<usize> {
+    if let Some(value) = explicit {
+        return validate_subprocess_stream_limit_bytes(value);
+    }
+    let Some(env_value) = env_value else {
+        return Ok(DEFAULT_SUBPROCESS_STREAM_LIMIT_BYTES);
+    };
+    let parsed: i64 = env_value.trim().parse().map_err(|_| {
+        AgentsError::user(format!(
+            "{SUBPROCESS_STREAM_LIMIT_ENV} must be an integer number of bytes."
+        ))
+    })?;
+    // A negative value parses in Python and is rejected by the range check.
+    validate_subprocess_stream_limit_bytes(usize::try_from(parsed).unwrap_or(0))
+}
+
 /// Runs the Codex CLI and streams its JSONL output.
 #[derive(Debug, Clone)]
 pub struct CodexExec {
     executable_path: String,
     env_override: Option<BTreeMap<String, String>>,
+    subprocess_stream_limit_bytes: Option<usize>,
 }
 
 impl CodexExec {
@@ -177,7 +250,16 @@ impl CodexExec {
                 .filter(|p| !p.is_empty())
                 .unwrap_or_else(find_codex_path),
             env_override,
+            subprocess_stream_limit_bytes: None,
         }
+    }
+
+    /// Cap how many bytes one JSONL line may occupy; `None` uses
+    /// [`SUBPROCESS_STREAM_LIMIT_ENV`] and then
+    /// [`DEFAULT_SUBPROCESS_STREAM_LIMIT_BYTES`]. The value is validated when a turn starts.
+    pub fn with_subprocess_stream_limit_bytes(mut self, limit: Option<usize>) -> Self {
+        self.subprocess_stream_limit_bytes = limit;
+        self
     }
 
     /// The resolved path of the `codex` binary.
@@ -209,6 +291,10 @@ impl CodexExec {
     pub async fn run(&self, args: CodexExecArgs) -> Result<CodexLineStream> {
         let command_args = build_command_args(&args);
         let env = self.build_env(&args);
+        let stream_limit = resolve_subprocess_stream_limit_bytes(
+            self.subprocess_stream_limit_bytes,
+            std::env::var(SUBPROCESS_STREAM_LIMIT_ENV).ok().as_deref(),
+        )?;
 
         let mut child = Command::new(&self.executable_path)
             .args(&command_args)
@@ -258,8 +344,12 @@ impl CodexExec {
 
         let state = StreamState {
             child,
-            lines: BufReader::new(stdout).lines(),
+            reader: LineReader {
+                reader: BufReader::new(stdout),
+                limit: stream_limit,
+            },
             stderr_task,
+            cancel: args.cancel.clone(),
             idle_timeout: args.idle_timeout,
             done: false,
         };
@@ -267,43 +357,180 @@ impl CodexExec {
     }
 }
 
+/// Reads one JSONL line at a time, refusing lines longer than `limit` bytes the way asyncio's
+/// `StreamReader.readline` refuses a line longer than its buffer limit.
+struct LineReader<R> {
+    reader: BufReader<R>,
+    limit: usize,
+}
+
+fn stream_limit_error(reason: &str, limit: usize) -> AgentsError {
+    AgentsError::other(format!(
+        "Codex stdout exceeded the {limit} byte subprocess stream limit: {reason}"
+    ))
+}
+
+enum Chunk {
+    Eof,
+    Separator(usize),
+    More(usize),
+}
+
+impl<R: tokio::io::AsyncRead + Unpin> LineReader<R> {
+    /// The next line without its trailing newline, or `None` at end of stream.
+    async fn next_line(&mut self) -> Result<Option<String>> {
+        let mut buffer: Vec<u8> = Vec::new();
+        loop {
+            let chunk = {
+                let available = self.reader.fill_buf().await.map_err(AgentsError::Io)?;
+                if available.is_empty() {
+                    Chunk::Eof
+                } else if let Some(index) = available.iter().position(|byte| *byte == b'\n') {
+                    buffer.extend_from_slice(&available[..index]);
+                    Chunk::Separator(index + 1)
+                } else {
+                    buffer.extend_from_slice(available);
+                    Chunk::More(available.len())
+                }
+            };
+            match chunk {
+                Chunk::Eof => {
+                    if buffer.is_empty() {
+                        return Ok(None);
+                    }
+                    break;
+                }
+                Chunk::Separator(consumed) => {
+                    self.reader.consume(consumed);
+                    if buffer.len() > self.limit {
+                        return Err(stream_limit_error(
+                            "Separator is found, but chunk is longer than limit",
+                            self.limit,
+                        ));
+                    }
+                    break;
+                }
+                Chunk::More(consumed) => {
+                    self.reader.consume(consumed);
+                    if buffer.len() > self.limit {
+                        return Err(stream_limit_error(
+                            "Separator is not found, and chunk exceed the limit",
+                            self.limit,
+                        ));
+                    }
+                }
+            }
+        }
+        // Python decodes then `rstrip("\n")`, so a trailing carriage return is kept.
+        Ok(Some(String::from_utf8_lossy(&buffer).into_owned()))
+    }
+}
+
 struct StreamState {
     child: Child,
-    lines: Lines<BufReader<ChildStdout>>,
+    reader: LineReader<ChildStdout>,
     stderr_task: Option<JoinHandle<Vec<u8>>>,
+    cancel: Option<CancellationToken>,
     idle_timeout: Option<Duration>,
     done: bool,
+}
+
+enum ReadOutcome {
+    Line(String),
+    Eof,
+    Error(AgentsError),
+    Cancelled,
+    IdleTimeout,
+}
+
+fn to_outcome(result: Result<Option<String>>) -> ReadOutcome {
+    match result {
+        Ok(Some(line)) => ReadOutcome::Line(line),
+        Ok(None) => ReadOutcome::Eof,
+        Err(e) => ReadOutcome::Error(e),
+    }
+}
+
+async fn read_outcome(
+    reader: &mut LineReader<ChildStdout>,
+    cancel: Option<&CancellationToken>,
+    idle_timeout: Option<Duration>,
+) -> ReadOutcome {
+    let read = reader.next_line();
+    tokio::pin!(read);
+    match (cancel, idle_timeout) {
+        (Some(token), Some(timeout)) => tokio::select! {
+            biased;
+            _ = token.cancelled() => ReadOutcome::Cancelled,
+            result = &mut read => to_outcome(result),
+            _ = tokio::time::sleep(timeout) => ReadOutcome::IdleTimeout,
+        },
+        (Some(token), None) => tokio::select! {
+            biased;
+            _ = token.cancelled() => ReadOutcome::Cancelled,
+            result = &mut read => to_outcome(result),
+        },
+        (None, Some(timeout)) => tokio::select! {
+            biased;
+            result = &mut read => to_outcome(result),
+            _ = tokio::time::sleep(timeout) => ReadOutcome::IdleTimeout,
+        },
+        (None, None) => to_outcome(read.await),
+    }
 }
 
 async fn next_line(mut state: StreamState) -> Option<(Result<String>, StreamState)> {
     if state.done {
         return None;
     }
-    let line = match state.idle_timeout {
-        Some(timeout) => match tokio::time::timeout(timeout, state.lines.next_line()).await {
-            Ok(result) => result,
-            Err(_) => {
-                state.done = true;
-                let _ = state.child.start_kill();
-                let message = format!("Codex stream idle for {} seconds.", timeout.as_secs_f64());
-                return Some((Err(AgentsError::other(message)), state));
-            }
-        },
-        None => state.lines.next_line().await,
-    };
-    match line {
-        Ok(Some(line)) => Some((Ok(line), state)),
-        Ok(None) => {
+    let outcome = read_outcome(&mut state.reader, state.cancel.as_ref(), state.idle_timeout).await;
+    match outcome {
+        ReadOutcome::Line(line) => Some((Ok(line), state)),
+        ReadOutcome::Error(e) => {
+            state.done = true;
+            Some((Err(e), state))
+        }
+        ReadOutcome::Eof => {
             state.done = true;
             exit_error(&mut state)
                 .await
                 .map(|error| (Err(error), state))
         }
-        Err(e) => {
+        ReadOutcome::Cancelled => {
+            // Python terminates the subprocess, so the turn ends with its non-zero exit status.
             state.done = true;
-            Some((Err(AgentsError::Io(e)), state))
+            let _ = state.child.start_kill();
+            let error = exit_error(&mut state)
+                .await
+                .unwrap_or_else(|| AgentsError::other("Codex exec was cancelled."));
+            Some((Err(error), state))
+        }
+        ReadOutcome::IdleTimeout => {
+            state.done = true;
+            if let Some(token) = &state.cancel {
+                token.cancel();
+            }
+            let _ = state.child.start_kill();
+            let timeout = state.idle_timeout.unwrap_or_default();
+            let message = format!("Codex stream idle for {} seconds.", timeout.as_secs_f64());
+            Some((Err(AgentsError::other(message)), state))
         }
     }
+}
+
+/// The exit code of a finished process, negated for a signal like Python's `returncode`.
+fn exit_code(status: &std::process::ExitStatus) -> i32 {
+    if let Some(code) = status.code() {
+        return code;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(signal) = status.signal() {
+            return -signal;
+        }
+    }
+    -1
 }
 
 async fn exit_error(state: &mut StreamState) -> Option<AgentsError> {
@@ -321,7 +548,7 @@ async fn exit_error(state: &mut StreamState) -> Option<AgentsError> {
     let stderr_text = String::from_utf8_lossy(&stderr);
     Some(AgentsError::other(format!(
         "Codex exec exited with code {}: {stderr_text}",
-        status.code().unwrap_or(-1)
+        exit_code(&status)
     )))
 }
 
@@ -453,6 +680,134 @@ mod tests {
             Some(SDK_ORIGINATOR)
         );
         assert!(!env.contains_key("PATH"));
+    }
+
+    #[test]
+    fn resolves_the_codex_path_like_shutil_which() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let not_executable = dir.path().join("skipped");
+        let executable = dir.path().join("found");
+        std::fs::create_dir_all(&not_executable).expect("dir");
+        std::fs::create_dir_all(&executable).expect("dir");
+        std::fs::write(not_executable.join("codex"), "#!/bin/sh\n").expect("write");
+        std::fs::write(executable.join("codex"), "#!/bin/sh\n").expect("write");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                not_executable.join("codex"),
+                std::fs::Permissions::from_mode(0o644),
+            )
+            .expect("chmod");
+            std::fs::set_permissions(
+                executable.join("codex"),
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .expect("chmod");
+        }
+        let search_path =
+            std::env::join_paths([not_executable.as_path(), executable.as_path()]).expect("join");
+
+        // `CODEX_PATH` wins over the search path.
+        assert_eq!(
+            resolve_codex_path(Some("/custom/codex"), Some(search_path.as_os_str())),
+            "/custom/codex"
+        );
+        // An empty override is ignored; a non-executable candidate is skipped on unix.
+        let resolved = resolve_codex_path(Some(""), Some(search_path.as_os_str()));
+        #[cfg(unix)]
+        assert_eq!(resolved, executable.join("codex").to_string_lossy());
+        #[cfg(not(unix))]
+        assert_eq!(resolved, not_executable.join("codex").to_string_lossy());
+        // No vendored binary to fall back to, so the bare name is returned.
+        assert_eq!(resolve_codex_path(None, None), "codex");
+    }
+
+    #[test]
+    fn resolves_the_subprocess_stream_limit() {
+        assert_eq!(
+            resolve_subprocess_stream_limit_bytes(None, None).unwrap(),
+            DEFAULT_SUBPROCESS_STREAM_LIMIT_BYTES
+        );
+        assert_eq!(
+            resolve_subprocess_stream_limit_bytes(Some(65536), Some("131072")).unwrap(),
+            65536
+        );
+        assert_eq!(
+            resolve_subprocess_stream_limit_bytes(None, Some(" 131072 ")).unwrap(),
+            131072
+        );
+        let not_an_int = resolve_subprocess_stream_limit_bytes(None, Some("many")).unwrap_err();
+        assert_eq!(
+            not_an_int.to_string(),
+            format!("{SUBPROCESS_STREAM_LIMIT_ENV} must be an integer number of bytes.")
+        );
+        for out_of_range in [Some(1024), Some(MAX_SUBPROCESS_STREAM_LIMIT_BYTES + 1)] {
+            let error = resolve_subprocess_stream_limit_bytes(out_of_range, None).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "codex_subprocess_stream_limit_bytes must be between 65536 and 67108864 bytes."
+            );
+        }
+        let negative = resolve_subprocess_stream_limit_bytes(None, Some("-1")).unwrap_err();
+        assert!(error_mentions_range(&negative));
+    }
+
+    fn error_mentions_range(error: &AgentsError) -> bool {
+        error.to_string().contains("must be between")
+    }
+
+    fn line_reader(input: &'static str, limit: usize) -> LineReader<&'static [u8]> {
+        LineReader {
+            reader: BufReader::with_capacity(16, input.as_bytes()),
+            limit,
+        }
+    }
+
+    #[tokio::test]
+    async fn the_line_reader_splits_on_newlines_and_keeps_carriage_returns() {
+        let mut reader = line_reader("first\r\nsecond\nno trailing newline", 1024);
+        assert_eq!(
+            reader.next_line().await.unwrap().as_deref(),
+            Some("first\r")
+        );
+        assert_eq!(reader.next_line().await.unwrap().as_deref(), Some("second"));
+        assert_eq!(
+            reader.next_line().await.unwrap().as_deref(),
+            Some("no trailing newline")
+        );
+        assert_eq!(reader.next_line().await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn the_line_reader_rejects_lines_over_the_limit() {
+        let mut reader = line_reader(
+            "short\nxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n",
+            32,
+        );
+        assert_eq!(reader.next_line().await.unwrap().as_deref(), Some("short"));
+        let error = reader.next_line().await.unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Codex stdout exceeded the 32 byte subprocess stream limit: Separator is not found, \
+             and chunk exceed the limit"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_line_reader_rejects_a_long_line_it_read_whole() {
+        let input = format!("{}\n", "y".repeat(40));
+        let mut reader = LineReader {
+            reader: BufReader::with_capacity(256, input.as_bytes()),
+            limit: 32,
+        };
+        let error = reader.next_line().await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .ends_with("Separator is found, but chunk is longer than limit"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]

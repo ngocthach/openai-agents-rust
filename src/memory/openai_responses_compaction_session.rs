@@ -250,10 +250,32 @@ fn tool_call_id(item: &InputItem) -> Option<&str> {
     item.as_value().get("call_id").and_then(Value::as_str)
 }
 
-/// The `call_id` of a tool or program call output item.
+/// The `call_id` of a tool call output item. Program outputs are checked separately.
 fn tool_output_call_id(item: &InputItem) -> Option<&str> {
     let kind = item.item_type()?;
-    if !kind.ends_with("_output") {
+    if !kind.ends_with("_output") || kind == "program_output" {
+        return None;
+    }
+    item.as_value().get("call_id").and_then(Value::as_str)
+}
+
+/// The `call_id` of the program that owns `item`, for a program-owned item.
+///
+/// Port of `_get_program_caller_id`.
+fn program_caller_id(item: &InputItem) -> Option<&str> {
+    let caller = item.as_value().get("caller")?;
+    if caller.get("type").and_then(Value::as_str) != Some("program") {
+        return None;
+    }
+    caller
+        .get("caller_id")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+}
+
+/// The `call_id` of an item of exactly `kind`.
+fn call_id_of_type<'a>(item: &'a InputItem, kind: &str) -> Option<&'a str> {
+    if item.item_type()? != kind {
         return None;
     }
     item.as_value().get("call_id").and_then(Value::as_str)
@@ -269,6 +291,36 @@ fn has_complete_tool_groups(items: &[InputItem]) -> bool {
     let calls: BTreeSet<&str> = items.iter().filter_map(tool_call_id).collect();
     let outputs: BTreeSet<&str> = items.iter().filter_map(tool_output_call_id).collect();
     if calls != outputs {
+        return false;
+    }
+
+    // Programs are a group of their own: `drop_orphan_function_calls` keeps a program that has
+    // no output while items it owns are retained, and drops it — together with those items and
+    // any reasoning item in front of it — once nothing is left. Either way the suffix would
+    // come back changed, which is what Python refuses to compact.
+    let programs: BTreeSet<&str> = items
+        .iter()
+        .filter_map(|i| call_id_of_type(i, "program"))
+        .collect();
+    let program_outputs: BTreeSet<&str> = items
+        .iter()
+        .filter_map(|i| call_id_of_type(i, "program_output"))
+        .collect();
+    if !program_outputs.is_subset(&programs) {
+        return false;
+    }
+    if programs.iter().any(|call_id| {
+        !program_outputs.contains(call_id)
+            && !items.iter().any(|i| program_caller_id(i) == Some(*call_id))
+    }) {
+        return false;
+    }
+    // A program-owned item whose program is outside the suffix would be dropped with it.
+    if items
+        .iter()
+        .filter_map(program_caller_id)
+        .any(|call_id| !programs.contains(call_id))
+    {
         return false;
     }
     let requests: BTreeSet<&str> = items
@@ -304,15 +356,16 @@ struct CompactionState {
 ///
 /// # Differences from the Python SDK
 ///
-/// The Python implementation can replace a bounded suffix of history atomically when the
-/// wrapped store supports it, and matches stored items against the exact model exchange of the
-/// last turn. This port always replaces the complete stored history (`clear_session` followed
-/// by `add_items`, restoring the previous items when the replacement fails), which is the
-/// behaviour Python uses for stores without atomic suffix replacement and for manual
-/// `run_compaction` calls. Mutations through this session are serialized against compaction by
+/// Python memoizes the candidate list it hands the decision hook and keeps it up to date
+/// through its own mutations (`_ensure_compaction_candidates`, `openai_responses_compaction
+/// _session.py` L814-850, maintained at L765-812). This port re-reads the store instead. The
+/// cache is consulted only for an unlimited read through a non-encrypted store, and every
+/// wrapper mutation either extends it with exactly what was written or clears it, so for
+/// wrapper-only traffic it holds what a fresh read would return. It can only diverge when
+/// another writer changes the wrapped store directly, and then it is stale — so re-reading is
+/// never less accurate. Mutations through this session are serialized against compaction by
 /// an internal lock, and the stored history is re-read after the compaction request so a
 /// concurrent append by another writer makes the replacement be skipped rather than lost.
-/// `max_rollback_items` is not implemented.
 pub struct OpenAIResponsesCompactionSession {
     session_id: String,
     underlying: Arc<dyn Session>,
@@ -320,6 +373,7 @@ pub struct OpenAIResponsesCompactionSession {
     model: String,
     compaction_mode: CompactionMode,
     should_trigger: ShouldTriggerCompaction,
+    max_rollback_items: Option<usize>,
     state: Mutex<CompactionState>,
     mutation_lock: Mutex<()>,
 }
@@ -336,19 +390,6 @@ impl fmt::Debug for OpenAIResponsesCompactionSession {
 }
 
 impl OpenAIResponsesCompactionSession {
-    /// Wrap `underlying`, compacting with `gpt-4.1` and a client built from the environment.
-    ///
-    /// Rejects a session that manages its history on the provider's servers, such as
-    /// [`crate::memory::OpenAIConversationsSession`]: compaction rewrites stored items, which
-    /// such a store does not own. [`OpenAIResponsesCompactionSession::new`] accepts one and
-    /// fails on first use instead.
-    pub fn try_new(session_id: impl Into<String>, underlying: Arc<dyn Session>) -> Result<Self> {
-        if underlying.manages_history_remotely() {
-            return Err(unwrappable_session_error());
-        }
-        Ok(Self::new(session_id, underlying))
-    }
-
     /// Whether item ids must be ignored when matching stored history against the model
     /// exchange, inherited from the wrapped store. Port of `_ignore_ids_for_matching`.
     fn ignore_ids_for_matching(&self) -> bool {
@@ -365,20 +406,64 @@ impl OpenAIResponsesCompactionSession {
 
     /// Wrap `underlying`, compacting with `gpt-4.1` and a client built from the environment.
     ///
-    /// A store that manages its own history on the provider's servers cannot be compacted;
-    /// every session operation on such a wrapper fails. Use
-    /// [`OpenAIResponsesCompactionSession::try_new`] to find that out at construction time.
-    pub fn new(session_id: impl Into<String>, underlying: Arc<dyn Session>) -> Self {
-        OpenAIResponsesCompactionSession {
+    /// Rejects a store that manages its own history on the provider's servers, such as
+    /// [`crate::memory::OpenAIConversationsSession`]: compaction rewrites stored items, which
+    /// such a store does not own. Port of Python's `__init__`, which raises for the same
+    /// reason.
+    pub fn new(session_id: impl Into<String>, underlying: Arc<dyn Session>) -> Result<Self> {
+        if underlying.manages_history_remotely() {
+            return Err(unwrappable_session_error());
+        }
+        Ok(OpenAIResponsesCompactionSession {
             session_id: session_id.into(),
             underlying,
             client: OpenAIClient::from_env(),
             model: "gpt-4.1".to_string(),
             compaction_mode: CompactionMode::Auto,
             should_trigger: Arc::new(default_should_trigger_compaction),
+            max_rollback_items: None,
             state: Mutex::new(CompactionState::default()),
             mutation_lock: Mutex::new(()),
+        })
+    }
+
+    /// Bound the size of the complete-history snapshots manual compaction and whole-history
+    /// replacement take.
+    ///
+    /// A history longer than `max_rollback_items` fails the compaction before the API call and
+    /// before any replacement, so the stored history is retained. This is a count of items, not
+    /// of bytes, and it does not bound stored history, model input or
+    /// [`SessionSettings::limit`]. Native automatic suffix replacement needs no full-history
+    /// snapshot and is unaffected. Port of Python's `max_rollback_items`.
+    pub fn with_max_rollback_items(mut self, max_rollback_items: usize) -> Result<Self> {
+        if max_rollback_items == 0 {
+            return Err(AgentsError::user(
+                "max_rollback_items must be positive or None",
+            ));
         }
+        self.max_rollback_items = Some(max_rollback_items);
+        Ok(self)
+    }
+
+    /// Read the complete stored history, refusing one longer than `max_rollback_items`.
+    ///
+    /// Reads one item beyond the budget so an oversized history is detected rather than
+    /// silently truncated. Port of `_get_all_underlying_session_items`.
+    async fn all_underlying_items(&self) -> Result<Vec<InputItem>> {
+        let limit = match self.max_rollback_items {
+            None => ALL_SESSION_ITEMS_LIMIT,
+            Some(budget) => budget.saturating_add(1),
+        };
+        let items = self.underlying.get_items(Some(limit)).await?;
+        if self
+            .max_rollback_items
+            .is_some_and(|budget| items.len() > budget)
+        {
+            return Err(AgentsError::user(
+                "Compaction history exceeds max_rollback_items; history was retained",
+            ));
+        }
+        Ok(items)
     }
 
     /// Use a specific OpenAI client for the compaction requests.
@@ -499,10 +584,15 @@ impl OpenAIResponsesCompactionSession {
             ));
         }
 
-        let session_items = self
-            .underlying
-            .get_items(Some(ALL_SESSION_ITEMS_LIMIT))
-            .await?;
+        // A manual call always replaces the whole history, so its budget is checked up front,
+        // before the compaction API is asked to do any work.
+        let session_items = if model_exchange.is_none() {
+            self.all_underlying_items().await?
+        } else {
+            self.underlying
+                .get_items(Some(ALL_SESSION_ITEMS_LIMIT))
+                .await?
+        };
         let candidates = select_compaction_candidate_items(&session_items);
         let approved_mode = resolved_mode;
         let approved_items = session_items.clone();
@@ -661,6 +751,12 @@ impl OpenAIResponsesCompactionSession {
         resolved_mode: ResolvedCompactionMode,
         session_items: Vec<InputItem>,
     ) -> Result<Usage> {
+        // Check the rollback budget before the request, so an oversized history costs nothing.
+        // The automatic path reaches here only when the store has no atomic suffix
+        // replacement, which is exactly when Python checks it too.
+        if self.max_rollback_items.is_some() {
+            self.all_underlying_items().await?;
+        }
         let (usage, output_items) = self
             .request_compaction(&response_id, resolved_mode, &session_items)
             .await?;
@@ -669,10 +765,7 @@ impl OpenAIResponsesCompactionSession {
         // the compaction API call was in flight, and replacing the whole history would drop
         // those items. This also refreshes the rollback snapshot, so a failed replacement
         // cannot revive items that expired meanwhile.
-        let current_items = self
-            .underlying
-            .get_items(Some(ALL_SESSION_ITEMS_LIMIT))
-            .await?;
+        let current_items = self.all_underlying_items().await?;
         if current_items != session_items {
             log::warn!(
                 "Skipped compaction replacement because the stored history changed while the \
@@ -1025,6 +1118,35 @@ mod tests {
     }
 
     #[test]
+    fn program_groups_must_survive_orphan_pruning() {
+        let program = InputItem(json!({"type": "program", "call_id": "p1"}));
+        let output = InputItem(json!({"type": "program_output", "call_id": "p1"}));
+        let owned = InputItem(json!({
+            "type": "function_call",
+            "call_id": "c1",
+            "name": "f",
+            "caller": {"type": "program", "caller_id": "p1"},
+        }));
+        let owned_output = InputItem::function_call_output("c1", "done");
+
+        // A program with its output is a complete group.
+        assert!(has_complete_tool_groups(&[program.clone(), output.clone()]));
+        // So is a program still running whose owned items are present: Python keeps it.
+        assert!(has_complete_tool_groups(&[
+            program.clone(),
+            owned.clone(),
+            owned_output.clone()
+        ]));
+        // An orphan program would be pruned along with the reasoning before it, so the suffix
+        // is refused rather than compacted.
+        assert!(!has_complete_tool_groups(std::slice::from_ref(&program)));
+        // A program output without its program, and an owned item without its program, would
+        // both be pruned too.
+        assert!(!has_complete_tool_groups(&[output]));
+        assert!(!has_complete_tool_groups(&[owned, owned_output]));
+    }
+
+    #[test]
     fn tool_groups_must_be_complete() {
         let call = InputItem(json!({"type": "function_call", "call_id": "c1", "name": "f"}));
         let output = InputItem::function_call_output("c1", "done");
@@ -1052,7 +1174,8 @@ mod tests {
         let s = OpenAIResponsesCompactionSession::new(
             "s",
             Arc::new(super::super::InMemorySession::new("s")),
-        );
+        )
+        .unwrap();
         assert_eq!(
             s.resolve_mode(None, Some("resp_1"), None, None),
             ResolvedCompactionMode::PreviousResponseId

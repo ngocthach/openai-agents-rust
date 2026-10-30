@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use futures::StreamExt;
 
-use crate::error::Result;
+use crate::error::{AgentsError, Result};
 use crate::tracing::scope::ScopeSnapshot;
 use crate::tracing::spans::Trace;
 use crate::tracing::trace;
@@ -176,6 +176,9 @@ impl VoicePipeline {
         if let Some(metadata) = &self.config.trace_metadata {
             builder = builder.metadata(metadata.clone());
         }
+        if let Some(key) = &self.config.tracing_api_key {
+            builder = builder.tracing_api_key(key.clone());
+        }
         Some(builder.build())
     }
 }
@@ -185,6 +188,12 @@ struct SessionGuard(Arc<AudioResultWriter>);
 
 impl Drop for SessionGuard {
     fn drop(&mut self) {
+        // A panic in the workflow or a model unwinds the producer task. Report it the way the
+        // error path does, so the consumer sees a failure instead of a clean `session_ended`.
+        if std::thread::panicking() && !self.0.has_failed() {
+            self.0
+                .add_error(AgentsError::other("The voice pipeline panicked"));
+        }
         self.0.close_segments();
     }
 }

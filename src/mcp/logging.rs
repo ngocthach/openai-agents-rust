@@ -5,6 +5,8 @@
 //! userinfo and secrets in its query string. [`get_mcp_server_log_name`] keeps only the parts
 //! that identify the server, so a name can be logged, put in a span or embedded in an error.
 
+use std::collections::BTreeMap;
+
 use serde_json::Value;
 
 use super::MCPTool;
@@ -171,6 +173,94 @@ pub fn get_mcp_server_log_message(message: &str, server_name: &str) -> String {
     }
 }
 
+/// Characters that cannot appear inside a URL and therefore end one inside a sentence.
+fn url_terminator(c: char) -> bool {
+    c.is_whitespace()
+        || matches!(
+            c,
+            '"' | '\'' | '<' | '>' | '`' | '|' | '\\' | '^' | '{' | '}'
+        )
+}
+
+/// Strip userinfo, query and fragment from one URL, whatever its scheme.
+///
+/// Unlike [`get_mcp_server_log_name`] this does not require `http`/`https`, because a transport
+/// error can name a `ws://`, `unix://` or proxy URL that carries the same credentials.
+fn redact_url(url: &str) -> String {
+    let Some((scheme, after)) = url.split_once("://") else {
+        return url.to_string();
+    };
+    let split = after
+        .find(['/', '?', '#'])
+        .map_or((after, ""), |i| (&after[..i], &after[i..]));
+    let (netloc, rest) = split;
+    let netloc = match netloc.rsplit_once('@') {
+        Some((_, host)) => host,
+        None => netloc,
+    };
+    let path = rest.split(['?', '#']).next().unwrap_or("");
+    format!("{scheme}://{netloc}{path}")
+}
+
+/// Remove credentials and query secrets from every URL embedded in a message.
+///
+/// Python cannot rewrite the URLs inside an `httpx` exception, so it discards the whole
+/// exception and substitutes a fixed string (`_credential_safe_exception_group` /
+/// `_credential_safe_exception_leaf`). A Rust transport error is already a string, so the same
+/// invariant — no credential ever reaches a log, a span or an error message — is met by
+/// rewriting each URL in place, which keeps the diagnostic text useful.
+///
+/// ```
+/// # #[cfg(feature = "mcp")] {
+/// use openai_agents_sdk::mcp::redact_credentials;
+///
+/// assert_eq!(
+///     redact_credentials("send failed for https://u:pw@example.com/mcp?token=abc (timeout)"),
+///     "send failed for https://example.com/mcp (timeout)"
+/// );
+/// # }
+/// ```
+pub fn redact_credentials(message: &str) -> String {
+    let mut out = String::with_capacity(message.len());
+    let bytes = message.as_bytes();
+    let mut i = 0usize;
+    while i < message.len() {
+        if !message.is_char_boundary(i) {
+            i += 1;
+            continue;
+        }
+        if bytes[i..].starts_with(b"://") {
+            // Walk back over the scheme, which must be `[A-Za-z][A-Za-z0-9+.-]*`.
+            let mut start = i;
+            while start > 0 {
+                let c = bytes[start - 1] as char;
+                if c.is_ascii_alphanumeric() || c == '+' || c == '-' || c == '.' {
+                    start -= 1;
+                } else {
+                    break;
+                }
+            }
+            while start < i && !(bytes[start] as char).is_ascii_alphabetic() {
+                start += 1;
+            }
+            if start < i {
+                let end = message[i..]
+                    .find(url_terminator)
+                    .map_or(message.len(), |o| i + o);
+                let url = &message[start..end];
+                out.truncate(out.len() - (i - start));
+                out.push_str(&redact_url(url));
+                i = end;
+                continue;
+            }
+        }
+        let ch = message[i..].chars().next().expect("char boundary");
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
 /// Resolved display metadata for an MCP tool. Mirrors `agents._mcp_tool_metadata.MCPToolMetadata`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MCPToolMetadata {
@@ -217,6 +307,56 @@ pub fn extract_mcp_tool_metadata(tool: &MCPTool) -> MCPToolMetadata {
         description: resolve_mcp_tool_description(tool),
         title: resolve_mcp_tool_title(tool),
     }
+}
+
+/// [`extract_mcp_tool_metadata`] for a hosted-MCP tool, which arrives as raw JSON.
+///
+/// Python's resolvers take `Any` and read either a mapping key or an attribute; the Rust
+/// equivalents are this `Value` form for hosted MCP and the [`MCPTool`] form for local MCP.
+pub fn extract_mcp_tool_metadata_value(tool: &Value) -> MCPToolMetadata {
+    let field = |key: &str| non_empty(tool.get(key).and_then(Value::as_str));
+    MCPToolMetadata {
+        description: field("description"),
+        title: field("title").or_else(|| {
+            non_empty(
+                tool.get("annotations")
+                    .and_then(|a| a.get("title"))
+                    .and_then(Value::as_str),
+            )
+        }),
+    }
+}
+
+/// Index the display metadata of every hosted `mcp_list_tools` payload in `items`.
+///
+/// Accepts raw payloads and run items whose `raw_item` holds the payload, as Python's
+/// `collect_mcp_list_tools_metadata` does. The key is `(server_label, tool name)`.
+pub fn collect_mcp_list_tools_metadata(
+    items: &[Value],
+) -> BTreeMap<(String, String), MCPToolMetadata> {
+    let mut out = BTreeMap::new();
+    for item in items {
+        let raw = item.get("raw_item").unwrap_or(item);
+        if raw.get("type").and_then(Value::as_str) != Some("mcp_list_tools") {
+            continue;
+        }
+        let Some(server_label) = non_empty(raw.get("server_label").and_then(Value::as_str)) else {
+            continue;
+        };
+        let Some(tools) = raw.get("tools").and_then(Value::as_array) else {
+            continue;
+        };
+        for tool in tools {
+            let Some(name) = non_empty(tool.get("name").and_then(Value::as_str)) else {
+                continue;
+            };
+            out.insert(
+                (server_label.clone(), name),
+                extract_mcp_tool_metadata_value(tool),
+            );
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -270,6 +410,52 @@ mod tests {
         assert_eq!(
             get_mcp_server_log_name("sse: https://[2001:db8::1/x"),
             "sse: <invalid-url>"
+        );
+    }
+
+    #[test]
+    fn redacts_urls_inside_error_text() {
+        assert_eq!(
+            redact_credentials("POST https://user:pw@example.com/mcp?token=abc failed"),
+            "POST https://example.com/mcp failed"
+        );
+        // Any scheme, not just http(s): a transport error can name a websocket or proxy URL.
+        assert_eq!(redact_credentials("ws://a:b@host:9/x?k=v"), "ws://host:9/x");
+        // A bare fragment or an unterminated URL at the end of the message.
+        assert_eq!(redact_credentials("see http://h/p#frag"), "see http://h/p");
+        // Nothing that looks like a URL is left alone, including a stray `://`.
+        assert_eq!(redact_credentials("no urls here"), "no urls here");
+        assert_eq!(redact_credentials("weird ://x"), "weird ://x");
+        // Several URLs in one message, and non-ASCII text around them.
+        assert_eq!(
+            redact_credentials("é https://u@a/1 and https://v:w@b/2?q=1 é"),
+            "é https://a/1 and https://b/2 é"
+        );
+    }
+
+    #[test]
+    fn indexes_hosted_mcp_list_tools_metadata() {
+        let items = vec![
+            json!({"type": "other"}),
+            json!({"raw_item": {"type": "mcp_list_tools", "server_label": "srv", "tools": [
+                {"name": "a", "description": "Desc A"},
+                {"name": "b", "annotations": {"title": "Title B"}},
+                {"name": ""},
+            ]}}),
+            // No server label: skipped entirely.
+            json!({"type": "mcp_list_tools", "tools": [{"name": "c"}]}),
+        ];
+        let map = collect_mcp_list_tools_metadata(&items);
+        assert_eq!(map.len(), 2);
+        assert_eq!(
+            map[&("srv".to_string(), "a".to_string())]
+                .description
+                .as_deref(),
+            Some("Desc A")
+        );
+        assert_eq!(
+            map[&("srv".to_string(), "b".to_string())].title.as_deref(),
+            Some("Title B")
         );
     }
 

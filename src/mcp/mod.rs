@@ -6,22 +6,28 @@
 //! HTTP+SSE transport ([`MCPServerSse`]). For OpenAI-hosted MCP, use
 //! [`crate::tool::HostedMCPTool`] instead.
 
+mod handler;
+mod http;
 pub mod logging;
 mod sse;
+mod stdio;
 pub mod util;
 
 pub use logging::{
-    MCPToolMetadata, extract_mcp_tool_metadata, get_mcp_server_log_message,
-    get_mcp_server_log_name, resolve_mcp_tool_description, resolve_mcp_tool_description_for_model,
+    MCPToolMetadata, collect_mcp_list_tools_metadata, extract_mcp_tool_metadata,
+    extract_mcp_tool_metadata_value, get_mcp_server_log_message, get_mcp_server_log_name,
+    redact_credentials, resolve_mcp_tool_description, resolve_mcp_tool_description_for_model,
     resolve_mcp_tool_title,
 };
 
+use std::any::Any;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use futures::future::BoxFuture;
 use rmcp::service::RunningService;
 use rmcp::transport::{ConfigureCommandExt, StreamableHttpClientTransport, TokioChildProcess};
 use rmcp::{RoleClient, ServiceExt};
@@ -60,14 +66,63 @@ impl MCPTool {
     }
 }
 
-/// Context passed to a dynamic tool filter.
-#[derive(Debug, Clone)]
+/// Context passed to a dynamic tool filter. Mirrors `agents.mcp.util.ToolFilterContext`.
+///
+/// `run_context` and `agent` are type-erased because [`MCPServer`] is not generic over the run
+/// context type: making it generic would change every `Arc<dyn MCPServer>` in the crate.
+/// Python types both fields `Any` for the same reason, and
+/// [`ToolFilterContext::run_context`] / [`ToolFilterContext::agent`] recover the concrete type.
+#[derive(Clone)]
 pub struct ToolFilterContext {
     pub agent_name: String,
     pub server_name: String,
+    /// The active [`crate::run_context::RunContext<C>`], when the caller supplied one.
+    pub run_context_any: Option<Arc<dyn Any + Send + Sync>>,
+    /// The agent whose tools are being listed, when the caller supplied it.
+    pub agent_any: Option<Arc<dyn Any + Send + Sync>>,
 }
 
-type DynamicFilter = Arc<dyn Fn(&ToolFilterContext, &MCPTool) -> bool + Send + Sync>;
+impl fmt::Debug for ToolFilterContext {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ToolFilterContext")
+            .field("agent_name", &self.agent_name)
+            .field("server_name", &self.server_name)
+            .field("run_context", &self.run_context_any.is_some())
+            .field("agent", &self.agent_any.is_some())
+            .finish()
+    }
+}
+
+impl ToolFilterContext {
+    /// A context with no run context and no agent attached.
+    pub fn new(agent_name: impl Into<String>, server_name: impl Into<String>) -> Self {
+        ToolFilterContext {
+            agent_name: agent_name.into(),
+            server_name: server_name.into(),
+            run_context_any: None,
+            agent_any: None,
+        }
+    }
+
+    /// The run context, when it was supplied and `C` is the run's context type.
+    pub fn run_context<C: Send + Sync + 'static>(
+        &self,
+    ) -> Option<&crate::run_context::RunContext<C>> {
+        self.run_context_any
+            .as_ref()?
+            .downcast_ref::<crate::run_context::RunContext<C>>()
+    }
+
+    /// The agent, when it was supplied and `C` is the run's context type.
+    pub fn agent<C: Send + Sync + 'static>(&self) -> Option<&Arc<crate::agent::Agent<C>>> {
+        self.agent_any
+            .as_ref()?
+            .downcast_ref::<Arc<crate::agent::Agent<C>>>()
+    }
+}
+
+type DynamicFilter =
+    Arc<dyn Fn(&ToolFilterContext, &MCPTool) -> BoxFuture<'static, bool> + Send + Sync>;
 
 /// Which tools of a server are exposed.
 #[derive(Clone, Default)]
@@ -113,7 +168,27 @@ pub fn create_static_tool_filter(
 }
 
 impl ToolFilter {
-    fn allows(&self, ctx: &ToolFilterContext, tool: &MCPTool) -> bool {
+    /// A dynamic filter from a synchronous predicate.
+    pub fn dynamic<F>(f: F) -> Self
+    where
+        F: Fn(&ToolFilterContext, &MCPTool) -> bool + Send + Sync + 'static,
+    {
+        ToolFilter::Dynamic(Arc::new(move |ctx, tool| {
+            let allowed = f(ctx, tool);
+            Box::pin(async move { allowed })
+        }))
+    }
+
+    /// A dynamic filter that may await, as Python's `ToolFilterCallable` may be a coroutine.
+    pub fn dynamic_async<F, Fut>(f: F) -> Self
+    where
+        F: Fn(&ToolFilterContext, &MCPTool) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = bool> + Send + 'static,
+    {
+        ToolFilter::Dynamic(Arc::new(move |ctx, tool| Box::pin(f(ctx, tool))))
+    }
+
+    async fn allows(&self, ctx: &ToolFilterContext, tool: &MCPTool) -> bool {
         match self {
             ToolFilter::All => true,
             ToolFilter::Static {
@@ -132,12 +207,12 @@ impl ToolFilter {
                 }
                 true
             }
-            ToolFilter::Dynamic(f) => f(ctx, tool),
+            ToolFilter::Dynamic(f) => f(ctx, tool).await,
         }
     }
 }
 
-type ApprovalFn = Arc<dyn Fn(&str, &MCPTool) -> bool + Send + Sync>;
+type ApprovalFn = Arc<dyn Fn(&str, &MCPTool) -> BoxFuture<'static, bool> + Send + Sync>;
 
 /// Approval policy for local MCP tools.
 #[derive(Clone, Default)]
@@ -165,13 +240,35 @@ impl fmt::Debug for RequireApproval {
 }
 
 impl RequireApproval {
+    /// A per-call policy from a synchronous predicate.
+    pub fn dynamic<F>(f: F) -> Self
+    where
+        F: Fn(&str, &MCPTool) -> bool + Send + Sync + 'static,
+    {
+        RequireApproval::Dynamic(Arc::new(move |agent_name, tool| {
+            let needed = f(agent_name, tool);
+            Box::pin(async move { needed })
+        }))
+    }
+
+    /// A per-call policy that may await, as Python's approval callable may be a coroutine.
+    pub fn dynamic_async<F, Fut>(f: F) -> Self
+    where
+        F: Fn(&str, &MCPTool) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = bool> + Send + 'static,
+    {
+        RequireApproval::Dynamic(Arc::new(move |agent_name, tool| {
+            Box::pin(f(agent_name, tool))
+        }))
+    }
+
     /// Whether `tool` requires approval for `agent_name`.
-    pub fn requires(&self, agent_name: &str, tool: &MCPTool) -> bool {
+    pub async fn requires(&self, agent_name: &str, tool: &MCPTool) -> bool {
         match self {
             RequireApproval::Never => false,
             RequireApproval::Always => true,
             RequireApproval::PerTool(m) => m.get(&tool.name).copied().unwrap_or(false),
-            RequireApproval::Dynamic(f) => f(agent_name, tool),
+            RequireApproval::Dynamic(f) => f(agent_name, tool).await,
         }
     }
 }
@@ -193,6 +290,120 @@ pub struct MCPToolMetaContext {
 pub type MCPToolMetaResolver =
     Arc<dyn Fn(&MCPToolMetaContext) -> Option<Map<String, Value>> + Send + Sync>;
 
+/// A notification delivered by an MCP server, as raw JSON.
+///
+/// Mirrors Python's `message_handler`, which receives whatever the session delivers.
+pub type MCPMessageHandler = Arc<dyn Fn(&Value) + Send + Sync>;
+
+/// Per-server tool policy: the settings that depend on the run context type.
+///
+/// Python keeps `failure_error_function`, `tool_input_guardrails`, `tool_output_guardrails` and
+/// `custom_data_extractor` directly on the server, typed `Any`. [`MCPServer`] is not generic
+/// over `C`, so this port keeps them in one typed struct that
+/// [`MCPServerConfig::tool_policy`] stores type-erased; the tool builder recovers it with a
+/// downcast for the concrete `C` of the run.
+pub struct MCPToolPolicy<C> {
+    /// Turns a failure of any tool on this server into a model-visible message.
+    ///
+    /// `None` re-raises. Leave [`MCPToolPolicy::failure_error_function_set`] `false` to inherit
+    /// the agent's `MCPConfig::failure_error_function`, which is Python's `_UNSET` default.
+    pub failure_error_function: Option<crate::tool::ToolErrorFn<C>>,
+    /// Whether `failure_error_function` was set explicitly (Python's `_UNSET` sentinel).
+    pub failure_error_function_set: bool,
+    /// Guardrails applied to every tool on this server.
+    pub tool_input_guardrails: Vec<crate::tool_guardrails::ToolInputGuardrail<C>>,
+    /// Guardrails applied to every tool result from this server.
+    pub tool_output_guardrails: Vec<crate::tool_guardrails::ToolOutputGuardrail<C>>,
+    /// Produces SDK-only custom data for every tool on this server.
+    pub custom_data_extractor: Option<crate::tool::CustomDataExtractor<C>>,
+}
+
+impl<C> Default for MCPToolPolicy<C> {
+    fn default() -> Self {
+        MCPToolPolicy {
+            failure_error_function: None,
+            failure_error_function_set: false,
+            tool_input_guardrails: Vec::new(),
+            tool_output_guardrails: Vec::new(),
+            custom_data_extractor: None,
+        }
+    }
+}
+
+impl<C> Clone for MCPToolPolicy<C> {
+    fn clone(&self) -> Self {
+        MCPToolPolicy {
+            failure_error_function: self.failure_error_function.clone(),
+            failure_error_function_set: self.failure_error_function_set,
+            tool_input_guardrails: self.tool_input_guardrails.clone(),
+            tool_output_guardrails: self.tool_output_guardrails.clone(),
+            custom_data_extractor: self.custom_data_extractor.clone(),
+        }
+    }
+}
+
+impl<C> fmt::Debug for MCPToolPolicy<C> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MCPToolPolicy")
+            .field(
+                "failure_error_function",
+                &self.failure_error_function.is_some(),
+            )
+            .field(
+                "failure_error_function_set",
+                &self.failure_error_function_set,
+            )
+            .field("tool_input_guardrails", &self.tool_input_guardrails.len())
+            .field("tool_output_guardrails", &self.tool_output_guardrails.len())
+            .field(
+                "custom_data_extractor",
+                &self.custom_data_extractor.is_some(),
+            )
+            .finish()
+    }
+}
+
+impl<C: Send + Sync + 'static> MCPToolPolicy<C> {
+    /// An empty policy.
+    pub fn new() -> Self {
+        MCPToolPolicy::default()
+    }
+
+    /// Set the failure formatter (Python's explicit `failure_error_function=`).
+    pub fn with_failure_error_function(mut self, f: Option<crate::tool::ToolErrorFn<C>>) -> Self {
+        self.failure_error_function = f;
+        self.failure_error_function_set = true;
+        self
+    }
+
+    /// Apply `guardrails` to every tool on the server.
+    pub fn with_tool_input_guardrails(
+        mut self,
+        guardrails: Vec<crate::tool_guardrails::ToolInputGuardrail<C>>,
+    ) -> Self {
+        self.tool_input_guardrails = guardrails;
+        self
+    }
+
+    /// Apply `guardrails` to every tool result from the server.
+    pub fn with_tool_output_guardrails(
+        mut self,
+        guardrails: Vec<crate::tool_guardrails::ToolOutputGuardrail<C>>,
+    ) -> Self {
+        self.tool_output_guardrails = guardrails;
+        self
+    }
+
+    /// Attach SDK-only custom data to every tool result from the server.
+    pub fn with_custom_data_extractor(
+        mut self,
+        extractor: Option<crate::tool::CustomDataExtractor<C>>,
+    ) -> Self {
+        self.custom_data_extractor = extractor;
+        self
+    }
+}
+
 /// Settings shared by local MCP servers.
 #[derive(Clone)]
 pub struct MCPServerConfig {
@@ -204,8 +415,9 @@ pub struct MCPServerConfig {
     pub require_approval: RequireApproval,
     /// Timeout of each MCP request.
     pub client_session_timeout: Option<Duration>,
-    /// Retries for `list_tools` and `call_tool`.
-    pub max_retry_attempts: u32,
+    /// Retries for `list_tools` and `call_tool`. A negative value retries forever, as Python's
+    /// `max_retry_attempts = -1` does.
+    pub max_retry_attempts: i32,
     /// Base backoff between retries.
     pub retry_backoff_seconds_base: f64,
     /// Upper bound on the backoff between retries (`None` leaves it uncapped).
@@ -219,6 +431,11 @@ pub struct MCPServerConfig {
     pub use_structured_content: bool,
     /// Optional source of protocol-level request metadata (`_meta`) for tool calls.
     pub tool_meta_resolver: Option<MCPToolMetaResolver>,
+    /// Called for every notification the server sends. Mirrors `message_handler`.
+    pub message_handler: Option<MCPMessageHandler>,
+    /// A type-erased [`MCPToolPolicy<C>`]; set it with
+    /// [`MCPServerConfig::with_tool_policy`].
+    pub tool_policy: Option<Arc<dyn Any + Send + Sync>>,
 }
 
 impl fmt::Debug for MCPServerConfig {
@@ -240,7 +457,24 @@ impl fmt::Debug for MCPServerConfig {
                 "tool_meta_resolver",
                 &self.tool_meta_resolver.as_ref().map(|_| "Fn(..)"),
             )
+            .field("message_handler", &self.message_handler.is_some())
+            .field("tool_policy", &self.tool_policy.is_some())
             .finish()
+    }
+}
+
+impl MCPServerConfig {
+    /// Store the per-server tool policy for runs whose context type is `C`.
+    pub fn with_tool_policy<C: Send + Sync + 'static>(mut self, policy: MCPToolPolicy<C>) -> Self {
+        self.tool_policy = Some(Arc::new(policy));
+        self
+    }
+
+    /// The per-server tool policy, when one was set for context type `C`.
+    pub fn tool_policy<C: Send + Sync + 'static>(&self) -> Option<&MCPToolPolicy<C>> {
+        self.tool_policy
+            .as_ref()?
+            .downcast_ref::<MCPToolPolicy<C>>()
     }
 }
 
@@ -257,6 +491,8 @@ impl Default for MCPServerConfig {
             max_list_pages: None,
             use_structured_content: false,
             tool_meta_resolver: None,
+            message_handler: None,
+            tool_policy: None,
         }
     }
 }
@@ -355,8 +591,20 @@ enum TransportSpec {
     Sse(MCPServerSseParams),
 }
 
+/// Produces the bearer token sent as `Authorization: Bearer <token>` on every HTTP MCP request.
+///
+/// Python passes an `httpx.Auth` object; the Rust equivalent is a callback consulted when the
+/// transport is built, so a short-lived credential can be refreshed by reconnecting. A value
+/// that already starts with `Bearer ` is accepted and not doubled up.
+pub type MCPAuthProvider = Arc<dyn Fn() -> Option<String> + Send + Sync>;
+
+/// The bare token of a credential that may or may not already carry the `Bearer ` prefix.
+pub(crate) fn bearer_token(value: &str) -> &str {
+    value.strip_prefix("Bearer ").unwrap_or(value)
+}
+
 /// Parameters for an HTTP+SSE MCP server.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct MCPServerSseParams {
     /// The SSE endpoint URL.
     pub url: String,
@@ -366,6 +614,24 @@ pub struct MCPServerSseParams {
     pub timeout: Duration,
     /// How long to wait for a new SSE event (default 5 minutes).
     pub sse_read_timeout: Duration,
+    /// Supplies the `Authorization` header. Mirrors the `auth` parameter.
+    pub auth: Option<MCPAuthProvider>,
+    /// A caller-built HTTP client, in place of the one the transport would build.
+    /// Mirrors `httpx_client_factory`.
+    pub http_client: Option<reqwest::Client>,
+}
+
+impl fmt::Debug for MCPServerSseParams {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MCPServerSseParams")
+            .field("url", &get_mcp_server_log_name(&self.url))
+            .field("headers", &self.headers.keys().collect::<Vec<_>>())
+            .field("timeout", &self.timeout)
+            .field("sse_read_timeout", &self.sse_read_timeout)
+            .field("auth", &self.auth.is_some())
+            .field("http_client", &self.http_client.is_some())
+            .finish()
+    }
 }
 
 impl Default for MCPServerSseParams {
@@ -375,57 +641,229 @@ impl Default for MCPServerSseParams {
             headers: HashMap::new(),
             timeout: Duration::from_secs(5),
             sse_read_timeout: Duration::from_secs(300),
+            auth: None,
+            http_client: None,
         }
     }
 }
 
+/// What to do with bytes a stdio server writes that are not valid UTF-8.
+///
+/// Mirrors Python's `encoding_error_handler`. The MCP spec requires UTF-8 on stdio, so the
+/// `encoding` parameter itself has no Rust counterpart (see [`MCPServerStdioParams::encoding`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum EncodingErrorHandler {
+    /// Fail the connection when the server writes invalid UTF-8 (Python's default).
+    #[default]
+    Strict,
+    /// Drop the invalid bytes.
+    Ignore,
+    /// Replace each invalid sequence with U+FFFD.
+    Replace,
+}
+
 /// Parameters for a stdio MCP server.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct MCPServerStdioParams {
     pub command: String,
     pub args: Vec<String>,
     pub env: HashMap<String, String>,
     pub cwd: Option<String>,
+    /// The text encoding of the server's stream. Only `utf-8` is accepted: the MCP stdio
+    /// transport mandates UTF-8 and Rust strings are UTF-8, so any other value is a
+    /// configuration error rather than a silent transcoding. Mirrors Python's `encoding`,
+    /// which also defaults to `utf-8`.
+    pub encoding: String,
+    /// How invalid UTF-8 from the server is handled.
+    pub encoding_error_handler: EncodingErrorHandler,
+}
+
+impl Default for MCPServerStdioParams {
+    fn default() -> Self {
+        MCPServerStdioParams {
+            command: String::new(),
+            args: Vec::new(),
+            env: HashMap::new(),
+            cwd: None,
+            encoding: "utf-8".to_string(),
+            encoding_error_handler: EncodingErrorHandler::Strict,
+        }
+    }
 }
 
 /// Parameters for a Streamable HTTP MCP server.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone)]
 pub struct MCPServerStreamableHttpParams {
     pub url: String,
     /// Extra headers. An `Authorization: Bearer <token>` header is used as the bearer token.
     pub headers: HashMap<String, String>,
+    /// Timeout of one HTTP request (default 5 seconds).
+    pub timeout: Duration,
+    /// How long to wait for a new SSE event on a response stream (default 5 minutes).
+    pub sse_read_timeout: Duration,
+    /// Send `DELETE <url>` to end the server-side session on close (default `true`).
+    pub terminate_on_close: bool,
+    /// Treat a failed `notifications/initialized` POST as success, for servers that reject it.
+    pub ignore_initialized_notification_failure: bool,
+    /// Supplies the `Authorization` header. Mirrors the `auth` parameter.
+    pub auth: Option<MCPAuthProvider>,
+    /// A caller-built HTTP client. Mirrors `httpx_client_factory`.
+    pub http_client: Option<reqwest::Client>,
+}
+
+impl fmt::Debug for MCPServerStreamableHttpParams {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MCPServerStreamableHttpParams")
+            .field("url", &get_mcp_server_log_name(&self.url))
+            .field("headers", &self.headers.keys().collect::<Vec<_>>())
+            .field("timeout", &self.timeout)
+            .field("sse_read_timeout", &self.sse_read_timeout)
+            .field("terminate_on_close", &self.terminate_on_close)
+            .field(
+                "ignore_initialized_notification_failure",
+                &self.ignore_initialized_notification_failure,
+            )
+            .field("auth", &self.auth.is_some())
+            .field("http_client", &self.http_client.is_some())
+            .finish()
+    }
+}
+
+impl Default for MCPServerStreamableHttpParams {
+    fn default() -> Self {
+        MCPServerStreamableHttpParams {
+            url: String::new(),
+            headers: HashMap::new(),
+            timeout: Duration::from_secs(5),
+            sse_read_timeout: Duration::from_secs(300),
+            terminate_on_close: true,
+            ignore_initialized_notification_failure: false,
+            auth: None,
+            http_client: None,
+        }
+    }
+}
+
+/// One live connection to a server.
+///
+/// `child` is only set for a stdio server whose decoder is not
+/// [`EncodingErrorHandler::Strict`]: that path spawns the process here so the output can be
+/// sanitized before the JSON-RPC codec sees it, which also means this port owns the child's
+/// lifetime instead of `rmcp`.
+struct Connection {
+    service: RunningService<RoleClient, handler::MCPClientHandler>,
+    child: Option<tokio::process::Child>,
+}
+
+impl Connection {
+    async fn close(self) {
+        let _ = self.service.cancel().await;
+        if let Some(mut child) = self.child {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+        }
+    }
 }
 
 struct Core {
     name: String,
     transport: TransportSpec,
     config: MCPServerConfig,
-    service: Mutex<Option<RunningService<RoleClient, ()>>>,
+    connection: Mutex<Option<Connection>>,
     tools_cache: Mutex<Option<Vec<MCPTool>>>,
+    session_id: Arc<std::sync::Mutex<Option<String>>>,
 }
 
+/// Turn an `rmcp` failure into an `AgentsError`, removing any credential it embeds.
+///
+/// A transport error carries the request URL, which is exactly where an MCP credential lives.
+/// This is the Rust counterpart of Python's `_credential_safe_exception_group`.
 fn svc_err(e: impl fmt::Display) -> AgentsError {
-    AgentsError::other(format!("MCP error: {e}"))
+    AgentsError::other(redact_credentials(&format!("MCP error: {e}")))
+}
+
+/// Whether a failed request should be retried on a freshly opened session.
+///
+/// Port of `_should_retry_in_isolated_session`: a transport that was cancelled, closed, timed
+/// out or failed to send is worth a second session; a server-side JSON-RPC error is not.
+fn should_retry_in_isolated_session(e: &rmcp::ServiceError) -> bool {
+    matches!(
+        e,
+        rmcp::ServiceError::TransportSend(_)
+            | rmcp::ServiceError::TransportClosed
+            | rmcp::ServiceError::Cancelled { .. }
+            | rmcp::ServiceError::Timeout { .. }
+    )
+}
+
+/// A failed `call_tool` attempt, and whether the failure came from the isolated retry.
+enum CallFailure {
+    /// The shared session failed and no isolated retry was attempted.
+    Shared(AgentsError),
+    /// The isolated retry was attempted and also failed.
+    Isolated(AgentsError),
+}
+
+impl CallFailure {
+    fn into_error(self) -> AgentsError {
+        match self {
+            CallFailure::Shared(e) | CallFailure::Isolated(e) => e,
+        }
+    }
 }
 
 impl Core {
-    async fn connect(&self) -> Result<()> {
-        let mut guard = self.service.lock().await;
-        if guard.is_some() {
-            return Ok(());
-        }
-        let service = match &self.transport {
+    /// Open a new connection to the server, without touching the shared one.
+    async fn build_connection(&self) -> Result<Connection> {
+        let client = handler::MCPClientHandler::new(self.config.message_handler.clone());
+        let connection = match &self.transport {
             TransportSpec::Stdio(p) => {
-                let p = p.clone();
-                let cmd = tokio::process::Command::new(&p.command).configure(move |c| {
-                    c.args(&p.args);
-                    c.envs(&p.env);
-                    if let Some(cwd) = &p.cwd {
-                        c.current_dir(cwd);
+                if !stdio::is_utf8_encoding(&p.encoding) {
+                    return Err(AgentsError::user(format!(
+                        "MCP stdio server '{}' requested encoding '{}'. The MCP stdio transport \
+                         is UTF-8 only.",
+                        self.log_name(),
+                        p.encoding
+                    )));
+                }
+                if p.encoding_error_handler == EncodingErrorHandler::Strict {
+                    let p = p.clone();
+                    let cmd = tokio::process::Command::new(&p.command).configure(move |c| {
+                        c.args(&p.args);
+                        c.envs(&p.env);
+                        if let Some(cwd) = &p.cwd {
+                            c.current_dir(cwd);
+                        }
+                    });
+                    let transport = TokioChildProcess::new(cmd)?;
+                    Connection {
+                        service: client.serve(transport).await.map_err(svc_err)?,
+                        child: None,
                     }
-                });
-                let transport = TokioChildProcess::new(cmd)?;
-                ().serve(transport).await.map_err(svc_err)?
+                } else {
+                    let mut command = tokio::process::Command::new(&p.command);
+                    command
+                        .args(&p.args)
+                        .envs(&p.env)
+                        .stdin(std::process::Stdio::piped())
+                        .stdout(std::process::Stdio::piped())
+                        .kill_on_drop(true);
+                    if let Some(cwd) = &p.cwd {
+                        command.current_dir(cwd);
+                    }
+                    let mut child = command.spawn()?;
+                    let stdin = child.stdin.take().ok_or_else(|| {
+                        AgentsError::other("MCP stdio server has no stdin pipe".to_string())
+                    })?;
+                    let stdout = child.stdout.take().ok_or_else(|| {
+                        AgentsError::other("MCP stdio server has no stdout pipe".to_string())
+                    })?;
+                    let reader = stdio::Utf8Sanitizer::new(stdout, p.encoding_error_handler);
+                    Connection {
+                        service: client.serve((reader, stdin)).await.map_err(svc_err)?,
+                        child: Some(child),
+                    }
+                }
             }
             TransportSpec::StreamableHttp(p) => {
                 let mut config =
@@ -448,22 +886,59 @@ impl Core {
                     custom.insert(name, value);
                 }
                 config = config.custom_headers(custom);
-                let transport = StreamableHttpClientTransport::from_config(config);
-                ().serve(transport).await.map_err(svc_err)?
+                if let Some(auth) = &p.auth
+                    && let Some(value) = auth()
+                {
+                    config = config.auth_header(bearer_token(&value).to_string());
+                }
+                let http = match &p.http_client {
+                    Some(c) => c.clone(),
+                    None => {
+                        crate::util::ensure_crypto_provider();
+                        reqwest::Client::builder()
+                            .connect_timeout(p.timeout)
+                            .read_timeout(p.sse_read_timeout)
+                            .build()?
+                    }
+                };
+                let client_wrapper = http::ObservedHttpClient::new(
+                    http,
+                    self.session_id.clone(),
+                    p.terminate_on_close,
+                    p.ignore_initialized_notification_failure,
+                );
+                let transport = StreamableHttpClientTransport::with_client(client_wrapper, config);
+                Connection {
+                    service: client.serve(transport).await.map_err(svc_err)?,
+                    child: None,
+                }
             }
             TransportSpec::Sse(p) => {
-                let transport =
-                    sse::connect(&p.url, &p.headers, p.timeout, p.sse_read_timeout).await?;
-                ().serve(transport).await.map_err(svc_err)?
+                let transport = sse::connect(p).await?;
+                Connection {
+                    service: client.serve(transport).await.map_err(svc_err)?,
+                    child: None,
+                }
             }
         };
-        *guard = Some(service);
+        Ok(connection)
+    }
+
+    async fn connect(&self) -> Result<()> {
+        let mut guard = self.connection.lock().await;
+        if guard.is_some() {
+            return Ok(());
+        }
+        *guard = Some(self.build_connection().await?);
         Ok(())
     }
 
     async fn cleanup(&self) -> Result<()> {
-        if let Some(s) = self.service.lock().await.take() {
-            let _ = s.cancel().await;
+        if let Some(c) = self.connection.lock().await.take() {
+            c.close().await;
+        }
+        if let Ok(mut slot) = self.session_id.lock() {
+            *slot = None;
         }
         Ok(())
     }
@@ -473,22 +948,24 @@ impl Core {
         get_mcp_server_log_name(&self.name)
     }
 
+    fn timeout_error(&self) -> AgentsError {
+        AgentsError::other(format!("MCP request to '{}' timed out", self.log_name()))
+    }
+
     async fn with_timeout<T>(
         &self,
         fut: impl std::future::Future<Output = Result<T>>,
     ) -> Result<T> {
         match self.config.client_session_timeout {
-            Some(d) if !d.is_zero() => tokio::time::timeout(d, fut).await.map_err(|_| {
-                AgentsError::other(format!("MCP request to '{}' timed out", self.log_name()))
-            })?,
+            Some(d) if !d.is_zero() => tokio::time::timeout(d, fut)
+                .await
+                .unwrap_or_else(|_| Err(self.timeout_error())),
             _ => fut.await,
         }
     }
 
-    async fn session(
-        &self,
-    ) -> Result<tokio::sync::MutexGuard<'_, Option<RunningService<RoleClient, ()>>>> {
-        let guard = self.service.lock().await;
+    async fn session(&self) -> Result<tokio::sync::MutexGuard<'_, Option<Connection>>> {
+        let guard = self.connection.lock().await;
         if guard.is_none() {
             return Err(AgentsError::user(format!(
                 "Server '{}' not initialized. Call connect() first.",
@@ -498,30 +975,40 @@ impl Core {
         Ok(guard)
     }
 
+    /// Whether the retry budget is unlimited (Python's `max_retry_attempts == -1`).
+    fn unlimited_retries(&self) -> bool {
+        self.config.max_retry_attempts < 0
+    }
+
+    /// Wait out the backoff for the `n`-th retry already taken.
+    async fn backoff(&self, taken: u32) {
+        let mut delay = self.config.retry_backoff_seconds_base * 2f64.powi(taken as i32);
+        if let Some(max) = self.config.retry_backoff_seconds_max {
+            delay = delay.min(max);
+        }
+        tokio::time::sleep(Duration::from_secs_f64(delay.max(0.0))).await;
+    }
+
+    fn log_retry(&self, e: &AgentsError) {
+        crate::logger::log_tool_action_warning(
+            &get_mcp_server_log_message("Retrying failed request to MCP server", &self.name),
+            e,
+        );
+    }
+
     async fn retry<T, F, Fut>(&self, mut f: F) -> Result<T>
     where
         F: FnMut() -> Fut,
         Fut: std::future::Future<Output = Result<T>>,
     {
-        let mut attempt = 0;
+        let mut attempt: i32 = 0;
         loop {
             match self.with_timeout(f()).await {
                 Ok(v) => return Ok(v),
-                Err(e) if attempt < self.config.max_retry_attempts => {
-                    attempt += 1;
-                    let mut delay =
-                        self.config.retry_backoff_seconds_base * 2f64.powi(attempt as i32 - 1);
-                    if let Some(max) = self.config.retry_backoff_seconds_max {
-                        delay = delay.min(max);
-                    }
-                    crate::logger::log_tool_action_warning(
-                        &get_mcp_server_log_message(
-                            "Retrying failed request to MCP server",
-                            &self.name,
-                        ),
-                        &e,
-                    );
-                    tokio::time::sleep(Duration::from_secs_f64(delay.max(0.0))).await;
+                Err(e) if self.unlimited_retries() || attempt < self.config.max_retry_attempts => {
+                    self.log_retry(&e);
+                    self.backoff(attempt.max(0) as u32).await;
+                    attempt = attempt.saturating_add(1);
                 }
                 Err(e) => return Err(e),
             }
@@ -574,7 +1061,7 @@ impl Core {
                 loop {
                     let page = {
                         let guard = self.session().await?;
-                        let s = guard.as_ref().expect("session checked");
+                        let s = &guard.as_ref().expect("session checked").service;
                         s.list_tools(cursor.clone().map(|c| {
                             rmcp::model::PaginatedRequestParams::default().with_cursor(Some(c))
                         }))
@@ -609,25 +1096,112 @@ impl Core {
         arguments: Option<Map<String, Value>>,
         meta: Option<Map<String, Value>>,
     ) -> Result<Value> {
-        self.retry(|| {
-            let arguments = arguments.clone();
-            let meta = meta.clone();
-            async move {
-                let mut req = json!({"name": tool_name});
-                if let Some(a) = arguments {
-                    req["arguments"] = Value::Object(a);
-                }
-                if let Some(m) = meta {
-                    req["_meta"] = Value::Object(m);
-                }
-                let params: rmcp::model::CallToolRequestParams = serde_json::from_value(req)?;
-                let guard = self.session().await?;
-                let s = guard.as_ref().expect("session checked");
-                let result = s.call_tool(params).await.map_err(svc_err)?;
-                Ok(serde_json::to_value(result)?)
+        let mut req = json!({"name": tool_name});
+        if let Some(a) = arguments {
+            req["arguments"] = Value::Object(a);
+        }
+        if let Some(m) = meta {
+            req["_meta"] = Value::Object(m);
+        }
+        let params: rmcp::model::CallToolRequestParams = serde_json::from_value(req)?;
+
+        // Port of `call_tool`'s retry loop: the budget counts retries, not backoffs, and a
+        // failed isolated retry charges the budget on its own.
+        let unlimited = self.unlimited_retries();
+        let mut retries_used: i32 = 0;
+        let mut backoffs_taken: u32 = 0;
+        let mut first_attempt = true;
+        loop {
+            if !first_attempt && !unlimited {
+                retries_used += 1;
             }
-        })
-        .await
+            let allow_isolated_retry = unlimited || retries_used < self.config.max_retry_attempts;
+            match self.call_tool_once(&params, allow_isolated_retry).await {
+                Ok(value) => return Ok(value),
+                Err(failure) => {
+                    if matches!(failure, CallFailure::Isolated(_)) {
+                        retries_used += 1;
+                    }
+                    if !unlimited && retries_used >= self.config.max_retry_attempts {
+                        return Err(failure.into_error());
+                    }
+                    let error = failure.into_error();
+                    self.log_retry(&error);
+                    self.backoff(backoffs_taken).await;
+                    backoffs_taken = backoffs_taken.saturating_add(1);
+                }
+            }
+            first_attempt = false;
+        }
+    }
+
+    /// One `call_tool` attempt on the shared session, with an optional retry on a fresh one.
+    ///
+    /// Port of `_call_tool_with_isolated_retry`: a transport failure can mean the shared
+    /// session itself is unusable, so the call is replayed once against a connection opened
+    /// only for it, which is then closed. The shared session is left untouched either way.
+    async fn call_tool_once(
+        &self,
+        params: &rmcp::model::CallToolRequestParams,
+        allow_isolated_retry: bool,
+    ) -> std::result::Result<Value, CallFailure> {
+        /// What the shared session produced, before the isolated retry is decided.
+        enum SharedOutcome {
+            Done(rmcp::model::CallToolResult),
+            NeedsIsolation,
+            Failed(AgentsError),
+        }
+
+        let attempt = async {
+            let guard = match self.session().await {
+                Ok(guard) => guard,
+                Err(e) => return SharedOutcome::Failed(e),
+            };
+            let s = &guard.as_ref().expect("session checked").service;
+            match s.call_tool(params.clone()).await {
+                Ok(result) => SharedOutcome::Done(result),
+                Err(e) if allow_isolated_retry && should_retry_in_isolated_session(&e) => {
+                    SharedOutcome::NeedsIsolation
+                }
+                Err(e) => SharedOutcome::Failed(svc_err(e)),
+            }
+        };
+        let outcome = match self.config.client_session_timeout {
+            Some(d) if !d.is_zero() => match tokio::time::timeout(d, attempt).await {
+                Ok(outcome) => outcome,
+                // A client-side timeout is one of Python's isolation triggers too.
+                Err(_) if allow_isolated_retry => SharedOutcome::NeedsIsolation,
+                Err(_) => SharedOutcome::Failed(self.timeout_error()),
+            },
+            _ => attempt.await,
+        };
+        match outcome {
+            SharedOutcome::Done(result) => {
+                return serde_json::to_value(result)
+                    .map_err(|e| CallFailure::Shared(AgentsError::from(e)));
+            }
+            SharedOutcome::Failed(e) => return Err(CallFailure::Shared(e)),
+            SharedOutcome::NeedsIsolation => {}
+        }
+        let connection = self
+            .build_connection()
+            .await
+            .map_err(CallFailure::Isolated)?;
+        let outcome = self
+            .with_timeout(async {
+                connection
+                    .service
+                    .call_tool(params.clone())
+                    .await
+                    .map_err(svc_err)
+            })
+            .await;
+        connection.close().await;
+        match outcome {
+            Ok(result) => serde_json::to_value(result)
+                .map_err(|e| CallFailure::Isolated(AgentsError::from(e))),
+            Err(e) => Err(CallFailure::Isolated(e)),
+        }
     }
 
     async fn list_prompts(&self) -> Result<Vec<Value>> {
@@ -636,7 +1210,7 @@ impl Core {
         let mut pages = 0usize;
         loop {
             let guard = self.session().await?;
-            let s = guard.as_ref().expect("session checked");
+            let s = &guard.as_ref().expect("session checked").service;
             let params = cursor
                 .clone()
                 .map(|c| rmcp::model::PaginatedRequestParams::default().with_cursor(Some(c)));
@@ -661,7 +1235,7 @@ impl Core {
 
     async fn list_resources(&self, cursor: Option<&str>) -> Result<Value> {
         let guard = self.session().await?;
-        let s = guard.as_ref().expect("session checked");
+        let s = &guard.as_ref().expect("session checked").service;
         let params = cursor.map(|c| {
             rmcp::model::PaginatedRequestParams::default().with_cursor(Some(c.to_string()))
         });
@@ -673,7 +1247,7 @@ impl Core {
 
     async fn list_resource_templates(&self, cursor: Option<&str>) -> Result<Value> {
         let guard = self.session().await?;
-        let s = guard.as_ref().expect("session checked");
+        let s = &guard.as_ref().expect("session checked").service;
         let params = cursor.map(|c| {
             rmcp::model::PaginatedRequestParams::default().with_cursor(Some(c.to_string()))
         });
@@ -687,7 +1261,7 @@ impl Core {
         let params: rmcp::model::ReadResourceRequestParams =
             serde_json::from_value(json!({"uri": uri}))?;
         let guard = self.session().await?;
-        let s = guard.as_ref().expect("session checked");
+        let s = &guard.as_ref().expect("session checked").service;
         let result = self
             .with_timeout(async { s.read_resource(params).await.map_err(svc_err) })
             .await?;
@@ -695,8 +1269,8 @@ impl Core {
     }
 
     async fn server_initialize_result(&self) -> Option<Value> {
-        let guard = self.service.lock().await;
-        let info = guard.as_ref()?.peer_info()?;
+        let guard = self.connection.lock().await;
+        let info = guard.as_ref()?.service.peer_info()?;
         serde_json::to_value(&*info).ok()
     }
 
@@ -711,7 +1285,7 @@ impl Core {
         }
         let params: rmcp::model::GetPromptRequestParams = serde_json::from_value(req)?;
         let guard = self.session().await?;
-        let s = guard.as_ref().expect("session checked");
+        let s = &guard.as_ref().expect("session checked").service;
         let r = self
             .with_timeout(async { s.get_prompt(params).await.map_err(svc_err) })
             .await?;
@@ -743,8 +1317,9 @@ macro_rules! mcp_server_type {
                         name: name.into(),
                         transport: TransportSpec::$variant(params),
                         config: MCPServerConfig::default(),
-                        service: Mutex::new(None),
+                        connection: Mutex::new(None),
                         tools_cache: Mutex::new(None),
+                        session_id: Arc::new(std::sync::Mutex::new(None)),
                     },
                 }
             }
@@ -779,9 +1354,27 @@ macro_rules! mcp_server_type {
                 self
             }
 
-            /// Retry `list_tools` and `call_tool`.
-            pub fn with_max_retry_attempts(mut self, attempts: u32) -> Self {
+            /// Retry `list_tools` and `call_tool`. A negative value retries forever.
+            pub fn with_max_retry_attempts(mut self, attempts: i32) -> Self {
                 self.core.config.max_retry_attempts = attempts;
+                self
+            }
+
+            /// Receive every notification the server sends. Mirrors `message_handler`.
+            pub fn with_message_handler<F>(mut self, handler: F) -> Self
+            where
+                F: Fn(&Value) + Send + Sync + 'static,
+            {
+                self.core.config.message_handler = Some(Arc::new(handler));
+                self
+            }
+
+            /// Apply the per-server tool policy for runs whose context type is `C`.
+            pub fn with_tool_policy<C: Send + Sync + 'static>(
+                mut self,
+                policy: MCPToolPolicy<C>,
+            ) -> Self {
+                self.core.config.tool_policy = Some(Arc::new(policy));
                 self
             }
 
@@ -850,6 +1443,9 @@ macro_rules! mcp_server_type {
             }
             async fn server_initialize_result(&self) -> Option<Value> {
                 self.core.server_initialize_result().await
+            }
+            async fn session_id(&self) -> Option<String> {
+                self.core.session_id.lock().ok()?.clone()
             }
             async fn list_resources(&self, cursor: Option<&str>) -> Result<Value> {
                 self.core.list_resources(cursor).await

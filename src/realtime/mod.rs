@@ -102,7 +102,7 @@ pub use model_events::{
     RealtimeModelToolCallEvent,
 };
 pub use model_inputs::{RealtimeInterrupt, RealtimeModelSendEvent};
-pub use openai_model::{OpenAIRealtimeSIPModel, OpenAIRealtimeWebSocketModel};
+pub use openai_model::{OpenAIRealtimeSIPModel, OpenAIRealtimeWebSocketModel, get_api_key};
 pub use runner::RealtimeRunner;
 pub use session::RealtimeSession;
 pub use testing::{

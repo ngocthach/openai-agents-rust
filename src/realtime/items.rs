@@ -14,6 +14,9 @@ pub enum RealtimeContent {
         /// The text, when known.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         text: Option<String>,
+        /// Any other fields the transport reported, kept so they survive a round trip.
+        #[serde(flatten, default, skip_serializing_if = "serde_json::Map::is_empty")]
+        extra: serde_json::Map<String, serde_json::Value>,
     },
     /// Audio sent by the user.
     InputAudio {
@@ -23,6 +26,9 @@ pub enum RealtimeContent {
         /// Transcript of the audio, when available.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         transcript: Option<String>,
+        /// Any other fields the transport reported, kept so they survive a round trip.
+        #[serde(flatten, default, skip_serializing_if = "serde_json::Map::is_empty")]
+        extra: serde_json::Map<String, serde_json::Value>,
     },
     /// An image sent by the user.
     InputImage {
@@ -32,12 +38,18 @@ pub enum RealtimeContent {
         /// Detail hint (`auto`, `low` or `high`).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         detail: Option<String>,
+        /// Any other fields the transport reported, kept so they survive a round trip.
+        #[serde(flatten, default, skip_serializing_if = "serde_json::Map::is_empty")]
+        extra: serde_json::Map<String, serde_json::Value>,
     },
     /// Text produced by the assistant.
     Text {
         /// The text, when known.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         text: Option<String>,
+        /// Any other fields the transport reported, kept so they survive a round trip.
+        #[serde(flatten, default, skip_serializing_if = "serde_json::Map::is_empty")]
+        extra: serde_json::Map<String, serde_json::Value>,
     },
     /// Audio produced by the assistant.
     Audio {
@@ -47,6 +59,9 @@ pub enum RealtimeContent {
         /// Transcript of the audio, when available.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         transcript: Option<String>,
+        /// Any other fields the transport reported, kept so they survive a round trip.
+        #[serde(flatten, default, skip_serializing_if = "serde_json::Map::is_empty")]
+        extra: serde_json::Map<String, serde_json::Value>,
     },
 }
 
@@ -55,6 +70,7 @@ impl RealtimeContent {
     pub fn input_text(text: impl Into<String>) -> Self {
         RealtimeContent::InputText {
             text: Some(text.into()),
+            extra: serde_json::Map::new(),
         }
     }
 
@@ -62,6 +78,7 @@ impl RealtimeContent {
     pub fn text(text: impl Into<String>) -> Self {
         RealtimeContent::Text {
             text: Some(text.into()),
+            extra: serde_json::Map::new(),
         }
     }
 
@@ -70,13 +87,16 @@ impl RealtimeContent {
         RealtimeContent::Audio {
             audio: None,
             transcript: Some(transcript.into()),
+            extra: serde_json::Map::new(),
         }
     }
 
     /// The text of a text part, if this is one.
     pub fn text_value(&self) -> Option<&str> {
         match self {
-            RealtimeContent::InputText { text } | RealtimeContent::Text { text } => text.as_deref(),
+            RealtimeContent::InputText { text, .. } | RealtimeContent::Text { text, .. } => {
+                text.as_deref()
+            }
             _ => None,
         }
     }
@@ -100,13 +120,15 @@ impl RealtimeContent {
 
     fn with_transcript(&self, transcript: String) -> Self {
         match self {
-            RealtimeContent::InputAudio { audio, .. } => RealtimeContent::InputAudio {
+            RealtimeContent::InputAudio { audio, extra, .. } => RealtimeContent::InputAudio {
                 audio: audio.clone(),
                 transcript: Some(transcript),
+                extra: extra.clone(),
             },
-            RealtimeContent::Audio { audio, .. } => RealtimeContent::Audio {
+            RealtimeContent::Audio { audio, extra, .. } => RealtimeContent::Audio {
                 audio: audio.clone(),
                 transcript: Some(transcript),
+                extra: extra.clone(),
             },
             other => other.clone(),
         }
@@ -329,7 +351,7 @@ fn merge_message(old: &RealtimeMessageItem, new: &RealtimeMessageItem) -> Realti
                     *part = part.with_transcript(kept.to_string());
                 }
             }
-            RealtimeContent::Text { text } | RealtimeContent::InputText { text }
+            RealtimeContent::Text { text, .. } | RealtimeContent::InputText { text, .. }
                 if text.as_deref().unwrap_or_default().is_empty() =>
             {
                 if let Some(kept) = previous.text_value() {
@@ -400,6 +422,7 @@ mod tests {
                 RealtimeContent::Audio {
                     audio: Some("AAAA".to_string()),
                     transcript: Some("hello".to_string()),
+                    extra: Default::default(),
                 },
                 RealtimeContent::text("hi"),
             ],
@@ -411,6 +434,7 @@ mod tests {
             RealtimeContent::Audio {
                 audio: None,
                 transcript: Some("hello".to_string()),
+                extra: Default::default(),
             }
         );
         assert_eq!(content[1].text_value(), Some("hi"));
@@ -431,6 +455,7 @@ mod tests {
                 vec![RealtimeContent::Audio {
                     audio: None,
                     transcript: None,
+                    extra: Default::default(),
                 }],
             )),
         );
@@ -467,6 +492,7 @@ mod tests {
             vec![RealtimeContent::InputAudio {
                 audio: None,
                 transcript: None,
+                extra: Default::default(),
             }],
         ))];
         let added = apply_input_transcription(&mut history, "u1", "hi there");

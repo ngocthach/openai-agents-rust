@@ -17,7 +17,8 @@ pub struct Codex {
 impl Codex {
     /// Create a client with the given process options.
     pub fn new(options: CodexOptions) -> Self {
-        let exec = CodexExec::new(options.codex_path_override.clone(), options.env.clone());
+        let exec = CodexExec::new(options.codex_path_override.clone(), options.env.clone())
+            .with_subprocess_stream_limit_bytes(options.codex_subprocess_stream_limit_bytes);
         Codex {
             exec: Arc::new(exec),
             options,

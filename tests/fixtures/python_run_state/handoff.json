@@ -1,0 +1,310 @@
+{
+  "$schemaVersion": "1.21",
+  "auto_previous_response_id": false,
+  "context": {
+    "approvals": {},
+    "context": null,
+    "context_meta": {
+      "omitted": false,
+      "original_type": "none",
+      "requires_deserializer": false,
+      "serialized_via": "none"
+    },
+    "tool_invocations": {
+      "call_handoff_1": {
+        "approval_scope": "606c0d3b1473e5d615eda3cc5aff5685701ed3158b659ea6dceb6e93ac021c26",
+        "completed": true,
+        "executed": true,
+        "fingerprint": "ffe0cadf06ea57198b7ecef01854f9945e1bc271c063cd553cfd7ef15e0fc40b",
+        "type": "function_call"
+      }
+    },
+    "usage": {
+      "input_tokens": 34,
+      "input_tokens_details": [
+        {
+          "cache_write_tokens": 0,
+          "cached_tokens": 0
+        }
+      ],
+      "output_tokens": 13,
+      "output_tokens_details": [
+        {
+          "reasoning_tokens": 0
+        }
+      ],
+      "request_usage_entries": [
+        {
+          "input_tokens": 11,
+          "input_tokens_details": {
+            "cache_write_tokens": 0,
+            "cached_tokens": 0
+          },
+          "output_tokens": 7,
+          "output_tokens_details": {
+            "reasoning_tokens": 0
+          },
+          "total_tokens": 18
+        },
+        {
+          "input_tokens": 23,
+          "input_tokens_details": {
+            "cache_write_tokens": 0,
+            "cached_tokens": 0
+          },
+          "output_tokens": 6,
+          "output_tokens_details": {
+            "reasoning_tokens": 0
+          },
+          "total_tokens": 29
+        }
+      ],
+      "requests": 2,
+      "total_tokens": 47
+    }
+  },
+  "conversation_id": null,
+  "current_agent": {
+    "name": "Spanish Agent"
+  },
+  "current_step": null,
+  "current_turn": 2,
+  "current_turn_persisted_item_count": 0,
+  "generated_items": [
+    {
+      "agent": {
+        "name": "Triage Agent"
+      },
+      "raw_item": {
+        "arguments": "{}",
+        "call_id": "call_handoff_1",
+        "id": "fc_handoff_1",
+        "name": "transfer_to_spanish_agent",
+        "type": "function_call"
+      },
+      "type": "handoff_call_item"
+    },
+    {
+      "agent": {
+        "name": "Triage Agent"
+      },
+      "raw_item": {
+        "call_id": "call_handoff_1",
+        "output": "{\"assistant\": \"Spanish Agent\"}",
+        "type": "function_call_output"
+      },
+      "source_agent": {
+        "name": "Triage Agent"
+      },
+      "target_agent": {
+        "name": "Spanish Agent"
+      },
+      "type": "handoff_output_item"
+    },
+    {
+      "agent": {
+        "name": "Spanish Agent"
+      },
+      "raw_item": {
+        "content": [
+          {
+            "annotations": [],
+            "logprobs": [],
+            "text": "Hola, como estas?",
+            "type": "output_text"
+          }
+        ],
+        "id": "msg_handoff_1",
+        "role": "assistant",
+        "status": "completed",
+        "type": "message"
+      },
+      "type": "message_output_item"
+    }
+  ],
+  "generated_prompt_cache_key": null,
+  "generated_session_item_indexes": [
+    0,
+    1,
+    2
+  ],
+  "input_guardrail_results": [],
+  "last_model_response": {
+    "output": [
+      {
+        "content": [
+          {
+            "annotations": [],
+            "logprobs": [],
+            "text": "Hola, como estas?",
+            "type": "output_text"
+          }
+        ],
+        "id": "msg_handoff_1",
+        "role": "assistant",
+        "status": "completed",
+        "type": "message"
+      }
+    ],
+    "request_id": null,
+    "response_id": "resp_handoff_2",
+    "usage": {
+      "input_tokens": 23,
+      "input_tokens_details": [
+        {
+          "cache_write_tokens": 0,
+          "cached_tokens": 0
+        }
+      ],
+      "output_tokens": 6,
+      "output_tokens_details": [
+        {
+          "reasoning_tokens": 0
+        }
+      ],
+      "request_usage_entries": [],
+      "requests": 1,
+      "total_tokens": 29
+    }
+  },
+  "last_processed_response": null,
+  "max_turns": 10,
+  "model_responses": [
+    {
+      "output": [
+        {
+          "arguments": "{}",
+          "call_id": "call_handoff_1",
+          "id": "fc_handoff_1",
+          "name": "transfer_to_spanish_agent",
+          "type": "function_call"
+        }
+      ],
+      "request_id": null,
+      "response_id": "resp_handoff_1",
+      "usage": {
+        "input_tokens": 11,
+        "input_tokens_details": [
+          {
+            "cache_write_tokens": 0,
+            "cached_tokens": 0
+          }
+        ],
+        "output_tokens": 7,
+        "output_tokens_details": [
+          {
+            "reasoning_tokens": 0
+          }
+        ],
+        "request_usage_entries": [],
+        "requests": 1,
+        "total_tokens": 18
+      }
+    },
+    {
+      "output": [
+        {
+          "content": [
+            {
+              "annotations": [],
+              "logprobs": [],
+              "text": "Hola, como estas?",
+              "type": "output_text"
+            }
+          ],
+          "id": "msg_handoff_1",
+          "role": "assistant",
+          "status": "completed",
+          "type": "message"
+        }
+      ],
+      "request_id": null,
+      "response_id": "resp_handoff_2",
+      "usage": {
+        "input_tokens": 23,
+        "input_tokens_details": [
+          {
+            "cache_write_tokens": 0,
+            "cached_tokens": 0
+          }
+        ],
+        "output_tokens": 6,
+        "output_tokens_details": [
+          {
+            "reasoning_tokens": 0
+          }
+        ],
+        "request_usage_entries": [],
+        "requests": 1,
+        "total_tokens": 29
+      }
+    }
+  ],
+  "nested_history_owned_session_item_refs": [],
+  "no_active_agent_run": true,
+  "original_input": "Hola",
+  "output_guardrail_results": [],
+  "pending_input": [],
+  "previous_response_id": null,
+  "reasoning_item_id_policy": null,
+  "session_items": [
+    {
+      "agent": {
+        "name": "Triage Agent"
+      },
+      "raw_item": {
+        "arguments": "{}",
+        "call_id": "call_handoff_1",
+        "id": "fc_handoff_1",
+        "name": "transfer_to_spanish_agent",
+        "type": "function_call"
+      },
+      "type": "handoff_call_item"
+    },
+    {
+      "agent": {
+        "name": "Triage Agent"
+      },
+      "raw_item": {
+        "call_id": "call_handoff_1",
+        "output": "{\"assistant\": \"Spanish Agent\"}",
+        "type": "function_call_output"
+      },
+      "source_agent": {
+        "name": "Triage Agent"
+      },
+      "target_agent": {
+        "name": "Spanish Agent"
+      },
+      "type": "handoff_output_item"
+    },
+    {
+      "agent": {
+        "name": "Spanish Agent"
+      },
+      "raw_item": {
+        "content": [
+          {
+            "annotations": [],
+            "logprobs": [],
+            "text": "Hola, como estas?",
+            "type": "output_text"
+          }
+        ],
+        "id": "msg_handoff_1",
+        "role": "assistant",
+        "status": "completed",
+        "type": "message"
+      },
+      "type": "message_output_item"
+    }
+  ],
+  "tool_input_guardrail_results": [],
+  "tool_output_guardrail_results": [],
+  "tool_use_tracker": {
+    "Triage Agent": [
+      "transfer_to_spanish_agent"
+    ]
+  },
+  "trace": null
+}

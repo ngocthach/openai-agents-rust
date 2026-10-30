@@ -429,6 +429,10 @@ pub const DEFAULT_APPROVAL_REJECTION_MESSAGE: &str = "Tool execution was not app
 type InvokeFn<C> =
     Arc<dyn Fn(ToolContext<C>, String) -> BoxFuture<'static, Result<ToolOutput>> + Send + Sync>;
 
+/// Checks a tool's return value against the output type declared with
+/// [`FunctionTool::with_output_type`], returning the validation error message.
+type OutputValidatorFn = Arc<dyn Fn(&Value) -> std::result::Result<(), String> + Send + Sync>;
+
 /// A tool that wraps a Rust async function.
 pub struct FunctionTool<C> {
     /// Tool name shown to the model.
@@ -467,6 +471,15 @@ pub struct FunctionTool<C> {
     /// Strict JSON object schema of the tool's output, sent as `output_schema` on the
     /// Responses API. Mirrors `FunctionTool.output_json_schema`.
     pub output_json_schema: Option<Value>,
+    /// Runtime check of the tool's return value against a declared output type. Set by
+    /// [`FunctionTool::with_output_type`]; mirrors `FunctionTool._output_type_adapter`.
+    output_validator: Option<OutputValidatorFn>,
+    /// Human-readable title of the MCP tool this one was derived from, when it declared one.
+    /// Mirrors `FunctionTool._mcp_title`.
+    pub mcp_title: Option<String>,
+    /// Whether this tool came from `codex_tool`. Mirrors `FunctionTool._is_codex_tool`; the
+    /// agent uses it to fail fast on two Codex tools sharing a name.
+    pub(crate) is_codex_tool: bool,
     invoke: InvokeFn<C>,
     pub(crate) is_agent_tool: bool,
     pub(crate) mcp_server_name: Option<String>,
@@ -494,6 +507,9 @@ impl<C> Clone for FunctionTool<C> {
             allowed_callers: self.allowed_callers.clone(),
             custom_data_extractor: self.custom_data_extractor.clone(),
             output_json_schema: self.output_json_schema.clone(),
+            output_validator: self.output_validator.clone(),
+            mcp_title: self.mcp_title.clone(),
+            is_codex_tool: self.is_codex_tool,
             invoke: self.invoke.clone(),
             is_agent_tool: self.is_agent_tool,
             mcp_server_name: self.mcp_server_name.clone(),
@@ -646,6 +662,9 @@ impl<C: Send + Sync + 'static> FunctionTool<C> {
             allowed_callers: None,
             custom_data_extractor: None,
             output_json_schema: None,
+            output_validator: None,
+            mcp_title: None,
+            is_codex_tool: false,
             namespace: None,
             namespace_description: None,
         }
@@ -771,6 +790,54 @@ impl<C: Send + Sync + 'static> FunctionTool<C> {
         Ok(self)
     }
 
+    /// Declare the tool's output type.
+    ///
+    /// The strict JSON object schema is derived from `T`'s [`schemars::JsonSchema`]
+    /// implementation and reaches the wire as `output_schema`, exactly like
+    /// [`with_output_json_schema`](Self::with_output_json_schema). In addition the tool's
+    /// return value is validated against `T` before it reaches hooks, guardrails or the
+    /// model. Rust equivalent of `function_tool(output_type=...)`: Rust has no return-type
+    /// reflection, so the type is named rather than inferred from the closure.
+    ///
+    /// Returns an error when `T`'s schema is not a JSON object schema, as Python does for an
+    /// `output_type` that is not a model, TypedDict or dataclass.
+    pub fn with_output_type<T>(self) -> Result<Self>
+    where
+        T: JsonSchema + DeserializeOwned + 'static,
+    {
+        let mut schema = schemars::schema_for!(T).to_value();
+        if let Value::Object(m) = &mut schema {
+            m.remove("$schema");
+        }
+        if schema.get("type").and_then(Value::as_str) != Some("object") {
+            return Err(AgentsError::user(
+                "Function tool output_type must define a strict JSON object schema. Use a \
+                 struct deriving `schemars::JsonSchema`, or provide with_output_json_schema \
+                 directly.",
+            ));
+        }
+        let mut tool = self.with_output_json_schema(schema)?;
+        tool.output_validator = Some(Arc::new(|value: &Value| {
+            serde_json::from_value::<T>(value.clone())
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        }));
+        Ok(tool)
+    }
+
+    /// Mark this tool as produced by `codex_tool`, so an agent holding two same-named Codex
+    /// tools fails fast. Mirrors setting `FunctionTool._is_codex_tool`.
+    pub(crate) fn mark_codex_tool(&mut self) {
+        self.is_codex_tool = true;
+    }
+
+    /// Set the human-readable title of the MCP tool this one was derived from.
+    /// Mirrors `function_tool(mcp_title=...)`.
+    pub fn with_mcp_title(mut self, title: Option<String>) -> Self {
+        self.mcp_title = title;
+        self
+    }
+
     /// Attach SDK-only data to this tool's output items.
     pub fn with_custom_data_extractor<F, Fut>(mut self, f: F) -> Self
     where
@@ -791,7 +858,46 @@ impl<C: Send + Sync + 'static> FunctionTool<C> {
 impl<C> FunctionTool<C> {
     /// Invoke the tool with raw JSON arguments (bypasses guardrails, approvals and timeouts).
     pub async fn invoke(&self, ctx: ToolContext<C>, arguments: String) -> Result<ToolOutput> {
+        let name = ctx.tool_name.clone();
+        let output = self.invoke_body(ctx, arguments).await?;
+        self.validate_output(&name, &output)?;
+        Ok(output)
+    }
+
+    /// Run the tool body without checking the declared output type. The runner validates
+    /// separately so a type mismatch fails the run instead of being handed to the tool's
+    /// `failure_error_function`, which is how Python's `AgentsException` re-raise behaves.
+    pub(crate) async fn invoke_body(
+        &self,
+        ctx: ToolContext<C>,
+        arguments: String,
+    ) -> Result<ToolOutput> {
         (self.invoke)(ctx, arguments).await
+    }
+
+    /// Check the output against the type declared with [`Self::with_output_type`].
+    /// Port of `_validate_function_tool_output`: the validation error echoes the offending
+    /// value, so it is dropped unless the logging policy allows tool data.
+    pub(crate) fn validate_output(&self, tool_name: &str, output: &ToolOutput) -> Result<()> {
+        let Some(validate) = &self.output_validator else {
+            return Ok(());
+        };
+        match validate(&output.to_json_value()) {
+            Ok(()) => Ok(()),
+            Err(detail) => {
+                let base = format!(
+                    "Function tool {tool_name} returned an output that does not match its \
+                     declared output type"
+                );
+                Err(AgentsError::user(
+                    if crate::logger::may_log_model_data(true) {
+                        format!("{base}: {detail}")
+                    } else {
+                        base
+                    },
+                ))
+            }
+        }
     }
 
     /// Convert to a Responses API `function` tool param.

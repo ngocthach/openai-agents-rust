@@ -23,16 +23,12 @@ use crate::voice::input::{AudioData, AudioFormat};
 use crate::voice::model::{TTSModel, TTSModelSettings};
 use crate::voice::pipeline_config::VoicePipelineConfig;
 
-/// Error message recorded on a span when sensitive data must not be traced.
-const REDACTED_TRACE_ERROR_MESSAGE: &str = "Error details are redacted.";
-
 /// The trace-safe rendering of an error message. Port of `util._error_tracing.get_trace_error`.
+///
+/// Delegates to the crate-wide redaction layer so voice spans carry exactly the same
+/// [`crate::tracing::REDACTED_TRACE_ERROR_MESSAGE`] text as model and tool spans.
 pub(crate) fn get_trace_error(trace_include_sensitive_data: bool, error: &AgentsError) -> String {
-    if trace_include_sensitive_data {
-        error.to_string()
-    } else {
-        REDACTED_TRACE_ERROR_MESSAGE.to_string()
-    }
+    crate::tracing::model_error_text(error, trace_include_sensitive_data)
 }
 
 /// Events of one text segment, consumed by the dispatcher in the order segments were created.

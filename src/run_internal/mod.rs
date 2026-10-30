@@ -7,9 +7,10 @@ mod model_call;
 mod oai_conversation;
 pub(crate) mod prompt_cache_key;
 mod tool_caller;
+pub(crate) mod tool_invocation;
 mod tools;
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -37,7 +38,10 @@ use crate::run_context::RunContext;
 use crate::run_error_handlers::{
     RunErrorData, RunErrorHandler, RunErrorHandlerInput, RunErrorHandlers,
 };
-use crate::run_state::{CURRENT_SCHEMA_VERSION, RunState};
+use crate::run_state::{
+    CURRENT_SCHEMA_VERSION, ProcessedResponseSnapshot, RunState, ToolInvocationRecord,
+    ToolRunSnapshot,
+};
 use crate::stream_events::{RunItemStreamEventName, StreamEvent};
 use crate::tool::{FunctionTool, HostedMCPTool, MCPToolApprovalRequest, Tool, ToolOutput};
 use crate::tool_guardrails::{
@@ -81,6 +85,82 @@ struct ProcessedResponse<C> {
     call_positions: HashMap<String, usize>,
 }
 
+impl<C> ProcessedResponse<C> {
+    /// Capture the classification in the serializable shape `RunState` persists, so an
+    /// interrupted snapshot carries what the Python runner needs to continue the turn.
+    /// Mirrors `RunState._serialize_processed_response`.
+    fn snapshot(&self) -> ProcessedResponseSnapshot {
+        let function_run = |call: &FunctionCall, tool: &FunctionTool<C>| ToolRunSnapshot {
+            tool_name: tool.name.clone(),
+            namespace: tool.namespace().map(str::to_string),
+            tool_call: call.to_value(),
+            description: Some(tool.description.clone()),
+            params_json_schema: Some(tool.params_json_schema.clone()),
+        };
+        let local_run = |raw: &Value, name: String| ToolRunSnapshot {
+            tool_name: name,
+            namespace: None,
+            tool_call: raw.clone(),
+            description: None,
+            params_json_schema: None,
+        };
+        let mut snapshot = ProcessedResponseSnapshot {
+            tools_used: self.tools_used.clone(),
+            functions: self
+                .functions
+                .iter()
+                .map(|(call, tool)| function_run(call, tool))
+                .collect(),
+            handoffs: self
+                .handoffs
+                .iter()
+                .map(|(call, h)| ToolRunSnapshot {
+                    tool_name: h.tool_name.clone(),
+                    namespace: None,
+                    tool_call: call.to_value(),
+                    description: None,
+                    params_json_schema: None,
+                })
+                .collect(),
+            mcp_approval_requests: self
+                .mcp_approvals
+                .iter()
+                .map(|(raw, tool)| {
+                    json!({
+                        "request_item": {"raw_item": raw},
+                        "mcp_tool": match tool.as_ref().and_then(HostedMCPTool::server_label) {
+                            Some(label) => json!({"name": label}),
+                            None => json!({}),
+                        },
+                    })
+                })
+                .collect(),
+            ..Default::default()
+        };
+        for call in &self.local_calls {
+            let name = call.tool_name();
+            match call {
+                local_tools::LocalCall::Computer(raw, _) => {
+                    snapshot.computer_actions.push(local_run(raw, name))
+                }
+                local_tools::LocalCall::Shell(raw, _) => {
+                    snapshot.shell_actions.push(local_run(raw, name))
+                }
+                local_tools::LocalCall::LocalShell(raw, _) => {
+                    snapshot.local_shell_actions.push(local_run(raw, name))
+                }
+                local_tools::LocalCall::ApplyPatch(raw, _) => {
+                    snapshot.apply_patch_actions.push(local_run(raw, name))
+                }
+                local_tools::LocalCall::Custom(raw, _) => {
+                    snapshot.custom_tool_actions.push(local_run(raw, name))
+                }
+            }
+        }
+        snapshot
+    }
+}
+
 struct RunLoop<C> {
     starting_agent: Arc<Agent<C>>,
     current_agent: Arc<Agent<C>>,
@@ -120,8 +200,19 @@ struct RunLoop<C> {
     should_run_agent_start_hooks: bool,
     agent_span: Option<Span>,
     trace_id: Option<String>,
+    /// Canonical identity of every tool call the run has seen, restored from the snapshot.
+    tool_invocations: BTreeMap<String, ToolInvocationRecord>,
+    /// Identifies this run to models that keep per-run state.
+    model_owner: crate::models::run_context::ModelRunOwner,
+    /// Every model this run resolved, so each is told when the run ends.
+    models_used: Vec<Arc<dyn Model>>,
+    /// Trace settings the snapshot was traced with, so a resume keeps the same trace.
+    trace_state: Option<tr::TraceState>,
     /// Index in `generated_items` where the current turn's items start.
     turn_start: usize,
+    /// Classification of the model response the current turn is executing, kept so an
+    /// interrupted snapshot can carry Python's `last_processed_response`.
+    last_processed_response: Option<ProcessedResponseSnapshot>,
     /// Index in the tool guardrail result lists where the current turn's results start.
     turn_tool_input_guardrail_start: usize,
     turn_tool_output_guardrail_start: usize,
@@ -502,7 +593,12 @@ pub(crate) async fn run_loop<C: Send + Sync + 'static>(
         should_run_agent_start_hooks: true,
         agent_span: None,
         trace_id: None,
+        tool_invocations: BTreeMap::new(),
+        model_owner: crate::models::run_context::new_model_run_owner(),
+        models_used: Vec::new(),
+        trace_state: None,
         turn_start: 0,
+        last_processed_response: None,
         turn_tool_input_guardrail_start: 0,
         turn_tool_output_guardrail_start: 0,
     };
@@ -517,10 +613,12 @@ pub(crate) async fn run_loop<C: Send + Sync + 'static>(
     }
     // Rejected output cannot be removed from a server-managed conversation, so a blocked
     // terminal output would stay in the provider's history. Port of
-    // `validate_output_guardrails_with_server_managed_conversation`.
+    // `validate_output_guardrails_with_server_managed_conversation`, including its exemption:
+    // Chat Completions owns its released warn-and-ignore behaviour for this combination.
     if server_managed
         && (!lp.starting_agent.output_guardrails.is_empty()
             || !lp.config.output_guardrails.is_empty())
+        && !lp.resolve_model(&lp.starting_agent)?.is_chat_completions()
     {
         return Err(AgentsError::user(
             "Output guardrails cannot be combined with conversation_id, previous_response_id, \
@@ -541,29 +639,23 @@ pub(crate) async fn run_loop<C: Send + Sync + 'static>(
 
     // Tracing: reuse the current trace, or start one. A run with tracing turned off always
     // gets its own disabled trace so it cannot export spans into an enabled outer trace.
-    let mut metadata = lp.config.trace_metadata.clone();
-    if let Some(h) = crate::models::resolve_openai_harness_id(lp.config.model_provider.as_ref())
-        && !metadata
-            .as_ref()
-            .is_some_and(|m| m.contains_key("agent_harness_id"))
-    {
-        metadata
-            .get_or_insert_with(Default::default)
-            .insert("agent_harness_id".into(), Value::String(h));
-    }
-    let created = tr::create_trace_for_run(
-        lp.config.workflow_name.clone(),
-        lp.config.trace_id.clone().or_else(|| lp.trace_id.clone()),
-        lp.config.group_id.clone(),
-        metadata,
+    let settings = resolve_trace_settings(lp.trace_state.as_ref(), &lp.config);
+    let created = tr::create_trace_for_run_with_state(
+        settings.workflow_name,
+        settings.trace_id.or_else(|| lp.trace_id.clone()),
+        settings.group_id,
+        settings.metadata,
         lp.config.tracing_api_key.clone(),
         lp.config.tracing_disabled,
+        lp.trace_state.as_ref(),
+        lp.is_resumed,
     );
     let trace = created
         .clone()
         .or_else(scope::current_trace)
         .expect("trace");
     lp.trace_id = Some(trace.trace_id().to_string());
+    lp.trace_state = tr::TraceState::from_trace(Some(&trace));
     // A disabled run must not see the caller's span either, or its children would attach to it.
     let mask = lp.config.tracing_disabled.then(tr::masked_run_span);
 
@@ -611,6 +703,7 @@ pub(crate) async fn run_loop<C: Send + Sync + 'static>(
         if let Some(s) = lp.agent_span.take() {
             s.finish();
         }
+        lp.cleanup_models().await;
         res
     };
     let body = async {
@@ -625,6 +718,164 @@ pub(crate) async fn run_loop<C: Send + Sync + 'static>(
     }
 }
 
+/// Whether a run item came out of the model response rather than out of executing it.
+/// These are the items Python collects into `ProcessedResponse.new_items`.
+fn is_model_derived_item(kind: &RunItemKind) -> bool {
+    matches!(
+        kind,
+        RunItemKind::MessageOutput { .. }
+            | RunItemKind::Reasoning { .. }
+            | RunItemKind::ToolCall { .. }
+            | RunItemKind::HandoffCall { .. }
+            | RunItemKind::MCPListTools { .. }
+            | RunItemKind::MCPApprovalRequest { .. }
+            | RunItemKind::Compaction { .. }
+    )
+}
+
+/// Reject a snapshot whose items no longer match the identities its ledger recorded.
+/// Port of the `ModelBehaviorError` branches of `_tool_invocation_status` /
+/// `_rebind_tool_invocation`.
+fn validate_restored_tool_invocations(state: &RunState) -> Result<()> {
+    if state.tool_invocations.is_empty() {
+        return Ok(());
+    }
+    let reused = || {
+        AgentsError::model_behavior(
+            "Model reused a tool call ID for a different invocation. \
+             Use a unique call ID for each tool invocation.",
+        )
+    };
+    let check = |raw: &Value, role: Option<&'static str>| -> Result<()> {
+        let Some(id) = tool_invocation::tool_invocation_identity(raw, role) else {
+            return Ok(());
+        };
+        let Some(record) = state.tool_invocations.get(&id.call_id) else {
+            return Ok(());
+        };
+        if record.invocation_type != id.invocation_type
+            || record.approval_scope != id.approval_scope
+            || record.fingerprint != id.fingerprint
+        {
+            return Err(reused());
+        }
+        Ok(())
+    };
+    for item in &state.generated_items {
+        if let Some((raw, role)) = invocation_raw_item(item) {
+            check(&raw, role)?;
+        }
+    }
+    // The interruption list is not checked separately: an approval item carries a
+    // `FunctionCall`-shaped copy of its call (local tools keep their real payload in
+    // `extra`), while the ledger was written from the tool call item in `generated_items`,
+    // which is the same call in its wire shape.
+    Ok(())
+}
+
+/// Build the canonical tool-invocation ledger of a run from its generated items.
+/// Mirrors the state `RunContextWrapper._tool_invocations` holds at snapshot time: one record
+/// per tool call, marked executed and completed once its output item is in history.
+fn tool_invocation_ledger(items: &[RunItem]) -> BTreeMap<String, ToolInvocationRecord> {
+    let mut ledger: BTreeMap<String, ToolInvocationRecord> = BTreeMap::new();
+    for item in items {
+        if let Some((raw, role)) = invocation_raw_item(item)
+            && let Some(id) = tool_invocation::tool_invocation_identity(&raw, role)
+        {
+            ledger
+                .entry(id.call_id)
+                .or_insert_with(|| ToolInvocationRecord {
+                    invocation_type: id.invocation_type,
+                    approval_scope: id.approval_scope,
+                    fingerprint: id.fingerprint,
+                    executed: false,
+                    completed: false,
+                });
+        }
+    }
+    for item in items {
+        let raw = match &item.kind {
+            RunItemKind::ToolCallOutput { raw_item, .. } => raw_item.clone(),
+            RunItemKind::HandoffOutput { raw_item, .. } => raw_item.0.clone(),
+            RunItemKind::MCPApprovalResponse { raw_item } => raw_item.clone(),
+            _ => continue,
+        };
+        if let Some((_, call_id)) = tool_invocation::tool_output_identity(&raw)
+            && let Some(record) = ledger.get_mut(&call_id)
+        {
+            record.executed = true;
+            record.completed = true;
+        }
+    }
+    ledger
+}
+
+/// The raw item and invocation role of a run item that represents a tool invocation.
+fn invocation_raw_item(item: &RunItem) -> Option<(Value, Option<&'static str>)> {
+    match &item.kind {
+        RunItemKind::ToolCall { raw_item } => Some((raw_item.clone(), None)),
+        RunItemKind::HandoffCall { raw_item } => {
+            Some((raw_item.to_value(), Some(tool_invocation::HANDOFF_ROLE)))
+        }
+        RunItemKind::MCPApprovalRequest { raw_item } => Some((raw_item.clone(), None)),
+        _ => None,
+    }
+}
+
+/// The tracing settings a run starts with, after merging an explicit [`RunConfig`] with the
+/// trace a resumed snapshot was already exporting to.
+struct ResolvedTraceSettings {
+    workflow_name: String,
+    trace_id: Option<String>,
+    group_id: Option<String>,
+    metadata: Option<serde_json::Map<String, Value>>,
+}
+
+/// Resolve tracing settings, preferring explicit `RunConfig` overrides over the snapshot's
+/// trace. Port of `agent_runner_helpers.resolve_trace_settings`: the workflow name comes from
+/// the snapshot only while the config still carries the default one, and the harness id is
+/// added to the metadata afterwards.
+fn resolve_trace_settings<C>(
+    trace_state: Option<&tr::TraceState>,
+    config: &RunConfig<C>,
+) -> ResolvedTraceSettings {
+    let default_workflow_name = RunConfig::<C>::default().workflow_name;
+    let mut settings = ResolvedTraceSettings {
+        workflow_name: config.workflow_name.clone(),
+        trace_id: config.trace_id.clone(),
+        group_id: config.group_id.clone(),
+        metadata: config.trace_metadata.clone(),
+    };
+    if let Some(state) = trace_state {
+        if settings.workflow_name == default_workflow_name
+            && let Some(name) = state.workflow_name.as_ref().filter(|n| !n.is_empty())
+        {
+            settings.workflow_name = name.clone();
+        }
+        if settings.trace_id.is_none() {
+            settings.trace_id = state.trace_id.clone();
+        }
+        if settings.group_id.is_none() {
+            settings.group_id = state.group_id.clone();
+        }
+        if settings.metadata.is_none() {
+            settings.metadata = state.metadata.clone();
+        }
+    }
+    if let Some(h) = crate::models::resolve_openai_harness_id(config.model_provider.as_ref())
+        && !settings
+            .metadata
+            .as_ref()
+            .is_some_and(|m| m.contains_key("agent_harness_id"))
+    {
+        settings
+            .metadata
+            .get_or_insert_with(Default::default)
+            .insert("agent_harness_id".into(), Value::String(h));
+    }
+    settings
+}
+
 impl<C: Send + Sync + 'static> RunLoop<C> {
     fn restore(&mut self, state: RunState, restore_usage: bool) -> Result<()> {
         if state.schema_version != CURRENT_SCHEMA_VERSION {
@@ -636,6 +887,14 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
         if state.final_output.is_some() {
             return Err(AgentsError::user(
                 "This run state already finished; start a new run instead.",
+            ));
+        }
+        // Port of `reject_unrecoverable_resume`: the snapshot owns a terminal result no
+        // resume can reproduce, so it is refused before any session, model or tool work.
+        if state.terminal_unrecoverable {
+            return Err(AgentsError::user(
+                "This RunState ended at an unrecoverable boundary and cannot be resumed. \
+                 Start a new run instead.",
             ));
         }
         let ambiguous = ambiguous_agent_names(&self.starting_agent);
@@ -710,12 +969,30 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
         self.session_saved_items = state.session_saved_items.min(self.generated_items.len());
         self.input_saved_to_session = state.input_saved_to_session;
         self.pending_input = state.pending_input.clone();
+        // A restored call must still be the call its ledger entry was written for. Port of
+        // `RunContextWrapper._tool_invocation_status`'s identity check: a snapshot whose tool
+        // arguments or routing were edited is rejected instead of silently re-approved.
+        validate_restored_tool_invocations(&state)?;
+        self.tool_invocations = state.tool_invocations.clone();
         self.resume_pending_tools = state.pending_tool_processing;
+        // Carried so a snapshot taken before the resumed turn re-executes still names the
+        // tools the parked response asked for; `process_response` replaces it.
+        self.last_processed_response = state.last_processed_response.clone();
         self.trace_id = state.trace_id.clone();
+        self.trace_state = state.trace_state.clone();
         self.turn_start = state.turn_start_index.min(self.generated_items.len());
         self.is_resumed = true;
         self.should_run_agent_start_hooks = false;
         Ok(())
+    }
+
+    /// Tell every model this run resolved that the run has ended, so a model holding
+    /// per-run state can release it. Port of `cleanup_models_after_run`: a model that fails
+    /// to clean up is logged, never fatal.
+    async fn cleanup_models(&mut self) {
+        for model in std::mem::take(&mut self.models_used) {
+            model.cleanup_on_run_end(self.model_owner).await;
+        }
     }
 
     fn emit(&self, ev: StreamEvent<C>) {
@@ -1170,6 +1447,7 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
             input_saved_to_session: self.input_saved_to_session,
             final_output: None,
             trace_id: self.trace_id.clone(),
+            trace_state: self.trace_state.clone(),
             context: None,
             turn_start_index: self.turn_start,
             tool_use_tracker: self
@@ -1184,6 +1462,30 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
                 .collect(),
             generated_prompt_cache_key: self.prompt_cache_key.generated_key(),
             server_conversation: self.server_conversation.state(),
+            // Rust returns an error instead of a snapshot when a terminal save fails, so a
+            // snapshot this loop builds is always resumable.
+            terminal_unrecoverable: false,
+            tool_invocations: tool_invocation_ledger(&self.generated_items),
+            // Python keeps the processed response only while a turn is parked on an
+            // approval, and clears it once the run finishes.
+            last_processed_response: (!interruptions.is_empty())
+                .then(|| self.last_processed_response.clone())
+                .flatten()
+                .map(|mut p| {
+                    // Python's `ProcessedResponse.new_items` holds only the items derived
+                    // from the model response itself. The tool outputs and the approval
+                    // items the turn appended afterwards are listed separately and indexed
+                    // through the ownership range, so `new_items` is the turn's leading run
+                    // of model-derived items.
+                    p.new_items = self.generated_items
+                        [self.turn_start.min(self.generated_items.len())..]
+                        .iter()
+                        .take_while(|i| is_model_derived_item(&i.kind))
+                        .cloned()
+                        .collect();
+                    p.interruptions = interruptions.clone();
+                    p
+                }),
         };
         RunResult {
             input: self.original_input.clone(),
@@ -1216,7 +1518,10 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
         items.extend(new);
         let items = items::deduplicate_input_items_preferring_latest(items);
         if !items.is_empty() {
-            session.add_items(items).await?;
+            // A cancelled run (a dropped `select!` branch, an elapsed timeout) must not abort
+            // a half-written session write. Port of `await_session_mutation`.
+            crate::memory::await_session_mutation(async move { session.add_items(items).await })
+                .await?;
         }
         self.input_saved_to_session = true;
         self.session_saved_items = self.generated_items.len();
@@ -1274,7 +1579,13 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
             has_local_tool_outputs,
             model_exchange,
         };
-        let usage = session.on_run_completed(&info).await?;
+        // Compaction replaces a stored suffix, so a dropped caller must not leave the store
+        // half-rewritten. Port of `await_session_mutation`.
+        let usage =
+            crate::memory::await_session_mutation(
+                async move { session.on_run_completed(&info).await },
+            )
+            .await?;
         if usage.requests > 0 || usage.total_tokens > 0 {
             self.ctx.add_usage(&usage);
         }
@@ -1469,6 +1780,9 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
         let system_prompt = agent.get_system_prompt(&self.ctx).await?;
         let prompt = agent.get_prompt(&self.ctx).await?;
         let model = self.resolve_model(&agent)?;
+        if !self.models_used.iter().any(|m| Arc::ptr_eq(m, &model)) {
+            self.models_used.push(model.clone());
+        }
         let settings = self.resolve_settings(&agent, &model);
 
         let mut input = self.build_model_input();
@@ -1540,13 +1854,23 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
                 .await;
         }
 
+        // Every model call of this run runs under the run's owner id, so a model that keeps
+        // per-run state can tell this run's calls from another's. Port of
+        // `model_run_context` / `model_run_context_stream`.
+        let owner = self.model_owner;
         let response = if parallel.is_empty() {
-            Box::pin(model_call::call_model(&model, request, self.sink.as_ref())).await?
+            Box::pin(crate::models::run_context::model_run_context(
+                owner,
+                model_call::call_model(&model, request, self.sink.as_ref()),
+            ))
+            .await?
         } else {
             let g_input = guardrail_input.clone().unwrap_or_default();
             let (guard_results, model_result) = {
-                let model_fut =
-                    Box::pin(model_call::call_model(&model, request, self.sink.as_ref()));
+                let model_fut = Box::pin(crate::models::run_context::model_run_context(
+                    owner,
+                    model_call::call_model(&model, request, self.sink.as_ref()),
+                ));
                 let guard_fut = self.run_input_guardrails(parallel, g_input);
                 tokio::pin!(model_fut);
                 tokio::pin!(guard_fut);
@@ -1669,6 +1993,43 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
         for out in &response.output {
             let raw_out = out.to_value();
             let out_type = out.item_type();
+            // One call id must name one invocation for the whole run. Port of
+            // `RunContextWrapper._tool_invocation_status`'s binding step.
+            let role = (out_type == "function_call"
+                && handoff_map.contains_key(
+                    raw_out
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default(),
+                ))
+            .then_some(tool_invocation::HANDOFF_ROLE);
+            if let Some(id) = tool_invocation::tool_invocation_identity(&raw_out, role) {
+                match self.tool_invocations.get(&id.call_id) {
+                    Some(record)
+                        if record.invocation_type != id.invocation_type
+                            || record.approval_scope != id.approval_scope
+                            || record.fingerprint != id.fingerprint =>
+                    {
+                        return Err(AgentsError::model_behavior(
+                            "Model reused a tool call ID for a different invocation. \
+                             Use a unique call ID for each tool invocation.",
+                        ));
+                    }
+                    Some(_) => {}
+                    None => {
+                        self.tool_invocations.insert(
+                            id.call_id.clone(),
+                            ToolInvocationRecord {
+                                invocation_type: id.invocation_type,
+                                approval_scope: id.approval_scope,
+                                fingerprint: id.fingerprint,
+                                executed: false,
+                                completed: false,
+                            },
+                        );
+                    }
+                }
+            }
             let is_program_owned = raw_out
                 .get("caller")
                 .and_then(|c| c.get("type"))
@@ -2051,6 +2412,7 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
         agent: &Arc<Agent<C>>,
         mut processed: ProcessedResponse<C>,
     ) -> Result<NextStep<C>> {
+        self.last_processed_response = Some(processed.snapshot());
         let mut interruptions: Vec<ToolApprovalItem> = Vec::new();
         let ran_functions = !processed.functions.is_empty();
         let outputs_start = self.generated_items.len();

@@ -3,11 +3,11 @@
 //! event naming the URL to `POST` JSON-RPC messages to, and reads replies as `message` events.
 
 use std::collections::HashMap;
-use std::time::Duration;
 
 use futures::{Sink, Stream, StreamExt};
 use rmcp::model::{ClientJsonRpcMessage, ServerJsonRpcMessage};
 
+use super::logging::{get_mcp_server_log_name, redact_credentials};
 use crate::error::{AgentsError, Result};
 
 /// One parsed SSE event.
@@ -109,26 +109,43 @@ fn build_headers(headers: &HashMap<String, String>) -> Result<reqwest::header::H
 
 /// Open the SSE stream and return a `(sink, stream)` pair usable as an rmcp transport.
 pub(crate) async fn connect(
-    url: &str,
-    headers: &HashMap<String, String>,
-    timeout: Duration,
-    sse_read_timeout: Duration,
+    params: &super::MCPServerSseParams,
 ) -> Result<(
     impl Sink<ClientJsonRpcMessage, Error = std::io::Error> + Send + Unpin + 'static,
     impl Stream<Item = ServerJsonRpcMessage> + Send + Unpin + 'static,
 )> {
-    let header_map = build_headers(headers)?;
-    crate::util::ensure_crypto_provider();
-    let client = reqwest::Client::builder()
-        .connect_timeout(timeout)
-        .read_timeout(sse_read_timeout)
-        .build()?;
+    let url = params.url.as_str();
+    let timeout = params.timeout;
+    let mut header_map = build_headers(&params.headers)?;
+    if let Some(auth) = &params.auth
+        && let Some(value) = auth()
+    {
+        let value = reqwest::header::HeaderValue::from_str(&format!(
+            "Bearer {}",
+            super::bearer_token(&value)
+        ))
+        .map_err(|e| AgentsError::user(format!("Invalid MCP auth header value: {e}")))?;
+        header_map.insert(reqwest::header::AUTHORIZATION, value);
+    }
+    // `httpx_client_factory`'s counterpart: a caller-built client replaces the default one.
+    let client = match &params.http_client {
+        Some(c) => c.clone(),
+        None => {
+            crate::util::ensure_crypto_provider();
+            reqwest::Client::builder()
+                .connect_timeout(timeout)
+                .read_timeout(params.sse_read_timeout)
+                .build()?
+        }
+    };
+    // A reqwest error names the request URL, which is where an MCP credential lives.
     let resp = client
         .get(url)
         .headers(header_map.clone())
         .header(reqwest::header::ACCEPT, "text/event-stream")
         .send()
-        .await?;
+        .await
+        .map_err(|e| AgentsError::other(redact_credentials(&format!("MCP SSE error: {e}"))))?;
     if !resp.status().is_success() {
         return Err(AgentsError::other(format!(
             "MCP SSE connection failed with status {}",
@@ -136,8 +153,12 @@ pub(crate) async fn connect(
         )));
     }
     let mut events = Box::pin(sse_events(resp.bytes_stream()));
-    let base = reqwest::Url::parse(url)
-        .map_err(|e| AgentsError::user(format!("Invalid MCP SSE URL {url}: {e}")))?;
+    let base = reqwest::Url::parse(url).map_err(|e| {
+        AgentsError::user(format!(
+            "Invalid MCP SSE URL {}: {e}",
+            get_mcp_server_log_name(url)
+        ))
+    })?;
     let endpoint = loop {
         let next = tokio::time::timeout(timeout, events.next())
             .await
@@ -145,17 +166,25 @@ pub(crate) async fn connect(
         match next {
             Some(Ok(ev)) if ev.event == "endpoint" => {
                 let ep = base.join(ev.data.trim()).map_err(|e| {
-                    AgentsError::other(format!("Invalid MCP SSE endpoint {}: {e}", ev.data))
+                    AgentsError::other(redact_credentials(&format!(
+                        "Invalid MCP SSE endpoint {}: {e}",
+                        ev.data
+                    )))
                 })?;
                 if ep.origin() != base.origin() {
                     return Err(AgentsError::other(format!(
-                        "MCP SSE endpoint origin does not match the connection origin: {ep}"
+                        "MCP SSE endpoint origin does not match the connection origin: {}",
+                        get_mcp_server_log_name(ep.as_str())
                     )));
                 }
                 break ep;
             }
             Some(Ok(_)) => continue,
-            Some(Err(e)) => return Err(AgentsError::other(format!("MCP SSE error: {e}"))),
+            Some(Err(e)) => {
+                return Err(AgentsError::other(redact_credentials(&format!(
+                    "MCP SSE error: {e}"
+                ))));
+            }
             None => {
                 return Err(AgentsError::other(
                     "MCP SSE stream closed before the endpoint event",
@@ -192,7 +221,9 @@ pub(crate) async fn connect(
                 .json(&msg)
                 .send()
                 .await
-                .map_err(std::io::Error::other)?;
+                .map_err(|e| {
+                    std::io::Error::other(redact_credentials(&format!("MCP SSE POST failed: {e}")))
+                })?;
             if !resp.status().is_success() {
                 return Err(std::io::Error::other(format!(
                     "MCP SSE POST failed with status {}",

@@ -281,7 +281,7 @@ pub(crate) async fn execute_function_tool<C: Send + Sync + 'static>(
             h.on_tool_start(&tool_ctx, env.agent, &tool_enum).await;
         }
 
-        let invocation = tool.invoke(tool_ctx.clone(), call.arguments.clone());
+        let invocation = tool.invoke_body(tool_ctx.clone(), call.arguments.clone());
         let result = match tool.timeout {
             Some(d) => match tokio::time::timeout(d, invocation).await {
                 Ok(r) => r,
@@ -355,6 +355,10 @@ pub(crate) async fn execute_function_tool<C: Send + Sync + 'static>(
                 }
             }
         };
+
+        // A declared output type is a contract on the tool, not model feedback: a mismatch
+        // fails the run rather than reaching `failure_error_function`.
+        tool.validate_output(&tool_ctx.tool_name, &output)?;
 
         for g in &tool.tool_output_guardrails {
             let out = g

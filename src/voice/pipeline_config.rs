@@ -16,6 +16,12 @@ pub struct VoicePipelineConfig {
     pub model_provider: Arc<dyn VoiceModelProvider>,
     /// Disable tracing of the pipeline, including when a caller trace is active.
     pub tracing_disabled: bool,
+    /// Export this pipeline's trace with a specific API key.
+    ///
+    /// Python's `VoicePipelineConfig.tracing` is a `TracingConfig`; its `api_key` is the only
+    /// key the voice pipeline reads (`TraceProvider.create_trace` ignores the rest), so this
+    /// carries the same meaning as [`RunConfig::tracing_api_key`](crate::RunConfig).
+    pub tracing_api_key: Option<String>,
     /// Include sensitive data (transcripts, spoken text) in traces. Defaults to `true`.
     ///
     /// This covers the voice pipeline only, not what happens inside the workflow.
@@ -39,6 +45,7 @@ impl Default for VoicePipelineConfig {
         VoicePipelineConfig {
             model_provider: Arc::new(OpenAIVoiceModelProvider::new()),
             tracing_disabled: false,
+            tracing_api_key: None,
             trace_include_sensitive_data: true,
             trace_include_sensitive_audio_data: true,
             workflow_name: "Voice Agent".to_string(),
@@ -65,6 +72,12 @@ impl VoicePipelineConfig {
     /// Disable tracing of the pipeline.
     pub fn with_tracing_disabled(mut self, disabled: bool) -> Self {
         self.tracing_disabled = disabled;
+        self
+    }
+
+    /// Export this pipeline's trace with a specific API key.
+    pub fn with_tracing_api_key(mut self, key: impl Into<String>) -> Self {
+        self.tracing_api_key = Some(key.into());
         self
     }
 

@@ -29,6 +29,18 @@ TOOLS = [
         "description": "Echo the _meta of the request",
         "inputSchema": {"type": "object"},
     },
+    # Always returns a JSON-RPC error, so the client's failure formatter is exercised.
+    {
+        "name": "fail",
+        "description": "Always fails",
+        "inputSchema": {"type": "object"},
+    },
+    # Emits a server notification before replying, so message handlers are exercised.
+    {
+        "name": "notify",
+        "description": "Send a notification, then reply",
+        "inputSchema": {"type": "object"},
+    },
 ]
 
 RESOURCES = [
@@ -38,6 +50,12 @@ RESOURCES = [
 RESOURCE_TEMPLATES = [
     {"uriTemplate": "file:///{path}", "name": "any file", "mimeType": "text/plain"},
 ]
+
+
+def notify(method, params):
+    payload = {"jsonrpc": "2.0", "method": method, "params": params}
+    sys.stdout.write(json.dumps(payload) + "\n")
+    sys.stdout.flush()
 
 
 def reply(msg_id, result=None, error=None):
@@ -73,6 +91,11 @@ for line in sys.stdin:
         if params.get("name") == "add":
             total = args.get("a", 0) + args.get("b", 0)
             reply(msg_id, {"content": [{"type": "text", "text": str(total)}], "isError": False})
+        elif params.get("name") == "fail":
+            reply(msg_id, error={"code": -32000, "message": "tool exploded"})
+        elif params.get("name") == "notify":
+            notify("notifications/resources/updated", {"uri": "file:///notes.txt"})
+            reply(msg_id, {"content": [{"type": "text", "text": "notified"}], "isError": False})
         elif params.get("name") == "echo_meta":
             meta = json.dumps(params.get("_meta") or {}, sort_keys=True)
             reply(msg_id, {"content": [{"type": "text", "text": meta}], "isError": False})

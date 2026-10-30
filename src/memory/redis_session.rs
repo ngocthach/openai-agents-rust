@@ -34,17 +34,79 @@ pub fn redis_session_keys(key_prefix: &str, session_id: &str) -> (String, String
 /// nothing. Running the whole check-and-replace inside Redis is what makes it atomic without
 /// `WATCH`. The expiry is re-applied afterwards because trimming the list to empty deletes the
 /// key, which would otherwise resurrect it without a TTL.
-const REPLACE_SUFFIX_SCRIPT: &str = r#"
+/// Lua prelude shared by every writing script.
+///
+/// `guard()` reproduces the key-type validation Python performs under `WATCH`, and `now()`
+/// reads the server clock. Both run inside the script, so the whole check-then-write sequence
+/// is one atomic Redis operation and a type that changes between them cannot be missed — the
+/// idiomatic Redis equivalent of Python's `WATCH`/`MULTI`.
+///
+/// `TYPE` answers `none` for a key that does not exist, which is always acceptable.
+/// Scripts are replicated by their effects from Redis 5 on, so reading `TIME` is allowed.
+const KEY_GUARD_PRELUDE: &str = r#"
+local function check(key, expected)
+  local actual = redis.call('TYPE', key)['ok']
+  if actual ~= 'none' and actual ~= expected then
+    return 'WRONGTYPE Redis key ' .. key .. ' holds a ' .. actual .. ', expected a ' .. expected
+  end
+  return nil
+end
+local function guard()
+  return check(KEYS[1], 'list') or check(KEYS[2], 'hash') or check(KEYS[3], 'string')
+end
+local function now()
+  return redis.call('TIME')[1]
+end
+"#;
+
+/// Append items, stamping the metadata hash with the server clock.
+///
+/// `KEYS` are the message list, the metadata hash and the counter; `ARGV` is the TTL in
+/// milliseconds (0 for none), the session id, then one serialized item per remaining argument.
+const ADD_ITEMS_SCRIPT: &str = r#"
+local err = guard()
+if err then return redis.error_reply(err) end
 local ttl_ms = tonumber(ARGV[1])
-local now = ARGV[2]
-local handle_count = tonumber(ARGV[3])
+local stamp = now()
+redis.call('HSET', KEYS[2], 'session_id', ARGV[2])
+redis.call('HSETNX', KEYS[2], 'created_at', stamp)
+for i = 3, #ARGV do
+  redis.call('RPUSH', KEYS[1], ARGV[i])
+end
+redis.call('HSET', KEYS[2], 'updated_at', stamp)
+if ttl_ms > 0 then
+  for i = 1, 3 do
+    redis.call('PEXPIRE', KEYS[i], ttl_ms)
+  end
+end
+return 1
+"#;
+
+/// Delete every key of one session, refusing keys another type occupies.
+const CLEAR_SESSION_SCRIPT: &str = r#"
+local err = guard()
+if err then return redis.error_reply(err) end
+redis.call('DEL', KEYS[1], KEYS[2], KEYS[3])
+return 1
+"#;
+
+/// Replace a suffix of the message list.
+///
+/// `ARGV` is the TTL in milliseconds, the number of handles, the handles, the number of
+/// replacement items, then the items.
+const REPLACE_SUFFIX_SCRIPT: &str = r#"
+local err = guard()
+if err then return redis.error_reply(err) end
+local ttl_ms = tonumber(ARGV[1])
+local handle_count = tonumber(ARGV[2])
+local stamp = now()
 local total = redis.call('LLEN', KEYS[1])
 if total < handle_count then return 0 end
 local start = total - handle_count
 if handle_count > 0 then
   local tail = redis.call('LRANGE', KEYS[1], start, -1)
   for i = 1, handle_count do
-    if tail[i] ~= ARGV[3 + i] then return 0 end
+    if tail[i] ~= ARGV[2 + i] then return 0 end
   end
 end
 if start == 0 then
@@ -52,11 +114,11 @@ if start == 0 then
 else
   redis.call('LTRIM', KEYS[1], 0, start - 1)
 end
-local item_count = tonumber(ARGV[4 + handle_count])
+local item_count = tonumber(ARGV[3 + handle_count])
 for i = 1, item_count do
-  redis.call('RPUSH', KEYS[1], ARGV[4 + handle_count + i])
+  redis.call('RPUSH', KEYS[1], ARGV[3 + handle_count + i])
 end
-redis.call('HSET', KEYS[2], 'updated_at', now)
+redis.call('HSET', KEYS[2], 'updated_at', stamp)
 if ttl_ms > 0 then
   for i = 1, 3 do
     if redis.call('EXISTS', KEYS[i]) == 1 then
@@ -74,22 +136,6 @@ fn serialize_item(item: &InputItem) -> Result<String> {
 
 fn redis_err(e: redis::RedisError) -> AgentsError {
     AgentsError::other(format!("Redis error: {e}"))
-}
-
-/// Reject a session key occupied by a different Redis data type.
-///
-/// Redis `TYPE` answers `none` for a key that does not exist, which is always acceptable. A
-/// colliding session id can otherwise share a legacy key with something else; Python detects
-/// that under `WATCH` and refuses to touch it.
-fn validate_key_types(keys: &[(&str, &str, &str)]) -> Result<()> {
-    for (key, actual, expected) in keys {
-        if *actual != "none" && actual != expected {
-            return Err(AgentsError::other(format!(
-                "WRONGTYPE Redis key {key} holds a {actual}, expected a {expected}"
-            )));
-        }
-    }
-    Ok(())
 }
 
 /// Conversation history stored in Redis.
@@ -199,40 +245,29 @@ impl RedisSession {
             .is_ok()
     }
 
-    /// Check that this session's keys hold the expected Redis types and read the server clock.
+    /// An `EVAL` of `body` with this session's three keys and the shared guard prelude.
     ///
-    /// A session id can collide with a legacy key of another type; Python rejects that under
-    /// `WATCH`, and this performs the same check in the round trip before the write. Returns
-    /// the server's current time in seconds, which the metadata hash records so timestamps do
-    /// not depend on the client clock.
-    async fn check_keys_and_server_time(&self, conn: &mut MultiplexedConnection) -> Result<u64> {
-        let (session_type, messages_type, counter_type, server_time): (
-            String,
-            String,
-            String,
-            Vec<String>,
-        ) = redis::pipe()
-            .cmd("TYPE")
-            .arg(&self.session_key)
-            .cmd("TYPE")
+    /// Folding the key-type validation and the server clock into the script makes every write
+    /// one atomic Redis operation, so a key whose type changes between the check and the write
+    /// cannot slip through — what Python's `WATCH`/`MULTI` guarantees. Caller arguments start
+    /// at `ARGV[1]`.
+    fn script(&self, body: &str) -> redis::Cmd {
+        let mut cmd = redis::cmd("EVAL");
+        cmd.arg(format!("{KEY_GUARD_PRELUDE}{body}"))
+            .arg(3)
             .arg(&self.messages_key)
-            .cmd("TYPE")
-            .arg(&self.counter_key)
-            .cmd("TIME")
-            .query_async(conn)
-            .await
-            .map_err(redis_err)?;
+            .arg(&self.session_key)
+            .arg(&self.counter_key);
+        cmd
+    }
 
-        validate_key_types(&[
-            (&self.session_key, &session_type, "hash"),
-            (&self.messages_key, &messages_type, "list"),
-            (&self.counter_key, &counter_type, "string"),
-        ])?;
-
-        Ok(server_time
-            .first()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0))
+    /// The TTL in milliseconds, or 0 when the session does not expire.
+    fn ttl_millis(&self) -> Result<i64> {
+        match self.ttl {
+            Some(ttl) => i64::try_from(ttl.saturating_mul(1000))
+                .map_err(|_| AgentsError::user("ttl is outside Redis's supported range")),
+            None => Ok(0),
+        }
     }
 
     /// Decode a window of raw list entries, skipping corrupted ones.
@@ -299,41 +334,17 @@ impl Session for RedisSession {
             .iter()
             .map(serialize_item)
             .collect::<Result<Vec<_>>>()?;
+        let ttl_ms = self.ttl_millis()?;
         let mut conn = self.connection.lock().await;
-        let now = self
-            .check_keys_and_server_time(&mut conn)
-            .await?
-            .to_string();
-
-        let mut pipe = redis::pipe();
-        pipe.atomic()
-            .cmd("HSET")
-            .arg(&self.session_key)
-            .arg("session_id")
-            .arg(&self.session_id)
-            .ignore()
-            .cmd("HSETNX")
-            .arg(&self.session_key)
-            .arg("created_at")
-            .arg(&now)
-            .ignore()
-            .cmd("RPUSH")
-            .arg(&self.messages_key)
-            .arg(&serialized)
-            .ignore()
-            .cmd("HSET")
-            .arg(&self.session_key)
-            .arg("updated_at")
-            .arg(&now)
-            .ignore();
-        if let Some(ttl) = self.ttl {
-            let ttl_ms = i64::try_from(ttl.saturating_mul(1000))
-                .map_err(|_| AgentsError::user("ttl is outside Redis's supported range"))?;
-            for key in [&self.session_key, &self.messages_key, &self.counter_key] {
-                pipe.cmd("PEXPIRE").arg(key).arg(ttl_ms).ignore();
-            }
+        let mut cmd = self.script(ADD_ITEMS_SCRIPT);
+        cmd.arg(ttl_ms).arg(&self.session_id);
+        for entry in &serialized {
+            cmd.arg(entry);
         }
-        pipe.query_async::<()>(&mut *conn).await.map_err(redis_err)
+        cmd.query_async::<i64>(&mut *conn)
+            .await
+            .map(|_| ())
+            .map_err(redis_err)
     }
 
     async fn pop_item(&self) -> Result<Option<InputItem>> {
@@ -410,23 +421,10 @@ impl Session for RedisSession {
             .iter()
             .map(serialize_item)
             .collect::<Result<Vec<_>>>()?;
-        let ttl_ms = match self.ttl {
-            Some(ttl) => i64::try_from(ttl.saturating_mul(1000))
-                .map_err(|_| AgentsError::user("ttl is outside Redis's supported range"))?,
-            None => 0,
-        };
+        let ttl_ms = self.ttl_millis()?;
         let mut conn = self.connection.lock().await;
-        let now = self.check_keys_and_server_time(&mut conn).await?;
-
-        let mut cmd = redis::cmd("EVAL");
-        cmd.arg(REPLACE_SUFFIX_SCRIPT)
-            .arg(3)
-            .arg(&self.messages_key)
-            .arg(&self.session_key)
-            .arg(&self.counter_key)
-            .arg(ttl_ms)
-            .arg(now.to_string())
-            .arg(handles.len());
+        let mut cmd = self.script(REPLACE_SUFFIX_SCRIPT);
+        cmd.arg(ttl_ms).arg(handles.len());
         for handle in handles {
             cmd.arg(&handle.0);
         }
@@ -440,13 +438,10 @@ impl Session for RedisSession {
 
     async fn clear_session(&self) -> Result<()> {
         let mut conn = self.connection.lock().await;
-        self.check_keys_and_server_time(&mut conn).await?;
-        redis::cmd("DEL")
-            .arg(&self.session_key)
-            .arg(&self.messages_key)
-            .arg(&self.counter_key)
-            .query_async::<()>(&mut *conn)
+        self.script(CLEAR_SESSION_SCRIPT)
+            .query_async::<i64>(&mut *conn)
             .await
+            .map(|_| ())
             .map_err(redis_err)
     }
 }
@@ -490,44 +485,25 @@ mod tests {
     }
 
     #[test]
-    fn key_type_validation_accepts_missing_keys_and_rejects_collisions() {
+    fn every_write_runs_the_key_type_guard_inside_one_script() {
+        // The check and the write are one `EVAL`, so a type that changes between them cannot
+        // slip through — what Python's `WATCH`/`MULTI` guarantees.
+        for body in [
+            ADD_ITEMS_SCRIPT,
+            CLEAR_SESSION_SCRIPT,
+            REPLACE_SUFFIX_SCRIPT,
+        ] {
+            assert!(body.contains("local err = guard()"), "{body}");
+            assert!(body.contains("return redis.error_reply(err)"), "{body}");
+        }
+        assert!(KEY_GUARD_PRELUDE.contains("redis.call('TYPE', key)"));
+        assert!(KEY_GUARD_PRELUDE.contains("WRONGTYPE Redis key "));
         // `none` means the key does not exist yet, which every operation tolerates.
-        assert!(
-            validate_key_types(&[
-                ("agents:session:u", "none", "hash"),
-                ("agents:session:u:messages", "none", "list"),
-                ("agents:session:u:counter", "none", "string"),
-            ])
-            .is_ok()
-        );
-        assert!(
-            validate_key_types(&[
-                ("agents:session:u", "hash", "hash"),
-                ("agents:session:u:messages", "list", "list"),
-            ])
-            .is_ok()
-        );
-
-        let err = validate_key_types(&[
-            ("agents:session:u", "hash", "hash"),
-            ("agents:session:u:messages", "set", "list"),
-        ])
-        .unwrap_err();
-        let message = err.to_string();
-        assert!(message.contains("WRONGTYPE"), "{message}");
-        assert!(message.contains("agents:session:u:messages"), "{message}");
-        assert!(
-            message.contains("holds a set, expected a list"),
-            "{message}"
-        );
-
-        // The first mismatch is the one reported.
-        let err = validate_key_types(&[
-            ("agents:session:u", "stream", "hash"),
-            ("agents:session:u:messages", "set", "list"),
-        ])
-        .unwrap_err();
-        assert!(err.to_string().contains("holds a stream"), "{err}");
+        assert!(KEY_GUARD_PRELUDE.contains("actual ~= 'none'"));
+        // Timestamps come from the server clock, read inside the same script.
+        assert!(KEY_GUARD_PRELUDE.contains("redis.call('TIME')"));
+        assert!(ADD_ITEMS_SCRIPT.contains("local stamp = now()"));
+        assert!(REPLACE_SUFFIX_SCRIPT.contains("local stamp = now()"));
     }
 
     /// Integration coverage against a real server; skipped unless `REDIS_URL` is set.

@@ -15,6 +15,7 @@ use crate::guardrail::{InputGuardrailResult, OutputGuardrailResult};
 use crate::items::{InputItem, ModelResponse, RunItem, ToolApprovalItem};
 use crate::run_context::ApprovalsState;
 use crate::tool_guardrails::{ToolInputGuardrailResult, ToolOutputGuardrailResult};
+use crate::tracing::TraceState;
 use crate::usage::Usage;
 
 mod wire;
@@ -94,6 +95,11 @@ pub struct RunState {
     /// Trace id of the run.
     #[serde(default)]
     pub trace_id: Option<String>,
+    /// Full trace metadata of the run (workflow name, group id, metadata). A resumed run
+    /// restores the settings the snapshot was traced with unless `RunConfig` overrides them.
+    /// Mirrors `RunState._trace_state`.
+    #[serde(default)]
+    pub trace_state: Option<TraceState>,
     /// Optional application context, serialized by the application.
     #[serde(default)]
     pub context: Option<Value>,
@@ -110,6 +116,87 @@ pub struct RunState {
     /// Server-managed conversation bookkeeping, so a resume neither resends nor skips items.
     #[serde(default)]
     pub server_conversation: ServerConversationState,
+    /// The run ended at a boundary a resume cannot reproduce (a terminal output whose
+    /// persistence failed, or a handoff an input guardrail rejected). Mirrors
+    /// `RunState._terminal_unrecoverable`: resuming such a snapshot is refused. Rust never
+    /// produces one — a failed terminal save returns an error rather than a snapshot — but a
+    /// Python-written snapshot can carry it.
+    #[serde(default)]
+    pub terminal_unrecoverable: bool,
+    /// Canonical identity of every tool call the run has seen, keyed by call id. Mirrors
+    /// `RunContextWrapper._tool_invocations`: it binds an approval decision to the exact call
+    /// it was given for, so a replay with mutated arguments is rejected rather than reused.
+    #[serde(default)]
+    pub tool_invocations: BTreeMap<String, ToolInvocationRecord>,
+    /// What the run loop made of the model response that produced the pending interruptions.
+    /// Mirrors `RunState._last_processed_response`; `None` unless the run stopped at an
+    /// interruption, which is also when Python writes it.
+    #[serde(default)]
+    pub last_processed_response: Option<ProcessedResponseSnapshot>,
+}
+
+/// One entry of the tool-invocation ledger. Mirrors `_ToolInvocationRecord`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolInvocationRecord {
+    /// The invocation item type (`function_call`, `shell_call`, ...).
+    #[serde(rename = "type")]
+    pub invocation_type: String,
+    /// SHA-256 of what the call is authorized as (its tool routing).
+    pub approval_scope: String,
+    /// SHA-256 of the call's full semantic payload, arguments included.
+    pub fingerprint: String,
+    /// The tool started running.
+    pub executed: bool,
+    /// The tool's output was committed to history.
+    pub completed: bool,
+}
+
+/// The classified tool activity of the interrupted turn, in the shape Python's
+/// `_serialize_processed_response` writes. The Python runner needs it to continue an
+/// interrupted turn; Rust rebuilds execution from `model_responses.last()` and keeps this so
+/// a snapshot written here stays resumable by the Python SDK.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ProcessedResponseSnapshot {
+    /// Items the turn generated before it paused, excluding the approval items themselves.
+    pub new_items: Vec<RunItem>,
+    /// Names of the tools the response asked for.
+    pub tools_used: Vec<String>,
+    /// Function-tool calls scheduled by the response.
+    pub functions: Vec<ToolRunSnapshot>,
+    /// Handoff calls scheduled by the response.
+    pub handoffs: Vec<ToolRunSnapshot>,
+    /// Computer-tool calls.
+    pub computer_actions: Vec<ToolRunSnapshot>,
+    /// Custom-tool calls.
+    pub custom_tool_actions: Vec<ToolRunSnapshot>,
+    /// Local shell calls.
+    pub local_shell_actions: Vec<ToolRunSnapshot>,
+    /// Shell-tool calls.
+    pub shell_actions: Vec<ToolRunSnapshot>,
+    /// Apply-patch calls.
+    pub apply_patch_actions: Vec<ToolRunSnapshot>,
+    /// Hosted-MCP approval requests, as `{request_item, mcp_tool}` payloads.
+    pub mcp_approval_requests: Vec<Value>,
+    /// The approvals the turn is waiting on.
+    pub interruptions: Vec<ToolApprovalItem>,
+    /// Hosted-MCP server labels bound to each call id.
+    pub mcp_tool_bindings: BTreeMap<String, Vec<String>>,
+}
+
+/// One tool call a [`ProcessedResponseSnapshot`] scheduled, with the metadata the Python
+/// deserializer matches against the resumed agent's tools.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ToolRunSnapshot {
+    /// The tool's own name (not namespaced).
+    pub tool_name: String,
+    /// Namespace of the tool, when it has one.
+    pub namespace: Option<String>,
+    /// The raw tool-call item.
+    pub tool_call: Value,
+    /// The tool description, when the group carries one.
+    pub description: Option<String>,
+    /// The tool parameter schema, written for function tools only.
+    pub params_json_schema: Option<Value>,
 }
 
 /// What a server-managed conversation has already seen. Mirrors the state

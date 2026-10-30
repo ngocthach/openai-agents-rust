@@ -13,12 +13,14 @@ use openai_agents_sdk::tracing::{
     InMemoryTraceProcessor, TracingProcessor, set_trace_processors, trace,
 };
 use openai_agents_sdk::voice::testing::{
-    FakeSTTModel, FakeTTSModel, FakeVoiceWorkflow, pcm16_bytes,
+    FakeSTTModel, FakeTTSModel, FakeTranscriptionSession, FakeVoiceWorkflow, VoiceScriptError,
+    operation, pcm16_bytes, pcm16_samples,
 };
 use openai_agents_sdk::voice::{
     AudioData, AudioInput, OpenAISTTModel, OpenAITTSModel, STTModel, STTModelSettings,
-    SingleAgentVoiceWorkflow, StreamedAudioInput, StreamedAudioResult, TTSModel, TTSModelSettings,
-    VoicePipeline, VoicePipelineConfig, VoiceStreamEvent, VoiceWorkflowBase,
+    SingleAgentVoiceWorkflow, StreamedAudioInput, StreamedAudioResult,
+    StreamedTranscriptionSession, TTSModel, TTSModelSettings, TextStream, VoicePipeline,
+    VoicePipelineConfig, VoiceStreamEvent, VoiceWebSocketOptions, VoiceWorkflowBase,
     get_sentence_based_splitter,
 };
 use openai_agents_sdk::{Agent, OpenAIClient};
@@ -876,4 +878,393 @@ async fn session_creation_and_tts_settings_are_recorded() {
     assert_eq!(tts_calls[0].text, "Spoken.");
     assert_eq!(tts_calls[0].settings.voice, Some(TTSVoice::Echo));
     assert_eq!(tts_calls[0].settings.instructions, "Be brisk.");
+}
+
+// ===== The script-error hierarchy and `assert_complete` =====
+
+#[tokio::test]
+async fn an_exhausted_script_fails_with_pythons_messages() {
+    let stt = FakeSTTModel::new();
+    let error = stt
+        .transcribe(
+            &AudioInput::new(vec![0; 2]),
+            &Default::default(),
+            true,
+            true,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "Unexpected static transcription call: no scripted transcriptions remain."
+    );
+
+    let input = StreamedAudioInput::new();
+    input.end().unwrap();
+    let error = stt
+        .create_session(&input, &Default::default(), true, true)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "Unexpected streamed transcription session: no scripted sessions remain."
+    );
+
+    let tts = FakeTTSModel::new();
+    let error = tts
+        .run("hi", &Default::default())
+        .await
+        .err()
+        .expect("no scripted result");
+    assert_eq!(
+        error.to_string(),
+        "Unexpected TTS call: no scripted results remain."
+    );
+
+    let workflow = FakeVoiceWorkflow::new();
+    let turn = std::pin::pin!(workflow.run("hi".to_string()))
+        .next()
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(
+        turn.to_string(),
+        "Unexpected workflow turn: no scripted turns remain."
+    );
+}
+
+#[tokio::test]
+async fn assert_complete_reports_every_unconsumed_step() {
+    let stt = FakeSTTModel::new()
+        .with_transcription("a")
+        .with_session(vec!["b".to_string()]);
+    assert_eq!(
+        stt.assert_complete(),
+        Err(VoiceScriptError::UnconsumedVoiceSteps {
+            message: "2 scripted STT step(s) were not consumed.".to_string(),
+            remaining_steps: 2,
+        })
+    );
+
+    let tts = FakeTTSModel::new().with_result(vec![pcm16_samples(&[1])]);
+    assert_eq!(
+        tts.assert_complete(),
+        Err(VoiceScriptError::UnconsumedVoiceSteps {
+            message: "1 scripted TTS result(s) were not consumed.".to_string(),
+            remaining_steps: 1,
+        })
+    );
+
+    let workflow = FakeVoiceWorkflow::new().with_turn(vec!["x".to_string()]);
+    assert_eq!(
+        workflow.assert_complete(),
+        Err(VoiceScriptError::UnconsumedVoiceSteps {
+            message: "1 scripted workflow turn(s) were not consumed.".to_string(),
+            remaining_steps: 1,
+        })
+    );
+
+    // A created session with turns left fails the model's own `assert_complete`.
+    let session = FakeTranscriptionSession::new(vec!["one".to_string(), "two".to_string()]);
+    let stt = FakeSTTModel::new().with_session_instance(session.clone());
+    let input = StreamedAudioInput::new();
+    input.end().unwrap();
+    let mut created = stt
+        .create_session(&input, &Default::default(), false, false)
+        .await
+        .unwrap();
+    assert_eq!(created.next_turn().await.unwrap().as_deref(), Some("one"));
+    assert_eq!(
+        stt.assert_complete(),
+        Err(VoiceScriptError::UnconsumedVoiceSteps {
+            message: "1 scripted transcription turn(s) were not consumed.".to_string(),
+            remaining_steps: 1,
+        })
+    );
+    assert_eq!(session.assert_complete(), stt.assert_complete());
+}
+
+#[tokio::test]
+async fn a_configured_workflow_start_is_consumed_exactly_once() {
+    // An unconfigured start yields nothing and never fails, however often it is called.
+    let workflow = FakeVoiceWorkflow::new();
+    for _ in 0..2 {
+        let fragments: Vec<_> = std::pin::pin!(workflow.on_start()).collect().await;
+        assert!(fragments.is_empty());
+    }
+    assert_eq!(workflow.assert_complete(), Ok(()));
+
+    let workflow = FakeVoiceWorkflow::new().with_start(vec!["Hello.".to_string()]);
+    let first: Vec<String> = std::pin::pin!(workflow.on_start())
+        .map(|f| f.unwrap())
+        .collect()
+        .await;
+    assert_eq!(first, ["Hello."]);
+    assert_eq!(workflow.assert_complete(), Ok(()));
+
+    let error = std::pin::pin!(workflow.on_start())
+        .next()
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "Unexpected workflow startup call: no scripted startup step remains."
+    );
+    assert_eq!(
+        VoiceScriptError::UnexpectedVoiceCall {
+            message: error.to_string(),
+            operation: operation::WORKFLOW_START,
+        }
+        .to_string(),
+        error.to_string()
+    );
+}
+
+#[tokio::test]
+async fn a_scripted_session_close_failure_reaches_the_pipeline_and_close_is_idempotent() {
+    trace_processor();
+    let session = FakeTranscriptionSession::new(vec!["first".to_string()])
+        .with_close_error("could not close the session");
+    let stt = Arc::new(FakeSTTModel::new().with_session_instance(session.clone()));
+    let tts = Arc::new(FakeTTSModel::new().with_result(vec![pcm16_bytes(&[5])]));
+    let workflow = Arc::new(FakeVoiceWorkflow::new().with_turn(vec!["Ok.".to_string()]));
+
+    let pipeline = VoicePipeline::new(workflow)
+        .with_stt_model(stt.clone())
+        .with_tts_model(tts)
+        .with_config(VoicePipelineConfig::default().with_tracing_disabled(true));
+
+    let input = StreamedAudioInput::new();
+    input.end().unwrap();
+    let mut result = pipeline.run(input).await.unwrap();
+    let (labels, _) = extract_events(&mut result).await;
+
+    assert_eq!(
+        labels,
+        [
+            "turn_started",
+            "audio",
+            "turn_ended",
+            "error: could not close the session"
+        ]
+    );
+    assert_eq!(session.close_calls(), 1);
+    assert!(session.is_closed());
+
+    // A second close is a no-op: it counts, and it does not fail again.
+    let mut again = session.clone();
+    again.close().await.unwrap();
+    assert_eq!(session.close_calls(), 2);
+    assert_eq!(stt.assert_complete(), Ok(()));
+}
+
+#[tokio::test]
+async fn a_closed_session_stops_yielding_its_remaining_turns() {
+    let mut session = FakeTranscriptionSession::new(vec!["one".to_string(), "two".to_string()]);
+    assert_eq!(session.next_turn().await.unwrap().as_deref(), Some("one"));
+    session.close().await.unwrap();
+    assert_eq!(session.next_turn().await.unwrap(), None);
+    assert_eq!(
+        session.assert_complete(),
+        Err(VoiceScriptError::UnconsumedVoiceSteps {
+            message: "1 scripted transcription turn(s) were not consumed.".to_string(),
+            remaining_steps: 1,
+        })
+    );
+}
+
+#[tokio::test]
+async fn a_failing_turn_ends_a_streamed_session() {
+    trace_processor();
+    let session =
+        FakeTranscriptionSession::new(vec!["first".to_string()]).with_turn_error("socket died");
+    let stt = Arc::new(FakeSTTModel::new().with_session_instance(session));
+    let tts = Arc::new(FakeTTSModel::new().with_result(vec![pcm16_bytes(&[5])]));
+    let workflow = Arc::new(FakeVoiceWorkflow::new().with_turn(vec!["Ok.".to_string()]));
+
+    let pipeline = VoicePipeline::new(workflow)
+        .with_stt_model(stt)
+        .with_tts_model(tts)
+        .with_config(VoicePipelineConfig::default().with_tracing_disabled(true));
+
+    let input = StreamedAudioInput::new();
+    input.end().unwrap();
+    let mut result = pipeline.run(input).await.unwrap();
+    let (labels, _) = extract_events(&mut result).await;
+    assert_eq!(
+        labels,
+        ["turn_started", "audio", "turn_ended", "error: socket died"]
+    );
+}
+
+// ===== Cancellation and panic bookkeeping =====
+
+/// A workflow that panics instead of producing text.
+#[derive(Debug)]
+struct PanickingWorkflow;
+
+impl VoiceWorkflowBase for PanickingWorkflow {
+    fn run(&self, _transcription: String) -> TextStream<'_> {
+        panic!("the workflow exploded");
+    }
+}
+
+#[tokio::test]
+async fn a_panicking_workflow_still_ends_the_stream() {
+    trace_processor();
+    let stt = Arc::new(FakeSTTModel::new().with_transcription("hi"));
+    let tts = Arc::new(FakeTTSModel::new());
+    let pipeline = VoicePipeline::new(Arc::new(PanickingWorkflow))
+        .with_stt_model(stt)
+        .with_tts_model(tts)
+        .with_config(VoicePipelineConfig::default().with_tracing_disabled(true));
+
+    let mut result = pipeline.run(AudioInput::new(vec![0; 4])).await.unwrap();
+    let (labels, samples) = extract_events(&mut result).await;
+    assert_eq!(labels, ["error: The voice pipeline panicked"]);
+    assert!(samples.is_empty());
+    assert!(result.is_complete());
+}
+
+#[tokio::test]
+async fn dropping_the_result_stops_the_pipeline() {
+    trace_processor();
+    let stt = Arc::new(FakeSTTModel::new().with_session(vec![
+        "first".to_string(),
+        "second".to_string(),
+        "third".to_string(),
+    ]));
+    let tts = Arc::new(FakeTTSModel::new().with_result(vec![pcm16_bytes(&[1])]));
+    let workflow = Arc::new(
+        FakeVoiceWorkflow::new()
+            .with_turn(vec!["One.".to_string()])
+            .with_turn(vec!["Two.".to_string()])
+            .with_turn(vec!["Three.".to_string()]),
+    );
+
+    let pipeline = VoicePipeline::new(workflow.clone())
+        .with_stt_model(stt.clone())
+        .with_tts_model(tts)
+        .with_config(VoicePipelineConfig::default().with_tracing_disabled(true));
+
+    let input = StreamedAudioInput::new();
+    input.end().unwrap();
+    let mut result = pipeline.run(input).await.unwrap();
+    {
+        let mut stream = std::pin::pin!(result.stream());
+        assert!(stream.next().await.is_some());
+    }
+    drop(result);
+    // The aborted producer never reaches the later turns.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(workflow.transcriptions().len() < 3);
+}
+
+// ===== Trace configuration =====
+
+/// A workflow recording the tracing API key of the trace it runs in.
+#[derive(Debug, Default)]
+struct TraceKeyWorkflow {
+    key: Mutex<Option<String>>,
+}
+
+impl VoiceWorkflowBase for TraceKeyWorkflow {
+    fn run(&self, _transcription: String) -> TextStream<'_> {
+        *self.key.lock().unwrap() = openai_agents_sdk::tracing::current_trace()
+            .and_then(|trace| trace.tracing_api_key().map(str::to_string));
+        futures::stream::iter(vec![Ok("Done.".to_string())]).boxed()
+    }
+}
+
+#[tokio::test]
+async fn the_pipeline_trace_carries_the_configured_tracing_api_key() {
+    trace_processor();
+    let workflow = Arc::new(TraceKeyWorkflow::default());
+    let pipeline = VoicePipeline::new(workflow.clone())
+        .with_stt_model(Arc::new(FakeSTTModel::new().with_transcription("hi")))
+        .with_tts_model(Arc::new(
+            FakeTTSModel::new().with_result(vec![pcm16_bytes(&[1])]),
+        ))
+        .with_config(VoicePipelineConfig::default().with_tracing_api_key("sk-trace-test"));
+
+    let mut result = pipeline.run(AudioInput::new(vec![0; 4])).await.unwrap();
+    extract_events(&mut result).await;
+    assert_eq!(
+        workflow.key.lock().unwrap().as_deref(),
+        Some("sk-trace-test")
+    );
+}
+
+// ===== Websocket keepalive and frame-size settings =====
+
+#[tokio::test]
+async fn the_websocket_max_size_rejects_an_oversized_event() {
+    trace_processor();
+    let (base, _server) = mock_transcription_server().await;
+    let client = OpenAIClient::new("sk-test").with_base_url(base);
+    let model = OpenAISTTModel::new("gpt-transcribe", client)
+        .with_websocket_options(VoiceWebSocketOptions::default().with_max_size(Some(4)));
+    assert_eq!(model.websocket_options().max_size, Some(4));
+
+    let input = StreamedAudioInput::new();
+    input.end().unwrap();
+    let error = model
+        .create_session(&input, &STTModelSettings::default(), false, false)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("STT websocket"), "{error}");
+}
+
+/// Complete the handshake, then stop reading so no pong can be sent.
+async fn mock_silent_transcription_server() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(socket).await.unwrap();
+        ws.send(tokio_tungstenite::tungstenite::Message::text(
+            json!({"type": "session.created"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        while let Some(Ok(message)) = ws.next().await {
+            if message
+                .to_text()
+                .is_ok_and(|text| text.contains("session.update"))
+            {
+                ws.send(tokio_tungstenite::tungstenite::Message::text(
+                    json!({"type": "session.updated"}).to_string(),
+                ))
+                .await
+                .unwrap();
+                break;
+            }
+        }
+        // Hold the socket open without reading: keepalive pings go unanswered.
+        tokio::time::sleep(Duration::from_secs(30)).await;
+    });
+    format!("http://{addr}/v1")
+}
+
+#[tokio::test]
+async fn an_unanswered_keepalive_ping_fails_the_session() {
+    trace_processor();
+    let base = mock_silent_transcription_server().await;
+    let client = OpenAIClient::new("sk-test").with_base_url(base);
+    let model = OpenAISTTModel::new("gpt-transcribe", client).with_websocket_options(
+        VoiceWebSocketOptions::default()
+            .with_ping_interval(Some(0.05))
+            .with_ping_timeout(Some(0.05)),
+    );
+
+    let input = StreamedAudioInput::new();
+    input.add_audio(vec![1, 2, 3]).unwrap();
+    let mut session = model
+        .create_session(&input, &STTModelSettings::default(), false, false)
+        .await
+        .unwrap();
+    let error = session.next_turn().await.unwrap_err();
+    assert!(error.to_string().contains("keepalive pong"), "{error}");
+    session.close().await.unwrap();
 }

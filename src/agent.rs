@@ -1,5 +1,7 @@
 //! Agents. Mirrors `agents.agent`.
 
+#[cfg(feature = "mcp")]
+use std::collections::HashSet;
 use std::fmt;
 use std::future::Future;
 use std::sync::Arc;
@@ -540,16 +542,39 @@ impl<C: Send + Sync + 'static> Agent<C> {
         out
     }
 
+    /// The tool names a derived MCP tool must not shadow: this agent's own function tools
+    /// plus the tool names of its enabled handoffs. Port of `_get_mcp_tool_reserved_names`.
+    #[cfg(feature = "mcp")]
+    pub async fn mcp_reserved_tool_names(&self, ctx: &RunContext<C>) -> HashSet<String> {
+        let mut reserved: HashSet<String> = self
+            .tools
+            .iter()
+            .filter_map(|t| t.as_function().map(|f| f.name.clone()))
+            .collect();
+        for h in &self.handoffs {
+            if h.is_enabled.evaluate(ctx, &self.name).await {
+                reserved.insert(h.tool_name.clone());
+            }
+        }
+        reserved
+    }
+
     /// All enabled tools, including MCP tools.
-    pub async fn get_all_tools(&self, ctx: &RunContext<C>) -> Result<Vec<Tool<C>>> {
+    ///
+    /// Takes `Arc<Self>` so a dynamic [`crate::mcp::ToolFilter`] receives the agent through
+    /// `ToolFilterContext::agent`, as Python's `get_public_agent(self)` does.
+    pub async fn get_all_tools(self: &Arc<Self>, ctx: &RunContext<C>) -> Result<Vec<Tool<C>>> {
         let mut out = Vec::new();
         #[cfg(feature = "mcp")]
         {
-            let mcp_tools = crate::mcp::util::get_all_function_tools(
+            let reserved = self.mcp_reserved_tool_names(ctx).await;
+            let mcp_tools = crate::mcp::util::get_all_function_tools_for_agent(
                 &self.mcp_servers,
                 &self.mcp_config,
                 ctx,
                 &self.name,
+                Some(self.clone()),
+                &reserved,
             )
             .await?;
             out.extend(mcp_tools);
@@ -564,8 +589,36 @@ impl<C: Send + Sync + 'static> Agent<C> {
                 other => out.push(other.clone()),
             }
         }
+        validate_codex_tool_name_collisions(&out)?;
         Ok(out)
     }
+}
+
+/// Reject two tools sharing a name when at least one of them is a Codex tool: a Codex tool
+/// keeps per-tool state, so a collision silently routes calls to the wrong instance.
+/// Port of `_validate_codex_tool_name_collisions`.
+fn validate_codex_tool_name_collisions<C>(tools: &[Tool<C>]) -> Result<()> {
+    let codex_names: std::collections::BTreeSet<&str> = tools
+        .iter()
+        .filter_map(|t| t.as_function())
+        .filter(|f| f.is_codex_tool)
+        .map(|f| f.name.as_str())
+        .collect();
+    if codex_names.is_empty() {
+        return Ok(());
+    }
+    let duplicates: Vec<&str> = codex_names
+        .into_iter()
+        .filter(|name| tools.iter().filter(|t| t.name() == *name).count() > 1)
+        .collect();
+    if duplicates.is_empty() {
+        return Ok(());
+    }
+    Err(crate::error::AgentsError::user(format!(
+        "Duplicate Codex tool names found: {}. Provide a unique codex_tool(name=...) per tool \
+         instance.",
+        duplicates.join(", ")
+    )))
 }
 
 type OutputExtractor<C> =
@@ -1093,6 +1146,7 @@ mod tests {
         let ctx = RunContext::new(NotCloneCtx {
             _m: std::sync::Mutex::new(0),
         });
+        let agent = Arc::new(agent);
         let tools = agent.get_all_tools(&ctx).await.unwrap();
         assert_eq!(tools.len(), 1);
         let _ = format!("{agent:?}");

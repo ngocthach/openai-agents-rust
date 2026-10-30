@@ -1,13 +1,11 @@
 //! The OpenAI text-to-speech model. Mirrors `agents.voice.models.openai_tts`.
 
 use async_trait::async_trait;
-use futures::StreamExt;
 use serde_json::{Value, json};
 
 use crate::error::Result;
 use crate::models::OpenAIClient;
 use crate::voice::model::{AudioByteStream, TTSModel, TTSModelSettings, TTSVoice};
-use crate::voice::models::{check_response, request_headers, request_url};
 
 /// The voice used when [`TTSModelSettings::voice`] is not set.
 pub const DEFAULT_VOICE: &str = "ash";
@@ -63,18 +61,13 @@ impl TTSModel for OpenAITTSModel {
     }
 
     async fn run(&self, text: &str, settings: &TTSModelSettings) -> Result<AudioByteStream> {
-        let response = self
-            .http
-            .post(request_url(&self.client, "/audio/speech"))
-            .headers(request_headers(&self.client)?)
-            .json(&self.request_body(text, settings))
-            .send()
+        // Goes through the shared client so the `RequestAuth` hook, the default query and
+        // the OpenAI error mapping apply here as they do to every other request.
+        let (stream, _request_id) = self
+            .client
+            .post_bytes_stream("/audio/speech", &self.request_body(text, settings), None)
             .await?;
-        let response = check_response(response).await?;
-        Ok(response
-            .bytes_stream()
-            .map(|chunk| chunk.map_err(Into::into))
-            .boxed())
+        Ok(stream)
     }
 }
 

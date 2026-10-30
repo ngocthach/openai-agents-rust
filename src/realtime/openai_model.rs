@@ -496,7 +496,7 @@ impl RealtimeModel for OpenAIRealtimeWebSocketModel {
                 }
             }
             None => {
-                let api_key = resolve_api_key(config.api_key.as_ref()).await?;
+                let api_key = get_api_key(config.api_key.as_ref()).await?;
                 let value = HeaderValue::from_str(&format!("Bearer {api_key}"))
                     .map_err(|e| AgentsError::user(format!("Invalid API key: {e}")))?;
                 request
@@ -1785,7 +1785,12 @@ fn connect_url(url: Option<&str>, call_id: Option<&str>, model: &str) -> String 
 ///
 /// An explicit key may be a provider resolved at connect time, so a short-lived key can be
 /// refreshed without rebuilding the model.
-async fn resolve_api_key(explicit: Option<&RealtimeApiKey>) -> Result<String> {
+/// Resolve the API key a realtime connection uses: the explicit key or key function, then the
+/// SDK default key, then `OPENAI_API_KEY`.
+///
+/// Port of `agents.realtime.openai_realtime.get_api_key`, which this crate's
+/// [`RealtimeApiKey`] generalizes to a literal or a function.
+pub async fn get_api_key(explicit: Option<&RealtimeApiKey>) -> Result<String> {
     if let Some(key) = explicit {
         return key.resolve().await;
     }
@@ -1822,6 +1827,21 @@ fn u64_field(event: &Value, key: &str) -> u64 {
     event.get(key).and_then(Value::as_u64).unwrap_or_default()
 }
 
+/// The fields of `value` that this port does not model, kept so they survive a round trip, as
+/// Python's `extra="allow"` does.
+fn extra_fields(value: &Value, known: &[&str]) -> Map<String, Value> {
+    value
+        .as_object()
+        .map(|fields| {
+            fields
+                .iter()
+                .filter(|(key, _)| !known.contains(&key.as_str()))
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Parse a wire message item into a [`RealtimeItem`], normalizing GA content types.
 fn parse_message_item(
     item: &Value,
@@ -1853,13 +1873,27 @@ fn parse_message_item(
             .and_then(Value::as_str)
             .map(str::to_string);
         let text = part.get("text").and_then(Value::as_str).map(str::to_string);
+        // Keep the part's unmodelled fields, as Python's `extra="allow"` does on content parts.
+        let part_extra = |known: &[&str]| extra_fields(part, known);
         match part.get("type").and_then(Value::as_str) {
-            Some("audio") | Some("output_audio") => {
-                content.push(RealtimeContent::Audio { audio, transcript })
-            }
-            Some("input_audio") => content.push(RealtimeContent::InputAudio { audio, transcript }),
-            Some("text") | Some("output_text") => content.push(RealtimeContent::Text { text }),
-            Some("input_text") => content.push(RealtimeContent::InputText { text }),
+            Some("audio") | Some("output_audio") => content.push(RealtimeContent::Audio {
+                audio,
+                transcript,
+                extra: part_extra(&["type", "audio", "transcript"]),
+            }),
+            Some("input_audio") => content.push(RealtimeContent::InputAudio {
+                audio,
+                transcript,
+                extra: part_extra(&["type", "audio", "transcript"]),
+            }),
+            Some("text") | Some("output_text") => content.push(RealtimeContent::Text {
+                text,
+                extra: part_extra(&["type", "text"]),
+            }),
+            Some("input_text") => content.push(RealtimeContent::InputText {
+                text,
+                extra: part_extra(&["type", "text"]),
+            }),
             Some("input_image") => content.push(RealtimeContent::InputImage {
                 image_url: part
                     .get("image_url")
@@ -1869,6 +1903,7 @@ fn parse_message_item(
                     .get("detail")
                     .and_then(Value::as_str)
                     .map(str::to_string),
+                extra: part_extra(&["type", "image_url", "detail"]),
             }),
             _ => {}
         }
@@ -1883,17 +1918,7 @@ fn parse_message_item(
 
     // Keep whatever else the server sent, so a field this port does not model survives the round
     // trip, as Python's `extra="allow"` does.
-    let known = ["id", "type", "role", "status", "content", "object"];
-    let extra: Map<String, Value> = item
-        .as_object()
-        .map(|fields| {
-            fields
-                .iter()
-                .filter(|(key, _)| !known.contains(&key.as_str()))
-                .map(|(key, value)| (key.clone(), value.clone()))
-                .collect()
-        })
-        .unwrap_or_default();
+    let extra = extra_fields(item, &["id", "type", "role", "status", "content", "object"]);
 
     Some(RealtimeItem::Message(RealtimeMessageItem {
         item_id: item
