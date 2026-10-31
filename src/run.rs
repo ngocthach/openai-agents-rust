@@ -18,8 +18,16 @@ use crate::run_config::RunConfig;
 use crate::run_context::RunContext;
 use crate::run_error_handlers::RunErrorHandlers;
 use crate::run_internal::{EventSink, run_loop};
+use crate::run_state::RunState;
 use crate::tracing::scope::ScopeSnapshot;
 use crate::util::BoxFuture;
+
+/// Prepares the starting agent after the first turn's blocking input guardrails have passed.
+///
+/// A sandbox run uses it to create its session only for input that cleared the guardrails, as
+/// Python does, and returns the agent the run continues with.
+pub type PrepareAgentFn<C> =
+    Arc<dyn Fn(Arc<Agent<C>>) -> BoxFuture<'static, Result<Arc<Agent<C>>>> + Send + Sync>;
 
 /// Default maximum number of model turns per run.
 pub const DEFAULT_MAX_TURNS: usize = 10;
@@ -48,6 +56,42 @@ pub struct RunOptions<C> {
     pub(crate) shares_parent_context: bool,
     /// Set for nested `Agent::as_tool` runs, describing the invocation that started them.
     pub(crate) agent_tool_invocation: Option<crate::result::AgentToolInvocation>,
+    /// Where a failed run leaves its checkpoint.
+    pub(crate) checkpoint: Option<RunCheckpoint>,
+    /// Prepares the starting agent after the blocking input guardrails.
+    pub(crate) prepare_agent: Option<PrepareAgentFn<C>>,
+}
+
+/// A slot a failed run leaves its checkpoint in.
+///
+/// Python mutates the `RunState` it was given, so a caller retries a failed resume by
+/// serializing that same object. A Rust run consumes its state; give the run a `RunCheckpoint`
+/// through [`RunOptions::checkpoint`] and, when the run fails, [`RunCheckpoint::take`] returns the
+/// state it was in: tool outputs committed before the failure are kept, so a retry does not run
+/// those tools again, and a withheld session write rides along.
+#[derive(Clone, Default)]
+pub struct RunCheckpoint(Arc<Mutex<Option<RunState>>>);
+
+impl RunCheckpoint {
+    /// An empty slot.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Take the checkpoint the failed run left, if it left one.
+    pub fn take(&self) -> Option<RunState> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
+
+    pub(crate) fn set(&self, state: RunState) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(state);
+    }
+}
+
+impl fmt::Debug for RunCheckpoint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("RunCheckpoint")
+    }
 }
 
 impl<C> fmt::Debug for RunOptions<C> {
@@ -88,7 +132,26 @@ impl<C: Send + Sync + 'static> RunOptions<C> {
             session: None,
             shares_parent_context: false,
             agent_tool_invocation: None,
+            checkpoint: None,
+            prepare_agent: None,
         }
+    }
+
+    /// Prepare the starting agent once the first turn's blocking input guardrails have passed
+    /// and before the first model call. A tripped guardrail ends the run without it.
+    pub fn prepare_agent<F, Fut>(mut self, prepare: F) -> Self
+    where
+        F: Fn(Arc<Agent<C>>) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Result<Arc<Agent<C>>>> + Send + 'static,
+    {
+        self.prepare_agent = Some(Arc::new(move |agent| Box::pin(prepare(agent))));
+        self
+    }
+
+    /// Leave the state of a failed run in `checkpoint`, so the failure can be retried.
+    pub fn checkpoint(mut self, checkpoint: &RunCheckpoint) -> Self {
+        self.checkpoint = Some(checkpoint.clone());
+        self
     }
 
     pub fn max_turns(mut self, max_turns: Option<usize>) -> Self {

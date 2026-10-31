@@ -51,6 +51,10 @@ pub struct RunState {
     pub max_turns: Option<usize>,
     /// Name of the agent that was active when the run stopped.
     pub current_agent_name: String,
+    /// Identity key of that agent (`name#2`, ...) when another agent in the graph shares its
+    /// name; `None` when the name alone identifies it.
+    #[serde(default)]
+    pub current_agent_identity: Option<String>,
     /// The original input of the run.
     pub original_input: Vec<InputItem>,
     /// Items generated so far.
@@ -133,6 +137,12 @@ pub struct RunState {
     /// Python-written snapshot can carry it.
     #[serde(default)]
     pub terminal_unrecoverable: bool,
+    /// The session write an interruption withheld while an output guardrail could still reject
+    /// the turn. Mirrors `RunState._pending_session_write`: a record naming the owning session,
+    /// the withheld items and the response boundary. The items it names are also the unsaved
+    /// tail of `generated_items`, so a resume settles them together with the resolved turn.
+    #[serde(default)]
+    pub pending_session_write: Option<Value>,
     /// Canonical identity of every tool call the run has seen, keyed by call id. Mirrors
     /// `RunContextWrapper._tool_invocations`: it binds an approval decision to the exact call
     /// it was given for, so a replay with mutated arguments is rejected rather than reused.

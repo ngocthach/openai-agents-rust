@@ -11,30 +11,44 @@ const MAX_SCHEMA_DEPTH: usize = 100;
 const ADDITIONAL_PROPERTIES_ERROR: &str = "additionalProperties should not be set for object types. \
 If you really need this, update the function or output tool to not use a strict schema.";
 
+const NESTED_RESOURCE_REF_ERROR: &str = "JSON schema contains a reference owned by or crossing a nested `$id` resource that cannot \
+be resolved against the document root.";
+
 const REF_NON_CONSTRAINING_SIBLINGS: &[&str] = &[
-    "description",
-    "title",
-    "examples",
-    "default",
-    "deprecated",
-    "readOnly",
-    "writeOnly",
+    "$anchor",
     "$comment",
+    "$defs",
+    "$schema",
+    "contentEncoding",
+    "contentMediaType",
+    "contentSchema",
+    "default",
+    "definitions",
+    "deprecated",
+    "description",
+    "examples",
+    "readOnly",
+    "title",
+    "writeOnly",
 ];
 
 const ROOT_REF_NON_CONSTRAINING_SIBLINGS: &[&str] = &[
-    "description",
-    "title",
-    "examples",
-    "default",
-    "deprecated",
-    "readOnly",
-    "writeOnly",
+    "$anchor",
     "$comment",
     "$defs",
-    "definitions",
-    "$schema",
     "$id",
+    "$schema",
+    "contentEncoding",
+    "contentMediaType",
+    "contentSchema",
+    "default",
+    "definitions",
+    "deprecated",
+    "description",
+    "examples",
+    "readOnly",
+    "title",
+    "writeOnly",
 ];
 
 /// String formats accepted by OpenAI structured outputs.
@@ -86,7 +100,7 @@ pub fn ensure_strict_json_schema(schema: &Value) -> Result<Value> {
     }
     let root = schema.clone();
     let mut budget = MAX_SCHEMA_NODES;
-    let strict = ensure_strict(schema.clone(), &root, &mut budget, 1, true)?;
+    let strict = ensure_strict(schema.clone(), &root, &mut budget, 1, true, false)?;
     ensure_strict_root(strict)
 }
 
@@ -137,12 +151,84 @@ fn spend(budget: &mut usize) -> Result<()> {
     Ok(())
 }
 
+/// Whether a schema node declares its own `$id` resource, as `_declares_schema_resource` does.
+fn declares_schema_resource(obj: &Map<String, Value>) -> bool {
+    matches!(obj.get("$id"), Some(Value::String(_)))
+}
+
+/// JSON-level equality: booleans never equal numbers, and integers equal equal floats.
+fn json_values_equal(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::Bool(_), _) | (_, Value::Bool(_)) => left == right,
+        (Value::Number(a), Value::Number(b)) => match (a.as_f64(), b.as_f64()) {
+            (Some(a), Some(b)) => a == b,
+            _ => a == b,
+        },
+        (Value::Array(a), Value::Array(b)) => {
+            a.len() == b.len() && a.iter().zip(b).all(|(x, y)| json_values_equal(x, y))
+        }
+        (Value::Object(a), Value::Object(b)) => {
+            a.len() == b.len()
+                && a.iter()
+                    .all(|(k, v)| b.get(k).is_some_and(|other| json_values_equal(v, other)))
+        }
+        _ => left == right,
+    }
+}
+
+/// Follow a chain of `$ref`s that only carry non-constraining siblings, as
+/// `_resolve_non_constraining_ref_chain` does.
+fn resolve_non_constraining_ref_chain(
+    root: &Value,
+    schema: &Map<String, Value>,
+    budget: &mut usize,
+) -> Result<Value> {
+    let mut resolved = schema.clone();
+    let mut seen_refs: Vec<String> = Vec::new();
+    let mut carried: Map<String, Value> = Map::new();
+    loop {
+        let Some(Value::String(reference)) = resolved.get("$ref").cloned() else {
+            break;
+        };
+        if resolved
+            .keys()
+            .any(|k| k != "$ref" && !REF_NON_CONSTRAINING_SIBLINGS.contains(&k.as_str()))
+        {
+            break;
+        }
+        if seen_refs.contains(&reference) {
+            return Err(AgentsError::user(
+                "JSON schema contains a circular `$ref` chain.",
+            ));
+        }
+        seen_refs.push(reference.clone());
+        for (key, value) in &resolved {
+            if key != "$ref" && !carried.contains_key(key) {
+                carried.insert(key.clone(), value.clone());
+            }
+        }
+        spend(budget)?;
+        let target = resolve_ref(root, &reference)?;
+        let Value::Object(target) = target else {
+            return Err(AgentsError::user(format!(
+                "Expected `$ref: {reference}` to resolve to an object"
+            )));
+        };
+        resolved = target;
+    }
+    for (key, value) in carried {
+        resolved.insert(key, value);
+    }
+    Ok(Value::Object(resolved))
+}
+
 fn ensure_strict(
     schema: Value,
     root: &Value,
     budget: &mut usize,
     depth: usize,
     is_root: bool,
+    inside_nested_resource: bool,
 ) -> Result<Value> {
     if depth > MAX_SCHEMA_DEPTH {
         return Err(AgentsError::user(
@@ -161,8 +247,13 @@ fn ensure_strict(
         obj.remove("$schema");
     }
     let next = depth + 1;
+    let inside_nested_resource =
+        inside_nested_resource || (!is_root && declares_schema_resource(&obj));
 
     if obj.contains_key("$ref") {
+        if inside_nested_resource {
+            return Err(AgentsError::user(NESTED_RESOURCE_REF_ERROR));
+        }
         let allowed: &[&str] = if is_root {
             ROOT_REF_NON_CONSTRAINING_SIBLINGS
         } else {
@@ -188,7 +279,10 @@ fn ensure_strict(
         if let Some(Value::Object(defs)) = obj.get(defs_key).cloned() {
             let mut new_defs = Map::new();
             for (name, def) in defs {
-                new_defs.insert(name, ensure_strict(def, root, budget, next, false)?);
+                new_defs.insert(
+                    name,
+                    ensure_strict(def, root, budget, next, false, inside_nested_resource)?,
+                );
             }
             obj.insert(defs_key.into(), Value::Object(new_defs));
         }
@@ -227,7 +321,10 @@ fn ensure_strict(
         obj.insert("required".into(), Value::Array(keys));
         let mut new_props = Map::new();
         for (k, v) in props {
-            new_props.insert(k, ensure_strict(v, root, budget, next, false)?);
+            new_props.insert(
+                k,
+                ensure_strict(v, root, budget, next, false, inside_nested_resource)?,
+            );
         }
         obj.insert("properties".into(), Value::Object(new_props));
     }
@@ -237,14 +334,21 @@ fn ensure_strict(
     {
         obj.insert(
             "items".into(),
-            ensure_strict(items, root, budget, next, false)?,
+            ensure_strict(items, root, budget, next, false, inside_nested_resource)?,
         );
     }
 
     if let Some(Value::Array(any_of)) = obj.get("anyOf").cloned() {
         let mut out = Vec::with_capacity(any_of.len());
         for v in any_of {
-            out.push(ensure_strict(v, root, budget, next, false)?);
+            out.push(ensure_strict(
+                v,
+                root,
+                budget,
+                next,
+                false,
+                inside_nested_resource,
+            )?);
         }
         obj.insert("anyOf".into(), Value::Array(out));
     }
@@ -255,7 +359,14 @@ fn ensure_strict(
             _ => Vec::new(),
         };
         for v in one_of {
-            existing.push(ensure_strict(v, root, budget, next, false)?);
+            existing.push(ensure_strict(
+                v,
+                root,
+                budget,
+                next,
+                false,
+                inside_nested_resource,
+            )?);
         }
         obj.insert("anyOf".into(), Value::Array(existing));
         obj.remove("oneOf");
@@ -264,17 +375,51 @@ fn ensure_strict(
     if let Some(Value::Array(all_of)) = obj.get("allOf").cloned() {
         if all_of.len() == 1 {
             let entry = all_of[0].clone();
-            let strict_entry = ensure_strict(entry, root, budget, next, false)?;
+            let pure_ref_entry = match &entry {
+                Value::Object(e) => {
+                    e.contains_key("$ref")
+                        && !e.keys().any(|k| {
+                            k != "$ref" && !REF_NON_CONSTRAINING_SIBLINGS.contains(&k.as_str())
+                        })
+                }
+                _ => false,
+            };
+            let strict_entry = if pure_ref_entry {
+                if inside_nested_resource {
+                    return Err(AgentsError::user(NESTED_RESOURCE_REF_ERROR));
+                }
+                spend(budget)?;
+                let Value::Object(e) = &entry else {
+                    unreachable!("checked above");
+                };
+                resolve_non_constraining_ref_chain(root, e, budget)?
+            } else {
+                ensure_strict(entry, root, budget, next, false, inside_nested_resource)?
+            };
             obj.remove("allOf");
             if !explicitly_closed {
                 obj.remove("additionalProperties");
             }
             let merged = merge_single_all_of(&strict_entry, &obj)?;
-            return ensure_strict(Value::Object(merged), root, budget, next, false);
+            return ensure_strict(
+                Value::Object(merged),
+                root,
+                budget,
+                next,
+                false,
+                inside_nested_resource,
+            );
         } else {
             let mut out = Vec::with_capacity(all_of.len());
             for v in all_of {
-                out.push(ensure_strict(v, root, budget, next, false)?);
+                out.push(ensure_strict(
+                    v,
+                    root,
+                    budget,
+                    next,
+                    false,
+                    inside_nested_resource,
+                )?);
             }
             obj.insert("allOf".into(), Value::Array(out));
         }
@@ -298,7 +443,14 @@ fn ensure_strict(
         for (k, v) in obj {
             merged.insert(k, v);
         }
-        return ensure_strict(Value::Object(merged), root, budget, next, false);
+        return ensure_strict(
+            Value::Object(merged),
+            root,
+            budget,
+            next,
+            false,
+            inside_nested_resource,
+        );
     }
 
     Ok(Value::Object(obj))
@@ -309,30 +461,49 @@ fn merge_single_all_of(entry: &Value, parent: &Map<String, Value>) -> Result<Map
         return Err(AgentsError::user("allOf entry must be an object"));
     };
     let mut merged = entry_obj.clone();
-    for (k, v) in parent {
-        match (k.as_str(), merged.get(k)) {
-            ("properties", Some(Value::Object(existing))) => {
-                let mut props = existing.clone();
-                if let Value::Object(pv) = v {
-                    props.extend(pv.clone());
-                }
-                merged.insert(k.clone(), Value::Object(props));
+    let mut incompatible: Vec<String> = Vec::new();
+
+    let parent_properties_empty = match parent.get("properties") {
+        None => true,
+        Some(Value::Object(p)) => p.is_empty(),
+        Some(_) => false,
+    };
+    let entry_has_properties =
+        matches!(entry_obj.get("properties"), Some(Value::Object(p)) if !p.is_empty());
+    if parent.get("additionalProperties") == Some(&Value::Bool(false))
+        && parent_properties_empty
+        && entry_has_properties
+    {
+        // `additionalProperties` only sees properties declared in its own schema, not in `allOf`.
+        incompatible.push("properties".into());
+    }
+
+    for (key, parent_value) in parent {
+        match merged.get(key) {
+            None => {
+                merged.insert(key.clone(), parent_value.clone());
             }
-            ("required", Some(Value::Array(existing))) => {
-                let mut req = existing.clone();
-                if let Value::Array(rv) = v {
-                    for r in rv {
-                        if !req.contains(r) {
-                            req.push(r.clone());
-                        }
-                    }
+            Some(existing) => {
+                if REF_NON_CONSTRAINING_SIBLINGS.contains(&key.as_str()) {
+                    merged.insert(key.clone(), parent_value.clone());
+                } else if !(json_values_equal(parent_value, existing)
+                    || (key == "properties" && parent_value == &Value::Object(Map::new()))
+                    || (key == "required" && parent_value == &Value::Array(Vec::new())))
+                {
+                    incompatible.push(key.clone());
                 }
-                merged.insert(k.clone(), Value::Array(req));
-            }
-            _ => {
-                merged.insert(k.clone(), v.clone());
             }
         }
+    }
+
+    if !incompatible.is_empty() {
+        incompatible.sort();
+        incompatible.dedup();
+        return Err(AgentsError::user(format!(
+            "JSON schema contains a singleton `allOf` entry with incompatible parent keyword(s) \
+({}) that cannot be merged without changing its accepted values.",
+            incompatible.join(", ")
+        )));
     }
     Ok(merged)
 }
@@ -371,6 +542,11 @@ pub fn resolve_ref(root: &Value, reference: &str) -> Result<Value> {
                 )));
             }
         };
+        if let Value::Object(obj) = current
+            && declares_schema_resource(obj)
+        {
+            return Err(AgentsError::user(NESTED_RESOURCE_REF_ERROR));
+        }
     }
     Ok(current.clone())
 }

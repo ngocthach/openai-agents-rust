@@ -120,7 +120,7 @@ pub struct RunResult<C> {
     pub(crate) model_input_items: Vec<RunItem>,
     /// Whether model history diverged from the public history during this run.
     pub(crate) replay_from_model_input_items: bool,
-    pub(crate) state: RunState,
+    pub(crate) state: Box<RunState>,
 }
 
 impl<C> fmt::Debug for RunResult<C> {
@@ -216,7 +216,7 @@ impl<C> RunResult<C> {
 
     /// A resumable snapshot with an independent copy of the usage so far.
     pub fn to_state(&self) -> RunState {
-        let mut s = self.state.clone();
+        let mut s = (*self.state).clone();
         s.usage = self.context_wrapper.usage();
         s.approvals = self.context_wrapper.export_approvals();
         s.nested_agent_tool_states = self.context_wrapper.nested_states();
@@ -258,6 +258,9 @@ pub struct StreamCompletion {
     pub new_items: Vec<RunItem>,
     /// The final output, when the run produced one.
     pub final_output: Option<Value>,
+    /// Name of the agent that was active when the run ended: the last agent of the result, or
+    /// the agent the stream had reached when the run failed.
+    pub last_agent_name: String,
 }
 
 impl StreamCompletion {
@@ -370,13 +373,17 @@ impl<C: Send + Sync + 'static> RunResultStreaming<C> {
     async fn run_completion_hook(&mut self) {
         if let Some(hook) = self.on_complete.take() {
             let completion = match self.result.as_ref() {
-                None => StreamCompletion::default(),
+                None => StreamCompletion {
+                    last_agent_name: self.current_agent.name.clone(),
+                    ..Default::default()
+                },
                 Some(result) => StreamCompletion {
                     succeeded: true,
                     interruptions: result.interruptions.len(),
                     input: result.input.clone(),
                     new_items: result.new_items.clone(),
                     final_output: result.final_output.clone(),
+                    last_agent_name: result.last_agent.name.clone(),
                 },
             };
             hook(completion).await;

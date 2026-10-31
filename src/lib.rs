@@ -115,7 +115,8 @@ pub use run_state::RunState;
 pub use stream_events::{RunItemStreamEventName, StreamEvent};
 pub use tool::{
     CodeInterpreterTool, FileSearchTool, FunctionTool, FunctionToolResult, HostedMCPTool,
-    ImageGenerationTool, Tool, ToolOutput, ToolOutputPart, WebSearchTool, function_tool,
+    ImageGenerationTool, Tool, ToolOrigin, ToolOriginType, ToolOutput, ToolOutputPart,
+    WebSearchTool, function_tool,
 };
 pub use tool_context::ToolContext;
 pub use tool_guardrails::{

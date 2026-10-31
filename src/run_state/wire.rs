@@ -46,6 +46,21 @@ fn agent_ref(name: &str) -> Value {
     json!({ "name": name })
 }
 
+/// An agent reference with its duplicate-name identity key, when it needs one.
+fn agent_ref_with_identity(name: &str, identity: Option<&str>) -> Value {
+    match identity {
+        Some(identity) if identity != name => json!({ "name": name, "identity": identity }),
+        _ => agent_ref(name),
+    }
+}
+
+fn agent_identity_of(value: Option<&Value>) -> Option<String> {
+    value
+        .and_then(|v| v.get("identity"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
 fn agent_name_of(value: Option<&Value>) -> String {
     match value {
         Some(Value::String(s)) => s.clone(),
@@ -242,6 +257,7 @@ fn run_item_to_wire(item: &RunItem) -> Value {
             agent: item.agent.clone(),
             raw_item: raw_item.clone(),
             tool_name: tool_name.clone(),
+            tool_origin: item.tool_origin.clone(),
         });
     }
     let mut value = serde_json::to_value(item).unwrap_or_else(|_| json!({}));
@@ -357,12 +373,22 @@ fn run_item_from_wire(value: &Value) -> Result<RunItem> {
             "input_id",
             "tool_lookup_key",
             "allow_bare_name_alias",
-            "tool_origin",
             "tool_namespace",
-            "description",
-            "title",
         ] {
             m.remove(key);
+        }
+        // Origin metadata is read tolerantly: a malformed or unknown origin is dropped, so a
+        // snapshot written by a newer SDK still loads.
+        let origin = m
+            .remove("tool_origin")
+            .and_then(|v| crate::tool::ToolOrigin::from_json_dict(&v));
+        if let Some(origin) = origin {
+            m.insert("tool_origin".into(), origin.to_json_dict());
+        }
+        for key in ["description", "title"] {
+            if !m.get(key).is_some_and(Value::is_string) {
+                m.remove(key);
+            }
         }
     }
     serde_json::from_value(value.clone()).map_err(|e| {
@@ -377,12 +403,18 @@ fn run_item_from_wire(value: &Value) -> Result<RunItem> {
 }
 
 fn interruption_to_wire(item: &ToolApprovalItem) -> Value {
-    json!({
+    let mut value = json!({
         "type": "tool_approval_item",
         "raw_item": item.raw_item.to_value(),
         "agent": agent_ref(&item.agent),
         "tool_name": item.tool_name,
-    })
+    });
+    if let Some(origin) = &item.tool_origin
+        && let Value::Object(m) = &mut value
+    {
+        m.insert("tool_origin".into(), origin.to_json_dict());
+    }
+    value
 }
 
 /// `FunctionCall::to_value` writes `"type": "function_call"`; reading it back would otherwise
@@ -411,6 +443,9 @@ fn interruption_from_wire(value: &Value) -> Result<ToolApprovalItem> {
         agent: agent_name_of(value.get("agent")),
         raw_item,
         tool_name,
+        tool_origin: value
+            .get("tool_origin")
+            .and_then(crate::tool::ToolOrigin::from_json_dict),
     })
 }
 
@@ -925,7 +960,10 @@ pub(super) fn to_wire(state: &RunState) -> Result<Value> {
     let mut envelope = json!({
         "$schemaVersion": CURRENT_SCHEMA_VERSION,
         "current_turn": state.current_turn,
-        "current_agent": agent_ref(&state.current_agent_name),
+        "current_agent": agent_ref_with_identity(
+            &state.current_agent_name,
+            state.current_agent_identity.as_deref(),
+        ),
         "original_input": state.original_input,
         "pending_input": state.pending_input,
         "model_responses": model_responses,
@@ -1006,6 +1044,11 @@ pub(super) fn to_wire(state: &RunState) -> Result<Value> {
         && let Value::Object(map) = &mut envelope
     {
         map.insert("terminal_unrecoverable".into(), Value::Bool(true));
+    }
+    if let Some(pending) = &state.pending_session_write
+        && let Value::Object(map) = &mut envelope
+    {
+        map.insert("pending_session_write".into(), pending.clone());
     }
     if let (Some(ownership), Value::Object(map)) = (ownership, &mut envelope) {
         map.insert(
@@ -1164,6 +1207,7 @@ pub(super) fn from_wire(value: &Value) -> Result<RunState> {
             .and_then(Value::as_u64)
             .map(|v| v as usize),
         current_agent_name: agent_name_of(value.get("current_agent")),
+        current_agent_identity: agent_identity_of(value.get("current_agent")),
         original_input: input_items(value.get("original_input")),
         generated_items,
         model_responses: value
@@ -1231,6 +1275,10 @@ pub(super) fn from_wire(value: &Value) -> Result<RunState> {
         // stays out of `trace_state` and the round trip is stable.
         // Python writes the key only when it is `true`, and only accepts it as `true`.
         terminal_unrecoverable: value.get("terminal_unrecoverable") == Some(&Value::Bool(true)),
+        pending_session_write: value
+            .get("pending_session_write")
+            .filter(|v| v.is_object())
+            .cloned(),
         tool_invocations: tool_invocations_from_wire(&context)?,
         trace_state: crate::tracing::TraceState::from_json(value.get("trace")).filter(|t| {
             t.workflow_name.is_some()

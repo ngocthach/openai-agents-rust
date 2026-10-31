@@ -1,5 +1,6 @@
 //! The agent loop. Port of `agents.run_internal`.
 
+pub(crate) mod agent_identity;
 pub(crate) mod history;
 mod items;
 mod local_tools;
@@ -75,6 +76,9 @@ enum NextStep<C> {
 /// The classified tool activity of a model response.
 struct ProcessedResponse<C> {
     functions: Vec<(FunctionCall, Arc<FunctionTool<C>>)>,
+    /// Function calls of this response whose outputs already exist (a resumed turn), with
+    /// their tool.
+    completed_functions: Vec<(FunctionCall, Arc<FunctionTool<C>>)>,
     handoffs: Vec<(FunctionCall, Handoff<C>)>,
     mcp_approvals: Vec<(Value, Option<HostedMCPTool<C>>)>,
     local_calls: Vec<local_tools::LocalCall<C>>,
@@ -186,7 +190,7 @@ struct RunLoop<C> {
     output_guardrail_results: Vec<OutputGuardrailResult>,
     tool_input_guardrail_results: Vec<ToolInputGuardrailResult>,
     tool_output_guardrail_results: Vec<ToolOutputGuardrailResult>,
-    tools_used: HashMap<String, Vec<String>>,
+    tools_used: ToolUseTracker<C>,
     previous_response_id: Option<String>,
     conversation_id: Option<String>,
     auto_previous_response_id: bool,
@@ -226,29 +230,124 @@ struct RunLoop<C> {
     /// Whether a handoff filter or nested history made model history differ from the public
     /// history, so `to_input_list(Normalized)` should replay the model view.
     model_history_diverged: bool,
+    /// The input of the latest model call as the model saw it (after `call_model_input_filter`)
+    /// and the items it answered with. Compaction only replaces history this exchange covers.
+    /// Port of `_session_compaction_model_exchange`.
+    compaction_exchange: Option<(Vec<InputItem>, Vec<InputItem>)>,
+    /// The record of a session write an interruption withheld (see
+    /// `RunState::pending_session_write`). While it stands, the unsaved tail of
+    /// `generated_items` is a held batch that settles at the next gate-legal exit.
+    pending_write: Option<Value>,
+    /// Set while a turn is executing the tools of a processed model response, so a failure
+    /// there checkpoints as a turn that resumes by re-processing that response.
+    turn_in_flight: bool,
+    /// Where a failed run leaves its checkpoint, when the caller asked for one.
+    checkpoint: Option<crate::run::RunCheckpoint>,
+    /// Prepares the starting agent once the first turn's blocking input guardrails passed.
+    prepare_agent: Option<crate::run::PrepareAgentFn<C>>,
+    /// The first turn's blocking input guardrails already ran (ahead of `prepare_agent`).
+    first_blocking_guardrails_done: bool,
+    /// The run resumed a failed turn (a checkpoint with no open approvals): calls that already
+    /// have outputs count towards the tool-use decision, as they did when they ran.
+    resumed_from_failure: bool,
+    /// Items already in the history when a resume began. A handoff input filter sees them as
+    /// the pre-handoff items of the resumed turn, so the response that parked on an approval
+    /// is part of the context the filter reasons about, as in Python.
+    resumed_pre_count: Option<usize>,
+    /// Source of [`RunItem`] lineage keys.
+    next_occurrence: u64,
+    /// The response id of a held batch that has already been reported to the session.
+    settle_notified: Option<String>,
+    /// The `store` setting the latest model call ran under, after the run config merge.
+    last_store: Option<bool>,
     /// What a server-managed conversation already holds.
     server_conversation: oai_conversation::ServerConversationTracker,
     /// The one prompt cache key this run generates, reused across turns.
     prompt_cache_key: prompt_cache_key::PromptCacheKeyResolver,
 }
 
-fn find_agent<C>(start: &Arc<Agent<C>>, name: &str) -> Option<Arc<Agent<C>>> {
-    let mut seen = HashSet::new();
-    let mut queue = VecDeque::from([start.clone()]);
-    while let Some(a) = queue.pop_front() {
-        if a.name == name {
-            return Some(a);
+/// Drop calls from a settling batch whose outputs did not survive, together with the reasoning
+/// items tied to them. `pending` names calls whose approval is still open: they have no output
+/// yet because they have not run, so they settle now and pair up at a later exit.
+fn settle_safe_items(items: Vec<InputItem>, pending: &HashSet<String>) -> Vec<InputItem> {
+    const PLACEHOLDER: &str = "__settle_placeholder";
+    let mut working = items;
+    // A pending call is exempt from the orphan prune; the prune only understands outputs, so
+    // the exemption rides in as a placeholder output that is discarded again below.
+    let placeholders: Vec<InputItem> = working
+        .iter()
+        .filter_map(|item| {
+            let ty = item.item_type()?;
+            let call_id = item.0.get("call_id").and_then(Value::as_str)?;
+            if !pending.contains(call_id) {
+                return None;
+            }
+            let output_type = items::output_type_of_call(ty)?;
+            Some(InputItem(
+                json!({"type": output_type, "call_id": call_id, PLACEHOLDER: true}),
+            ))
+        })
+        .collect();
+    working.extend(placeholders);
+    items::drop_orphan_function_calls(working)
+        .into_iter()
+        .filter(|item| item.0.get(PLACEHOLDER).is_none())
+        .collect()
+}
+
+/// The tools each agent has used, keyed by agent object. Port of `AgentToolUseTracker`.
+///
+/// Runtime checks go by agent identity so two agents sharing a name stay separate; the
+/// serialized snapshot is keyed by the stable identity key (`name`, `name#2`, ...).
+struct ToolUseTracker<C> {
+    agents: Vec<(Arc<Agent<C>>, Vec<String>)>,
+}
+
+impl<C> Default for ToolUseTracker<C> {
+    fn default() -> Self {
+        ToolUseTracker { agents: Vec::new() }
+    }
+}
+
+impl<C> ToolUseTracker<C> {
+    fn add(&mut self, agent: &Arc<Agent<C>>, tools: &[String]) {
+        match self.agents.iter_mut().find(|(a, _)| Arc::ptr_eq(a, agent)) {
+            Some((_, used)) => used.extend(tools.iter().cloned()),
+            None => self.agents.push((agent.clone(), tools.to_vec())),
         }
-        if !seen.insert(Arc::as_ptr(&a) as usize) {
-            continue;
+    }
+
+    fn has_used(&self, agent: &Agent<C>) -> bool {
+        self.agents
+            .iter()
+            .any(|(a, used)| std::ptr::eq(a.as_ref(), agent) && !used.is_empty())
+    }
+
+    fn snapshot(&self, start: &Arc<Agent<C>>) -> BTreeMap<String, Vec<String>> {
+        let keys = agent_identity::identity_keys_by_ptr(start);
+        let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for (agent, tools) in &self.agents {
+            let key = keys
+                .get(&(Arc::as_ptr(agent) as usize))
+                .cloned()
+                .unwrap_or_else(|| agent.name.clone());
+            out.entry(key).or_default().extend(tools.iter().cloned());
         }
-        for h in &a.handoffs {
-            if let Some(t) = h.agent.as_ref() {
-                queue.push_back(t.clone());
+        for tools in out.values_mut() {
+            tools.sort();
+            tools.dedup();
+        }
+        out
+    }
+
+    /// Seed from a snapshot; an entry whose agent is no longer in the graph is skipped.
+    fn hydrate(&mut self, start: &Arc<Agent<C>>, snapshot: &BTreeMap<String, Vec<String>>) {
+        for (key, tools) in snapshot {
+            if let Some(agent) = agent_identity::resolve_identity(start, key) {
+                self.add(&agent, tools);
             }
         }
     }
-    None
 }
 
 /// Names shared by two distinct agents in the graph reachable from `start`. A run state
@@ -557,6 +656,8 @@ pub(crate) async fn run_loop<C: Send + Sync + 'static>(
         session,
         shares_parent_context,
         agent_tool_invocation,
+        checkpoint,
+        prepare_agent,
     } = options;
 
     let mut lp = RunLoop {
@@ -576,6 +677,17 @@ pub(crate) async fn run_loop<C: Send + Sync + 'static>(
         model_items: Vec::new(),
         agent_tool_invocation,
         model_history_diverged: false,
+        compaction_exchange: None,
+        pending_write: None,
+        turn_in_flight: false,
+        checkpoint,
+        prepare_agent,
+        first_blocking_guardrails_done: false,
+        resumed_from_failure: false,
+        resumed_pre_count: None,
+        next_occurrence: 0,
+        settle_notified: None,
+        last_store: None,
         server_conversation: Default::default(),
         prompt_cache_key: Default::default(),
         model_responses: Vec::new(),
@@ -584,7 +696,7 @@ pub(crate) async fn run_loop<C: Send + Sync + 'static>(
         output_guardrail_results: Vec::new(),
         tool_input_guardrail_results: Vec::new(),
         tool_output_guardrail_results: Vec::new(),
-        tools_used: HashMap::new(),
+        tools_used: ToolUseTracker::default(),
         previous_response_id,
         conversation_id,
         auto_previous_response_id,
@@ -912,16 +1024,37 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
                  Start a new run instead.",
             ));
         }
+        // A withheld batch belongs to the session it was parked against; settling it into
+        // another conversation would split the call from its history.
+        if let (Some(pending), Some(session)) = (&state.pending_session_write, &self.session)
+            && pending
+                .get("held")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            && let Some(expected) = pending.get("session_id").and_then(Value::as_str)
+            && session.session_id() != expected
+        {
+            return Err(AgentsError::user(
+                "Resume the pending Session write with the original Session and session ID.",
+            ));
+        }
+        self.pending_write = state.pending_session_write.clone();
+        // A graph with same-named agents resumes through the identity key the snapshot recorded
+        // for its current agent; a snapshot without one cannot say which duplicate it meant.
         let ambiguous = ambiguous_agent_names(&self.starting_agent);
-        if !ambiguous.is_empty() {
+        if state.current_agent_identity.is_none() && ambiguous.contains(&state.current_agent_name) {
             return Err(AgentsError::user(format!(
                 "Cannot resume a run whose agent graph has same-named agents ({}). \
                  Use unique agent names before starting a resumable run.",
                 ambiguous.join(", ")
             )));
         }
+        let identity = state
+            .current_agent_identity
+            .as_deref()
+            .unwrap_or(&state.current_agent_name);
         let agent =
-            find_agent(&self.starting_agent, &state.current_agent_name).ok_or_else(|| {
+            agent_identity::resolve_identity(&self.starting_agent, identity).ok_or_else(|| {
                 AgentsError::user(format!(
                     "Could not find agent '{}' reachable from the starting agent",
                     state.current_agent_name
@@ -975,12 +1108,8 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
         self.prompt_cache_key = prompt_cache_key::PromptCacheKeyResolver::from_generated_key(
             state.generated_prompt_cache_key.clone(),
         );
-        for (agent_name, tools) in &state.tool_use_tracker {
-            self.tools_used
-                .entry(agent_name.clone())
-                .or_default()
-                .extend(tools.iter().cloned());
-        }
+        self.tools_used
+            .hydrate(&self.starting_agent, &state.tool_use_tracker);
         self.session_saved_items = state.session_saved_items.min(self.generated_items.len());
         self.input_saved_to_session = state.input_saved_to_session;
         self.pending_input = state.pending_input.clone();
@@ -999,6 +1128,25 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
         self.trace_id = state.trace_id.clone();
         self.trace_state = state.trace_state.clone();
         self.turn_start = state.turn_start_index.min(self.generated_items.len());
+        self.resumed_pre_count = state
+            .pending_tool_processing
+            .then_some(self.generated_items.len());
+        self.resumed_from_failure = state.pending_tool_processing && state.interruptions.is_empty();
+        // Output guardrails can still reject the parked turn, so its items must not already be
+        // in the session. Port of `_validate_resumed_session_output_guardrail_safety`.
+        if state.pending_tool_processing && self.output_guardrails_gate_applies() {
+            let persisted = self.session_saved_items.saturating_sub(self.turn_start);
+            if persisted > 0 {
+                if self.session.is_some() {
+                    return Err(AgentsError::user(
+                        "Cannot resume an approval checkpoint with output guardrails after \
+                         current-turn items were persisted. Start a new run from safe input.",
+                    ));
+                }
+                // A detached run cannot contribute its old persisted prefix to this run.
+                self.session_saved_items = self.turn_start;
+            }
+        }
         self.is_resumed = true;
         self.should_run_agent_start_hooks = false;
         Ok(())
@@ -1048,6 +1196,15 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
         }
     }
 
+    /// The state a failed run leaves behind. A failure inside a turn that already processed its
+    /// model response resumes by re-processing that response: calls whose outputs were
+    /// committed are skipped, the rest run.
+    fn failure_checkpoint(&self) -> RunState {
+        let mut state = *self.build_result(None, Vec::new()).state;
+        state.pending_tool_processing = self.turn_in_flight;
+        state
+    }
+
     fn server_managed(&self) -> bool {
         self.conversation_id.is_some()
             || self.previous_response_id.is_some()
@@ -1060,6 +1217,9 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
         match outcome {
             Ok(r) => Ok(r),
             Err(e) => {
+                if let Some(slot) = &self.checkpoint {
+                    slot.set(self.failure_checkpoint());
+                }
                 let details = self.run_details();
                 Err(e.with_run_data(details))
             }
@@ -1116,8 +1276,34 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
         self.emit(StreamEvent::AgentUpdated {
             new_agent: self.current_agent.clone(),
         });
+        if let Some(prepare) = self.prepare_agent.take() {
+            // Python runs the blocking input guardrails before it prepares (creates the
+            // sandbox session for) the starting agent, so rejected input never costs one.
+            if !self.is_resumed {
+                let blocking: Vec<_> = self
+                    .config
+                    .input_guardrails
+                    .iter()
+                    .chain(self.current_agent.input_guardrails.iter())
+                    .filter(|g| !g.run_in_parallel)
+                    .cloned()
+                    .collect();
+                if !blocking.is_empty() {
+                    let input = self.original_input.clone();
+                    let results = self.run_input_guardrails(blocking, input).await?;
+                    self.record_input_guardrails(results)?;
+                }
+                self.first_blocking_guardrails_done = true;
+            }
+            let prepared = prepare(self.starting_agent.clone()).await?;
+            self.starting_agent = prepared.clone();
+            self.current_agent = prepared;
+        }
         loop {
-            if let Some(s) = &self.sink
+            // A resume that still owes the approved tools their turn runs them first: an
+            // after-turn cancel stops the run after that turn, not before it.
+            if !self.resume_pending_tools
+                && let Some(s) = &self.sink
                 && s.cancel_after_turn.load(Ordering::SeqCst)
             {
                 self.save_session().await?;
@@ -1197,13 +1383,33 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
                 }
             };
 
+            self.resumed_pre_count = None;
+            self.turn_in_flight = false;
             match step {
                 NextStep::FinalOutput(output) => {
                     return Box::pin(self.finish_with_output(output)).await;
                 }
                 NextStep::Interruption(items) => {
-                    self.save_session().await?;
-                    self.notify_session_completed().await?;
+                    if self.defers_interrupted_writes() {
+                        // The parked response may still become guarded terminal output, so it
+                        // is withheld: only the input and earlier turns are written now, and
+                        // the batch settles with the resolved turn at a later exit.
+                        let pending: HashSet<String> =
+                            items.iter().map(|i| i.raw_item.call_id.clone()).collect();
+                        self.save_session_through(self.turn_start, &pending).await?;
+                        self.register_held_write();
+                    } else if self.session.is_none() && self.pending_write.is_some() {
+                        // A detached resume cannot write, but the standing held record
+                        // carries the session identity: the newly parked call folds into it
+                        // so the reattach does not settle its output orphaned.
+                        self.register_held_write();
+                    } else {
+                        let pending: HashSet<String> =
+                            items.iter().map(|i| i.raw_item.call_id.clone()).collect();
+                        self.save_session_through(self.generated_items.len(), &pending)
+                            .await?;
+                        self.notify_session_completed().await?;
+                    }
                     return Ok(self.build_result(None, items));
                 }
                 NextStep::Handoff(agent) => {
@@ -1313,7 +1519,17 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
             let results = futures::future::join_all(futs).await;
             let batch_start = self.output_guardrail_results.len();
             for r in results {
-                let r = r?;
+                let r = match r {
+                    Ok(r) => r,
+                    Err(e) => {
+                        // A crashing guardrail does not undo the turn that already ran: its
+                        // calls and their outputs are persisted together before the error
+                        // propagates, so history never keeps a call without its output.
+                        // A failed final-turn save is the more actionable error and wins.
+                        self.save_session().await?;
+                        return Err(e);
+                    }
+                };
                 self.output_guardrail_results.push(r.clone());
                 if r.output.tripwire_triggered {
                     return Err(self.block_output(&agent, r, batch_start).await?);
@@ -1443,6 +1659,10 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
             current_turn: self.current_turn,
             max_turns: self.max_turns,
             current_agent_name: self.current_agent.name.clone(),
+            current_agent_identity: {
+                let key = agent_identity::identity_key(&self.starting_agent, &self.current_agent);
+                (key != self.current_agent.name).then_some(key)
+            },
             original_input: self.original_input.clone(),
             generated_items: self.generated_items.clone(),
             model_responses: self.model_responses.clone(),
@@ -1468,21 +1688,13 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
             trace_state: self.trace_state.clone(),
             context: None,
             turn_start_index: self.turn_start,
-            tool_use_tracker: self
-                .tools_used
-                .iter()
-                .map(|(agent, tools)| {
-                    let mut names: Vec<String> = tools.clone();
-                    names.sort();
-                    names.dedup();
-                    (agent.clone(), names)
-                })
-                .collect(),
+            tool_use_tracker: self.tools_used.snapshot(&self.starting_agent),
             generated_prompt_cache_key: self.prompt_cache_key.generated_key(),
             server_conversation: self.server_conversation.state(),
             // Rust returns an error instead of a snapshot when a terminal save fails, so a
             // snapshot this loop builds is always resumable.
             terminal_unrecoverable: false,
+            pending_session_write: self.pending_write.clone(),
             tool_invocations: tool_invocation_ledger(
                 &self.generated_items,
                 &self.unbound_approvals,
@@ -1529,57 +1741,203 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
             agent_tool_invocation: self.agent_tool_invocation.clone(),
             model_input_items: self.model_items.clone(),
             replay_from_model_input_items: self.model_history_diverged,
-            state,
+            state: Box::new(state),
         }
     }
 
     async fn save_session(&mut self) -> Result<()> {
+        self.save_session_through(self.generated_items.len(), &HashSet::new())
+            .await
+    }
+
+    /// Whether output guardrails could still reject a turn this agent finishes with a tool.
+    fn output_guardrails_gate_applies(&self) -> bool {
+        (!self.current_agent.output_guardrails.is_empty()
+            || !self.config.output_guardrails.is_empty())
+            && !matches!(
+                self.current_agent.tool_use_behavior,
+                ToolUseBehavior::RunLlmAgain
+            )
+    }
+
+    /// Whether an interruption must withhold its session write: only approval state that could
+    /// still become guarded terminal tool output is held back. Port of
+    /// `_should_defer_interrupted_session_items`.
+    fn defers_interrupted_writes(&self) -> bool {
+        self.session.is_some() && self.output_guardrails_gate_applies()
+    }
+
+    /// Record the withheld batch on the checkpoint. Registering touches only the checkpoint,
+    /// never the session. A detached run (no session) folds into a standing record instead,
+    /// which carries the session identity. Port of `defer_interrupted_session_write` /
+    /// `extend_held_session_write`.
+    fn register_held_write(&mut self) {
+        let session_id = match &self.session {
+            Some(session) => Some(session.session_id().to_string()),
+            None => self
+                .pending_write
+                .as_ref()
+                .and_then(|p| p.get("session_id"))
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        };
+        let Some(session_id) = session_id else {
+            return;
+        };
+        let start = self.session_saved_items.min(self.generated_items.len());
+        let boundary = self.turn_start.clamp(start, self.generated_items.len());
+        let items: Vec<Value> = items_to_input(&self.generated_items[start..])
+            .into_iter()
+            .map(|i| i.0)
+            .collect();
+        if items.is_empty() {
+            self.pending_write = None;
+            return;
+        }
+        let prior = items_to_input(&self.generated_items[start..boundary]).len();
+        // Storage belongs to the response, not to the later run resolving its approvals: an
+        // extension of the same response keeps the response's id and setting, while a freshly
+        // parked response advances the frontier to its own.
+        let same_response = self
+            .pending_write
+            .as_ref()
+            .and_then(|p| p.get("current_response"))
+            .and_then(|c| c.get("turn"))
+            .and_then(Value::as_u64)
+            == Some(self.current_turn as u64);
+        let (response_id, store) = match (&self.pending_write, same_response) {
+            (Some(existing), true) => (
+                existing.get("response_id").cloned().unwrap_or(Value::Null),
+                existing.get("store").cloned().unwrap_or(Value::Null),
+            ),
+            _ => (
+                json!(
+                    self.model_responses
+                        .last()
+                        .and_then(|r| r.response_id.clone())
+                ),
+                json!(self.last_store),
+            ),
+        };
+        self.pending_write = Some(json!({
+            "session_id": session_id,
+            "items": items,
+            "before": Value::Null,
+            "persisted_count": 0,
+            "held": true,
+            "response_id": response_id,
+            "store": store,
+            "reasoning_item_id_policy": Value::Null,
+            "current_response": {"turn": self.current_turn, "start": prior},
+        }));
+    }
+
+    /// Persist the run input and `generated_items[..limit]` that are not yet saved.
+    ///
+    /// A batch that was held across an interruption settles through the same append, so a call
+    /// and its output land together; a call whose output a handoff filter dropped is dropped
+    /// with it, except calls whose approval is still `pending`. Port of
+    /// `_held_items_safe_to_settle`.
+    async fn save_session_through(
+        &mut self,
+        limit: usize,
+        pending: &HashSet<String>,
+    ) -> Result<()> {
         let Some(session) = self.session.clone() else {
             return Ok(());
         };
+        let limit = limit.min(self.generated_items.len());
+        let start = self.session_saved_items.min(limit);
         let mut items = Vec::new();
         if !self.input_saved_to_session {
             items.extend(self.session_input.clone());
         }
-        let new: Vec<InputItem> = items_to_input(&self.generated_items[self.session_saved_items..]);
+        let held = self.pending_write.is_some();
+        let mut new: Vec<InputItem> = items_to_input(&self.generated_items[start..limit]);
+        if held {
+            new = settle_safe_items(new, pending);
+        }
         items.extend(new);
         let items = items::deduplicate_input_items_preferring_latest(items);
-        if !items.is_empty() {
+        // A held batch was never offered to the session, so a tail that already ends with
+        // exactly this batch means an earlier settle wrote it and lost the acknowledgement;
+        // appending again would duplicate it. Port of the digest reconciliation in
+        // `resume_pending_session_write`.
+        let already_written = held
+            && !items.is_empty()
+            && match session.get_items(Some(items.len())).await {
+                Ok(tail) => tail.len() == items.len() && tail == items,
+                Err(_) => false,
+            };
+        if !items.is_empty() && !already_written {
             // A cancelled run (a dropped `select!` branch, an elapsed timeout) must not abort
             // a half-written session write. Port of `await_session_mutation`.
             crate::memory::await_session_mutation(async move { session.add_items(items).await })
                 .await?;
         }
         self.input_saved_to_session = true;
-        self.session_saved_items = self.generated_items.len();
+        self.session_saved_items = self.session_saved_items.max(limit);
+        if limit >= self.generated_items.len() {
+            // Everything is written: the withheld batch has settled. The session now hears
+            // about the response it belongs to, under the storage mode that response ran with,
+            // before any further model request.
+            if let Some(record) = self.pending_write.take() {
+                let response_id = record
+                    .get("response_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                let store = record.get("store").and_then(Value::as_bool);
+                if response_id.is_some() {
+                    self.settle_notified = response_id.clone();
+                    self.notify_session(Some((response_id, store))).await?;
+                }
+            }
+        }
         Ok(())
     }
 
     /// Notify the session that the run finished (used for automatic compaction).
     async fn notify_session_completed(&mut self) -> Result<()> {
+        // The response a held batch already settled for was notified when it settled.
+        if let Some(settled) = &self.settle_notified
+            && self
+                .model_responses
+                .last()
+                .and_then(|r| r.response_id.as_ref())
+                == Some(settled)
+        {
+            return Ok(());
+        }
+        self.notify_session(None).await
+    }
+
+    /// Tell the session a response's items are written. `held` carries the response id and
+    /// storage mode a withheld batch was parked under, which the settle must keep.
+    async fn notify_session(&mut self, held: Option<(Option<String>, Option<bool>)>) -> Result<()> {
         let Some(session) = self.session.clone() else {
             return Ok(());
         };
-        let has_local_tool_outputs = self.generated_items
-            [self.turn_start.min(self.generated_items.len())..]
-            .iter()
-            .any(|i| matches!(i.kind, RunItemKind::ToolCallOutput { .. }));
+        let has_local_tool_outputs = held.is_some()
+            || self.generated_items[self.turn_start.min(self.generated_items.len())..]
+                .iter()
+                .any(|i| matches!(i.kind, RunItemKind::ToolCallOutput { .. }));
         // Everything the model was sent plus everything it produced this run. A compacting
         // session matches the stored tail against these digests, so it only ever replaces
         // history the model actually saw. Both spellings of a reasoning item are recorded,
         // because the stored copy may keep an id the replayed input omitted. Only sessions that
         // compact ask for this, so an ordinary session pays nothing for it.
         let mut model_exchange = Vec::new();
-        if session.wants_model_exchange() {
+        if session.wants_model_exchange()
+            && let Some((exchange_input, exchange_output)) = &self.compaction_exchange
+        {
             let policy = self.config.reasoning_item_id_policy;
             // A store that owns its history assigns its own item ids, so matching on them
             // would never find the replayed item. Port of `_ignore_ids_for_matching`.
             let ignore_ids = session.manages_history_remotely();
-            for item in self
-                .model_prefix
+            for item in exchange_input
                 .iter()
                 .cloned()
-                .chain(items_to_input(&self.model_items))
+                .chain(exchange_output.iter().cloned())
             {
                 let item = if ignore_ids {
                     strip_item_id(item)
@@ -1597,12 +1955,18 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
                 model_exchange.push(digest);
             }
         }
+        let (response_id, store) = match held {
+            Some((response_id, store)) => (response_id, store),
+            None => (
+                self.model_responses
+                    .last()
+                    .and_then(|r| r.response_id.clone()),
+                self.last_store.or(self.current_agent.model_settings.store),
+            ),
+        };
         let info = crate::memory::SessionRunCompletion {
-            response_id: self
-                .model_responses
-                .last()
-                .and_then(|r| r.response_id.clone()),
-            store: self.current_agent.model_settings.store,
+            response_id,
+            store,
             has_local_tool_outputs,
             model_exchange,
         };
@@ -1629,9 +1993,18 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
         self.model_prefix = match &self.config.session_input_callback {
             Some(cb) => cb(history, self.session_input.clone()).await?,
             None => {
+                // Stored history is pruned of calls that never got an output; with a limit
+                // set, outputs whose call the limit cut off go too, so the model is never
+                // sent a half of a pair. The run's own input stays verbatim.
+                let history_len = history.len();
+                let history_indexes: HashSet<usize> = (0..history_len).collect();
                 let mut h = history;
                 h.extend(self.session_input.clone());
-                h
+                items::drop_orphan_function_calls_in(
+                    h,
+                    Some(&history_indexes),
+                    settings.limit.map(|_| &history_indexes),
+                )
             }
         };
         Ok(())
@@ -1656,13 +2029,7 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
                 .unwrap_or_else(|| agent.model_settings.clone())
         };
         let mut s = base.resolve(self.config.model_settings.as_ref());
-        if agent.reset_tool_choice
-            && self
-                .tools_used
-                .get(&agent.name)
-                .map(|v| !v.is_empty())
-                .unwrap_or(false)
-        {
+        if agent.reset_tool_choice && self.tools_used.has_used(agent) {
             s.tool_choice = None;
         }
         // One generated key per run, grouped by conversation, session, trace group or run.
@@ -1761,6 +2128,9 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
         let agent = self.current_agent.clone();
         if self.should_run_agent_start_hooks {
             self.should_run_agent_start_hooks = false;
+            // The agent-start hooks see the run input, as `context_wrapper.turn_input` does in
+            // Python; the model input replaces it once it has been built, below.
+            self.ctx.set_turn_input(self.original_input.clone());
             if let Some(h) = &self.hooks {
                 h.on_agent_start(&self.ctx, &agent).await;
             }
@@ -1797,7 +2167,8 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
         } else {
             (Vec::new(), Vec::new())
         };
-        if !blocking.is_empty() {
+        let already_ran = first_turn && std::mem::take(&mut self.first_blocking_guardrails_done);
+        if !blocking.is_empty() && !already_ran {
             let results = self
                 .run_input_guardrails(blocking, guardrail_input.clone().unwrap_or_default())
                 .await?;
@@ -1811,6 +2182,7 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
             self.models_used.push(model.clone());
         }
         let settings = self.resolve_settings(&agent, &model);
+        self.last_store = settings.store;
 
         let mut input = self.build_model_input();
         let mut instructions = system_prompt;
@@ -1831,6 +2203,8 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
         // Hooks and tools see exactly what the model is about to see.
         self.ctx.set_turn_input(input.clone());
         let sent_input = input.clone();
+        // A failed request must not reuse evidence from an earlier exchange.
+        self.compaction_exchange = None;
 
         let mut tool_specs: Vec<ToolSpec> = Vec::with_capacity(tools.len());
         for t in &tools {
@@ -1885,10 +2259,14 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
         // per-run state can tell this run's calls from another's. Port of
         // `model_run_context` / `model_run_context_stream`.
         let owner = self.model_owner;
+        // Programmatic tool calling has local side effects a replay could repeat.
+        let replay_unsafe_request = tools
+            .iter()
+            .any(|t| matches!(t, Tool::ProgrammaticToolCalling(_)));
         let response = if parallel.is_empty() {
             Box::pin(crate::models::run_context::model_run_context(
                 owner,
-                model_call::call_model(&model, request, self.sink.as_ref()),
+                model_call::call_model(&model, request, self.sink.as_ref(), replay_unsafe_request),
             ))
             .await?
         } else {
@@ -1896,7 +2274,12 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
             let (guard_results, model_result) = {
                 let model_fut = Box::pin(crate::models::run_context::model_run_context(
                     owner,
-                    model_call::call_model(&model, request, self.sink.as_ref()),
+                    model_call::call_model(
+                        &model,
+                        request,
+                        self.sink.as_ref(),
+                        replay_unsafe_request,
+                    ),
                 ));
                 let guard_fut = self.run_input_guardrails(parallel, g_input);
                 tokio::pin!(model_fut);
@@ -1929,6 +2312,14 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
             h.on_llm_end(&self.ctx, &agent, &response).await;
         }
         self.model_responses.push(response.clone());
+        self.compaction_exchange = Some((
+            sent_input.clone(),
+            response
+                .output
+                .iter()
+                .map(|o| InputItem(o.to_value()))
+                .collect(),
+        ));
 
         let processed =
             self.process_response(&agent, &tools, &handoffs, &response, true, &HashSet::new())?;
@@ -1975,6 +2366,7 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
     ) -> Result<ProcessedResponse<C>> {
         let mut processed = ProcessedResponse {
             functions: Vec::new(),
+            completed_functions: Vec::new(),
             handoffs: Vec::new(),
             mcp_approvals: Vec::new(),
             local_calls: Vec::new(),
@@ -2069,10 +2461,7 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
                 processed
                     .tools_used
                     .push("programmatic_tool_calling".into());
-                self.tools_used
-                    .entry(agent.name.clone())
-                    .or_default()
-                    .extend(processed.tools_used.iter().cloned());
+                self.tools_used.add(agent, &processed.tools_used);
                 return Err(AgentsError::model_behavior(format!(
                     "Model produced {out_type} item without a programmatic_tool_calling tool."
                 )));
@@ -2150,12 +2539,19 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
                                 RunItemKind::ToolCall {
                                     raw_item: fc.to_value(),
                                 },
-                            );
+                            )
+                            .with_tool_details(Some(t.description.clone()), t.mcp_title.clone())
+                            .with_tool_origin(Some(t.tool_origin()));
                             self.push_item(item, Some(RunItemStreamEventName::ToolCalled));
                         }
                         processed.tools_used.push(fc.name.clone());
                         let next = processed.call_positions.len();
                         processed.call_positions.insert(fc.call_id.clone(), next);
+                        if skip.contains(&fc.call_id) {
+                            processed
+                                .completed_functions
+                                .push((fc.clone(), (*t).clone()));
+                        }
                         if !skip.contains(&fc.call_id) {
                             processed.functions.push((fc.clone(), (*t).clone()));
                         }
@@ -2168,6 +2564,7 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
                                 )));
                             }
                             ToolNotFoundBehavior::ReturnErrorToModel => {
+                                processed.has_tool_activity = true;
                                 if append && !skip.contains(&fc.call_id) {
                                     let call_item = RunItem::new(
                                         name.clone(),
@@ -2408,12 +2805,20 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
                                 } else {
                                     RunItemStreamEventName::ToolCalled
                                 };
-                                let item = RunItem::new(
+                                let mut item = RunItem::new(
                                     name.clone(),
                                     RunItemKind::ToolCall {
                                         raw_item: v.clone(),
                                     },
                                 );
+                                if ty == "mcp_call"
+                                    && let Some(label) =
+                                        v.get("server_label").and_then(Value::as_str)
+                                {
+                                    item = item.with_tool_origin(Some(
+                                        crate::tool::ToolOrigin::mcp(label),
+                                    ));
+                                }
                                 self.push_item(item, Some(event));
                             }
                             // `tool_search_call` is deliberately excluded from tool-use
@@ -2427,10 +2832,7 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
             }
         }
         if !processed.tools_used.is_empty() {
-            self.tools_used
-                .entry(agent.name.clone())
-                .or_default()
-                .extend(processed.tools_used.iter().cloned());
+            self.tools_used.add(agent, &processed.tools_used);
         }
         Ok(processed)
     }
@@ -2441,14 +2843,16 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
         mut processed: ProcessedResponse<C>,
     ) -> Result<NextStep<C>> {
         self.last_processed_response = Some(processed.snapshot());
+        self.turn_in_flight = true;
         let mut interruptions: Vec<ToolApprovalItem> = Vec::new();
-        let ran_functions = !processed.functions.is_empty();
+        let mut ran_functions = !processed.functions.is_empty();
         let outputs_start = self.generated_items.len();
         let model_outputs_start = self.model_items.len();
         let call_positions = std::mem::take(&mut processed.call_positions);
 
-        // Function tools.
-        let results = {
+        // Function tools. A batch that fails still reports the outputs that were committed, so
+        // they land in history (and in the failure checkpoint) before the error propagates.
+        let (results, tool_failure) = {
             let env = ToolEnv {
                 ctx: &self.ctx,
                 agent,
@@ -2456,7 +2860,10 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
                 config: &self.config,
                 unbound_approvals: &self.unbound_approvals,
             };
-            Box::pin(tools::execute_function_tools(&env, processed.functions)).await?
+            match Box::pin(tools::execute_function_tools(&env, processed.functions)).await {
+                Ok(results) => (results, None),
+                Err(failure) => (failure.completed, Some(failure.error)),
+            }
         };
         let mut function_results = Vec::new();
         for r in results {
@@ -2465,6 +2872,7 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
             self.tool_output_guardrail_results
                 .extend(r.output_guardrail_results);
             let custom_data = r.custom_data.clone();
+            let origin = r.tool_origin.clone();
             match r.outcome {
                 tools::ToolOutcome::Output { output, item } => {
                     let ri = RunItem::new(
@@ -2474,7 +2882,8 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
                             output: output.to_json_value(),
                             custom_data: custom_data.clone(),
                         },
-                    );
+                    )
+                    .with_tool_origin(Some(origin));
                     self.push_item(ri.clone(), Some(RunItemStreamEventName::ToolOutput));
                     function_results.push(crate::tool::FunctionToolResult {
                         tool_name: r.tool_name,
@@ -2494,12 +2903,73 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
                                 raw_item: it.raw_item.clone(),
                                 tool_name: it.tool_name.clone(),
                             },
-                        );
+                        )
+                        .with_tool_origin(it.tool_origin.clone());
                         self.generated_items.push(ri);
                     }
                     interruptions.extend(items);
                 }
             }
+        }
+        if let Some(error) = tool_failure {
+            // Replay the committed outputs in the order the model asked for them, then fail.
+            items::order_current_turn_tool_outputs(
+                &mut self.generated_items,
+                outputs_start,
+                &call_positions,
+            );
+            items::order_current_turn_tool_outputs(
+                &mut self.model_items,
+                model_outputs_start,
+                &call_positions,
+            );
+            return Err(error);
+        }
+        if self.resumed_from_failure {
+            // The failed turn already ran these calls; their outputs still count towards the
+            // tool-use decision, as they did when they ran.
+            for (call, tool) in std::mem::take(&mut processed.completed_functions) {
+                let Some(item) = self.generated_items.iter().rev().find(|i| {
+                    matches!(
+                        &i.kind,
+                        RunItemKind::ToolCallOutput { raw_item, .. }
+                            if raw_item
+                                .get("call_id")
+                                .and_then(Value::as_str)
+                                == Some(call.call_id.as_str())
+                    )
+                }) else {
+                    continue;
+                };
+                let RunItemKind::ToolCallOutput {
+                    output,
+                    custom_data,
+                    ..
+                } = &item.kind
+                else {
+                    continue;
+                };
+                function_results.push(crate::tool::FunctionToolResult {
+                    tool_name: tool.name.clone(),
+                    qualified_tool_name: tool.qualified_name(),
+                    custom_data: custom_data.clone(),
+                    call_id: call.call_id.clone(),
+                    output: match output {
+                        Value::String(text) => ToolOutput::Text(text.clone()),
+                        other => ToolOutput::Json(other.clone()),
+                    },
+                    run_item: Some(item.clone()),
+                    interruptions: Vec::new(),
+                });
+            }
+            function_results.sort_by_key(|r| {
+                call_positions
+                    .get(&r.call_id)
+                    .copied()
+                    .unwrap_or(usize::MAX)
+            });
+            ran_functions |= !function_results.is_empty();
+            self.resumed_from_failure = false;
         }
 
         // Hosted MCP approval requests.
@@ -2581,6 +3051,7 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
                             extra,
                         },
                         tool_name: identity,
+                        tool_origin: None,
                     };
                     self.generated_items.push(RunItem::new(
                         agent.name.clone(),
@@ -2689,25 +3160,36 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
             return Ok(NextStep::RunAgain);
         }
 
-        // Final output from the last message.
-        let Some(message) = processed.last_message else {
+        // Final output from the last message, as `execute_tools_and_side_effects` does: a turn
+        // that only produced hosted tool activity runs again; an empty turn ends the run.
+        let message = processed.last_message;
+        if message.is_none() && (!processed.tools_used.is_empty() || processed.has_tool_activity) {
             return Ok(NextStep::RunAgain);
-        };
+        }
+        let refusal = message.as_ref().and_then(|m| m.refusal());
+        if let Some(refusal) = refusal {
+            let err = AgentsError::ModelRefusalError {
+                refusal,
+                run_data: None,
+            };
+            let handler = self.error_handlers.model_refusal.clone();
+            return self.handled_final(handler, err).await;
+        }
+        let text = message
+            .as_ref()
+            .map(|m| m.text_content())
+            .unwrap_or_default();
         match &agent.output_type {
             Some(schema) if !schema.is_plain_text() => {
-                if let Some(refusal) = message.refusal()
-                    && message.text_content().is_empty()
-                {
-                    let err = AgentsError::ModelRefusalError {
-                        refusal,
-                        run_data: None,
-                    };
-                    let handler = self.error_handlers.model_refusal.clone();
-                    return self.handled_final(handler, err).await;
-                }
-                let text = message.text_content();
                 if text.is_empty() {
-                    return Ok(NextStep::RunAgain);
+                    let handler = self.error_handlers.invalid_final_output.clone();
+                    if handler.is_none() {
+                        return Ok(NextStep::RunAgain);
+                    }
+                    let err = AgentsError::model_behavior(
+                        "Model returned no final output for the structured output type.",
+                    );
+                    return self.handled_final(handler, err).await;
                 }
                 match schema.validate_json(&text) {
                     Ok(v) => Ok(NextStep::FinalOutput(v)),
@@ -2717,16 +3199,7 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
                     }
                 }
             }
-            _ => {
-                let text = message.text_content();
-                if !text.is_empty() {
-                    Ok(NextStep::FinalOutput(Value::String(text)))
-                } else if let Some(r) = message.refusal() {
-                    Ok(NextStep::FinalOutput(Value::String(r)))
-                } else {
-                    Ok(NextStep::RunAgain)
-                }
-            }
+            _ => Ok(NextStep::FinalOutput(Value::String(text))),
         }
     }
 
@@ -2859,7 +3332,10 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
         });
         span.finish();
 
-        let pre_handoff_count = self.turn_start.min(self.generated_items.len());
+        let pre_handoff_count = self
+            .resumed_pre_count
+            .unwrap_or(self.turn_start)
+            .min(self.generated_items.len());
         let output_item = RunItem::new(
             agent.name.clone(),
             RunItemKind::HandoffOutput {
@@ -2890,6 +3366,20 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
                     "Handoff input filters are not supported with server-managed conversations.",
                 ));
             }
+            // Tag every item so the loop can tell which ones the filter kept: an item it
+            // dropped from history that was already saved cannot be unsaved, but the unsaved
+            // tail must follow what the filter decided to keep.
+            for item in &mut self.generated_items {
+                if item.occurrence.0.is_none() {
+                    self.next_occurrence += 1;
+                    item.occurrence.0 = Some(self.next_occurrence);
+                }
+            }
+            let saved_keys: HashSet<u64> = self.generated_items
+                [..self.session_saved_items.min(self.generated_items.len())]
+                .iter()
+                .filter_map(|i| i.occurrence.0)
+                .collect();
             let data = HandoffInputData {
                 input_history: self.model_prefix.clone(),
                 pre_handoff_items: self.generated_items[..pre_handoff_count].to_vec(),
@@ -2903,7 +3393,13 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
             generated.extend(filtered.new_items.clone());
             let mut model_items = filtered.pre_handoff_items;
             model_items.extend(filtered.input_items.unwrap_or(filtered.new_items));
-            self.session_saved_items = self.session_saved_items.min(generated.len());
+            // The saved prefix is whatever the filter kept of what was already written; the
+            // first item it did not carry over (a copy it made, or a survivor of the held
+            // batch) starts the unsaved tail.
+            self.session_saved_items = generated
+                .iter()
+                .position(|i| i.occurrence.0.is_none_or(|k| !saved_keys.contains(&k)))
+                .unwrap_or(generated.len());
             self.generated_items = generated;
             self.model_items = model_items;
             self.model_history_diverged = true;

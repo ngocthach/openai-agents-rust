@@ -443,4 +443,98 @@ mod tests {
     fn invalid_context_errors() {
         assert!(apply_diff("a\n", "@@\n-zzz\n", ApplyDiffMode::Default).is_err());
     }
+
+    // Ported from the Python SDK's tests/test_apply_diff_helpers.py.
+
+    #[test]
+    fn normalize_diff_lines_drops_trailing_blank() {
+        assert_eq!(normalize_diff_lines("a\nb\n"), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn is_done_true_when_index_out_of_range() {
+        let state = ParserState {
+            lines: vec!["line".to_string()],
+            index: 1,
+            fuzz: 0,
+        };
+        assert!(is_done(&state, &[]));
+    }
+
+    #[test]
+    fn read_str_returns_empty_when_missing_prefix() {
+        let mut state = ParserState {
+            lines: vec!["value".to_string()],
+            index: 0,
+            fuzz: 0,
+        };
+        assert_eq!(read_str(&mut state, "nomatch"), "");
+        assert_eq!(state.index, 0);
+    }
+
+    #[test]
+    fn read_section_returns_eof_flag() {
+        let result = read_section(&["*** End of File".to_string()], 0).unwrap();
+        assert!(result.eof);
+    }
+
+    #[test]
+    fn read_section_rejects_invalid_marker() {
+        assert!(read_section(&["*** Bad Marker".to_string()], 0).is_err());
+    }
+
+    #[test]
+    fn read_section_rejects_empty_segment() {
+        assert!(read_section(&[], 0).is_err());
+    }
+
+    #[test]
+    fn find_context_eof_fallbacks() {
+        let (index, fuzz) = find_context(&["one"], &["missing".to_string()], 0, true);
+        assert_eq!(index, None);
+        assert!(fuzz >= 10000);
+    }
+
+    #[test]
+    fn find_context_eof_ignores_trailing_empty_split_element() {
+        let (index, fuzz) = find_context(&["a", "b", ""], &[], 0, true);
+        assert_eq!(index, Some(2));
+        assert_eq!(fuzz, 0);
+
+        let (index, fuzz) =
+            find_context(&["x", "foo", "y", "foo", ""], &["foo".to_string()], 0, true);
+        assert_eq!(index, Some(3));
+        assert_eq!(fuzz, 0);
+    }
+
+    #[test]
+    fn find_context_core_stripped_matches() {
+        let (index, fuzz) = find_context_core(&[" line "], &["line".to_string()], 0);
+        assert_eq!(index, Some(0));
+        assert_eq!(fuzz, 100);
+    }
+
+    #[test]
+    fn apply_chunks_rejects_bad_chunks() {
+        let out_of_range = Chunk {
+            orig_index: 10,
+            del_lines: Vec::new(),
+            ins_lines: Vec::new(),
+        };
+        assert!(apply_chunks("abc", std::slice::from_ref(&out_of_range), "\n").is_err());
+
+        let overlapping = vec![
+            Chunk {
+                orig_index: 0,
+                del_lines: vec!["a".to_string()],
+                ins_lines: Vec::new(),
+            },
+            Chunk {
+                orig_index: 0,
+                del_lines: vec!["b".to_string()],
+                ins_lines: Vec::new(),
+            },
+        ];
+        assert!(apply_chunks("abc", &overlapping, "\n").is_err());
+    }
 }

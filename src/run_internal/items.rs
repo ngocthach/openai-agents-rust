@@ -26,6 +26,11 @@ fn output_type_for(call_type: &str) -> Option<&'static str> {
         .map(|(_, out)| *out)
 }
 
+/// The output item type that completes a call of this type.
+pub(crate) fn output_type_of_call(call_type: &str) -> Option<&'static str> {
+    output_type_for(call_type)
+}
+
 fn is_call_or_output_type(ty: &str) -> bool {
     TOOL_CALL_TO_OUTPUT_TYPE
         .iter()
@@ -160,13 +165,26 @@ fn completed_call_ids(items: &[InputItem]) -> HashMap<&'static str, HashSet<Stri
 /// does not replay stale calls, together with the reasoning items tied to them.
 /// Port of `drop_orphan_function_calls`.
 pub(crate) fn drop_orphan_function_calls(items: Vec<InputItem>) -> Vec<InputItem> {
+    drop_orphan_function_calls_in(items, None, None)
+}
+
+/// [`drop_orphan_function_calls`] restricted to the stored-history positions in
+/// `pruning_indexes` (items elsewhere are caller input and stay verbatim). When
+/// `output_pruning_indexes` names unambiguous stored history, tool outputs whose call is no
+/// longer present after pruning, such as one a session limit cut off, are dropped too.
+pub(crate) fn drop_orphan_function_calls_in(
+    items: Vec<InputItem>,
+    pruning_indexes: Option<&HashSet<usize>>,
+    output_pruning_indexes: Option<&HashSet<usize>>,
+) -> Vec<InputItem> {
     let completed = completed_call_ids(&items);
+    let in_scope = |index: usize| pruning_indexes.is_none_or(|set| set.contains(&index));
 
     // A program stays only while one of the items it owns is retained.
     let mut active_program_call_ids: HashSet<String> = HashSet::new();
     let mut orphan_program_call_ids: HashSet<String> = HashSet::new();
-    for item in &items {
-        if item.0.get("type").and_then(Value::as_str) != Some("program") {
+    for (index, item) in items.iter().enumerate() {
+        if !in_scope(index) || item.0.get("type").and_then(Value::as_str) != Some("program") {
             continue;
         }
         let Some(call_id) = item.0.get("call_id").and_then(Value::as_str) else {
@@ -180,7 +198,12 @@ pub(crate) fn drop_orphan_function_calls(items: Vec<InputItem>) -> Vec<InputItem
         }
         let has_owned = items
             .iter()
-            .any(|candidate| program_caller_id(&candidate.0) == Some(call_id));
+            .enumerate()
+            .any(|(candidate_index, candidate)| {
+                program_caller_id(&candidate.0) == Some(call_id)
+                // With a pruning scope, only an item outside it is known to be retained.
+                && pruning_indexes.is_none_or(|set| !set.contains(&candidate_index))
+            });
         if has_owned {
             active_program_call_ids.insert(call_id.to_string());
         } else {
@@ -193,6 +216,9 @@ pub(crate) fn drop_orphan_function_calls(items: Vec<InputItem>) -> Vec<InputItem
         let Some(ty) = item.0.get("type").and_then(Value::as_str) else {
             continue;
         };
+        if !in_scope(index) {
+            continue;
+        }
         if let Some(caller_id) = program_caller_id(&item.0)
             && orphan_program_call_ids.contains(caller_id)
         {
@@ -215,6 +241,50 @@ pub(crate) fn drop_orphan_function_calls(items: Vec<InputItem>) -> Vec<InputItem
         dropped.insert(index);
     }
 
+    // Only a dropped call or program-owned item strands the reasoning item before it.
+    let reasoning_triggers: HashSet<usize> = dropped.clone();
+
+    // Outputs whose call did not survive: `available` is every call id still retained.
+    if let Some(output_indexes) = output_pruning_indexes {
+        let mut available: HashMap<&'static str, HashSet<String>> = HashMap::new();
+        for (index, item) in items.iter().enumerate() {
+            if dropped.contains(&index) {
+                continue;
+            }
+            let Some(ty) = item.0.get("type").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(out_type) = output_type_for(ty) else {
+                continue;
+            };
+            if let Some(cid) = item.0.get("call_id").and_then(Value::as_str) {
+                available
+                    .entry(out_type)
+                    .or_default()
+                    .insert(cid.to_string());
+            }
+        }
+        let mut indexes: Vec<usize> = output_indexes.iter().copied().collect();
+        indexes.sort_unstable();
+        for index in indexes {
+            if dropped.contains(&index) || index >= items.len() {
+                continue;
+            }
+            let item = &items[index];
+            let Some(ty) = item.0.get("type").and_then(Value::as_str) else {
+                continue;
+            };
+            if !TOOL_CALL_TO_OUTPUT_TYPE.iter().any(|(_, out)| *out == ty) {
+                continue;
+            }
+            if let Some(cid) = item.0.get("call_id").and_then(Value::as_str)
+                && !available.get(ty).is_some_and(|ids| ids.contains(cid))
+            {
+                dropped.insert(index);
+            }
+        }
+    }
+
     if dropped.is_empty() {
         return items;
     }
@@ -234,7 +304,7 @@ pub(crate) fn drop_orphan_function_calls(items: Vec<InputItem>) -> Vec<InputItem
             if item.0.get("type").and_then(Value::as_str) == Some("reasoning") {
                 continue;
             }
-            if dropped.contains(&next) {
+            if reasoning_triggers.contains(&next) {
                 drop_reasoning.insert(index);
             }
             break;

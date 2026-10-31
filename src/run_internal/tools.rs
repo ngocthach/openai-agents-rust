@@ -13,7 +13,8 @@ use crate::lifecycle::RunHooks;
 use crate::run_config::{RunConfig, ToolErrorFormatterArgs, ToolErrorKind};
 use crate::run_context::RunContext;
 use crate::tool::{
-    DEFAULT_APPROVAL_REJECTION_MESSAGE, FunctionTool, Tool, ToolOutput, ToolTimeoutBehavior,
+    DEFAULT_APPROVAL_REJECTION_MESSAGE, FunctionTool, Tool, ToolOrigin, ToolOutput,
+    ToolTimeoutBehavior,
 };
 use crate::tool_context::ToolContext;
 use crate::tool_guardrails::{
@@ -60,12 +61,40 @@ pub(crate) enum ToolOutcome {
     Interruptions(Vec<ToolApprovalItem>),
 }
 
+/// A tool call that failed, possibly after its output was already committed.
+///
+/// The output of a tool whose body succeeded is committed before the post-output step (the
+/// custom-data merge) runs, so a failure there still hands back the output: a retry skips the
+/// completed invocation instead of running the tool again.
+pub(crate) struct ToolFailure {
+    pub error: AgentsError,
+    pub committed: Option<ToolExecResult>,
+}
+
+impl From<AgentsError> for ToolFailure {
+    fn from(error: AgentsError) -> Self {
+        ToolFailure {
+            error,
+            committed: None,
+        }
+    }
+}
+
+/// A batch of tool calls that failed, with the outputs that completed before the failure in
+/// model call order.
+pub(crate) struct ToolBatchFailure {
+    pub error: AgentsError,
+    pub completed: Vec<ToolExecResult>,
+}
+
 /// Result of executing one tool call.
 pub(crate) struct ToolExecResult {
     pub call: FunctionCall,
     pub tool_name: String,
     pub qualified_tool_name: String,
     pub custom_data: Option<Value>,
+    /// Where the tool came from, attached to the output and approval items it produces.
+    pub tool_origin: ToolOrigin,
     pub outcome: ToolOutcome,
     pub input_guardrail_results: Vec<ToolInputGuardrailResult>,
     pub output_guardrail_results: Vec<ToolOutputGuardrailResult>,
@@ -187,7 +216,7 @@ pub(crate) async fn execute_function_tool<C: Send + Sync + 'static>(
     env: &ToolEnv<'_, C>,
     call: FunctionCall,
     tool: Arc<FunctionTool<C>>,
-) -> Result<ToolExecResult> {
+) -> std::result::Result<ToolExecResult, ToolFailure> {
     let mut input_results = Vec::new();
     let mut output_results = Vec::new();
     let tool_ctx = ToolContext::from_call(env.ctx.clone(), &env.agent.name, &call)
@@ -199,6 +228,7 @@ pub(crate) async fn execute_function_tool<C: Send + Sync + 'static>(
         tool_name: tool.name.clone(),
         qualified_tool_name: tool.qualified_name(),
         custom_data: None,
+        tool_origin: tool.tool_origin(),
         outcome,
         input_guardrail_results: i,
         output_guardrail_results: o,
@@ -211,28 +241,38 @@ pub(crate) async fn execute_function_tool<C: Send + Sync + 'static>(
         .evaluate(env.ctx, &call.arguments, &call.call_id)
         .await;
     if needs_approval {
-        if env.config.tool_execution.pre_approval_tool_input_guardrails
-            && let InputGuardrailVerdict::Reject(msg) =
+        let status_now = || {
+            bound_approval_status(
+                env.ctx,
+                env.unbound_approvals,
+                &env.agent.name,
+                &approval_name,
+                &call.call_id,
+            )
+        };
+        let mut status = status_now();
+        // The guardrails vet a call before it is offered for approval. Once an approval
+        // decision exists they run with the invocation instead, so a resumed run does not
+        // run them a second time.
+        if status.is_none() && env.config.tool_execution.pre_approval_tool_input_guardrails {
+            if let InputGuardrailVerdict::Reject(msg) =
                 run_input_guardrails(env, &tool, &tool_ctx, &mut input_results).await?
-        {
-            return Ok(finish(
-                output_outcome(&call, ToolOutput::Text(msg)),
-                input_results,
-                output_results,
-            ));
+            {
+                return Ok(finish(
+                    output_outcome(&call, ToolOutput::Text(msg)),
+                    input_results,
+                    output_results,
+                ));
+            }
+            status = status_now();
         }
-        match bound_approval_status(
-            env.ctx,
-            env.unbound_approvals,
-            &env.agent.name,
-            &approval_name,
-            &call.call_id,
-        ) {
+        match status {
             None => {
                 let item = ToolApprovalItem {
                     agent: env.agent.name.clone(),
                     raw_item: call.clone(),
                     tool_name: approval_name.clone(),
+                    tool_origin: Some(tool.tool_origin()),
                 };
                 return Ok(finish(
                     ToolOutcome::Interruptions(vec![item]),
@@ -460,7 +500,16 @@ pub(crate) async fn execute_function_tool<C: Send + Sync + 'static>(
         }
         _ => None,
     };
-    let custom_data = crate::tool::merge_custom_data(&[tool_ctx.custom_data(), extracted])?;
+    let custom_data = match crate::tool::merge_custom_data(&[tool_ctx.custom_data(), extracted]) {
+        Ok(data) => data,
+        Err(error) => {
+            // The output is committed; only the SDK-only data failed to attach.
+            return Err(ToolFailure {
+                error,
+                committed: Some(finish(outcome, input_results, output_results)),
+            });
+        }
+    };
     let mut result = finish(outcome, input_results, output_results);
     result.custom_data = custom_data;
     Ok(result)
@@ -471,7 +520,7 @@ pub(crate) async fn execute_function_tool<C: Send + Sync + 'static>(
 pub(crate) async fn execute_function_tools<C: Send + Sync + 'static>(
     env: &ToolEnv<'_, C>,
     runs: Vec<(FunctionCall, Arc<FunctionTool<C>>)>,
-) -> Result<Vec<ToolExecResult>> {
+) -> std::result::Result<Vec<ToolExecResult>, ToolBatchFailure> {
     if runs.is_empty() {
         return Ok(Vec::new());
     }
@@ -485,13 +534,30 @@ pub(crate) async fn execute_function_tools<C: Send + Sync + 'static>(
     // tool-call order. Returning there drops the stream, which cancels every sibling still in
     // flight instead of letting it run to completion. Port of the `_FunctionToolBatchExecutor`
     // failure arbitration (`_select_function_tool_failure` + `_cancel_function_tool_tasks`).
+    // Siblings that had already committed their output are kept, in call order, so a retry
+    // does not run them again.
     let stream = futures::stream::iter(runs)
         .map(|(call, tool)| Box::pin(execute_function_tool(env, call, tool)))
         .buffered(limit);
     let mut stream = std::pin::pin!(stream);
     let mut results = Vec::new();
     while let Some(result) = stream.next().await {
-        results.push(result?);
+        match result {
+            Ok(result) => results.push(result),
+            Err(failure) => {
+                results.extend(failure.committed);
+                while let Some(Some(sibling)) = futures::FutureExt::now_or_never(stream.next()) {
+                    match sibling {
+                        Ok(result) => results.push(result),
+                        Err(other) => results.extend(other.committed),
+                    }
+                }
+                return Err(ToolBatchFailure {
+                    error: failure.error,
+                    completed: results,
+                });
+            }
+        }
     }
     Ok(results)
 }

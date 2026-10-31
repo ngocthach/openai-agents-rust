@@ -45,6 +45,7 @@ impl RunItemStreamEventName {
 }
 
 /// An event in a streamed run.
+#[allow(clippy::large_enum_variant)]
 pub enum StreamEvent<C> {
     /// A raw Responses API stream event (`response.output_text.delta`, ...).
     RawResponse(Value),

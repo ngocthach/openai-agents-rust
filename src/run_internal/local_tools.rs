@@ -121,11 +121,14 @@ async fn approval_gate<C: Send + Sync + 'static>(
 ) -> Gate {
     let agent = &env.agent.name;
     let call_id = call.call_id.clone();
+    // Sticky decisions are scoped by how the tool was invoked, so a native `apply_patch_call`
+    // approval never approves a custom tool of the same name.
+    let tool_key = crate::run_context::approval_tool_key(tool_name, &call);
     let mut status = super::tools::bound_approval_status(
         env.ctx,
         env.unbound_approvals,
         agent,
-        tool_name,
+        &tool_key,
         &call_id,
     );
     if status.is_none() {
@@ -136,6 +139,7 @@ async fn approval_gate<C: Send + Sync + 'static>(
             agent: agent.clone(),
             raw_item: call,
             tool_name: tool_name.to_string(),
+            tool_origin: None,
         };
         let mut decided = false;
         if let Some(handler) = on_approval
@@ -154,7 +158,7 @@ async fn approval_gate<C: Send + Sync + 'static>(
         // is what the mask means. Mirrors the `discard(call_id)` that ends Python's
         // `_apply_approval_decision`.
         status = decided
-            .then(|| env.ctx.is_tool_approved(agent, tool_name, &call_id))
+            .then(|| env.ctx.is_tool_approved(agent, &tool_key, &call_id))
             .flatten();
         if status.is_none() {
             return Gate::Pending(Box::new(item));
@@ -164,7 +168,7 @@ async fn approval_gate<C: Send + Sync + 'static>(
         Some(false) => {
             let message = env
                 .ctx
-                .rejection_message(agent, tool_name, &call_id)
+                .rejection_message(agent, &tool_key, &call_id)
                 .unwrap_or_else(|| {
                     format_tool_error_for(
                         env.config,

@@ -58,7 +58,7 @@ pub enum AgentsError {
     },
 
     /// A model call attempt exceeded `ModelSettings::timeout`.
-    #[error("Model call timed out after {timeout_seconds} seconds")]
+    #[error("Model call timed out after {timeout_seconds} seconds.")]
     ModelTimeoutError {
         timeout_seconds: f64,
         run_data: Option<Box<RunErrorDetails>>,
@@ -72,7 +72,7 @@ pub enum AgentsError {
     },
 
     /// A function tool exceeded its timeout and was configured to raise.
-    #[error("Tool '{tool_name}' timed out after {timeout_seconds} seconds")]
+    #[error("Tool '{tool_name}' timed out after {timeout_seconds} seconds.")]
     ToolTimeoutError {
         tool_name: String,
         timeout_seconds: f64,

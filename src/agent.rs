@@ -976,7 +976,8 @@ impl<C: Send + Sync + 'static> Agent<C> {
             .clone()
             .or_else(|| self.handoff_description.clone())
             .unwrap_or_default();
-        let structured = options.parameters.is_some();
+        // A custom input builder also opts into structured input, as in Python.
+        let structured = options.parameters.is_some() || options.input_builder.is_some();
         let schema = options.parameters.clone().unwrap_or_else(|| {
             serde_json::json!({
                 "type": "object",
@@ -1120,6 +1121,10 @@ impl<C: Send + Sync + 'static> Agent<C> {
         tool.needs_approval = needs_approval;
         tool.is_enabled = is_enabled;
         tool.is_agent_tool = true;
+        tool.tool_origin = Some(crate::tool::ToolOrigin::agent_as_tool(
+            self.name.clone(),
+            tool.name.clone(),
+        ));
         tool
     }
 }

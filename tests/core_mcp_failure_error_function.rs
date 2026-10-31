@@ -43,6 +43,7 @@ impl MCPServer for FailingServer {
 
     async fn list_tools(&self) -> Result<Vec<MCPTool>> {
         Ok(vec![MCPTool {
+            meta: None,
             name: "explode".into(),
             title: None,
             description: Some("Always fails".into()),

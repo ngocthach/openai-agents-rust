@@ -21,6 +21,100 @@ use crate::util::BoxFuture;
 mod local;
 pub use local::*;
 
+/// The runtime source of a function-tool-backed run item. Mirrors `ToolOriginType`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolOriginType {
+    /// An ordinary function tool.
+    Function,
+    /// A tool served by an MCP server.
+    Mcp,
+    /// An agent exposed through `Agent::as_tool`.
+    AgentAsTool,
+}
+
+impl ToolOriginType {
+    /// The wire spelling of the type.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ToolOriginType::Function => "function",
+            ToolOriginType::Mcp => "mcp",
+            ToolOriginType::AgentAsTool => "agent_as_tool",
+        }
+    }
+}
+
+/// Serializable metadata describing where a function-tool-backed item came from.
+/// Mirrors `ToolOrigin`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ToolOrigin {
+    /// What kind of tool produced the item.
+    #[serde(rename = "type")]
+    pub r#type: ToolOriginType,
+    /// Log-safe name of the MCP server, for [`ToolOriginType::Mcp`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_server_name: Option<String>,
+    /// Name of the wrapped agent, for [`ToolOriginType::AgentAsTool`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_name: Option<String>,
+    /// Name the wrapped agent's tool is exposed under, for [`ToolOriginType::AgentAsTool`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_tool_name: Option<String>,
+}
+
+impl ToolOrigin {
+    /// An origin of this type with no further detail.
+    pub fn new(r#type: ToolOriginType) -> Self {
+        ToolOrigin {
+            r#type,
+            mcp_server_name: None,
+            agent_name: None,
+            agent_tool_name: None,
+        }
+    }
+
+    /// The origin of a tool served by the MCP server named `server_name`.
+    pub fn mcp(server_name: impl Into<String>) -> Self {
+        ToolOrigin {
+            mcp_server_name: Some(server_name.into()),
+            ..ToolOrigin::new(ToolOriginType::Mcp)
+        }
+    }
+
+    /// The origin of an agent exposed as the tool `tool_name`.
+    pub fn agent_as_tool(agent_name: impl Into<String>, tool_name: impl Into<String>) -> Self {
+        ToolOrigin {
+            agent_name: Some(agent_name.into()),
+            agent_tool_name: Some(tool_name.into()),
+            ..ToolOrigin::new(ToolOriginType::AgentAsTool)
+        }
+    }
+
+    /// Convert to JSON-compatible data. Mirrors `ToolOrigin.to_json_dict`.
+    pub fn to_json_dict(&self) -> Value {
+        serde_json::to_value(self).unwrap_or(Value::Null)
+    }
+
+    /// Read from JSON-compatible data; anything malformed is `None`, so a snapshot written by a
+    /// newer SDK still loads. Mirrors `ToolOrigin.from_json_dict`.
+    pub fn from_json_dict(value: &Value) -> Option<ToolOrigin> {
+        let object = value.as_object()?;
+        let r#type = match object.get("type")?.as_str()? {
+            "function" => ToolOriginType::Function,
+            "mcp" => ToolOriginType::Mcp,
+            "agent_as_tool" => ToolOriginType::AgentAsTool,
+            _ => return None,
+        };
+        let optional = |key: &str| object.get(key).and_then(Value::as_str).map(str::to_string);
+        Some(ToolOrigin {
+            r#type,
+            mcp_server_name: optional("mcp_server_name"),
+            agent_name: optional("agent_name"),
+            agent_tool_name: optional("agent_tool_name"),
+        })
+    }
+}
+
 /// A structured part of a tool output (text, image or file).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -483,6 +577,8 @@ pub struct FunctionTool<C> {
     invoke: InvokeFn<C>,
     pub(crate) is_agent_tool: bool,
     pub(crate) mcp_server_name: Option<String>,
+    /// Explicit origin metadata for items this tool produces; see [`FunctionTool::tool_origin`].
+    pub(crate) tool_origin: Option<ToolOrigin>,
     pub(crate) namespace: Option<String>,
     pub(crate) namespace_description: Option<String>,
 }
@@ -513,6 +609,7 @@ impl<C> Clone for FunctionTool<C> {
             invoke: self.invoke.clone(),
             is_agent_tool: self.is_agent_tool,
             mcp_server_name: self.mcp_server_name.clone(),
+            tool_origin: self.tool_origin.clone(),
             namespace: self.namespace.clone(),
             namespace_description: self.namespace_description.clone(),
         }
@@ -659,6 +756,7 @@ impl<C: Send + Sync + 'static> FunctionTool<C> {
             invoke,
             is_agent_tool: false,
             mcp_server_name: None,
+            tool_origin: None,
             allowed_callers: None,
             custom_data_extractor: None,
             output_json_schema: None,
@@ -827,6 +925,19 @@ impl<C: Send + Sync + 'static> FunctionTool<C> {
 
     /// Mark this tool as produced by `codex_tool`, so an agent holding two same-named Codex
     /// tools fails fast. Mirrors setting `FunctionTool._is_codex_tool`.
+    /// Where items produced by this tool come from. Mirrors `get_function_tool_origin`: an
+    /// explicit origin wins, a tool served by an MCP server reports that server, and everything
+    /// else is a plain function tool.
+    pub fn tool_origin(&self) -> ToolOrigin {
+        if let Some(origin) = &self.tool_origin {
+            return origin.clone();
+        }
+        match &self.mcp_server_name {
+            Some(server) => ToolOrigin::mcp(server.clone()),
+            None => ToolOrigin::new(ToolOriginType::Function),
+        }
+    }
+
     pub(crate) fn mark_codex_tool(&mut self) {
         self.is_codex_tool = true;
     }
@@ -948,6 +1059,7 @@ impl<C> FunctionTool<C> {
             namespace_description: self.namespace_description.clone(),
             allowed_callers: self.allowed_callers.clone(),
             output_json_schema: self.output_json_schema.clone(),
+            needs_approval: !matches!(self.needs_approval, NeedsApproval::Static(false)),
         }
     }
 }

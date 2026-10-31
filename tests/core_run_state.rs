@@ -12,6 +12,7 @@ fn sample_state() -> RunState {
         agent: "Weather".into(),
         raw_item: call.clone(),
         tool_name: "get_weather".into(),
+        tool_origin: None,
     };
     let mut approvals = ApprovalsState::default();
     approvals.approve(&approval, false);

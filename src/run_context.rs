@@ -50,12 +50,46 @@ fn approval_key(agent: &str, tool_name: &str) -> String {
     format!("{agent}\u{1}{tool_name}")
 }
 
+/// Tool names whose sticky decisions are scoped by invocation type: the native `apply_patch_call`
+/// tool and a custom tool can both be called `apply_patch`, and approving one must not approve the
+/// other. Mirrors `RunContextWrapper._approval_keys_for_scope`.
+const SCOPED_APPROVAL_TOOL: &str = "apply_patch";
+
+/// The key a decision about `tool_name` is recorded under, given how the tool was invoked
+/// (`apply_patch_call`, `custom_tool_call`, `function_call`, ...). Only `apply_patch` is scoped;
+/// every other name keys as itself.
+pub fn scoped_tool_key(tool_name: &str, invocation_type: Option<&str>) -> String {
+    if tool_name == SCOPED_APPROVAL_TOOL {
+        format!("{tool_name}:{}", invocation_type.unwrap_or("function_call"))
+    } else {
+        tool_name.to_string()
+    }
+}
+
+/// [`scoped_tool_key`] for the tool call an approval item stands for.
+pub fn approval_tool_key(tool_name: &str, call: &crate::items::FunctionCall) -> String {
+    scoped_tool_key(tool_name, call.extra.get("type").and_then(Value::as_str))
+}
+
+/// The names a lookup consults, most specific first: a scoped `apply_patch:<type>` key falls back
+/// to the bare name for decisions recorded before scoping existed.
+fn lookup_names(tool_name: &str) -> impl Iterator<Item = &str> {
+    let bare = tool_name
+        .strip_prefix(SCOPED_APPROVAL_TOOL)
+        .filter(|rest| rest.starts_with(':'))
+        .map(|_| SCOPED_APPROVAL_TOOL);
+    std::iter::once(tool_name).chain(bare)
+}
+
 impl ApprovalsState {
     /// Approve a call; `always` approves future calls to the same tool by the same agent.
     pub fn approve(&mut self, item: &ToolApprovalItem, always: bool) {
         let rec = self
             .0
-            .entry(approval_key(&item.agent, &item.tool_name))
+            .entry(approval_key(
+                &item.agent,
+                &approval_tool_key(&item.tool_name, &item.raw_item),
+            ))
             .or_default();
         if always {
             rec.approved_always = true;
@@ -69,7 +103,10 @@ impl ApprovalsState {
     pub fn reject(&mut self, item: &ToolApprovalItem, always: bool, message: Option<String>) {
         let rec = self
             .0
-            .entry(approval_key(&item.agent, &item.tool_name))
+            .entry(approval_key(
+                &item.agent,
+                &approval_tool_key(&item.tool_name, &item.raw_item),
+            ))
             .or_default();
         if always {
             rec.rejected_always = true;
@@ -107,27 +144,29 @@ impl ApprovalsState {
     /// bucket, and snapshots written before it bound function tools to their agent) apply to
     /// every agent and are consulted when the agent-specific record is undecided.
     pub fn status(&self, agent: &str, tool_name: &str, call_id: &str) -> Option<bool> {
-        self.0
-            .get(&approval_key(agent, tool_name))
-            .and_then(|rec| Self::record_status(rec, call_id))
-            .or_else(|| {
+        let decided = |owner: &str| {
+            lookup_names(tool_name).find_map(|name| {
                 self.0
-                    .get(&approval_key("", tool_name))
+                    .get(&approval_key(owner, name))
                     .and_then(|rec| Self::record_status(rec, call_id))
             })
+        };
+        decided(agent).or_else(|| decided(""))
     }
 
     /// Custom rejection message for a call.
     pub fn rejection_message(&self, agent: &str, tool_name: &str, call_id: &str) -> Option<String> {
-        let message = |key: String| {
-            self.0.get(&key).and_then(|rec| {
-                rec.rejection_messages
-                    .get(call_id)
-                    .cloned()
-                    .or_else(|| rec.sticky_rejection_message.clone())
+        let message = |owner: &str| {
+            lookup_names(tool_name).find_map(|name| {
+                self.0.get(&approval_key(owner, name)).and_then(|rec| {
+                    rec.rejection_messages
+                        .get(call_id)
+                        .cloned()
+                        .or_else(|| rec.sticky_rejection_message.clone())
+                })
             })
         };
-        message(approval_key(agent, tool_name)).or_else(|| message(approval_key("", tool_name)))
+        message(agent).or_else(|| message(""))
     }
 
     /// Merge decisions from another state.
@@ -388,6 +427,7 @@ mod tests {
             agent: "a".into(),
             raw_item: FunctionCall::new("t", "{}"),
             tool_name: "t".into(),
+            tool_origin: None,
         };
         assert_eq!(ctx.is_tool_approved("a", "t", item.call_id()), None);
         ctx.approve_tool(&item, false);

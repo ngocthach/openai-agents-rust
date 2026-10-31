@@ -6,6 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
+use std::fmt;
 
 use crate::error::{AgentsError, Result};
 use crate::tool::{ToolOutput, ToolOutputPart};
@@ -211,7 +212,10 @@ impl FunctionCall {
     pub fn to_value(&self) -> Value {
         let mut v = serde_json::to_value(self).unwrap_or(Value::Null);
         if let Value::Object(m) = &mut v {
-            m.insert("type".into(), Value::String("function_call".into()));
+            // A call that stands in for another tool item (`apply_patch_call`,
+            // `custom_tool_call`, `mcp_approval_request`, ...) keeps that item's type.
+            m.entry("type")
+                .or_insert_with(|| Value::String("function_call".into()));
         }
         v
     }
@@ -498,6 +502,9 @@ pub struct ToolApprovalItem {
     pub raw_item: FunctionCall,
     /// Tool name (may differ from `raw_item.name` for MCP tools).
     pub tool_name: String,
+    /// Where the approved tool call came from. Mirrors `ToolApprovalItem.tool_origin`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_origin: Option<crate::tool::ToolOrigin>,
 }
 
 impl ToolApprovalItem {
@@ -579,6 +586,38 @@ pub struct RunItem {
     /// The item.
     #[serde(flatten)]
     pub kind: RunItemKind,
+    /// Description of the tool, when known at item creation time (tool calls).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Short display label of the tool, when known at item creation time (tool calls).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Where the item's tool came from (tool calls, outputs and approvals). Mirrors
+    /// `ToolCallItem.tool_origin`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_origin: Option<crate::tool::ToolOrigin>,
+    /// Run-local lineage key that survives copies, so the loop can tell which items a handoff
+    /// input filter kept. Never serialized and never part of equality. Mirrors
+    /// `_NESTED_HISTORY_RUN_ITEM_OCCURRENCE_KEY`.
+    #[serde(skip)]
+    pub(crate) occurrence: OccurrenceKey,
+}
+
+/// An opaque copy-lineage tag on a [`RunItem`]: invisible to equality, serialization and
+/// `Debug`, so it cannot change how items compare or what a snapshot contains.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct OccurrenceKey(pub(crate) Option<u64>);
+
+impl PartialEq for OccurrenceKey {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl fmt::Debug for OccurrenceKey {
+    fn fmt(&self, _f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        Ok(())
+    }
 }
 
 impl RunItem {
@@ -586,7 +625,24 @@ impl RunItem {
         RunItem {
             agent: agent.into(),
             kind,
+            description: None,
+            title: None,
+            tool_origin: None,
+            occurrence: OccurrenceKey::default(),
         }
+    }
+
+    /// Attach the tool's description and display title.
+    pub fn with_tool_details(mut self, description: Option<String>, title: Option<String>) -> Self {
+        self.description = description;
+        self.title = title;
+        self
+    }
+
+    /// Attach where the item's tool came from.
+    pub fn with_tool_origin(mut self, origin: Option<crate::tool::ToolOrigin>) -> Self {
+        self.tool_origin = origin;
+        self
     }
 
     /// The item type string (`message_output_item`, `tool_call_item`, ...).
@@ -614,9 +670,9 @@ impl RunItem {
             RunItemKind::MessageOutput { raw_item } => InputItem(raw_item.to_value()),
             RunItemKind::Reasoning { raw_item } => InputItem(raw_item.to_value()),
             RunItemKind::ToolCall { raw_item } => InputItem(strip_created_by(raw_item.clone())),
-            RunItemKind::ToolCallOutput { raw_item, .. } => {
-                InputItem(strip_created_by(raw_item.clone()))
-            }
+            RunItemKind::ToolCallOutput { raw_item, .. } => InputItem(strip_created_by(
+                sanitize_shell_call_output(raw_item.clone()),
+            )),
             RunItemKind::ToolApproval { raw_item, .. } => InputItem(raw_item.to_value()),
             RunItemKind::HandoffCall { raw_item } => InputItem(raw_item.to_value()),
             RunItemKind::HandoffOutput { raw_item, .. } => raw_item.clone(),
@@ -645,6 +701,7 @@ impl RunItem {
                 agent: self.agent.clone(),
                 raw_item: raw_item.clone(),
                 tool_name: tool_name.clone(),
+                tool_origin: self.tool_origin.clone(),
             }),
             _ => None,
         }
@@ -667,9 +724,34 @@ impl RunItem {
     }
 }
 
+/// Drop server-assigned `created_by` metadata, which the Responses input schema rejects.
+///
+/// `shell_call_output.output` is a list of content chunks that each carry their own
+/// `created_by`, so both levels are stripped.
 fn strip_created_by(mut value: Value) -> Value {
     if let Value::Object(m) = &mut value {
         m.remove("created_by");
+        if m.get("type").and_then(Value::as_str) == Some("shell_call_output")
+            && let Some(Value::Array(chunks)) = m.get_mut("output")
+        {
+            for chunk in chunks {
+                if let Value::Object(chunk) = chunk {
+                    chunk.remove("created_by");
+                }
+            }
+        }
+    }
+    value
+}
+
+/// Hosted shell outputs carry SDK book-keeping fields the Responses API does not accept.
+fn sanitize_shell_call_output(mut value: Value) -> Value {
+    if let Value::Object(m) = &mut value
+        && m.get("type").and_then(Value::as_str) == Some("shell_call_output")
+    {
+        m.remove("status");
+        m.remove("shell_output");
+        m.remove("provider_data");
     }
     value
 }
