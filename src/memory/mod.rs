@@ -131,6 +131,7 @@ pub(crate) const PRUNE_PREFIX_BATCH: i64 = 256;
 
 /// Settings controlling how history is retrieved.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SessionSettings {
     /// Maximum number of most recent items to retrieve (`None` = all).
     pub limit: Option<usize>,

@@ -28,6 +28,7 @@ use crate::realtime::config::{
     RealtimeRunConfig, RealtimeSessionModelSettings, RealtimeTurnDetectionConfig, RealtimeVoice,
 };
 use crate::realtime::debug::log_model_action_error;
+use crate::realtime::event_validation::{validate_client_event, validate_server_event};
 use crate::realtime::items::{
     RealtimeContent, RealtimeItem, RealtimeMessageItem, RealtimeMessageRole, RealtimeToolCallItem,
 };
@@ -721,6 +722,12 @@ impl RealtimeModel for OpenAIRealtimeWebSocketModel {
                 // A caller-supplied `response.create` takes part in the same sequencing as the
                 // ones the transport sends itself, or a follow-up input would start a second
                 // response while this one is still being created.
+                if let Err(problem) = validate_client_event(&message) {
+                    // Python drops a raw message that is not a client event and carries on.
+                    log_model_action_error("Failed to convert raw message", &message);
+                    log::debug!(target: crate::logger::LOG_TARGET, "{problem}");
+                    return Ok(());
+                }
                 if message.get("type").and_then(Value::as_str) == Some("response.create") {
                     self.inner.request_response_create(Some(message)).await
                 } else {
@@ -1551,27 +1558,30 @@ impl WsInner {
         self.emit(RealtimeModelEvent::RawServerEvent {
             data: event.clone(),
         });
-        let Some(event_type) = event.get("type").and_then(Value::as_str) else {
-            self.emit(RealtimeModelEvent::Other { data: event });
+        // A message item is converted before validation, so a provider that omits the envelope
+        // fields around it still updates the history.
+        let converted_without_validation = matches!(
+            event.get("type").and_then(Value::as_str),
+            Some("response.output_item.added" | "response.output_item.done")
+        ) && event.pointer("/item/type").and_then(Value::as_str)
+            == Some("message");
+        if !converted_without_validation && let Err(problem) = validate_server_event(&event) {
+            log_model_action_error("Failed to validate server event", &event);
+            self.emit(RealtimeModelEvent::Error {
+                error: json!({
+                    "message": problem,
+                    "context": "Failed to validate server event",
+                }),
+            });
             return;
-        };
+        }
+        let event_type = event
+            .get("type")
+            .and_then(Value::as_str)
+            .expect("a validated event has a type");
 
         match event_type {
             "response.output_audio.delta" => {
-                // The server always names the item, the response and the audio. An event
-                // without them cannot be tracked, so it is a protocol error rather than silence.
-                if ["item_id", "response_id", "delta"]
-                    .iter()
-                    .any(|key| event.get(key).and_then(Value::as_str).is_none())
-                {
-                    self.emit(RealtimeModelEvent::Error {
-                        error: json!({
-                            "message": "Invalid response.output_audio.delta event",
-                            "context": "Failed to validate server event",
-                        }),
-                    });
-                    return;
-                }
                 let item_id = string_field(&event, "item_id");
                 let content_index = usize_field(&event, "content_index");
                 let response_id = string_field(&event, "response_id");

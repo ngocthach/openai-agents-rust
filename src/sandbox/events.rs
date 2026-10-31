@@ -1432,6 +1432,10 @@ impl crate::sandbox::session::SandboxSession for InstrumentedSession {
         self.inner.set_archive_limits(limits);
     }
 
+    fn set_concurrency_limits(&self, limits: crate::sandbox::manifest::SandboxConcurrencyLimits) {
+        self.inner.set_concurrency_limits(limits);
+    }
+
     async fn ls(&self, path: &str) -> SandboxResult<Vec<crate::sandbox::types::FileEntry>> {
         self.inner.ls(path).await
     }

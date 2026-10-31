@@ -2246,6 +2246,10 @@ fn serialize_input(items: &[InputItem]) -> Value {
 
 /// Rebuild a run state from Python's envelope.
 pub(super) fn from_wire(value: &Value, version: &str) -> Result<RunState> {
+    // `pending_input` may be absent but never anything other than a list (a null counts).
+    if value.get("pending_input").is_some_and(|v| !v.is_array()) {
+        return Err(AgentsError::user("Run state pending_input must be a list"));
+    }
     let context = value.get("context").cloned().unwrap_or(Value::Null);
     let rust = value.get("rust").cloned().unwrap_or(Value::Null);
 

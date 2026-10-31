@@ -1586,27 +1586,18 @@ impl SandboxSession for ModalSandboxSession {
             if *terminated {
                 return Ok(());
             }
+            // Python's `_shutdown_backend` swallows every provider error and forgets the sandbox
+            // either way: teardown of a finished run must not fail it.
             let response = self
                 .helper
                 .call(json!({"op": "terminate", "sandbox_id": self.sandbox_id()}))
-                .await
-                .map_err(|error| {
-                    SandboxError::new(
-                        ErrorCode::WorkspaceStopError,
-                        format!("failed to terminate the Modal sandbox: {error}"),
-                    )
-                })?;
-            if response.get("ok").and_then(Value::as_bool) == Some(false) {
-                return Err(SandboxError::new(
-                    ErrorCode::WorkspaceStopError,
-                    format!(
-                        "failed to terminate the Modal sandbox: {}",
-                        response
-                            .get("detail")
-                            .and_then(Value::as_str)
-                            .unwrap_or("unknown error")
-                    ),
-                ));
+                .await;
+            match response {
+                Err(_) => log::debug!(target: crate::logger::LOG_TARGET, "failed to terminate the Modal sandbox on shutdown"),
+                Ok(response) if response.get("ok").and_then(Value::as_bool) == Some(false) => {
+                    log::debug!(target: crate::logger::LOG_TARGET, "the Modal helper could not terminate the sandbox on shutdown");
+                }
+                Ok(_) => {}
             }
             *terminated = true;
             Ok(())

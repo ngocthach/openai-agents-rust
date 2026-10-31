@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use crate::sandbox::archive::{self, CompressionScheme};
 use crate::sandbox::errors::SandboxOp;
 use crate::sandbox::errors::{ErrorCode, SandboxError, SandboxResult};
-use crate::sandbox::manifest::Manifest;
+use crate::sandbox::manifest::{Manifest, SandboxConcurrencyLimits};
 use crate::sandbox::mounts::{Mount, MountTransition};
 use crate::sandbox::pty::{PtyExecRequest, PtyExecUpdate, PtyWriteRequest};
 use crate::sandbox::runtime_helpers::{RuntimeHelperScript, WORKSPACE_FINGERPRINT_HELPER};
@@ -792,6 +792,15 @@ pub trait SandboxSession: Send + Sync + fmt::Debug {
     /// nothing but the per-session default: a caller can still pass limits to
     /// [`extract_with_limits`](Self::extract_with_limits) explicitly.
     fn set_archive_limits(&self, limits: Option<SandboxArchiveLimits>) {
+        let _ = limits;
+    }
+
+    /// Record the concurrency limits the runner resolved for this session.
+    ///
+    /// Mirrors Python's `_set_concurrency_limits`. Limits travel on the manifest a session
+    /// materializes, so the default drops them; a backend that applies work outside its manifest
+    /// can keep them.
+    fn set_concurrency_limits(&self, limits: SandboxConcurrencyLimits) {
         let _ = limits;
     }
 

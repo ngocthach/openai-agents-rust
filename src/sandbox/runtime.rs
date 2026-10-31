@@ -523,7 +523,11 @@ impl SandboxRunner {
                 // the session was *started with*, not the agent's default: the session owns the
                 // workspace root, the accounts and the mounts, and the capabilities only add
                 // entries to them. Mirrors Python's `_process_live_session_manifest`.
-                let processed = agent.resolved_manifest(Some(session.manifest().clone()));
+                let mut processed = agent.resolved_manifest(Some(session.manifest().clone()));
+                // The limits govern the entries the capabilities add to the live workspace.
+                if let Some(limits) = config.concurrency_limits {
+                    processed = processed.with_concurrency_limits(limits)?;
+                }
                 // An unsafe manifest is refused before the session is so much as probed or
                 // started, so nothing of it ever runs.
                 validate_mount_credential_boundaries(&processed)?;
@@ -536,6 +540,7 @@ impl SandboxRunner {
                 }
                 apply_live_session_manifest(session.as_ref(), &processed).await?;
                 session.set_archive_limits(config.archive_limits);
+                session.set_concurrency_limits(config.concurrency_limits.unwrap_or_default());
                 (session.clone(), None)
             }
             (None, Some(client)) => {
@@ -564,6 +569,7 @@ impl SandboxRunner {
                     }
                 };
                 session.set_archive_limits(config.archive_limits);
+                session.set_concurrency_limits(config.concurrency_limits.unwrap_or_default());
                 if let Err(error) =
                     sandbox_span_result("sandbox.start", serde_json::json!({}), session.start())
                         .await
@@ -736,6 +742,7 @@ impl SandboxRunner {
             .create_with_snapshot(Some(manifest), snapshot)
             .await?;
         session.set_archive_limits(config.archive_limits);
+        session.set_concurrency_limits(config.concurrency_limits.unwrap_or_default());
         if let Err(error) = session.start().await {
             let _ = client.delete(session.clone()).await;
             return Err(error.into());
@@ -1171,6 +1178,9 @@ pub async fn apply_live_session_manifest(
         {
             session.mkdir(parent, true).await?;
         }
+        // The processed manifest owns the limits, as `Manifest::apply` does for a fresh session.
+        let entry =
+            entry.with_copy_concurrency(processed.concurrency_limits().local_dir_file_width());
         entry.apply(session, &dest).await?;
     }
     Ok(())

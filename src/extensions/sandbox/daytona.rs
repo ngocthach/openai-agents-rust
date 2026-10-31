@@ -1167,7 +1167,12 @@ impl DaytonaSandboxSession {
         };
         self.started.store(false, Ordering::SeqCst);
         *terminated = true;
-        result
+        // Python's `_shutdown_backend` swallows every provider error: teardown of a finished run
+        // must not fail it, and the sandbox auto-stops on its own timeout anyway.
+        if let Err(error) = result {
+            log::warn!(target: crate::logger::LOG_TARGET, "failed to release the Daytona sandbox on shutdown: {error}");
+        }
+        Ok(())
     }
 }
 

@@ -621,6 +621,202 @@ fn resolve_host_source(
 }
 
 /// Copy a host directory tree into the sandbox, one file at a time.
+///
+/// The tree is walked through directory file descriptors: the source root is opened once without
+/// following a link, every subdirectory is opened relative to its already-open parent, and every
+/// file is opened relative to the descriptor of the directory it was listed in. A directory or
+/// file swapped for a link after it was validated therefore fails the open instead of being
+/// followed, and a directory swapped away after it was opened still yields the files that were
+/// listed in it (the same pinning Python's `dir_fd` walk gives).
+#[cfg(unix)]
+async fn copy_host_dir(
+    session: &dyn SandboxSession,
+    src: &Path,
+    dest: &str,
+    concurrency: usize,
+    user: Option<&User>,
+) -> SandboxResult<MaterializationResult> {
+    use std::sync::Arc;
+
+    // Files are copied with a bounded number in flight: one at a time is slow against a hosted
+    // backend where each write is a round trip, and all at once exhausts its connections. The
+    // whole tree is walked first so the copies keep the order the walk discovered them in,
+    // whatever order the backend finishes them in.
+    let root_label = src
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let root_fd = pinned::open_root(src).map_err(|e| pinned::open_error(src, &root_label, e))?;
+    let mut files: Vec<(Arc<pinned::Fd>, std::ffi::CString, String, String)> = Vec::new();
+    let mut pending: Vec<(Arc<pinned::Fd>, String, String)> =
+        vec![(Arc::new(root_fd), String::new(), dest.to_string())];
+    while let Some((dir_fd, rel_dir, sandbox_dir)) = pending.pop() {
+        let mut children = pinned::list_dir(&dir_fd).map_err(|e| {
+            SandboxError::new(
+                ErrorCode::LocalDirReadError,
+                format!(
+                    "Failed to read host directory `{}`: {e}",
+                    src.join(&rel_dir).display()
+                ),
+            )
+        })?;
+        // Directory order is the filesystem's, so sort: the result lists files in the same order
+        // on every run.
+        children.sort_by(|left, right| left.name.cmp(&right.name));
+        for child in children {
+            let name = child.name.to_string_lossy().into_owned();
+            let rel = if rel_dir.is_empty() {
+                name.clone()
+            } else {
+                format!("{rel_dir}/{name}")
+            };
+            match child.kind {
+                pinned::Kind::Symlink => {
+                    // Following a link would copy host state from outside `src`, and skipping
+                    // it would hand the sandbox a tree that silently differs from the one named.
+                    return Err(symlink_not_supported(src, true, &rel));
+                }
+                pinned::Kind::Dir => {
+                    let target = join_sandbox_path(&sandbox_dir, &name)?;
+                    session.mkdir_as(&target, true, user).await?;
+                    // Opened only now, relative to the pinned parent, so a swap between the
+                    // listing and this open is caught.
+                    let fd = pinned::open_dir_at(&dir_fd, &child.name)
+                        .map_err(|e| pinned::open_error(src, &rel, e))?;
+                    pending.push((Arc::new(fd), rel, target));
+                }
+                pinned::Kind::File => {
+                    let target = join_sandbox_path(&sandbox_dir, &name)?;
+                    files.push((Arc::clone(&dir_fd), child.name, rel, target));
+                }
+                pinned::Kind::Other => {}
+            }
+        }
+    }
+    let copies = files.into_iter().map(|(dir_fd, name, rel, target)| {
+        move || async move {
+            let content = pinned::read_file_at(&dir_fd, &name)
+                .await
+                .map_err(|e| pinned::open_error(src, &rel, e))?;
+            session.write_file_as(&target, &content, user).await?;
+            Ok::<_, SandboxError>(MaterializedFile::new(target, &content))
+        }
+    });
+    let written = gather_in_order(copies, Some(concurrency.max(1))).await?;
+    Ok(MaterializationResult::from_iter(written))
+}
+
+/// Descriptor-relative host reads that never follow a link.
+#[cfg(unix)]
+mod pinned {
+    use std::ffi::{CStr, CString};
+    use std::os::fd::OwnedFd;
+    use std::path::Path;
+
+    use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags, openat, statat};
+    use rustix::io::Errno;
+    use tokio::io::AsyncReadExt as _;
+
+    use super::{SandboxError, host_source_error, symlink_not_supported};
+
+    pub(super) type Fd = OwnedFd;
+
+    pub(super) enum Kind {
+        Symlink,
+        Dir,
+        File,
+        Other,
+    }
+
+    pub(super) struct Child {
+        pub(super) name: CString,
+        pub(super) kind: Kind,
+    }
+
+    const DIR_FLAGS: OFlags = OFlags::RDONLY
+        .union(OFlags::DIRECTORY)
+        .union(OFlags::NOFOLLOW)
+        .union(OFlags::CLOEXEC);
+
+    pub(super) fn open_root(path: &Path) -> std::io::Result<Fd> {
+        Ok(rustix::fs::open(path, DIR_FLAGS, Mode::empty())?)
+    }
+
+    pub(super) fn open_dir_at(dir: &Fd, name: &CStr) -> std::io::Result<Fd> {
+        Ok(openat(dir, name, DIR_FLAGS, Mode::empty())?)
+    }
+
+    pub(super) fn list_dir(dir: &Fd) -> std::io::Result<Vec<Child>> {
+        let mut children = Vec::new();
+        for entry in Dir::read_from(dir)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            if name.to_bytes() == b"." || name.to_bytes() == b".." {
+                continue;
+            }
+            let mut file_type = entry.file_type();
+            if file_type == FileType::Unknown {
+                file_type =
+                    FileType::from_raw_mode(statat(dir, name, AtFlags::SYMLINK_NOFOLLOW)?.st_mode);
+            }
+            let kind = match file_type {
+                FileType::Symlink => Kind::Symlink,
+                FileType::Directory => Kind::Dir,
+                FileType::RegularFile => Kind::File,
+                _ => Kind::Other,
+            };
+            children.push(Child {
+                name: name.to_owned(),
+                kind,
+            });
+        }
+        Ok(children)
+    }
+
+    /// Open `name` under `dir` without following a link, refusing anything but a regular file
+    /// (a FIFO swapped in would otherwise block the read), and read it.
+    pub(super) async fn read_file_at(dir: &Fd, name: &CStr) -> std::io::Result<Vec<u8>> {
+        let fd = openat(
+            dir,
+            name,
+            OFlags::RDONLY
+                .union(OFlags::NOFOLLOW)
+                .union(OFlags::NONBLOCK)
+                .union(OFlags::CLOEXEC),
+            Mode::empty(),
+        )?;
+        let file = std::fs::File::from(fd);
+        if !file.metadata()?.is_file() {
+            return Err(std::io::Error::other("path_changed_during_copy"));
+        }
+        let mut file = tokio::fs::File::from_std(file);
+        let mut contents = Vec::new();
+        file.read_to_end(&mut contents).await?;
+        Ok(contents)
+    }
+
+    /// Map an open failure onto the refusal Python reports: a link where a directory or file was
+    /// expected is `symlink_not_supported`, any other change is `path_changed_during_copy`.
+    pub(super) fn open_error(src: &Path, child: &str, error: std::io::Error) -> SandboxError {
+        let errno = error.raw_os_error().map(Errno::from_raw_os_error);
+        if matches!(errno, Some(Errno::LOOP | Errno::NOTDIR)) {
+            return symlink_not_supported(src, true, child);
+        }
+        host_source_error(
+            true,
+            src,
+            format!(
+                "Host source `{}` changed during the copy at `{child}`: {error}",
+                src.display()
+            ),
+        )
+        .with_context("reason", "path_changed_during_copy")
+        .with_context("child", child)
+    }
+}
+
+/// Copy a host directory tree into the sandbox, one file at a time.
+#[cfg(not(unix))]
 async fn copy_host_dir(
     session: &dyn SandboxSession,
     src: &Path,

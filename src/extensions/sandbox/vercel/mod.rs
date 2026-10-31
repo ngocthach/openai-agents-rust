@@ -966,7 +966,13 @@ fn vercel_status_is_retryable(status: u16) -> bool {
 }
 
 /// Split the `<sandbox name>:<session id>` pair stored in the persisted state.
+///
+/// A bare id without a name predates sandbox names; like Python, it is both the session id and
+/// the name.
 fn split_provider_id(provider_id: &str) -> SandboxResult<(String, String)> {
+    if !provider_id.is_empty() && !provider_id.contains(':') {
+        return Ok((provider_id.to_string(), provider_id.to_string()));
+    }
     provider_id
         .split_once(':')
         .map(|(name, session)| (name.to_string(), session.to_string()))
@@ -2070,7 +2076,11 @@ mod tests {
             split_provider_id("agents-abc:sess-1").unwrap(),
             ("agents-abc".to_string(), "sess-1".to_string())
         );
-        assert!(split_provider_id("agents-abc").is_err());
+        assert_eq!(
+            split_provider_id("legacy-id").unwrap(),
+            ("legacy-id".to_string(), "legacy-id".to_string())
+        );
+        assert!(split_provider_id("").is_err());
         assert!(split_provider_id(":sess-1").is_err());
     }
 

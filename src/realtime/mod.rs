@@ -58,6 +58,7 @@
 pub mod agent;
 pub mod config;
 pub mod debug;
+mod event_validation;
 pub mod events;
 pub mod handoffs;
 pub mod items;

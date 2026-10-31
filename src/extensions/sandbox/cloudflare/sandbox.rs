@@ -971,33 +971,48 @@ impl SandboxSession for CloudflareSandboxSession {
             "{}/v1/sandbox/{}",
             self.connection.worker_url, self.connection.sandbox_id
         );
+        // Python swallows a failed delete (a debug log with no provider text) so teardown never
+        // fails a finished run; only a terminal mount transition surfaces it, because there the
+        // sandbox has to be gone.
+        let terminal = self.mount_transition_terminal.load(Ordering::SeqCst);
         let response = self
             .connection
             .request(reqwest::Method::DELETE, &url)
             .timeout(self.connection.request_timeout)
             .send()
-            .await
-            .map_err(|error| {
-                self.delete_failure(
-                    SandboxError::new(
-                        ErrorCode::WorkspaceStopError,
-                        format!("`DELETE /sandbox` failed: {error}"),
-                    ),
-                    None,
-                )
-            })?;
+            .await;
         self.started.store(false, Ordering::SeqCst);
+        let response = match response {
+            Ok(response) => response,
+            Err(error) => {
+                if terminal {
+                    return Err(self.delete_failure(
+                        SandboxError::new(
+                            ErrorCode::WorkspaceStopError,
+                            format!("`DELETE /sandbox` failed: {error}"),
+                        ),
+                        None,
+                    ));
+                }
+                log::debug!(target: crate::logger::LOG_TARGET, "failed to delete the Cloudflare sandbox on shutdown");
+                return Ok(());
+            }
+        };
         let status = response.status();
         if status.is_client_error() && status.as_u16() != 404 || status.is_server_error() {
-            // The reply body is never read: after an ambiguous mount transition it may echo the
-            // mount request, which carries bucket credentials.
-            return Err(self.delete_failure(
-                SandboxError::new(
-                    ErrorCode::WorkspaceStopError,
-                    http_error_message("DELETE /sandbox", status.as_u16(), None),
-                ),
-                Some(status.as_u16()),
-            ));
+            if terminal {
+                // The reply body is never read: after an ambiguous mount transition it may echo
+                // the mount request, which carries bucket credentials.
+                return Err(self.delete_failure(
+                    SandboxError::new(
+                        ErrorCode::WorkspaceStopError,
+                        http_error_message("DELETE /sandbox", status.as_u16(), None),
+                    ),
+                    Some(status.as_u16()),
+                ));
+            }
+            log::debug!(target: crate::logger::LOG_TARGET, "failed to delete the Cloudflare sandbox on shutdown: HTTP {}", status.as_u16());
+            return Ok(());
         }
         *deleted = true;
         Ok(())

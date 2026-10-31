@@ -1,6 +1,6 @@
 [package]
 name = "openai-agents-sdk"
-version = "0.9.1"
+version = "0.10.0"
 edition = "2024"
 rust-version = "1.89"
 description = "Unofficial Rust port of the OpenAI Agents SDK: agents, tools, handoffs, guardrails, sessions, tracing, MCP"
@@ -27,7 +27,7 @@ mcp = ["dep:rmcp", "dep:sha1"]
 websocket = ["dep:tokio-tungstenite"]
 realtime = ["dep:tokio-tungstenite", "dep:base64"]
 voice = ["dep:base64", "dep:tokio-tungstenite"]
-sandbox = ["dep:base64", "dep:portable-pty", "dep:tokio-tungstenite", "dep:tar", "dep:flate2", "dep:zip"]
+sandbox = ["dep:base64", "dep:portable-pty", "dep:tokio-tungstenite", "dep:tar", "dep:flate2", "dep:zip", "dep:rustix"]
 encrypt = ["dep:hkdf", "dep:base64", "dep:aes", "dep:cbc", "dep:hmac"]
 redis = ["dep:redis"]
 mongodb = ["dep:mongodb"]
@@ -38,7 +38,7 @@ sqlx = ["dep:sqlx"]
 provider-auth = ["dep:hmac", "dep:base64", "dep:aws-lc-rs"]
 
 [dependencies]
-openai-agents-sdk-macros = { version = "0.9.1", path = "macros", optional = true }
+openai-agents-sdk-macros = { version = "0.10.0", path = "macros", optional = true }
 async-trait = "0.1"
 bytes = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
@@ -98,6 +98,11 @@ tempfile = "3"
 # Builds the zip fixtures the sandbox archive tests validate against.
 zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
 flate2 = "1"
+
+# Descriptor-relative opens for the sandbox host-directory copy: a path swapped for a link
+# after it was validated must fail the open instead of being followed.
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", default-features = false, features = ["fs", "std"], optional = true }
 
 # Only the PTY signal-disposition test needs it: it has to set SIG_IGN in the test process to
 # prove a PTY child does not inherit it.
