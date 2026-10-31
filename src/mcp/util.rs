@@ -79,6 +79,97 @@ fn shorten_tool_name(base_name: &str, seed: &str, force_hash: bool) -> String {
     format!("{stem}{suffix}")
 }
 
+/// Quote `value` the way Python's `repr()` quotes a `str`.
+///
+/// Duplicate tool names are reported back to the user, and a tool name comes from the server,
+/// so it may carry control characters that would forge log lines or terminal escapes. Python
+/// escapes them because it formats the names with `repr`; this reproduces that escaping for the
+/// characters a name can realistically contain: backslash, the quote in use, ASCII and C1
+/// control characters, and the format/line/paragraph separators that are invisible when printed.
+fn python_repr(value: &str) -> String {
+    // Python prefers single quotes and switches to double quotes only when that avoids escaping.
+    let quote = if value.contains('\'') && !value.contains('"') {
+        '"'
+    } else {
+        '\''
+    };
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push(quote);
+    for c in value.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c == quote => {
+                out.push('\\');
+                out.push(c);
+            }
+            c if is_python_unprintable(c) => {
+                let code = c as u32;
+                if code < 0x100 {
+                    out.push_str(&format!("\\x{code:02x}"));
+                } else if code < 0x10000 {
+                    out.push_str(&format!("\\u{code:04x}"));
+                } else {
+                    out.push_str(&format!("\\U{code:08x}"));
+                }
+            }
+            c => out.push(c),
+        }
+    }
+    out.push(quote);
+    out
+}
+
+/// Whether `str.isprintable()` would reject `c`, for the ranges a tool name can contain.
+///
+/// Covers Cc (ASCII and C1 controls), the Cf format characters and the Zl/Zp separators. Other
+/// unassigned or private-use code points are treated as printable; they are escaped by Python
+/// but cannot forge a log line, so the difference is cosmetic.
+fn is_python_unprintable(c: char) -> bool {
+    let code = c as u32;
+    matches!(code,
+        0x00..=0x1f
+        | 0x7f..=0x9f
+        | 0x00ad
+        | 0x0600..=0x0605
+        | 0x061c
+        | 0x06dd
+        | 0x070f
+        | 0x180e
+        | 0x200b..=0x200f
+        | 0x2028..=0x202e
+        | 0x2060..=0x2064
+        | 0x2066..=0x206f
+        | 0xfeff
+        | 0xfff9..=0xfffb)
+}
+
+/// The `UserError` Python raises when two MCP servers expose the same tool name.
+///
+/// `names` are the colliding names; `prefixed` says whether tool names already carry their
+/// server name, in which case suggesting the same option again would be useless, so Python
+/// leaves the hint out.
+fn duplicate_tool_names_error(names: &[String], prefixed: bool) -> AgentsError {
+    let quoted: Vec<String> = names.iter().map(|n| python_repr(n)).collect();
+    let listed = quoted.join(", ");
+    if prefixed {
+        AgentsError::user(format!(
+            "Duplicate tool names found across MCP servers: {listed}"
+        ))
+    } else {
+        AgentsError::user(format!(
+            "Duplicate tool names found across MCP servers: {listed}. \
+             Pass `include_server_in_tool_names=True` to \
+             `MCPUtil.get_all_function_tools()` or set \
+             `mcp_config={{'include_server_in_tool_names': True}}` on the \
+             agent to prefix tool names with their server name and avoid \
+             collisions."
+        ))
+    }
+}
+
 /// The base public name of an MCP tool exposed with its server name: `mcp_<server>__<tool>`.
 fn prefixed_tool_base_name(server_name: &str, tool_name: &str) -> String {
     format!(
@@ -171,7 +262,9 @@ pub fn convert_call_tool_result(result: &Value, use_structured_content: bool) ->
         })
         .collect();
     match parts.as_slice() {
-        [] => ToolOutput::Text(String::new()),
+        // Python returns the empty list for a result with no content blocks, which reaches the
+        // model as `[]` rather than as an empty string.
+        [] => ToolOutput::Json(json!([])),
         [ToolOutputPart::Text { text }] => ToolOutput::Text(text.clone()),
         _ => ToolOutput::Parts(parts),
     }
@@ -180,13 +273,39 @@ pub fn convert_call_tool_result(result: &Value, use_structured_content: bool) ->
 fn prepare_schema(schema: &Value, strict: bool) -> (Value, bool) {
     let mut schema = schema.clone();
     if let Value::Object(m) = &mut schema {
+        // The MCP spec does not require `properties`, but the OpenAI function schema does.
+        // Everything else the server declared — `$schema` included — is passed through, as
+        // `MCPUtil.to_function_tool` does.
         m.entry("properties").or_insert_with(|| json!({}));
-        m.remove("$schema");
     }
     if strict && let Ok(s) = ensure_strict_json_schema(&schema) {
         return (s, true);
     }
     (schema, false)
+}
+
+/// Deepest nesting a tool input schema may have, matching Python's `_MAX_SCHEMA_DEPTH`.
+const MAX_SCHEMA_DEPTH: usize = 100;
+
+/// Reject a schema nested deeper than [`MAX_SCHEMA_DEPTH`] before anything recurses into it.
+///
+/// Python's `_copy_json_schema` raises the same `UserError` for strict and non-strict conversion
+/// alike. The walk is iterative so a hostile schema cannot overflow the stack here.
+fn check_schema_depth(schema: &Value) -> Result<()> {
+    let mut stack: Vec<(&Value, usize)> = vec![(schema, 1)];
+    while let Some((value, depth)) = stack.pop() {
+        if depth > MAX_SCHEMA_DEPTH {
+            return Err(AgentsError::user(
+                "JSON schema is too deeply nested to process safely. Simplify or flatten the schema.",
+            ));
+        }
+        match value {
+            Value::Object(map) => stack.extend(map.values().map(|v| (v, depth + 1))),
+            Value::Array(items) => stack.extend(items.iter().map(|v| (v, depth + 1))),
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 /// Overlay `explicit` on top of `resolved`, as `MCPUtil._merge_mcp_meta` does.
@@ -225,16 +344,31 @@ pub async fn invoke_mcp_tool(
     } else {
         match serde_json::from_str::<Value>(input_json) {
             Ok(Value::Object(m)) => Some(m),
-            Ok(_) | Err(_) => {
+            Ok(_) => {
+                return Err(AgentsError::model_behavior(format!(
+                    "Invalid JSON input for tool {display}: expected a JSON object"
+                )));
+            }
+            Err(_) => {
+                // The payload may hold secrets, so it reaches the log and the error message
+                // only when tool-data logging is allowed.
                 let message = if crate::debug::dont_log_tool_data() {
+                    log::debug!("Invalid JSON input for MCP tool");
                     format!("Invalid JSON input for tool {display}")
                 } else {
-                    format!("Invalid JSON input for tool {display}: {input_json}")
+                    let message = format!("Invalid JSON input for tool {display}: {input_json}");
+                    log::debug!("{message}");
+                    message
                 };
                 return Err(AgentsError::model_behavior(message));
             }
         }
     };
+    if crate::debug::dont_log_tool_data() {
+        log::debug!("Invoking MCP tool");
+    } else {
+        log::debug!("Invoking MCP tool {display} with input {input_json}");
+    }
 
     let resolved = server.config().tool_meta_resolver.as_ref().and_then(|r| {
         r(&crate::mcp::MCPToolMetaContext {
@@ -254,13 +388,16 @@ pub async fn invoke_mcp_tool(
         }
     };
     let result = result.map_err(|e| {
-        crate::logger::log_tool_action_error(
-            &crate::mcp::get_mcp_server_log_message(
+        // Redacted mode names neither the tool nor the server, as Python's does.
+        let log_message = if crate::debug::dont_log_tool_data() {
+            "Error invoking MCP tool".to_string()
+        } else {
+            crate::mcp::get_mcp_server_log_message(
                 &format!("Error invoking MCP tool {display} on server"),
                 server.name(),
-            ),
-            &e,
-        );
+            )
+        };
+        crate::logger::log_tool_action_error(&log_message, &e);
         // A misconfiguration or a malformed model call is not a transport failure, so it keeps
         // its own kind instead of being flattened into a generic invocation error.
         match e {
@@ -311,6 +448,7 @@ pub async fn to_function_tool_with_failure<C: Send + Sync + 'static>(
     failure_error_function: Option<crate::tool::ToolErrorFn<C>>,
 ) -> FunctionTool<C> {
     let (schema, strict) = prepare_schema(&tool.input_schema, convert_to_strict);
+    let prepared_schema = schema.clone();
     let srv = server.clone();
     let mcp_tool = tool.clone();
     let display = exposed_name.clone();
@@ -322,9 +460,16 @@ pub async fn to_function_tool_with_failure<C: Send + Sync + 'static>(
             let srv = srv.clone();
             let mcp_tool = mcp_tool.clone();
             let display = display.clone();
-            async move { invoke_mcp_tool(&srv, &mcp_tool, &args, None, Some(&display)).await }
+            async move {
+                // A fresh copy of the static `_meta` per call, as Python's partial passes it.
+                let static_meta = mcp_tool.meta.clone();
+                invoke_mcp_tool(&srv, &mcp_tool, &args, static_meta, Some(&display)).await
+            }
         },
     );
+    // `FunctionTool::new_raw` strictifies whatever it is given; the MCP tool's schema must
+    // reach the model exactly as `prepare_schema` decided, strict or not.
+    f.params_json_schema = prepared_schema;
     f.strict_json_schema = strict;
     f.mcp_title = resolve_mcp_tool_title(tool);
     f.mcp_server_name = Some(get_mcp_server_log_name(server.name()));
@@ -397,7 +542,8 @@ pub async fn get_all_function_tools_for_agent<C: Send + Sync + 'static>(
     let mut listings: Vec<Vec<MCPTool>> = Vec::new();
     let mut names: HashSet<String> = reserved.clone();
     for (server_index, server) in servers.iter().enumerate() {
-        let span = mcp_tools_span(server.name(), None);
+        // The span is exported, so it carries the credential-free name, never the raw URL.
+        let span = mcp_tools_span(&get_mcp_server_log_name(server.name()), None);
         span.start();
         let listed = server.list_tools().await;
         let tools = match listed {
@@ -447,16 +593,36 @@ pub async fn get_all_function_tools_for_agent<C: Send + Sync + 'static>(
     };
 
     for (server_index, (server, tools)) in servers.iter().zip(&listings).enumerate() {
+        // Python compares one server's whole name set against the names seen so far and reports
+        // every collision at once, sorted, before adding that server's tools.
+        let exposed_names: Vec<String> = tools
+            .iter()
+            .enumerate()
+            .map(
+                |(tool_index, t)| match overrides.get(&(server_index, tool_index)) {
+                    Some(name) => name.clone(),
+                    None => t.name.clone(),
+                },
+            )
+            .collect();
+        let mut duplicates: Vec<String> = exposed_names
+            .iter()
+            .filter(|n| names.contains(*n))
+            .cloned()
+            .collect();
+        duplicates.sort();
+        duplicates.dedup();
+        if !duplicates.is_empty() {
+            return Err(duplicate_tool_names_error(
+                &duplicates,
+                config.include_server_in_tool_names,
+            ));
+        }
+        names.extend(exposed_names.iter().cloned());
+
         for (tool_index, t) in tools.iter().enumerate() {
-            let exposed = match overrides.get(&(server_index, tool_index)) {
-                Some(name) => name.clone(),
-                None => t.name.clone(),
-            };
-            if !names.insert(exposed.clone()) {
-                return Err(AgentsError::user(format!(
-                    "Duplicate tool names found across MCP servers: {exposed}. Set include_server_in_tool_names to disambiguate."
-                )));
-            }
+            check_schema_depth(&t.input_schema)?;
+            let exposed = exposed_names[tool_index].clone();
             out.push(Tool::Function(Arc::new(
                 to_function_tool_with_failure(
                     server.clone(),

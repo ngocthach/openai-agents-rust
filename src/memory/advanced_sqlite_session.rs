@@ -436,7 +436,35 @@ fn resolve_base_table_owners(conn: &Connection, ctx: &Ctx) -> Result<(String, St
 /// first pair's foreign keys. Without this check a second pair would join `message_structure`
 /// against the wrong messages table and read back the other pair's rows.
 fn claim_structure_tables(conn: &Connection, ctx: &Ctx) -> Result<()> {
+    let structure_exists: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'message_structure'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(sql_err)?;
+    if structure_exists.is_none() {
+        return Err(unclaimed_database_error());
+    }
     let (sessions_table, messages_table) = resolve_base_table_owners(conn, ctx)?;
+    check_structure_owners(conn, &sessions_table, &messages_table)
+}
+
+fn unclaimed_database_error() -> AgentsError {
+    AgentsError::user(
+        "The database has no claimed structure tables. Create an AdvancedSqliteSession with \
+         create_tables=True to create and claim them before opening the database without table \
+         creation.",
+    )
+}
+
+/// Verify that the structure tables' foreign keys name exactly this base-table pair.
+fn check_structure_owners(
+    conn: &Connection,
+    sessions_table: &str,
+    messages_table: &str,
+) -> Result<()> {
     for (table, columns) in [
         ("message_structure", &["session_id", "message_id"][..]),
         ("turn_usage", &["session_id"][..]),
@@ -451,10 +479,15 @@ fn claim_structure_tables(conn: &Connection, ctx: &Ctx) -> Result<()> {
             .collect();
         drop(stmt);
         for column in columns {
-            let (expected_table, expected_column) = match *column {
-                "session_id" => (&sessions_table, "session_id"),
-                _ => (&messages_table, "id"),
+            let (configured_table, expected_column) = match *column {
+                "session_id" => (sessions_table, "session_id"),
+                _ => (messages_table, "id"),
             };
+            // A quoted configured name (`"my sessions"`) names the table without its quotes.
+            // Ask SQLite when the table exists; before creation, unquote it ourselves.
+            let resolved_table = resolve_table_identifier(conn, configured_table)
+                .unwrap_or_else(|_| super::sqlite_session::unquoted_identifier(configured_table));
+            let expected_table = resolved_table.as_str();
             let matching: Vec<&(String, String, Option<String>)> = keys
                 .iter()
                 .filter(|(_, from, _)| from.eq_ignore_ascii_case(column))
@@ -482,6 +515,56 @@ fn claim_structure_tables(conn: &Connection, ctx: &Ctx) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Check who owns the structure tables of `path` before any base table is created.
+///
+/// A file that already holds structure tables belongs to one base-table pair; opening it with
+/// another pair, or without table creation when nothing claimed it, must fail without leaving
+/// new tables behind.
+fn preflight_structure_claim(
+    path: &std::path::Path,
+    sessions_table: &str,
+    messages_table: &str,
+    create_tables: bool,
+) -> Result<()> {
+    if !path.exists() {
+        return if create_tables {
+            Ok(())
+        } else {
+            Err(unclaimed_database_error())
+        };
+    }
+    let conn = Connection::open(path).map_err(sql_err)?;
+    let structure_exists: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'message_structure'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(sql_err)?;
+    if structure_exists.is_none() {
+        return if create_tables {
+            Ok(())
+        } else {
+            Err(unclaimed_database_error())
+        };
+    }
+    if !create_tables {
+        let ctx = Ctx {
+            session_id: String::new(),
+            sessions_table: sessions_table.to_string(),
+            messages_table: messages_table.to_string(),
+            branch: Arc::new(Mutex::new(BranchState {
+                branch: MAIN_BRANCH.to_string(),
+                generation: 0,
+            })),
+        };
+        // Names the missing base tables before any of them is created.
+        resolve_base_table_owners(&conn, &ctx)?;
+    }
+    check_structure_owners(&conn, sessions_table, messages_table)
 }
 
 /// The message type recorded for an item in `message_structure`.
@@ -521,7 +604,17 @@ fn extract_tool_name(item: &InputItem) -> Option<String> {
             | "shell_call"
             | "apply_patch_call"),
         ) => Some(t.to_string()),
-        _ => name.map(str::to_string),
+        _ => {
+            let name = name?;
+            // A namespace equal to the tool name is the reserved deferred top-level wire
+            // shape, so it collapses to the bare name; any other namespace qualifies it.
+            match value.get("namespace").and_then(Value::as_str) {
+                Some(ns) if !ns.is_empty() && ns != name && !name.is_empty() => {
+                    Some(format!("{ns}.{name}"))
+                }
+                _ => Some(name.to_string()),
+            }
+        }
     }
 }
 
@@ -588,7 +681,26 @@ impl AdvancedSqliteSession {
         db_path: impl AsRef<std::path::Path>,
         create_tables: bool,
     ) -> Result<Self> {
-        Self::from_base(SqliteSession::open(session_id, db_path)?, create_tables)
+        let path = db_path.as_ref();
+        preflight_structure_claim(path, "agent_sessions", "agent_messages", create_tables)?;
+        Self::from_base(SqliteSession::open(session_id, path)?, create_tables)
+    }
+
+    /// Like [`AdvancedSqliteSession::open_with`] with custom base-table names.
+    ///
+    /// The structure tables' owner is checked before any base table is created, so a rejected
+    /// pair leaves the database untouched, as Python's constructor does.
+    pub fn open_with_tables(
+        session_id: impl Into<String>,
+        db_path: impl AsRef<std::path::Path>,
+        sessions_table: &str,
+        messages_table: &str,
+        create_tables: bool,
+    ) -> Result<Self> {
+        let path = db_path.as_ref();
+        preflight_structure_claim(path, sessions_table, messages_table, create_tables)?;
+        let base = SqliteSession::with_tables(session_id, path, sessions_table, messages_table)?;
+        Self::from_base(base, create_tables)
     }
 
     /// Extend an existing [`SqliteSession`] with the structure and usage tables.
@@ -721,22 +833,39 @@ impl AdvancedSqliteSession {
             let rows: Vec<String> = match limit {
                 Some(0) => Vec::new(),
                 Some(n) => {
-                    let mut stmt = conn
-                        .prepare(&format!(
-                            "SELECT m.message_data FROM {m} m
-                             JOIN message_structure s ON m.id = s.message_id
-                             WHERE m.session_id = ? AND s.branch_id = ?
-                             ORDER BY s.sequence_number DESC LIMIT ?",
-                            m = ctx.messages_table
-                        ))
-                        .map_err(sql_err)?;
-                    let mut v: Vec<String> = stmt
-                        .query_map(params![ctx.session_id, branch, n as i64], |r| r.get(0))
-                        .map_err(sql_err)?
-                        .filter_map(std::result::Result::ok)
-                        .collect();
-                    v.reverse();
-                    v
+                    // Widen the fetch window while corrupt rows sit among the newest entries, so
+                    // `limit` counts readable items rather than stored rows. Port of the loop
+                    // in Python's `AdvancedSQLiteSession.get_items`.
+                    let mut window = n;
+                    loop {
+                        let mut stmt = conn
+                            .prepare(&format!(
+                                "SELECT m.message_data FROM {m} m
+                                 JOIN message_structure s ON m.id = s.message_id
+                                 WHERE m.session_id = ? AND s.branch_id = ?
+                                 ORDER BY s.sequence_number DESC LIMIT ?",
+                                m = ctx.messages_table
+                            ))
+                            .map_err(sql_err)?;
+                        let mut fetched: Vec<String> = stmt
+                            .query_map(params![ctx.session_id, branch, window as i64], |r| r.get(0))
+                            .map_err(sql_err)?
+                            .filter_map(std::result::Result::ok)
+                            .collect();
+                        let fetched_rows = fetched.len();
+                        fetched.reverse();
+                        let valid: Vec<String> = fetched
+                            .into_iter()
+                            .filter(|r| serde_json::from_str::<Value>(r).is_ok())
+                            .collect();
+                        if valid.len() >= n {
+                            break valid[valid.len() - n..].to_vec();
+                        }
+                        if fetched_rows < window {
+                            break valid;
+                        }
+                        window = window.saturating_mul(2);
+                    }
                 }
                 None => {
                     let mut stmt = conn
@@ -794,8 +923,8 @@ impl AdvancedSqliteSession {
 
     /// All branches of this session, oldest first.
     pub async fn list_branches(&self) -> Result<Vec<BranchInfo>> {
-        let current = self.current_branch();
         self.blocking(move |conn, ctx| {
+            let current = resolve_read_branch(conn, ctx, None)?;
             let mut stmt = conn
                 .prepare(
                     "SELECT branch_id, COUNT(*),
@@ -835,6 +964,9 @@ impl AdvancedSqliteSession {
         turn_number: i64,
         branch_name: Option<&str>,
     ) -> Result<String> {
+        if branch_name.is_some_and(|name| name.trim().is_empty()) {
+            return Err(AgentsError::user("Branch name cannot be empty"));
+        }
         let requested = branch_name.map(str::to_string);
         let branch_id = self
             .blocking(move |conn, ctx| {
@@ -900,14 +1032,13 @@ impl AdvancedSqliteSession {
         search: &str,
         branch_name: Option<&str>,
     ) -> Result<String> {
-        let turns = self.get_conversation_turns(None).await?;
-        let needle = search.to_lowercase();
-        let turn = turns
-            .iter()
-            .find(|t| t.content.to_lowercase().contains(&needle))
-            .ok_or_else(|| {
-                AgentsError::user(format!("No user turn contains the text {search:?}"))
-            })?;
+        if branch_name.is_some_and(|name| name.trim().is_empty()) {
+            return Err(AgentsError::user("Branch name cannot be empty"));
+        }
+        let turns = self.find_turns_by_content(search, None).await?;
+        let turn = turns.first().ok_or_else(|| {
+            AgentsError::user(format!("No user turns found containing '{search}'"))
+        })?;
         self.create_branch_from_turn(turn.turn, branch_name).await
     }
 
@@ -916,18 +1047,37 @@ impl AdvancedSqliteSession {
     /// The `main` branch cannot be deleted. Deleting the current branch requires `force` and
     /// switches the session back to `main`.
     pub async fn delete_branch(&self, branch_id: &str, force: bool) -> Result<()> {
+        if branch_id.trim().is_empty() {
+            return Err(AgentsError::user("Branch ID cannot be empty"));
+        }
         if branch_id == MAIN_BRANCH {
             return Err(AgentsError::user("Cannot delete the 'main' branch"));
         }
         let is_current = self.current_branch() == branch_id;
         if is_current && !force {
             return Err(AgentsError::user(format!(
-                "Branch '{branch_id}' is the current branch; pass force to delete it"
+                "Cannot delete current branch '{branch_id}'. Use force=True or switch branches \
+                 first"
             )));
         }
         let target = branch_id.to_string();
         self.blocking(move |conn, ctx| {
             let tx = conn.unchecked_transaction().map_err(sql_err)?;
+            // Back-fill the reservations before the branch's rows, their only durable evidence
+            // in a database written before reservations existed, are deleted.
+            ensure_branch_reservations(&tx, ctx)?;
+            let known: i64 = tx
+                .query_row(
+                    "SELECT COUNT(*) FROM message_structure WHERE session_id = ? AND branch_id = ?",
+                    params![ctx.session_id, target],
+                    |r| r.get(0),
+                )
+                .map_err(sql_err)?;
+            if known == 0 {
+                return Err(AgentsError::user(format!(
+                    "Branch '{target}' does not exist"
+                )));
+            }
             tx.execute(
                 "DELETE FROM message_structure WHERE session_id = ? AND branch_id = ?",
                 params![ctx.session_id, target],
@@ -964,7 +1114,7 @@ impl AdvancedSqliteSession {
     ) -> Result<Vec<ConversationTurn>> {
         let branch = branch_id.map(str::to_string);
         self.blocking(move |conn, ctx| {
-            let branch = branch.unwrap_or_else(|| ctx.branch_id());
+            let branch = resolve_read_branch(conn, ctx, branch)?;
             let mut stmt = conn
                 .prepare(&format!(
                     "SELECT s.branch_turn_number, m.message_data, s.created_at
@@ -1013,7 +1163,7 @@ impl AdvancedSqliteSession {
     ) -> Result<Vec<InputItem>> {
         let branch = branch_id.map(str::to_string);
         self.blocking(move |conn, ctx| {
-            let branch = branch.unwrap_or_else(|| ctx.branch_id());
+            let branch = resolve_read_branch(conn, ctx, branch)?;
             let mut stmt = conn
                 .prepare(&format!(
                     "SELECT m.message_data, s.branch_turn_number
@@ -1049,7 +1199,7 @@ impl AdvancedSqliteSession {
     ) -> Result<BTreeMap<i64, Vec<TurnMessage>>> {
         let branch = branch_id.map(str::to_string);
         self.blocking(move |conn, ctx| {
-            let branch = branch.unwrap_or_else(|| ctx.branch_id());
+            let branch = resolve_read_branch(conn, ctx, branch)?;
             let mut stmt = conn
                 .prepare(
                     "SELECT user_turn_number, message_type, tool_name
@@ -1085,11 +1235,12 @@ impl AdvancedSqliteSession {
         search: &str,
         branch_id: Option<&str>,
     ) -> Result<Vec<ConversationTurn>> {
-        let needle = search.to_lowercase();
+        // SQLite's LIKE folds ASCII case only, so `é` does not match `É`.
+        let needle = search.to_ascii_lowercase();
         let turns = self.get_conversation_turns(branch_id).await?;
         Ok(turns
             .into_iter()
-            .filter(|t| t.full_content.to_lowercase().contains(&needle))
+            .filter(|t| t.full_content.to_ascii_lowercase().contains(&needle))
             .collect())
     }
 
@@ -1097,19 +1248,39 @@ impl AdvancedSqliteSession {
     pub async fn get_tool_usage(&self, branch_id: Option<&str>) -> Result<Vec<ToolUsage>> {
         let branch = branch_id.map(str::to_string);
         self.blocking(move |conn, ctx| {
-            let branch = branch.unwrap_or_else(|| ctx.branch_id());
+            let branch = resolve_read_branch(conn, ctx, branch)?;
             let mut stmt = conn
                 .prepare(
-                    "SELECT COALESCE(tool_name, message_type) AS name,
-                            COUNT(*), user_turn_number
-                     FROM message_structure
-                     WHERE session_id = ? AND branch_id = ? AND message_type IN (
-                        'tool_call', 'function_call', 'computer_call', 'file_search_call',
-                        'web_search_call', 'code_interpreter_call', 'tool_search_call',
-                        'custom_tool_call', 'mcp_call', 'mcp_approval_request',
-                        'shell_call', 'apply_patch_call'
+                    "SELECT tool_name, SUM(usage_count), user_turn_number
+                     FROM (
+                        SELECT COALESCE(
+                                tool_name,
+                                CASE WHEN message_type IN ('shell_call', 'apply_patch_call')
+                                     THEN message_type END
+                               ) AS tool_name, 1 AS usage_count, user_turn_number
+                        FROM message_structure
+                        WHERE session_id = ?1 AND branch_id = ?2 AND message_type IN (
+                            'tool_call', 'function_call', 'computer_call', 'file_search_call',
+                            'web_search_call', 'code_interpreter_call', 'tool_search_call',
+                            'custom_tool_call', 'mcp_call', 'mcp_approval_request',
+                            'shell_call', 'apply_patch_call'
+                        )
+                        UNION ALL
+                        SELECT ms.tool_name, 1 AS usage_count, ms.user_turn_number
+                        FROM message_structure ms
+                        WHERE ms.session_id = ?1 AND ms.branch_id = ?2
+                          AND ms.message_type = 'tool_search_output'
+                          AND NOT EXISTS (
+                              SELECT 1 FROM message_structure calls
+                              WHERE calls.session_id = ms.session_id
+                                AND calls.branch_id = ms.branch_id
+                                AND calls.user_turn_number = ms.user_turn_number
+                                AND calls.tool_name = ms.tool_name
+                                AND calls.message_type = 'tool_search_call'
+                          )
                      )
-                     GROUP BY name, user_turn_number
+                     WHERE tool_name IS NOT NULL
+                     GROUP BY tool_name, user_turn_number
                      ORDER BY user_turn_number",
                 )
                 .map_err(sql_err)?;
@@ -1184,7 +1355,7 @@ impl AdvancedSqliteSession {
     ) -> Result<Vec<TurnUsage>> {
         let branch = branch_id.map(str::to_string);
         self.blocking(move |conn, ctx| {
-            let branch = branch.unwrap_or_else(|| ctx.branch_id());
+            let branch = resolve_read_branch(conn, ctx, branch)?;
             let mut stmt = conn
                 .prepare(
                     "SELECT user_turn_number, requests, input_tokens, output_tokens, total_tokens,
@@ -1354,8 +1525,12 @@ impl Session for AdvancedSqliteSession {
         if items.is_empty() {
             return Ok(());
         }
-        self.blocking(move |conn, ctx| Self::insert_with_structure(conn, ctx, &items))
-            .await
+        self.blocking(move |conn, ctx| {
+            // Another instance may have cleared the session since this one picked its branch.
+            refresh_branch_after_external_clear(conn, ctx, true)?;
+            Self::insert_with_structure(conn, ctx, &items)
+        })
+        .await
     }
 
     /// Remove the most recent item of the current branch.
@@ -1364,8 +1539,12 @@ impl Session for AdvancedSqliteSession {
     /// branch still references it. A `turn_usage` row is removed when the pop empties its turn.
     async fn pop_item(&self) -> Result<Option<InputItem>> {
         self.blocking(move |conn, ctx| {
+            refresh_branch_after_external_clear(conn, ctx, true)?;
             let branch = ctx.branch_id();
             let tx = conn.unchecked_transaction().map_err(sql_err)?;
+            // Back-fill the reservations before deleting the rows that are their only durable
+            // evidence in a database written before reservations existed.
+            ensure_branch_reservations(&tx, ctx)?;
             let row: Option<(i64, i64, i64, String)> = tx
                 .query_row(
                     &format!(
@@ -1382,6 +1561,7 @@ impl Session for AdvancedSqliteSession {
                 .optional()
                 .map_err(sql_err)?;
             let Some((structure_id, message_id, turn, data)) = row else {
+                tx.commit().map_err(sql_err)?;
                 return Ok(None);
             };
             tx.execute(

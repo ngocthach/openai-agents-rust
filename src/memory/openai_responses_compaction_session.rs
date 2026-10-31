@@ -125,6 +125,20 @@ fn strip_orphaned_assistant_ids(items: Vec<InputItem>) -> Vec<InputItem> {
         .collect()
 }
 
+/// Session-only and output-only metadata that must not be replayed to the model.
+///
+/// Port of `strip_internal_input_item_metadata`: the tool title/description the SDK attaches to
+/// stored calls, and `created_by` bookkeeping, never belong in a compact request.
+fn strip_internal_metadata(item: &InputItem) -> Value {
+    let mut value = item.as_value().clone();
+    if let Value::Object(map) = &mut value {
+        map.remove("_session_description");
+        map.remove("_session_title");
+        map.remove("created_by");
+    }
+    value
+}
+
 /// Rewrite a compacted `input_image` / `input_file` part into a replay-safe shape.
 fn normalize_content_part(part: &Value) -> Result<Value> {
     let Some(obj) = part.as_object() else {
@@ -369,6 +383,9 @@ struct CompactionState {
 pub struct OpenAIResponsesCompactionSession {
     session_id: String,
     underlying: Arc<dyn Session>,
+    /// The view compaction reads and rewrites the store through, when an outer session
+    /// transforms what is stored. See [`Session::wrap_compaction_store`].
+    view: std::sync::RwLock<Option<Arc<dyn Session>>>,
     client: OpenAIClient,
     model: String,
     compaction_mode: CompactionMode,
@@ -390,6 +407,19 @@ impl fmt::Debug for OpenAIResponsesCompactionSession {
 }
 
 impl OpenAIResponsesCompactionSession {
+    /// The store compaction itself reads and rewrites.
+    ///
+    /// The wrapped session, unless an outer session that stores items transformed installed a
+    /// view of it (see [`Session::wrap_compaction_store`]). The [`Session`] methods of this type
+    /// always address the wrapped session directly: the outer session transforms those items.
+    fn store(&self) -> Arc<dyn Session> {
+        self.view
+            .read()
+            .expect("compaction view poisoned")
+            .clone()
+            .unwrap_or_else(|| Arc::clone(&self.underlying))
+    }
+
     /// Whether item ids must be ignored when matching stored history against the model
     /// exchange, inherited from the wrapped store. Port of `_ignore_ids_for_matching`.
     fn ignore_ids_for_matching(&self) -> bool {
@@ -417,6 +447,7 @@ impl OpenAIResponsesCompactionSession {
         Ok(OpenAIResponsesCompactionSession {
             session_id: session_id.into(),
             underlying,
+            view: std::sync::RwLock::new(None),
             client: OpenAIClient::from_env(),
             model: "gpt-4.1".to_string(),
             compaction_mode: CompactionMode::Auto,
@@ -454,7 +485,7 @@ impl OpenAIResponsesCompactionSession {
             None => ALL_SESSION_ITEMS_LIMIT,
             Some(budget) => budget.saturating_add(1),
         };
-        let items = self.underlying.get_items(Some(limit)).await?;
+        let items = self.store().get_items(Some(limit)).await?;
         if self
             .max_rollback_items
             .is_some_and(|budget| items.len() > budget)
@@ -589,7 +620,7 @@ impl OpenAIResponsesCompactionSession {
         let session_items = if model_exchange.is_none() {
             self.all_underlying_items().await?
         } else {
-            self.underlying
+            self.store()
                 .get_items(Some(ALL_SESSION_ITEMS_LIMIT))
                 .await?
         };
@@ -615,12 +646,13 @@ impl OpenAIResponsesCompactionSession {
 
         if let Some(model_exchange) = model_exchange {
             let window = model_exchange.len().saturating_add(1);
-            let Some(found) = self.underlying.compaction_snapshot(window).await? else {
+            let store = self.store();
+            let Some(found) = store.compaction_snapshot(window).await? else {
                 // A store without atomic suffix replacement still has to prove that the model
                 // exchange covers its complete history before the whole of it is replaced.
                 // Without this a store whose history is longer than the run loaded would have
                 // the older part summarized away by a chain that never contained it.
-                let bounded = self.underlying.get_items(Some(window)).await?;
+                let bounded = store.get_items(Some(window)).await?;
                 let complete = bounded.len() < window;
                 if !complete
                     || match_model_exchange_suffix(
@@ -729,7 +761,7 @@ impl OpenAIResponsesCompactionSession {
             .await?;
 
         let replaced = self
-            .underlying
+            .store()
             .replace_compaction_suffix(&snapshot.handles[suffix_start..], output_items)
             .await?;
         if !replaced {
@@ -792,7 +824,7 @@ impl OpenAIResponsesCompactionSession {
                 body["previous_response_id"] = json!(response_id);
             }
             ResolvedCompactionMode::Input => {
-                let input: Vec<&Value> = items.iter().map(InputItem::as_value).collect();
+                let input: Vec<Value> = items.iter().map(strip_internal_metadata).collect();
                 body["input"] = json!(input);
             }
         }
@@ -822,38 +854,79 @@ impl OpenAIResponsesCompactionSession {
         output_items: Vec<InputItem>,
         previous: Vec<InputItem>,
     ) -> Result<()> {
+        // Treat clear -> add as one replacement transaction, as Python does: whether the clear
+        // returned decides how a failure is recovered.
+        let mut cleared = false;
+        let store = self.store();
         let replace = async {
-            self.underlying.clear_session().await?;
+            store.clear_session().await?;
+            cleared = true;
             if !output_items.is_empty() {
-                self.underlying.add_items(output_items).await?;
+                store.add_items(output_items).await?;
             }
             Ok::<(), AgentsError>(())
         };
         match replace.await {
             Ok(()) => Ok(()),
             Err(error) => {
-                if let Err(restore_error) = self.restore(previous).await {
-                    log::warn!(target: crate::logger::LOG_TARGET,
-                        "Failed to restore session history after compaction replacement failed: \
-                         {restore_error}"
-                    );
+                if cleared {
+                    self.restore(previous, &error, true).await;
                 } else {
-                    log::warn!(target: crate::logger::LOG_TARGET,
-                        "Restored previous session history after compaction replacement failed: \
-                         {error}"
-                    );
+                    self.restore_after_failed_clear(previous, &error).await;
                 }
                 Err(error)
             }
         }
     }
 
-    async fn restore(&self, previous: Vec<InputItem>) -> Result<()> {
-        self.underlying.clear_session().await?;
-        if !previous.is_empty() {
-            self.underlying.add_items(previous).await?;
+    /// Recover from a `clear_session` that failed: inspect the store, leave it alone when the
+    /// failed clear changed nothing, and otherwise re-add the previous items without clearing
+    /// again. Port of `_restore_underlying_session_items_after_failed_clear`.
+    async fn restore_after_failed_clear(
+        &self,
+        previous: Vec<InputItem>,
+        clear_error: &AgentsError,
+    ) {
+        let current = match self.all_underlying_items().await {
+            Ok(current) => current,
+            Err(inspection_error) => {
+                crate::logger::log_model_and_tool_action_warning(
+                    "Failed to inspect session history after compaction replacement clear failed.",
+                    &inspection_error,
+                );
+                return;
+            }
+        };
+        if current == previous {
+            return;
         }
-        Ok(())
+        self.restore(previous, clear_error, false).await;
+    }
+
+    /// Put `previous` back, optionally clearing what is stored first. Failures are logged and
+    /// never replace the error that triggered the recovery.
+    async fn restore(&self, previous: Vec<InputItem>, cause: &AgentsError, clear_first: bool) {
+        let store = self.store();
+        let outcome = async {
+            if clear_first {
+                store.clear_session().await?;
+            }
+            if !previous.is_empty() {
+                store.add_items(previous).await?;
+            }
+            Ok::<(), AgentsError>(())
+        }
+        .await;
+        match outcome {
+            Ok(()) => crate::logger::log_model_and_tool_action_warning(
+                "Restored previous session history after compaction replacement failed",
+                cause,
+            ),
+            Err(restore_error) => crate::logger::log_model_and_tool_action_warning(
+                "Failed to restore session history after compaction replacement failed.",
+                &restore_error,
+            ),
+        }
     }
 
     /// Remember that `response_id` still owes a compaction once its tool outputs settle.
@@ -870,7 +943,7 @@ impl OpenAIResponsesCompactionSession {
         );
         drop(state);
         let session_items = self
-            .underlying
+            .store()
             .get_items(Some(ALL_SESSION_ITEMS_LIMIT))
             .await?;
         let context = CompactionContext {
@@ -899,6 +972,13 @@ impl Session for OpenAIResponsesCompactionSession {
     /// Automatic suffix replacement needs the exchange, so the runner records it.
     fn wants_model_exchange(&self) -> bool {
         true
+    }
+
+    /// Compact through `wrap(stored)` instead of the stored form an outer session transforms.
+    fn wrap_compaction_store(&self, wrap: &super::CompactionStoreWrapper<'_>) -> Result<bool> {
+        let view = wrap(Arc::clone(&self.underlying))?;
+        *self.view.write().expect("compaction view poisoned") = Some(view);
+        Ok(true)
     }
 
     async fn get_items(&self, limit: Option<usize>) -> Result<Vec<InputItem>> {

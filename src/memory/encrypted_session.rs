@@ -113,10 +113,15 @@ fn is_encrypted_envelope(item: &InputItem) -> bool {
 ///
 /// # Composition with compaction
 ///
-/// Wrap this session *inside* [`OpenAIResponsesCompactionSession`]
-/// (`Compaction(Encrypted(store))`), never the other way round: a compaction session below
-/// the encryption layer would send ciphertext envelopes to the compaction API. This session
-/// does not forward [`Session::on_run_completed`] to the wrapped session.
+/// Either order works. `Compaction(Encrypted(store))` compacts plaintext because the
+/// compaction session reads this session. With the encryption outermost,
+/// `Encrypted(Compaction(store))` as in Python, this session hands the compaction session a
+/// decrypting view of its own store ([`Session::wrap_compaction_store`]), so ciphertext never
+/// reaches the compaction API and every item compaction writes back is encrypted again. It
+/// then forwards [`Session::on_run_completed`] and [`Session::wants_model_exchange`] to the
+/// compaction session, which is what makes the runner trigger compaction. Manual compaction
+/// is requested on the compaction session itself; unlike Python's `__getattr__` forwarding,
+/// this session has no `run_compaction`.
 ///
 /// [`OpenAIResponsesCompactionSession`]: super::OpenAIResponsesCompactionSession
 ///
@@ -176,14 +181,39 @@ impl EncryptedSession {
     ) -> Result<Self> {
         let session_id = session_id.into();
         let cipher = Fernet::from_key(&derive_key(encryption_key, &session_id)?);
-        Ok(EncryptedSession {
+        let session = EncryptedSession {
             session_id,
             underlying,
             cipher,
             ttl,
             max_scan_items: None,
             last_snapshot: Mutex::new(None),
-        })
+        };
+        session.install_compaction_view()?;
+        Ok(session)
+    }
+
+    /// A session over `store` with this session's key, lifetime and scan budget.
+    ///
+    /// This is what a wrapped compaction session reads and rewrites through, so the compaction
+    /// logic sees plaintext and every item it writes back is encrypted again.
+    fn view_over(&self, store: Arc<dyn Session>) -> EncryptedSession {
+        EncryptedSession {
+            session_id: self.session_id.clone(),
+            underlying: store,
+            cipher: self.cipher.clone(),
+            ttl: self.ttl,
+            max_scan_items: self.max_scan_items,
+            last_snapshot: Mutex::new(None),
+        }
+    }
+
+    /// When the wrapped session compacts history, make it compact through a decrypting view of
+    /// its own store. A session that does not compact ignores the call.
+    fn install_compaction_view(&self) -> Result<()> {
+        self.underlying
+            .wrap_compaction_store(&|store| Ok(Arc::new(self.view_over(store)) as Arc<dyn Session>))
+            .map(|_| ())
     }
 
     /// Bound the number of stored items read and unwrapped per `get_items` call.
@@ -195,6 +225,8 @@ impl EncryptedSession {
             return Err(AgentsError::user("max_scan_items must be positive"));
         }
         self.max_scan_items = Some(max_scan_items);
+        // A wrapped compaction session reads through a view that carries the budget.
+        self.install_compaction_view()?;
         Ok(self)
     }
 
@@ -419,6 +451,24 @@ impl Session for EncryptedSession {
 
     async fn clear_session(&self) -> Result<()> {
         self.underlying.clear_session().await
+    }
+
+    /// Whether the wrapped session wants the runner to record the last model exchange.
+    ///
+    /// A compaction session does, so that automatic compaction replaces only history the model
+    /// actually saw. The digests are computed from plaintext items, which is what the
+    /// compaction session matches against through its decrypting view.
+    fn wants_model_exchange(&self) -> bool {
+        self.underlying.wants_model_exchange()
+    }
+
+    /// Let a wrapped compaction session run after the run. Nothing else compacts, so this is
+    /// a no-op for every other wrapped session.
+    async fn on_run_completed(
+        &self,
+        info: &super::SessionRunCompletion,
+    ) -> Result<crate::usage::Usage> {
+        self.underlying.on_run_completed(info).await
     }
 
     /// Forward the wrapped store's snapshot, decrypting its items.

@@ -6,7 +6,7 @@ use std::fmt;
 use async_trait::async_trait;
 use futures::TryStreamExt;
 use mongodb::bson::{Bson, DateTime, Document, doc};
-use mongodb::options::{IndexOptions, ReturnDocument};
+use mongodb::options::{IndexOptions, ReadPreference, ReturnDocument, SelectionCriteria};
 use mongodb::{Client, Collection, IndexModel};
 use tokio::sync::OnceCell;
 
@@ -152,10 +152,15 @@ impl MongoDBSession {
     }
 
     /// The authoritative history generation for this session.
+    ///
+    /// Read from the primary even when the client prefers secondaries: a lagging secondary could
+    /// still report the generation from before a `clear_session`, which would expose cleared
+    /// history to reads and pops. Port of `_get_generation`'s `ReadPreference.PRIMARY`.
     async fn generation(&self) -> Result<i64> {
         let doc = self
             .sessions
             .find_one(doc! {"session_id": &self.session_id})
+            .selection_criteria(SelectionCriteria::ReadPreference(ReadPreference::Primary))
             .await
             .map_err(mongo_err)?;
         Ok(bson_int(doc.as_ref().and_then(|d| d.get("_generation"))).unwrap_or(0))

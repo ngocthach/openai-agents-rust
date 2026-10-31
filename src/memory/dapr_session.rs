@@ -259,12 +259,31 @@ impl DaprSession {
     }
 
     /// The raw serialized items stored under the messages key.
-    async fn read_messages(&self) -> Result<(Vec<String>, Option<String>)> {
+    ///
+    /// A value that is not a JSON array reads as empty. `strict` instead rejects it, which every
+    /// operation that rewrites the aggregate uses so corrupted state is never overwritten (the
+    /// strict decode of Python's `_decode_messages_for_update`).
+    async fn read_messages_checked(&self, strict: bool) -> Result<(Vec<String>, Option<String>)> {
         let state = self.get_state(&self.messages_key).await?;
         let Some(body) = state.body else {
             return Ok((Vec::new(), state.etag));
         };
-        Ok((decode_message_array(&body), state.etag))
+        match decode_message_array(&body) {
+            Some(raw) => Ok((raw, state.etag)),
+            None if strict => Err(AgentsError::user(
+                "The stored Dapr session messages are not a valid JSON list and cannot be \
+                 safely updated.",
+            )),
+            None => Ok((Vec::new(), state.etag)),
+        }
+    }
+
+    async fn read_messages(&self) -> Result<(Vec<String>, Option<String>)> {
+        self.read_messages_checked(false).await
+    }
+
+    async fn read_messages_for_update(&self) -> Result<(Vec<String>, Option<String>)> {
+        self.read_messages_checked(true).await
     }
 
     /// Run a conditional write, retrying while the sidecar reports an ETag conflict.
@@ -313,10 +332,18 @@ impl DaprSession {
             })
             .await;
         if let Err(e) = result {
-            log::warn!(target: crate::logger::LOG_TARGET,
-                "DaprSession stored the new items but could not update the session metadata for \
-                 {}: {e}",
-                self.session_id
+            // The failure text can carry provider data and the session id names a conversation,
+            // so, as in Python's `log_model_and_tool_action_warning`, both appear only when the
+            // model-data and tool-data policies allow it.
+            crate::logger::log_model_and_tool_data_warning(
+                "DaprSession stored the new items but could not update the session metadata",
+                || {
+                    format!(
+                        "DaprSession stored the new items but could not update the session \
+                         metadata for {}: {e}",
+                        self.session_id
+                    )
+                },
             );
         }
     }
@@ -378,25 +405,25 @@ fn is_concurrency_conflict(error: &AgentsError) -> bool {
 }
 
 /// Parse the stored messages value: a JSON array of serialized items.
-fn decode_message_array(body: &str) -> Vec<String> {
-    let Ok(value) = serde_json::from_str::<Value>(body) else {
-        return Vec::new();
-    };
+fn decode_message_array(body: &str) -> Option<Vec<String>> {
+    let value = serde_json::from_str::<Value>(body).ok()?;
     // Some state stores hand the array back wrapped in a JSON string.
     let value = match value {
         Value::String(s) => serde_json::from_str::<Value>(&s).unwrap_or(Value::Null),
         other => other,
     };
     let Value::Array(entries) = value else {
-        return Vec::new();
+        return None;
     };
-    entries
-        .into_iter()
-        .map(|e| match e {
-            Value::String(s) => s,
-            other => other.to_string(),
-        })
-        .collect()
+    Some(
+        entries
+            .into_iter()
+            .map(|e| match e {
+                Value::String(s) => s,
+                other => other.to_string(),
+            })
+            .collect(),
+    )
 }
 
 /// Decode serialized items, skipping corrupted entries.
@@ -440,7 +467,7 @@ impl Session for DaprSession {
             .collect::<std::result::Result<_, _>>()?;
         let _guard = self.lock.lock().await;
         self.with_retries(|| async {
-            let (mut raw, etag) = self.read_messages().await?;
+            let (mut raw, etag) = self.read_messages_for_update().await?;
             raw.extend(serialized.iter().cloned());
             self.save_state(&self.messages_key, json!(raw), etag.as_deref())
                 .await
@@ -455,7 +482,7 @@ impl Session for DaprSession {
         loop {
             let claimed = self
                 .with_retries(|| async {
-                    let (mut raw, etag) = self.read_messages().await?;
+                    let (mut raw, etag) = self.read_messages_for_update().await?;
                     let Some(last) = raw.pop() else {
                         return Ok(None);
                     };
@@ -527,7 +554,7 @@ impl Session for DaprSession {
             .collect::<std::result::Result<_, _>>()?;
         let _guard = self.lock.lock().await;
         self.with_retries(|| async {
-            let (raw, etag) = self.read_messages().await?;
+            let (raw, etag) = self.read_messages_for_update().await?;
             if raw.len() < handles.len() {
                 return Ok(false);
             }
@@ -563,10 +590,10 @@ mod tests {
     #[test]
     fn stored_arrays_decode_from_both_shapes() {
         let direct = r#"["{\"role\":\"user\"}","{\"role\":\"assistant\"}"]"#;
-        assert_eq!(decode_message_array(direct).len(), 2);
+        assert_eq!(decode_message_array(direct).unwrap().len(), 2);
         let wrapped = serde_json::to_string(direct).unwrap();
-        assert_eq!(decode_message_array(&wrapped).len(), 2);
-        assert!(decode_message_array("not json").is_empty());
+        assert_eq!(decode_message_array(&wrapped).unwrap().len(), 2);
+        assert!(decode_message_array("not json").is_none());
     }
 
     #[test]

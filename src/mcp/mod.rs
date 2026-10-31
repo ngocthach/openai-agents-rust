@@ -46,6 +46,10 @@ pub struct MCPTool {
     pub input_schema: Value,
     /// Advisory annotations (`readOnlyHint`, `destructiveHint`, ...).
     pub annotations: Option<Value>,
+    /// The tool's static `_meta`, sent as request metadata on every call (Python's
+    /// `MCPUtil._extract_static_meta`). Each call gets its own copy, so a server that mutates the
+    /// metadata it receives cannot change what the next call sends.
+    pub meta: Option<Map<String, Value>>,
 }
 
 impl MCPTool {
@@ -62,6 +66,7 @@ impl MCPTool {
                 .cloned()
                 .unwrap_or_else(|| json!({"type": "object", "properties": {}})),
             annotations: v.get("annotations").cloned(),
+            meta: v.get("_meta").and_then(Value::as_object).cloned(),
         })
     }
 }
@@ -967,10 +972,9 @@ impl Core {
     async fn session(&self) -> Result<tokio::sync::MutexGuard<'_, Option<Connection>>> {
         let guard = self.connection.lock().await;
         if guard.is_none() {
-            return Err(AgentsError::user(format!(
-                "Server '{}' not initialized. Call connect() first.",
-                self.log_name()
-            )));
+            return Err(AgentsError::user(
+                "Server not initialized. Make sure you call `connect()` first.".to_string(),
+            ));
         }
         Ok(guard)
     }
@@ -1020,6 +1024,9 @@ impl Core {
     /// Returns the next cursor, or `None` when the listing is complete. A server that repeats a
     /// cursor, or one that still has pages left when the page budget runs out, fails the call
     /// rather than returning a partial list.
+    ///
+    /// `operation` is `tools` or `prompts`; the messages are the ones Python raises, which
+    /// deliberately name neither the cursor nor the page payload.
     fn check_pagination(
         &self,
         next: Option<String>,
@@ -1032,62 +1039,108 @@ impl Core {
         };
         if previous.as_deref() == Some(next.as_str()) {
             return Err(AgentsError::user(format!(
-                "MCP server '{}' returned a repeated cursor while paginating {operation}.",
+                "MCP server '{}' returned a repeated cursor while listing {operation}.",
                 self.log_name()
             )));
         }
-        if let Some(max) = self.config.max_list_pages
-            && pages >= max
-        {
+        if self.config.max_list_pages.is_some_and(|max| pages >= max) {
+            let subject = if operation == "tools" {
+                "MCP tool listing"
+            } else {
+                "MCP prompt listing"
+            };
             return Err(AgentsError::user(format!(
-                "MCP server '{}' exceeded max_list_pages ({max}) while paginating {operation}.",
-                self.log_name()
+                "{subject} exceeded max_list_pages. Increase max_list_pages to allow more \
+                 pages, or check the server pagination."
             )));
         }
         Ok(Some(next))
     }
 
     async fn list_tools(&self) -> Result<Vec<MCPTool>> {
+        // Python checks for a session before it consults the cache, so a disconnected server
+        // never answers from a stale list.
+        drop(self.session().await?);
         if self.config.cache_tools_list
             && let Some(t) = self.tools_cache.lock().await.clone()
         {
             return Ok(t);
         }
-        let tools = self
-            .retry(|| async {
-                let mut out = Vec::new();
-                let mut cursor: Option<String> = None;
-                let mut pages = 0usize;
-                loop {
-                    let page = {
-                        let guard = self.session().await?;
-                        let s = &guard.as_ref().expect("session checked").service;
-                        s.list_tools(cursor.clone().map(|c| {
-                            rmcp::model::PaginatedRequestParams::default().with_cursor(Some(c))
-                        }))
-                        .await
-                        .map_err(svc_err)?
-                    };
-                    pages += 1;
-                    out.extend(
-                        page.tools
-                            .iter()
-                            .filter_map(|t| serde_json::to_value(t).ok())
-                            .filter_map(|v| MCPTool::from_value(&v)),
-                    );
-                    let next = page.next_cursor.map(|c| c.to_string());
-                    match self.check_pagination(next, cursor, pages, "list tools")? {
-                        Some(next) => cursor = Some(next),
-                        None => break,
-                    }
-                }
-                Ok(out)
-            })
-            .await?;
+        // Each page request retries on its own, as Python's `_list_tools_page` does, so a
+        // transient failure on page N never refetches (or recounts) the pages already read.
+        let mut out = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut pages = 0usize;
+        loop {
+            let page_cursor = cursor.clone();
+            let page = self
+                .retry(|| async {
+                    let guard = self.session().await?;
+                    let s = &guard.as_ref().expect("session checked").service;
+                    s.list_tools(page_cursor.clone().map(|c| {
+                        rmcp::model::PaginatedRequestParams::default().with_cursor(Some(c))
+                    }))
+                    .await
+                    .map_err(svc_err)
+                })
+                .await?;
+            pages += 1;
+            out.extend(
+                page.tools
+                    .iter()
+                    .filter_map(|t| serde_json::to_value(t).ok())
+                    .filter_map(|v| MCPTool::from_value(&v)),
+            );
+            let next = page.next_cursor.map(|c| c.to_string());
+            match self.check_pagination(next, cursor, pages, "tools")? {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+        let tools = out;
         if self.config.cache_tools_list {
             *self.tools_cache.lock().await = Some(tools.clone());
         }
         Ok(tools)
+    }
+
+    /// Reject a call that omits a parameter the cached tool schema requires, before any request
+    /// is sent. Port of `_validate_required_parameters`: it only applies while the tool list is
+    /// cached and the tool is in it.
+    async fn validate_required_parameters(
+        &self,
+        tool_name: &str,
+        arguments: Option<&Map<String, Value>>,
+    ) -> Result<()> {
+        let cache = self.tools_cache.lock().await;
+        let Some(tool) = cache
+            .as_ref()
+            .and_then(|tools| tools.iter().find(|t| t.name == tool_name))
+        else {
+            return Ok(());
+        };
+        let Some(required) = tool
+            .input_schema
+            .get("required")
+            .and_then(Value::as_array)
+            .filter(|r| !r.is_empty())
+        else {
+            return Ok(());
+        };
+        let mut missing: Vec<&str> = required
+            .iter()
+            .filter_map(Value::as_str)
+            .filter(|name| arguments.is_none_or(|a| !a.contains_key(*name)))
+            .collect();
+        if missing.is_empty() {
+            return Ok(());
+        }
+        missing.sort_unstable();
+        Err(AgentsError::user(format!(
+            "Failed to call tool '{tool_name}' on MCP server '{}': missing required parameters: {}",
+            self.log_name(),
+            missing.join(", ")
+        )))
     }
 
     async fn call_tool(
@@ -1096,6 +1149,8 @@ impl Core {
         arguments: Option<Map<String, Value>>,
         meta: Option<Map<String, Value>>,
     ) -> Result<Value> {
+        self.validate_required_parameters(tool_name, arguments.as_ref())
+            .await?;
         let mut req = json!({"name": tool_name});
         if let Some(a) = arguments {
             req["arguments"] = Value::Object(a);
@@ -1225,7 +1280,7 @@ impl Core {
             );
             let next = page.next_cursor.map(|c| c.to_string());
             drop(guard);
-            match self.check_pagination(next, cursor, pages, "list prompts")? {
+            match self.check_pagination(next, cursor, pages, "prompts")? {
                 Some(next) => cursor = Some(next),
                 None => break,
             }
@@ -1498,32 +1553,49 @@ mcp_server_type!(
 /// connect and cleanup to happen in the same task. tokio and `rmcp` have no such requirement,
 /// so connect and cleanup run directly here; parallel connect is expressed with `join_all`
 /// rather than a per-server command queue.
+///
+/// The lifecycle rules match `agents.mcp.manager.MCPServerManager`: a server that is already
+/// connected is not connected again, a retry cleans the previous attempt up first and skips a
+/// server whose cleanup failed, and a strict connect failure cleans up everything it opened
+/// before returning.
 #[derive(Debug)]
 pub struct MCPServerManager {
     servers: Vec<Arc<dyn MCPServer>>,
     active: Vec<Arc<dyn MCPServer>>,
     failed: Vec<(Arc<dyn MCPServer>, String)>,
     cleanup_errors: Vec<(Arc<dyn MCPServer>, String)>,
+    /// Identities (by `Arc` pointer) of the servers whose `connect` succeeded and whose
+    /// `cleanup` has not run since. Mirrors Python's `_connected_servers`.
+    connected: HashSet<usize>,
     strict: bool,
+    drop_failed_servers: bool,
     connect_in_parallel: bool,
     connect_timeout: Option<Duration>,
     cleanup_timeout: Option<Duration>,
+}
+
+/// The identity of a server, as the manager tracks it: the `Arc`'s address.
+fn server_id(server: &Arc<dyn MCPServer>) -> usize {
+    Arc::as_ptr(server) as *const () as usize
 }
 
 impl MCPServerManager {
     /// Manage `servers` (duplicates by pointer are kept once).
     pub fn new(servers: Vec<Arc<dyn MCPServer>>) -> Self {
         let mut seen = HashSet::new();
-        let servers = servers
+        let servers: Vec<Arc<dyn MCPServer>> = servers
             .into_iter()
-            .filter(|s| seen.insert(Arc::as_ptr(s) as *const () as usize))
+            .filter(|s| seen.insert(server_id(s)))
             .collect();
         MCPServerManager {
+            // Python exposes every managed server until a connection attempt has been made.
+            active: servers.clone(),
             servers,
-            active: Vec::new(),
             failed: Vec::new(),
             cleanup_errors: Vec::new(),
+            connected: HashSet::new(),
             strict: false,
+            drop_failed_servers: true,
             connect_in_parallel: false,
             connect_timeout: Some(Duration::from_secs(10)),
             cleanup_timeout: Some(Duration::from_secs(10)),
@@ -1534,6 +1606,30 @@ impl MCPServerManager {
     pub fn strict(mut self, strict: bool) -> Self {
         self.strict = strict;
         self
+    }
+
+    /// Change the strict flag after construction, as Python's `manager.strict = ...` does.
+    pub fn set_strict(&mut self, strict: bool) {
+        self.strict = strict;
+    }
+
+    /// Whether the manager fails on the first connection error.
+    pub fn is_strict(&self) -> bool {
+        self.strict
+    }
+
+    /// Whether [`MCPServerManager::active_servers`] hides servers that failed to connect
+    /// (the default). With `false`, every managed server stays active.
+    ///
+    /// Mirrors Python's `drop_failed_servers`.
+    pub fn with_drop_failed_servers(mut self, drop_failed: bool) -> Self {
+        self.drop_failed_servers = drop_failed;
+        self
+    }
+
+    /// Whether failed servers are hidden from [`MCPServerManager::active_servers`].
+    pub fn drops_failed_servers(&self) -> bool {
+        self.drop_failed_servers
     }
 
     /// Connect every server concurrently instead of one after another.
@@ -1557,6 +1653,26 @@ impl MCPServerManager {
         self
     }
 
+    /// The connection timeout in force, as Python's `connect_timeout_seconds` property.
+    pub fn connect_timeout(&self) -> Option<Duration> {
+        self.connect_timeout
+    }
+
+    /// The cleanup timeout in force, as Python's `cleanup_timeout_seconds` property.
+    pub fn cleanup_timeout(&self) -> Option<Duration> {
+        self.cleanup_timeout
+    }
+
+    /// Change the connection timeout after construction.
+    pub fn set_connect_timeout(&mut self, timeout: Option<Duration>) {
+        self.connect_timeout = timeout;
+    }
+
+    /// Change the cleanup timeout after construction.
+    pub fn set_cleanup_timeout(&mut self, timeout: Option<Duration>) {
+        self.cleanup_timeout = timeout;
+    }
+
     async fn connect_one(timeout: Option<Duration>, s: &Arc<dyn MCPServer>) -> Result<()> {
         match timeout {
             Some(d) => tokio::time::timeout(d, s.connect()).await.map_err(|_| {
@@ -1569,74 +1685,232 @@ impl MCPServerManager {
         }
     }
 
-    fn record_connect_results(
-        &mut self,
-        results: Vec<(Arc<dyn MCPServer>, Result<()>)>,
-    ) -> Result<()> {
-        let mut first_error = None;
-        for (s, outcome) in results {
-            match outcome {
-                Ok(()) => self.active.push(s),
-                Err(e) => {
-                    crate::logger::log_tool_action_warning(
-                        &get_mcp_server_log_message("Failed to connect MCP server", s.name()),
-                        &e,
-                    );
-                    self.failed.push((s, e.to_string()));
-                    if first_error.is_none() {
-                        first_error = Some(e);
-                    }
-                }
-            }
-        }
-        match first_error {
-            Some(e) if self.strict => Err(e),
-            _ => Ok(()),
+    async fn cleanup_one(timeout: Option<Duration>, s: &Arc<dyn MCPServer>) -> Result<()> {
+        match timeout {
+            Some(d) => tokio::time::timeout(d, s.cleanup())
+                .await
+                .unwrap_or_else(|_| {
+                    Err(AgentsError::other(format!(
+                        "Timed out cleaning up MCP server '{}'",
+                        get_mcp_server_log_name(s.name())
+                    )))
+                }),
+            None => s.cleanup().await,
         }
     }
 
-    /// Connect all servers.
-    pub async fn connect_all(&mut self) -> Result<()> {
-        self.active.clear();
-        self.failed.clear();
-        let servers = self.servers.clone();
-        let timeout = self.connect_timeout;
-        let results = if self.connect_in_parallel {
-            futures::future::join_all(
+    /// Forget a server's recorded failure, as Python does when a retry connects.
+    fn clear_failure(&mut self, id: usize) {
+        self.failed.retain(|(s, _)| server_id(s) != id);
+        self.cleanup_errors.retain(|(s, _)| server_id(s) != id);
+    }
+
+    fn record_connect_failure(&mut self, s: &Arc<dyn MCPServer>, e: &AgentsError) {
+        crate::logger::log_tool_action_error(
+            &get_mcp_server_log_message("Failed to connect MCP server", s.name()),
+            e,
+        );
+        let id = server_id(s);
+        self.failed
+            .retain(|(existing, _)| server_id(existing) != id);
+        self.failed.push((s.clone(), e.to_string()));
+    }
+
+    fn record_cleanup_failure(&mut self, s: &Arc<dyn MCPServer>, e: &AgentsError) {
+        crate::logger::log_tool_action_error(
+            &get_mcp_server_log_message("Failed to cleanup MCP server", s.name()),
+            e,
+        );
+        let id = server_id(s);
+        self.cleanup_errors
+            .retain(|(existing, _)| server_id(existing) != id);
+        self.cleanup_errors.push((s.clone(), e.to_string()));
+    }
+
+    /// Recompute the active list from the connected set.
+    fn refresh_active(&mut self) {
+        self.active = if self.drop_failed_servers {
+            self.servers
+                .iter()
+                .filter(|s| self.connected.contains(&server_id(s)))
+                .cloned()
+                .collect()
+        } else {
+            self.servers.clone()
+        };
+    }
+
+    /// The servers that still need a connection attempt (Python's `_servers_to_connect`).
+    fn servers_to_connect(&self, servers: &[Arc<dyn MCPServer>]) -> Vec<Arc<dyn MCPServer>> {
+        if self.connected.is_empty() {
+            return servers.to_vec();
+        }
+        servers
+            .iter()
+            .filter(|s| !self.connected.contains(&server_id(s)))
+            .cloned()
+            .collect()
+    }
+
+    /// Close `servers` in reverse order, returning the ones that closed cleanly.
+    ///
+    /// A failure is recorded and the server is left out of the returned list, so a retry never
+    /// opens a second connection over a transport that was never closed.
+    async fn cleanup_servers(
+        &mut self,
+        servers: Vec<Arc<dyn MCPServer>>,
+    ) -> Vec<Arc<dyn MCPServer>> {
+        let timeout = self.cleanup_timeout;
+        let mut cleaned: HashSet<usize> = HashSet::new();
+        for s in servers.iter().rev() {
+            match Self::cleanup_one(timeout, s).await {
+                Ok(()) => {
+                    self.connected.remove(&server_id(s));
+                    cleaned.insert(server_id(s));
+                }
+                Err(e) => {
+                    self.connected.remove(&server_id(s));
+                    self.record_cleanup_failure(s, &e);
+                }
+            }
+        }
+        servers
+            .into_iter()
+            .filter(|s| cleaned.contains(&server_id(s)))
+            .collect()
+    }
+
+    async fn attempt_connect(&mut self, s: &Arc<dyn MCPServer>) -> Result<()> {
+        match Self::connect_one(self.connect_timeout, s).await {
+            Ok(()) => {
+                self.connected.insert(server_id(s));
+                self.clear_failure(server_id(s));
+                Ok(())
+            }
+            Err(e) => {
+                self.record_connect_failure(s, &e);
+                Err(e)
+            }
+        }
+    }
+
+    /// Connect `servers`, returning the first failure in input order.
+    async fn connect_servers(&mut self, servers: &[Arc<dyn MCPServer>]) -> Option<AgentsError> {
+        let mut first_error: Option<AgentsError> = None;
+        if self.connect_in_parallel {
+            let timeout = self.connect_timeout;
+            let results = futures::future::join_all(
                 servers
                     .iter()
                     .map(|s| async move { (s.clone(), Self::connect_one(timeout, s).await) }),
             )
-            .await
-        } else {
-            let mut results = Vec::with_capacity(servers.len());
-            for s in &servers {
-                let outcome = Self::connect_one(timeout, s).await;
-                let failed_fast = self.strict && outcome.is_err();
-                results.push((s.clone(), outcome));
-                if failed_fast {
-                    break;
+            .await;
+            for (s, outcome) in results {
+                match outcome {
+                    Ok(()) => {
+                        self.connected.insert(server_id(&s));
+                        self.clear_failure(server_id(&s));
+                    }
+                    Err(e) => {
+                        self.record_connect_failure(&s, &e);
+                        if first_error.is_none() {
+                            first_error = Some(e);
+                        }
+                    }
                 }
             }
-            results
-        };
-        self.record_connect_results(results)
+        } else {
+            for s in servers {
+                if let Err(e) = self.attempt_connect(s).await {
+                    if first_error.is_none() {
+                        first_error = Some(e);
+                    }
+                    // Strict mode stops at the first failure, as Python's `raise_on_error` does.
+                    if self.strict {
+                        break;
+                    }
+                }
+            }
+        }
+        first_error
+    }
+
+    /// Connect all servers.
+    ///
+    /// Servers that are already connected are left alone. In strict mode the first failure is
+    /// returned after every server this call opened has been closed again.
+    pub async fn connect_all(&mut self) -> Result<()> {
+        let previously_connected: HashSet<usize> = self.connected.clone();
+        let previous_active = self.active.clone();
+        self.failed.clear();
+        self.cleanup_errors.clear();
+
+        let to_connect = self.servers_to_connect(&self.servers.clone());
+        let error = self.connect_servers(&to_connect).await;
+
+        match error {
+            Some(e) if self.strict => {
+                // Everything this call opened — and the server that failed half-way through
+                // its own connect — has to be closed before the error reaches the caller.
+                let opened: Vec<Arc<dyn MCPServer>> = to_connect
+                    .iter()
+                    .filter(|s| {
+                        self.connected.contains(&server_id(s))
+                            && !previously_connected.contains(&server_id(s))
+                    })
+                    .cloned()
+                    .collect();
+                let failed: Vec<Arc<dyn MCPServer>> =
+                    self.failed.iter().map(|(s, _)| s.clone()).collect();
+                let mut to_clean = opened;
+                for s in failed {
+                    if !to_clean.iter().any(|existing| Arc::ptr_eq(existing, &s)) {
+                        to_clean.push(s);
+                    }
+                }
+                self.cleanup_servers(to_clean).await;
+                if self.drop_failed_servers {
+                    self.active = self
+                        .servers
+                        .iter()
+                        .filter(|s| previously_connected.contains(&server_id(s)))
+                        .cloned()
+                        .collect();
+                } else {
+                    self.active = previous_active;
+                }
+                Err(e)
+            }
+            _ => {
+                self.refresh_active();
+                Ok(())
+            }
+        }
     }
 
     /// Retry failed servers (or reconnect all).
+    ///
+    /// With `failed_only`, every previously failed server is closed before it is retried, and a
+    /// server whose cleanup fails is not retried at all — its cleanup error stays in
+    /// [`MCPServerManager::errors`].
     pub async fn reconnect(&mut self, failed_only: bool) -> Result<()> {
-        if !failed_only {
+        let to_retry = if failed_only {
+            let failed: Vec<Arc<dyn MCPServer>> =
+                self.failed.iter().map(|(s, _)| s.clone()).collect();
+            self.cleanup_servers(failed).await
+        } else {
             self.cleanup_all().await;
-            return self.connect_all().await;
+            self.failed.clear();
+            self.cleanup_errors.clear();
+            self.servers.clone()
+        };
+        let to_retry = self.servers_to_connect(&to_retry);
+        let error = self.connect_servers(&to_retry).await;
+        self.refresh_active();
+        match error {
+            Some(e) if self.strict => Err(e),
+            _ => Ok(()),
         }
-        let failed = std::mem::take(&mut self.failed);
-        for (s, _) in failed {
-            match Self::connect_one(self.connect_timeout, &s).await {
-                Ok(()) => self.active.push(s),
-                Err(e) => self.failed.push((s, e.to_string())),
-            }
-        }
-        Ok(())
     }
 
     /// Successfully connected servers.
@@ -1655,40 +1929,29 @@ impl MCPServerManager {
     }
 
     /// The recorded connect and cleanup failures, by server name.
+    ///
+    /// One entry per server, as Python's `errors` dict: a later cleanup failure replaces the
+    /// connect failure recorded for the same server.
     pub fn errors(&self) -> Vec<(String, String)> {
-        self.failed
-            .iter()
-            .chain(&self.cleanup_errors)
-            .map(|(s, e)| (s.name().to_string(), e.clone()))
-            .collect()
+        let mut out: Vec<(String, String)> = Vec::new();
+        for (server, error) in self.failed.iter().chain(&self.cleanup_errors) {
+            let name = server.name().to_string();
+            match out.iter_mut().find(|(existing, _)| *existing == name) {
+                Some(slot) => slot.1 = error.clone(),
+                None => out.push((name, error.clone())),
+            }
+        }
+        out
     }
 
-    /// Close all servers, bounded by the cleanup timeout.
+    /// Close all servers, in reverse order, bounded by the cleanup timeout.
     ///
     /// Cleanup failures are recorded in [`MCPServerManager::errors`] so a later reconnect does
     /// not open a second connection over a transport that was never closed.
     pub async fn cleanup_all(&mut self) {
         self.cleanup_errors.clear();
-        for s in self.servers.clone() {
-            let outcome = match self.cleanup_timeout {
-                Some(d) => tokio::time::timeout(d, s.cleanup())
-                    .await
-                    .unwrap_or_else(|_| {
-                        Err(AgentsError::other(format!(
-                            "Timed out cleaning up MCP server '{}'",
-                            get_mcp_server_log_name(s.name())
-                        )))
-                    }),
-                None => s.cleanup().await,
-            };
-            if let Err(e) = outcome {
-                crate::logger::log_tool_action_warning(
-                    &get_mcp_server_log_message("Failed to cleanup MCP server", s.name()),
-                    &e,
-                );
-                self.cleanup_errors.push((s, e.to_string()));
-            }
-        }
-        self.active.clear();
+        let servers = self.servers.clone();
+        self.cleanup_servers(servers).await;
+        self.refresh_active();
     }
 }

@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use rusqlite::{Connection, OptionalExtension, params};
+use serde_json::Value;
 
 use super::{CompactionSnapshot, Session, SessionSettings, SnapshotHandle};
 use crate::error::{AgentsError, Result};
@@ -28,8 +29,40 @@ fn sql_err(e: rusqlite::Error) -> AgentsError {
     AgentsError::other(format!("SQLite error: {e}"))
 }
 
+/// A table name is a bare ASCII identifier or a SQL double-quoted one (`"my table"`, with `""`
+/// for an embedded quote).
+///
+/// Python interpolates the configured names into SQL verbatim, so its released `SQLiteSession`
+/// accepts SQL-quoted identifiers (and, by accident, any SQL fragment). Rust accepts the same
+/// quoted identifiers but nothing else, so a table name can never inject SQL.
 fn valid_identifier(name: &str) -> bool {
-    !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    if !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return true;
+    }
+    let Some(inner) = name
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+    else {
+        return false;
+    };
+    !inner.is_empty() && inner.replace("\"\"", "").find('"').is_none()
+}
+
+/// The text a quoted identifier names (`"a""b"` is `a"b`); a bare identifier is returned as is.
+pub(super) fn unquoted_identifier(name: &str) -> String {
+    match name
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+    {
+        Some(inner) => inner.replace("\"\"", "\""),
+        None => name.to_string(),
+    }
+}
+
+/// The name of the `(session_id, id)` index of `messages_table`, always safely quoted.
+fn messages_index_name(messages_table: &str) -> String {
+    let name = format!("idx_{}_session_id", unquoted_identifier(messages_table));
+    format!("\"{}\"", name.replace('"', "\"\""))
 }
 
 impl SqliteSession {
@@ -108,9 +141,10 @@ impl SqliteSession {
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (session_id) REFERENCES {s} (session_id) ON DELETE CASCADE
              );
-             CREATE INDEX IF NOT EXISTS idx_{m}_session_id ON {m} (session_id, id);",
+             CREATE INDEX IF NOT EXISTS {i} ON {m} (session_id, id);",
             s = self.sessions_table,
-            m = self.messages_table
+            m = self.messages_table,
+            i = messages_index_name(&self.messages_table)
         ))
         .map_err(sql_err)
     }
@@ -161,19 +195,36 @@ impl Session for SqliteSession {
             let rows: Vec<String> = match limit {
                 Some(0) => Vec::new(),
                 Some(n) => {
-                    let mut stmt = conn
-                        .prepare(&format!(
-                            "SELECT message_data FROM {} WHERE session_id = ? ORDER BY id DESC LIMIT ?",
-                            s.messages_table
-                        ))
-                        .map_err(sql_err)?;
-                    let mut v: Vec<String> = stmt
-                        .query_map(params![s.session_id, n as i64], |r| r.get(0))
-                        .map_err(sql_err)?
-                        .filter_map(|r| r.ok())
-                        .collect();
-                    v.reverse();
-                    v
+                    // Expand the fetch window while corrupt rows sit among the newest entries, so
+                    // `limit` counts readable conversation items rather than stored rows. Port of
+                    // the widening loop in Python's `SQLiteSession.get_items`.
+                    let mut window = n;
+                    loop {
+                        let mut stmt = conn
+                            .prepare(&format!(
+                                "SELECT message_data FROM {} WHERE session_id = ? ORDER BY id DESC LIMIT ?",
+                                s.messages_table
+                            ))
+                            .map_err(sql_err)?;
+                        let mut fetched: Vec<String> = stmt
+                            .query_map(params![s.session_id, window as i64], |r| r.get(0))
+                            .map_err(sql_err)?
+                            .filter_map(|r| r.ok())
+                            .collect();
+                        let fetched_rows = fetched.len();
+                        fetched.reverse();
+                        let valid: Vec<String> = fetched
+                            .into_iter()
+                            .filter(|r| serde_json::from_str::<Value>(r).is_ok())
+                            .collect();
+                        if valid.len() >= n {
+                            break valid[valid.len() - n..].to_vec();
+                        }
+                        if fetched_rows < window {
+                            break valid;
+                        }
+                        window = window.saturating_mul(2);
+                    }
                 }
                 None => {
                     let mut stmt = conn
@@ -614,5 +665,48 @@ mod tests {
             .unwrap();
         assert!(!replaced);
         assert_eq!(s.get_items(None).await.unwrap().len(), 3);
+    }
+
+    #[test]
+    fn identifiers_are_bare_or_sql_quoted() {
+        assert!(valid_identifier("agent_messages"));
+        assert!(valid_identifier("\"quoted_sessions\""));
+        assert!(valid_identifier("\"two words\""));
+        assert!(valid_identifier("\"a\"\"b\""));
+        for bad in [
+            "",
+            "bad table",
+            "t; DROP TABLE x",
+            "\"\"",
+            "\"unterminated",
+            "\"a\"b\"",
+            "[bracket]",
+        ] {
+            assert!(!valid_identifier(bad), "{bad}");
+        }
+        assert_eq!(unquoted_identifier("\"a\"\"b\""), "a\"b");
+        assert_eq!(unquoted_identifier("plain"), "plain");
+        assert_eq!(messages_index_name("plain"), "\"idx_plain_session_id\"");
+        assert_eq!(
+            messages_index_name("\"two words\""),
+            "\"idx_two words_session_id\""
+        );
+    }
+
+    #[tokio::test]
+    async fn quoted_table_names_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("quoted.db");
+        let session =
+            SqliteSession::with_tables("u1", &path, "\"my sessions\"", "\"my messages\"").unwrap();
+        session
+            .add_items(vec![InputItem::user("hi")])
+            .await
+            .unwrap();
+        assert_eq!(session.get_items(None).await.unwrap().len(), 1);
+        // A second open reuses the same tables and index without error.
+        let again =
+            SqliteSession::with_tables("u1", &path, "\"my sessions\"", "\"my messages\"").unwrap();
+        assert_eq!(again.get_items(None).await.unwrap().len(), 1);
     }
 }

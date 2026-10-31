@@ -335,7 +335,31 @@ pub trait Session: Send + Sync + fmt::Debug {
     ) -> Result<bool> {
         self.replace_compaction_suffix(handles, items).await
     }
+
+    /// Let an outer session that stores items in another form (for example encrypted) decide how
+    /// a compaction session reads and rewrites the store beneath it.
+    ///
+    /// A session that compacts history reads and replaces the *stored* items itself. When
+    /// another session wraps it and stores those items transformed, the compaction session
+    /// would otherwise read the wrapper's stored form: it would send ciphertext to the
+    /// compaction API and write its plaintext summary into an encrypted store. `wrap` receives
+    /// the store the compaction session works on and returns the view it must use for every
+    /// internal read and write instead; the session's own [`Session`] methods keep addressing
+    /// the raw store, because the outer wrapper applies its transformation to those.
+    ///
+    /// Returns `Ok(true)` when the view was installed. Every session that does not compact
+    /// ignores the call and returns `Ok(false)`. Port of the `read_items` / `prepare_items` /
+    /// `read_snapshot` arguments Python's `EncryptedSession` passes to
+    /// `OpenAIResponsesCompactionSession._run_compaction`.
+    fn wrap_compaction_store(&self, _wrap: &CompactionStoreWrapper<'_>) -> Result<bool> {
+        Ok(false)
+    }
 }
+
+/// Builds the view of a store a compaction session should use; see
+/// [`Session::wrap_compaction_store`].
+pub type CompactionStoreWrapper<'a> =
+    dyn Fn(std::sync::Arc<dyn Session>) -> Result<std::sync::Arc<dyn Session>> + Send + Sync + 'a;
 
 /// A session stored in process memory.
 ///

@@ -366,6 +366,7 @@ mod tests {
 
     fn tool(name: &str) -> MCPTool {
         MCPTool {
+            meta: None,
             name: name.to_string(),
             title: None,
             description: None,

@@ -20,6 +20,23 @@ fn sqlx_err(e: sqlx::Error) -> AgentsError {
     AgentsError::other(format!("SQL error: {e}"))
 }
 
+/// Replace every non-ASCII character of serialized JSON with `\uXXXX` escapes (UTF-16 surrogate
+/// pairs above the BMP), as Python's `json.dumps(ensure_ascii=True)` does.
+fn escape_non_ascii(json: &str) -> String {
+    let mut out = String::with_capacity(json.len());
+    for c in json.chars() {
+        if c.is_ascii() {
+            out.push(c);
+        } else {
+            let mut units = [0u16; 2];
+            for unit in c.encode_utf16(&mut units) {
+                out.push_str(&format!("\\u{unit:04x}"));
+            }
+        }
+    }
+    out
+}
+
 /// One row more than the window, so a snapshot can tell whether it reached the start of the
 /// history. Saturates rather than wrapping, since `usize::MAX` is a natural "everything".
 fn window_limit(limit: usize) -> i64 {
@@ -283,11 +300,19 @@ impl Schema {
 /// [`SqliteSession`](super::SqliteSession) resolve to the same `libsqlite3-sys`, so both link
 /// one copy of the C library and can be used in the same process. `SqliteSession` remains the
 /// lighter choice when SQLite is the only backend.
+///
+/// # Non-ASCII text
+///
+/// Items are stored with non-ASCII characters escaped (`\uXXXX`, surrogate pairs above the
+/// BMP), as the Python SDK does with `json.dumps(ensure_ascii=True)`, so rows written by either
+/// SDK read back identically. Call [`SqlxSession::with_ensure_ascii`] with `false` to store
+/// readable UTF-8 instead; both forms round-trip, and either SDK can read both.
 pub struct SqlxSession {
     session_id: String,
     pool: AnyPool,
     schema: Schema,
     settings: Option<SessionSettings>,
+    ensure_ascii: bool,
 }
 
 impl fmt::Debug for SqlxSession {
@@ -332,6 +357,7 @@ impl SqlxSession {
                 messages_table: DEFAULT_MESSAGES_TABLE.to_string(),
             },
             settings: None,
+            ensure_ascii: true,
         };
         if create_tables {
             session.create_tables().await?;
@@ -356,6 +382,23 @@ impl SqlxSession {
     pub fn with_settings(mut self, settings: SessionSettings) -> Self {
         self.settings = Some(settings);
         self
+    }
+
+    /// Choose whether non-ASCII characters are stored as `\uXXXX` escapes (the default, which
+    /// keeps the historical representation Python's `ensure_ascii=True` writes) or as readable
+    /// UTF-8 (`ensure_ascii=False`). Both round-trip identically.
+    pub fn with_ensure_ascii(mut self, ensure_ascii: bool) -> Self {
+        self.ensure_ascii = ensure_ascii;
+        self
+    }
+
+    fn serialize_item(&self, item: &InputItem) -> Result<String> {
+        let json = serde_json::to_string(item.as_value())?;
+        Ok(if self.ensure_ascii {
+            escape_non_ascii(&json)
+        } else {
+            json
+        })
     }
 
     /// The connection pool.
@@ -384,6 +427,69 @@ impl SqlxSession {
         raw.iter()
             .filter_map(|r| serde_json::from_str(r).ok().map(InputItem))
             .collect()
+    }
+}
+
+/// How many times a lost SQLite write-lock upgrade is retried before the error is returned.
+const LOCK_RETRIES: u32 = 100;
+
+fn is_lock_contention(error: &AgentsError) -> bool {
+    let message = error.to_string();
+    message.contains("database is locked") || message.contains("database table is locked")
+}
+
+impl SqlxSession {
+    /// Claim (select and delete) the newest row in one transaction, returning its raw JSON.
+    ///
+    /// SQLite cannot upgrade a read transaction while another connection holds the write lock;
+    /// it fails immediately instead of waiting, so a concurrent claim is retried rather than
+    /// surfacing `database is locked`. This is the equivalent of Python reserving the writer
+    /// before the tail claim on SQLite.
+    async fn claim_tail(&self) -> Result<Option<String>> {
+        let mut attempt = 0;
+        loop {
+            match self.claim_tail_once().await {
+                Err(e)
+                    if self.schema.dialect == SqlxDialect::Sqlite
+                        && is_lock_contention(&e)
+                        && attempt < LOCK_RETRIES =>
+                {
+                    attempt += 1;
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        5 * u64::from(attempt.min(10)),
+                    ))
+                    .await;
+                }
+                other => return other,
+            }
+        }
+    }
+
+    async fn claim_tail_once(&self) -> Result<Option<String>> {
+        let mut tx = self.pool.begin().await.map_err(sqlx_err)?;
+        let row = sqlx::query(AssertSqlSafe(self.schema.select_tail()))
+            .bind(self.session_id.clone())
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(sqlx_err)?;
+        let Some(row) = row else {
+            tx.commit().await.map_err(sqlx_err)?;
+            return Ok(None);
+        };
+        let id: i64 = row.try_get(0).map_err(sqlx_err)?;
+        let data: String = row.try_get(1).map_err(sqlx_err)?;
+        let deleted = sqlx::query(AssertSqlSafe(self.schema.delete_message()))
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .map_err(sqlx_err)?
+            .rows_affected();
+        tx.commit().await.map_err(sqlx_err)?;
+        if deleted == 0 {
+            // Another claimer removed the row first; look at the new tail.
+            return Box::pin(self.claim_tail_once()).await;
+        }
+        Ok(Some(data))
     }
 }
 
@@ -447,7 +553,7 @@ impl Session for SqlxSession {
         for item in &items {
             sqlx::query(AssertSqlSafe(self.schema.insert_message()))
                 .bind(self.session_id.clone())
-                .bind(serde_json::to_string(item.as_value())?)
+                .bind(self.serialize_item(item)?)
                 .execute(&mut *tx)
                 .await
                 .map_err(sqlx_err)?;
@@ -461,25 +567,15 @@ impl Session for SqlxSession {
     }
 
     async fn pop_item(&self) -> Result<Option<InputItem>> {
-        let mut tx = self.pool.begin().await.map_err(sqlx_err)?;
-        let row = sqlx::query(AssertSqlSafe(self.schema.select_tail()))
-            .bind(self.session_id.clone())
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(sqlx_err)?;
-        let Some(row) = row else {
-            tx.commit().await.map_err(sqlx_err)?;
-            return Ok(None);
-        };
-        let id: i64 = row.try_get(0).map_err(sqlx_err)?;
-        let data: String = row.try_get(1).map_err(sqlx_err)?;
-        sqlx::query(AssertSqlSafe(self.schema.delete_message()))
-            .bind(id)
-            .execute(&mut *tx)
-            .await
-            .map_err(sqlx_err)?;
-        tx.commit().await.map_err(sqlx_err)?;
-        Ok(serde_json::from_str(&data).ok().map(InputItem))
+        loop {
+            let Some(data) = self.claim_tail().await? else {
+                return Ok(None);
+            };
+            // A corrupted row is dropped and the next-newest one is claimed, as in Python.
+            if let Ok(value) = serde_json::from_str(&data) {
+                return Ok(Some(InputItem(value)));
+            }
+        }
     }
 
     /// Row ids make stable handles on both PostgreSQL and MySQL.
@@ -613,7 +709,7 @@ impl Session for SqlxSession {
         for item in &items {
             sqlx::query(AssertSqlSafe(self.schema.insert_message()))
                 .bind(self.session_id.clone())
-                .bind(serde_json::to_string(item.as_value())?)
+                .bind(self.serialize_item(item)?)
                 .execute(&mut *tx)
                 .await
                 .map_err(sqlx_err)?;

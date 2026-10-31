@@ -264,8 +264,9 @@ impl RedisSession {
     /// The TTL in milliseconds, or 0 when the session does not expire.
     fn ttl_millis(&self) -> Result<i64> {
         match self.ttl {
-            Some(ttl) => i64::try_from(ttl.saturating_mul(1000))
-                .map_err(|_| AgentsError::user("ttl is outside Redis's supported range")),
+            Some(ttl) => i64::try_from(ttl.saturating_mul(1000)).map_err(|_| {
+                AgentsError::user("ttl is outside Redis's supported expiration range")
+            }),
             None => Ok(0),
         }
     }

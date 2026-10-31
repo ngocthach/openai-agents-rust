@@ -160,6 +160,9 @@ impl OpenAIConversationsSession {
     async fn read_items(&self, limit: Option<usize>) -> Result<Vec<InputItem>> {
         let limit = resolve_session_limit(limit, self.settings.as_ref());
         if limit == Some(0) {
+            // A read still initializes the conversation, as Python's `get_items` does, but a
+            // zero limit is never forwarded to the Conversations API as a page size.
+            self.conversation_id().await?;
             return Ok(Vec::new());
         }
         let items = match limit {
@@ -181,6 +184,43 @@ impl Default for OpenAIConversationsSession {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Item types the Conversations create-item schema requires a server-assigned `id` for.
+const TYPES_WITH_REQUIRED_ID: &[&str] = &[
+    "file_search_call",
+    "web_search_call",
+    "computer_call",
+    "code_interpreter_call",
+    "image_generation_call",
+    "local_shell_call",
+    "local_shell_call_output",
+    "mcp_list_tools",
+    "mcp_approval_request",
+    "mcp_call",
+    "item_reference",
+    "program",
+    "program_output",
+];
+
+/// Remove provider-specific fields before an item is written to the Conversations API.
+///
+/// Port of `_sanitize_openai_conversation_item`: types whose schema requires an `id` (and
+/// reasoning items) keep it; every other item sheds the model's server-assigned id so replayed
+/// messages and tool calls do not carry stale provider identity. The SDK's own placeholder id
+/// is never a server identity and is always stripped.
+fn sanitize_for_conversation(item: &InputItem) -> Value {
+    let mut value = item.0.clone();
+    if let Value::Object(map) = &mut value {
+        map.remove("created_by");
+        let ty = map.get("type").and_then(Value::as_str).unwrap_or("");
+        let placeholder = map.get("id").and_then(Value::as_str) == Some("__fake_id__");
+        if placeholder || (ty != "reasoning" && !TYPES_WITH_REQUIRED_ID.contains(&ty)) {
+            map.remove("id");
+        }
+        map.remove("provider_data");
+    }
+    value
 }
 
 fn strip_server_fields(mut v: Value) -> Value {
@@ -227,7 +267,8 @@ impl Session for OpenAIConversationsSession {
         let _guard = self.mutation_lock.lock().await;
         let id = self.conversation_id().await?;
         for chunk in items.chunks(MAX_ITEMS_PER_REQUEST) {
-            let body = json!({"items": chunk.iter().map(|i| i.0.clone()).collect::<Vec<_>>()});
+            let body =
+                json!({"items": chunk.iter().map(sanitize_for_conversation).collect::<Vec<_>>()});
             self.client
                 .post_json(&format!("conversations/{id}/items"), &body, None, None)
                 .await?;
@@ -242,11 +283,17 @@ impl Session for OpenAIConversationsSession {
         let Some(item) = latest.into_iter().next() else {
             return Ok(None);
         };
-        if let Some(item_id) = item.get("id").and_then(Value::as_str) {
-            self.client
-                .delete(&format!("conversations/{id}/items/{item_id}"))
-                .await?;
-        }
+        // Python indexes `item["id"]` and raises `KeyError` without deleting, so an item the
+        // server returned without an id is left stored and reported instead of returned as if
+        // it had been removed.
+        let Some(item_id) = item.get("id").and_then(Value::as_str) else {
+            return Err(AgentsError::other(
+                "Conversation item has no id, so it cannot be removed",
+            ));
+        };
+        self.client
+            .delete(&format!("conversations/{id}/items/{item_id}"))
+            .await?;
         Ok(Some(InputItem(strip_server_fields(item))))
     }
 
