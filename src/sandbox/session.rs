@@ -9,6 +9,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 
 use crate::sandbox::archive::{self, CompressionScheme};
+use crate::sandbox::errors::SandboxOp;
 use crate::sandbox::errors::{ErrorCode, SandboxError, SandboxResult};
 use crate::sandbox::manifest::Manifest;
 use crate::sandbox::mounts::{Mount, MountTransition};
@@ -264,17 +265,27 @@ pub trait SandboxSession: Send + Sync + fmt::Debug {
             .exec(ExecRequest::argv(["cat", "--", path.as_str()]).with_user(Some(user.clone())))
             .await?;
         if !result.ok() {
-            return Err(SandboxError::new(
-                ErrorCode::WorkspaceReadNotFound,
-                format!(
-                    "`{}` could not read `{path}` as `{}`: {}",
-                    self.backend_id(),
-                    user.name,
-                    result.stderr_text().trim()
-                ),
-            ));
+            // A failed `cat` does not say why: the probe separates a missing file from one the
+            // user may not read, which the model reacts to very differently.
+            return Err(self.read_error_from_exec(&path, &result, Some(user)).await);
         }
         Ok(result.stdout)
+    }
+
+    /// Read a file as `user`, where the errors in `expected` are an ordinary answer.
+    ///
+    /// Mirrors Python's `_read_with_expected_span_errors`. The result is exactly that of
+    /// [`read_file_as`](Self::read_file_as); a session that records trace spans leaves the span
+    /// of an expected failure unmarked, so asking "is this file there yet?" does not paint the
+    /// trace with an error. The default ignores `expected`.
+    async fn read_file_expecting(
+        &self,
+        path: &str,
+        user: Option<&User>,
+        expected: &[ErrorCode],
+    ) -> SandboxResult<Vec<u8>> {
+        let _ = expected;
+        self.read_file_as(path, user).await
     }
 
     /// Write a file as `user`, so the file ends up owned by them.
@@ -398,6 +409,10 @@ pub trait SandboxSession: Send + Sync + fmt::Debug {
         if recursive {
             policy.validate_recursive_remove(path)?;
         }
+        if self.has_read_only_grant() {
+            self.validate_remote_path_access(path, true, recursive)
+                .await?;
+        }
         let path = policy.normalize_sandbox_path(path, true)?;
         let mut argv = vec!["rm".to_string()];
         if recursive {
@@ -413,7 +428,7 @@ pub trait SandboxSession: Send + Sync + fmt::Debug {
         Ok(())
     }
 
-    /// Move a path as `user`.
+    /// Move a path as `user`. See [`mv`](Self::mv) for what can be moved.
     async fn mv_as(
         &self,
         source: &str,
@@ -423,16 +438,87 @@ pub trait SandboxSession: Send + Sync + fmt::Debug {
         let Some(user) = user else {
             return self.mv(source, destination).await;
         };
-        let source = self.normalize_path_for_write(source)?;
-        let destination = self.normalize_path_for_write(destination)?;
-        let argv = vec!["mv".to_string(), "--".to_string(), source, destination];
-        let result = self
-            .exec(ExecRequest::argv(argv.clone()).with_user(Some(user.clone())))
-            .await?;
-        if !result.ok() {
-            return Err(SandboxError::exec_nonzero(&argv, &result));
+        mv_via_exec(self, source, destination, Some(user)).await
+    }
+
+    /// Whether two paths name the same file on the sandbox filesystem.
+    ///
+    /// Mirrors Python's `BaseSandboxSession.same_file`. The filesystem is asked, through
+    /// `test -ef`, which compares device and inode, because two spellings can be one file: a
+    /// filesystem that folds case stores `notes.txt` and `Notes.txt` as one entry, and APFS also
+    /// folds Unicode normalization. No string comparison answers that, and neither does the host
+    /// driving the session, which need not be the kind of system the sandbox runs on.
+    ///
+    /// With `follow_symlinks` false the answer is false whenever either leaf is a symlink, which
+    /// is the mode used before removing an `apply_patch` source.
+    async fn same_file(
+        &self,
+        left: &str,
+        right: &str,
+        follow_symlinks: bool,
+        user: Option<&User>,
+    ) -> SandboxResult<bool> {
+        let left = self.normalize_path(left)?;
+        let right = self.normalize_path(right)?;
+        let mut test = "[ \"$1\" -ef \"$2\" ]".to_string();
+        if !follow_symlinks {
+            test = format!("[ ! -L \"$1\" ] && [ ! -L \"$2\" ] && {test}");
         }
-        Ok(())
+        let argv = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            test,
+            "sh".to_string(),
+            left.clone(),
+            right.clone(),
+        ];
+        let result = self
+            .exec(
+                ExecRequest::argv(argv)
+                    .with_shell(ExecShell::None)
+                    .with_user(user.cloned()),
+            )
+            .await?;
+        match result.exit_code {
+            0 => Ok(true),
+            // `[` answers "different file" with 1 and reports its own failures with 2; a missing
+            // shell exits 127. Only 1 is an answer. A caller about to delete a file on the
+            // strength of this must not read "could not tell" as "different".
+            1 => Ok(false),
+            _ => {
+                let shown = vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    "<same_file_check>".to_string(),
+                    left,
+                    right,
+                ];
+                Err(SandboxError::exec_nonzero(&shown, &result))
+            }
+        }
+    }
+
+    /// Create a file, creating its parent directories.
+    ///
+    /// Mirrors Python's `_write_new_file` hook. A backend with a native no-clobber primitive
+    /// overrides this and fails with an error whose message contains `already exists`, which the
+    /// editor reports to the model as an occupied name. The default has no such primitive, so it
+    /// is a plain mkdir plus write and keeps the provider's write semantics: creating over an
+    /// existing name overwrites it, exactly as Python's base class does. A read probe would not
+    /// close the gap, only make it racy, so the default does not pretend to.
+    async fn write_new_file(
+        &self,
+        path: &str,
+        contents: &[u8],
+        user: Option<&User>,
+    ) -> SandboxResult<()> {
+        let target = self.normalize_path_for_write(path)?;
+        if let Some((parent, _)) = target.rsplit_once('/')
+            && !parent.is_empty()
+        {
+            self.mkdir_as(parent, true, user).await?;
+        }
+        self.write_file_as(&target, contents, user).await
     }
 
     /// Whether the session can run commands in a PTY (`exec_command` / `write_stdin`).
@@ -447,6 +533,17 @@ pub trait SandboxSession: Send + Sync + fmt::Debug {
     /// sandbox without a secret the caller believes it has. Materialization refuses instead, so
     /// the gap is visible at start-up rather than as a confusing failure inside the sandbox.
     fn resolves_environment(&self) -> bool {
+        false
+    }
+
+    /// Whether the operating-system state (accounts, packages) survived the pause this session is
+    /// resuming from.
+    ///
+    /// Mirrors Python's `should_provision_manifest_accounts_on_resume` being false: a backend that
+    /// resumes into the same container or VM it paused already has the manifest's accounts, so
+    /// restoring a snapshot must not run `useradd` for them again. The default `false` is the
+    /// safe one for a fresh sandbox, which has none of them.
+    fn system_state_preserved_on_start(&self) -> bool {
         false
     }
 
@@ -605,6 +702,12 @@ pub trait SandboxSession: Send + Sync + fmt::Debug {
         } else {
             policy.normalize_sandbox_path(path, true)?
         };
+        // With a read-only grant in play, an alias the lexical check cannot see could point a
+        // writable-looking path at protected data, so the sandbox resolves the real tree.
+        if self.has_read_only_grant() {
+            self.validate_remote_path_access(path, true, recursive)
+                .await?;
+        }
         let mut command = vec!["rm".to_string()];
         command.push(if recursive { "-rf" } else { "-f" }.to_string());
         command.push("--".to_string());
@@ -618,22 +721,15 @@ pub trait SandboxSession: Send + Sync + fmt::Debug {
     }
 
     /// Move or rename a workspace entry.
+    ///
+    /// Mirrors Python's `BaseSandboxSession.mv`: only a regular file or a symlink can be moved,
+    /// and an existing destination entry is replaced. `mv -T` makes a destination directory an
+    /// error instead of a place to put the source, which matters because `move_to` comes from
+    /// the model: a plain `mv` would report success for a move that never happened. A pre-check
+    /// for the directory would not do, since one created between the check and the move would
+    /// still receive the source.
     async fn mv(&self, source: &str, destination: &str) -> SandboxResult<()> {
-        // A move writes at both ends: it unlinks the source and creates the destination.
-        let from = self.normalize_path_for_write(source)?;
-        let to = self.normalize_path_for_write(destination)?;
-        let command = vec![
-            "mv".to_string(),
-            "-f".to_string(),
-            "--".to_string(),
-            from,
-            to,
-        ];
-        let result = self.exec(ExecRequest::argv(command.clone())).await?;
-        if !result.ok() {
-            return Err(SandboxError::exec_nonzero(&command, &result));
-        }
-        Ok(())
+        mv_via_exec(self, source, destination, None).await
     }
 
     /// Capture the workspace as a gzipped tar archive.
@@ -853,6 +949,105 @@ pub trait SandboxSession: Send + Sync + fmt::Debug {
         Ok(helper.install_path.clone())
     }
 
+    /// Validate a path against the sandbox's own filesystem before an operation touches it.
+    ///
+    /// Mirrors Python's `_validate_remote_path_access`. The lexical check cannot see a symlink
+    /// that leads out of an allowed root, or one that makes a read-only grant reachable from a
+    /// writable path, so the installed resolver walks the real tree inside the sandbox. A
+    /// recursive removal passes `recursive_remove` so the resolver also refuses a tree that
+    /// contains a read-only grant. The returned path is the normalized request, not the
+    /// realpath: a leaf symlink keeps its own semantics, so removing a link removes the link.
+    async fn validate_remote_path_access(
+        &self,
+        path: &str,
+        for_write: bool,
+        recursive_remove: bool,
+    ) -> SandboxResult<String> {
+        use crate::sandbox::runtime_helpers::RESOLVE_WORKSPACE_PATH_HELPER as HELPER;
+
+        let policy = self.workspace_path_policy()?;
+        let lexical = policy.normalize_sandbox_path(path, for_write)?;
+        let mode = if recursive_remove {
+            "2"
+        } else if for_write {
+            "1"
+        } else {
+            "0"
+        };
+        let helper_path = self.ensure_runtime_helper_installed(&HELPER).await?;
+        let mut argv = vec![
+            helper_path,
+            policy.sandbox_root().to_string(),
+            lexical.clone(),
+            mode.to_string(),
+        ];
+        for (grant_path, read_only) in policy.extra_path_grant_rules()? {
+            argv.push(grant_path);
+            argv.push(if read_only { "1" } else { "0" }.to_string());
+        }
+        let result = self
+            .exec(ExecRequest::argv(argv.clone()).with_shell(ExecShell::None))
+            .await?;
+        let stderr = result.stderr_text();
+        match result.exit_code {
+            0 if !result.stdout_text().trim().is_empty() => Ok(lexical),
+            0 => Err(SandboxError::new(
+                ErrorCode::ExecTransportError,
+                "the path resolution helper returned nothing",
+            )
+            .with_context("reason", "empty_stdout")),
+            111 => Err(SandboxError::new(
+                ErrorCode::InvalidManifestPath,
+                format!("manifest path must not escape root: {path}"),
+            )
+            .with_context("rel", path.to_string())
+            .with_context(
+                "reason",
+                if path.starts_with('/') {
+                    "absolute"
+                } else {
+                    "escape_root"
+                },
+            )
+            .with_context("resolved_path", stderr.trim().to_string())),
+            113 => Err(SandboxError::new(
+                ErrorCode::SandboxConfigInvalid,
+                stderr.trim().to_string(),
+            )),
+            114 => {
+                let field = |label: &str| {
+                    stderr
+                        .lines()
+                        .find_map(|line| line.strip_prefix(label))
+                        .map(|value| value.trim().to_string())
+                };
+                let mut error = SandboxError::new(
+                    ErrorCode::WorkspaceArchiveWriteError,
+                    format!("failed to write archive for path: {lexical}"),
+                )
+                .with_context("path", lexical.clone())
+                .with_context("reason", "read_only_extra_path_grant");
+                if let Some(grant) = field("read-only extra path grant: ") {
+                    error = error.with_context("grant_path", grant);
+                }
+                if let Some(resolved) = field("resolved path: ") {
+                    error = error.with_context("resolved_path", resolved);
+                }
+                Err(error)
+            }
+            _ => Err(SandboxError::exec_nonzero(&argv, &result)),
+        }
+    }
+
+    /// Whether any extra path grant is read-only, which is what makes a recursive removal need
+    /// the in-sandbox resolver.
+    fn has_read_only_grant(&self) -> bool {
+        self.workspace_path_policy()
+            .and_then(|policy| policy.extra_path_grant_rules())
+            .map(|rules| rules.iter().any(|(_, read_only)| *read_only))
+            .unwrap_or(false)
+    }
+
     /// The workspace fingerprint the snapshot this session resumes was taken from.
     ///
     /// A session that returns `Some` lets [`restore_session_snapshot`] skip the archive when the
@@ -956,6 +1151,148 @@ pub trait SandboxSession: Send + Sync + fmt::Debug {
         Ok(result.exit_code == 0)
     }
 
+    /// Where this session keeps the paths registered with
+    /// [`register_persist_workspace_skip_path`](Self::register_persist_workspace_skip_path).
+    ///
+    /// A backend that wants registrations to take effect returns a set it owns; the default
+    /// `None` accepts a registration and forgets it, which is what a backend whose archive is
+    /// not built from this workspace (a provider-native snapshot) has to do anyway.
+    fn persist_skip_registry(
+        &self,
+    ) -> Option<&std::sync::Mutex<std::collections::BTreeSet<String>>> {
+        None
+    }
+
+    /// The workspace-relative paths a workspace archive leaves out, beyond the manifest's own
+    /// ephemeral entries.
+    fn persist_workspace_skip_paths(&self) -> Vec<String> {
+        self.persist_skip_registry()
+            .map(|registry| {
+                registry
+                    .lock()
+                    .expect("persist skip registry poisoned")
+                    .iter()
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Keep a runtime-written path (an event outbox, say) out of workspace archives.
+    ///
+    /// Mirrors Python's `register_persist_workspace_skip_path`. The path is workspace-relative,
+    /// and a path that overlaps a mount is refused: skipping a mount's ancestor would drop the
+    /// mount's own persistence rules, and skipping something inside one is a no-op that hides a
+    /// misunderstanding. Returns the normalized relative path.
+    fn register_persist_workspace_skip_path(&self, path: &str) -> SandboxResult<String> {
+        let relative = self.workspace_path_policy()?.relative_path(path)?;
+        let root = self.workspace_root().trim_end_matches('/').to_string();
+        for (_, mount_path) in self.manifest().mount_targets() {
+            let mount_relative = mount_path
+                .strip_prefix(&root)
+                .unwrap_or(&mount_path)
+                .trim_start_matches('/')
+                .to_string();
+            let overlaps = relative == mount_relative
+                || mount_relative.starts_with(&format!("{relative}/"))
+                || relative.starts_with(&format!("{mount_relative}/"));
+            if overlaps {
+                return Err(SandboxError::new(
+                    ErrorCode::MountConfigInvalid,
+                    "persist workspace skip path must not overlap mount path",
+                )
+                .with_context("path", relative)
+                .with_context("mount_path", mount_path));
+            }
+        }
+        if let Some(registry) = self.persist_skip_registry() {
+            registry
+                .lock()
+                .expect("persist skip registry poisoned")
+                .insert(relative.clone());
+        }
+        Ok(relative)
+    }
+
+    /// Check that `path` is readable by `user`, and say why not.
+    ///
+    /// Mirrors Python's `_check_read_with_exec`. Returns the normalized path when it is
+    /// readable. A failed check is ambiguous (a missing file and an unreadable one both fail), so
+    /// the existence probe decides between [`ErrorCode::WorkspaceReadNotFound`] and
+    /// [`ErrorCode::WorkspaceArchiveReadError`]. A check that exits with anything but 1 is the
+    /// shell itself failing, which no probe can explain, so it is reported without one.
+    async fn check_read_access(&self, path: &str, user: Option<&User>) -> SandboxResult<String> {
+        let resolved = self.normalize_path(path)?;
+        let argv = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "[ -r \"$1\" ]".to_string(),
+            "sh".to_string(),
+            resolved.clone(),
+        ];
+        let result = self
+            .exec(
+                ExecRequest::argv(argv)
+                    .with_shell(ExecShell::None)
+                    .with_user(user.cloned()),
+            )
+            .await?;
+        if result.ok() {
+            return Ok(resolved);
+        }
+        Err(self.read_error_from_exec(&resolved, &result, user).await)
+    }
+
+    /// Classify a failed read of `path`. Mirrors Python's `_raise_read_error_from_exec`.
+    ///
+    /// The error context records the sizes of what the command printed but never the partial
+    /// stdout itself: it can be file content the caller was not allowed to see in a log.
+    async fn read_error_from_exec(
+        &self,
+        path: &str,
+        result: &ExecResult,
+        user: Option<&User>,
+    ) -> SandboxError {
+        let stderr = safe_decode(&result.stderr, 4096);
+        let archive_error = |message: String| {
+            SandboxError::new(ErrorCode::WorkspaceArchiveReadError, message)
+                .with_op(SandboxOp::Read)
+                .with_context("path", path.to_string())
+                .with_context("stdout_bytes", result.stdout.len().to_string())
+                .with_context("stderr", stderr.clone())
+        };
+        if result.exit_code != 1 {
+            return archive_error(format!("failed to read archive: {path}"));
+        }
+        let probe = self
+            .exec(
+                ExecRequest::argv(["sh", "-c", READ_PATH_PROBE_SCRIPT, "sh", path])
+                    .with_shell(ExecShell::None)
+                    .with_timeout(Some(ACCESS_PROBE_TIMEOUT))
+                    .with_user(user.cloned()),
+            )
+            .await;
+        let probe = match probe {
+            Ok(probe) => probe,
+            Err(error) => {
+                return archive_error(format!("failed to read archive: {path}")).caused_by(&error);
+            }
+        };
+        if probe.exit_code == 1 {
+            return SandboxError::new(
+                ErrorCode::WorkspaceReadNotFound,
+                format!("workspace path not found: {path}"),
+            )
+            .with_op(SandboxOp::Read)
+            .with_context("path", path.to_string())
+            .with_context("stdout_bytes", result.stdout.len().to_string())
+            .with_context("stderr", stderr)
+            .with_context("existence_probe_exit_code", probe.exit_code.to_string());
+        }
+        archive_error(format!("failed to read archive: {path}"))
+            .with_context("existence_probe_exit_code", probe.exit_code.to_string())
+    }
+
     /// Check that a file write at `path` can succeed, and say why not.
     ///
     /// Mirrors Python's `_check_write_with_exec`. Unlike Python this runs after a failed write
@@ -1047,6 +1384,19 @@ pub trait SandboxSession: Send + Sync + fmt::Debug {
         .with_context("check", label.to_string())
         .with_context("path", args.first().copied().unwrap_or("").to_string()))
     }
+}
+
+/// Decode `bytes` for a log field, cutting it at `max_chars` and marking the cut with `…`.
+///
+/// Mirrors Python's `_safe_decode`. Invalid UTF-8 is replaced rather than failing, because the
+/// bytes are diagnostics from a process the SDK does not control.
+pub fn safe_decode(bytes: &[u8], max_chars: usize) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    if text.chars().count() <= max_chars {
+        return text.into_owned();
+    }
+    let cut: String = text.chars().take(max_chars).collect();
+    format!("{cut}…")
 }
 
 /// The directory an absolute sandbox path lives in.
@@ -1149,7 +1499,13 @@ pub async fn compute_and_cache_snapshot_fingerprint(
         snapshot_fingerprint_cache_path(session.id()),
         crate::sandbox::state::manifest_digest(manifest),
     ];
-    command.extend(workspace_fingerprint_skip_relpaths(manifest, &root));
+    let mut skipped = workspace_fingerprint_skip_relpaths(manifest, &root);
+    // The runtime-registered skip paths are left out of the fingerprint as they are left out of
+    // the archive, or a registered outbox would make every workspace look modified.
+    skipped.extend(session.persist_workspace_skip_paths());
+    skipped.sort();
+    skipped.dedup();
+    command.extend(skipped);
     let result = session.exec(ExecRequest::argv(command.clone())).await?;
     if !result.ok() {
         return Err(SandboxError::exec_nonzero(&command, &result));
@@ -1224,10 +1580,15 @@ pub async fn live_workspace_matches_snapshot_on_resume(session: &dyn SandboxSess
 pub async fn clear_workspace_root_on_resume(session: &dyn SandboxSession) -> SandboxResult<()> {
     let root = session.workspace_root().to_string();
     let skip = workspace_resume_mount_skip_relpaths(session.manifest(), &root);
-    if skip
+    // A mount at the workspace root makes the whole workspace the mount. The relative-path list
+    // drops the empty relpath, so the root mount is detected from the resolved targets.
+    let trimmed_root = root.trim_end_matches('/');
+    let root_is_mounted = session
+        .manifest()
+        .ephemeral_mount_targets()
         .iter()
-        .any(|relative| relative == "." || relative.is_empty())
-    {
+        .any(|(_, path)| path.trim_end_matches('/') == trimmed_root);
+    if root_is_mounted || skip.iter().any(|relative| relative == ".") {
         return Ok(());
     }
     clear_workspace_dir_on_resume_pruned(session, &root, &root, &skip).await
@@ -1337,8 +1698,19 @@ where
     for exclude in workspace_archive_excludes(session.manifest(), &root) {
         command.push_str(&format!(" --exclude {}", shell_quote(&exclude)));
     }
+    for skipped in session.persist_workspace_skip_paths() {
+        command.push_str(&format!(
+            " --exclude {}",
+            shell_quote(&format!("./{skipped}"))
+        ));
+    }
     command.push_str(" .");
-    let result = session.exec(ExecRequest::shell(command.clone())).await?;
+    // A plain `sh -c`, never a login shell: the workspace is where the model writes files, and a
+    // login shell reads startup files (`.profile`, ...) from the user's home, which can be that
+    // workspace. The SDK's own archive command must not run what the model put there.
+    let result = session
+        .exec(ExecRequest::argv(["sh", "-c", command.as_str()]).with_shell(ExecShell::None))
+        .await?;
     if !result.ok() {
         return Err(SandboxError::new(
             ErrorCode::SnapshotPersistError,
@@ -1351,12 +1723,139 @@ where
     Ok(result.stdout)
 }
 
+/// Run `operation` with the given mounts detached, then re-attach them.
+///
+/// Mirrors Python's `with_ephemeral_mounts_removed`. The rules it exists to keep:
+///
+/// - Mounts are detached in order and re-attached in reverse, so nested mounts unwind the way
+///   they were stacked.
+/// - A failed detach stops the sequence and skips `operation`, but the mounts that did detach are
+///   put back before the error is returned. A detach that failed part-way leaves the session in
+///   an unknown state, so it is shut down once the others are restored.
+/// - A failed `operation` still re-attaches. If re-attaching fails too, the restore error wins,
+///   because a workspace with a missing mount is the worse outcome; the operation's own message
+///   is kept on it under `operation_error_context_key`, and the session is shut down.
+/// - `restore_on_success` false leaves the mounts detached after a successful `operation`, for a
+///   caller that is about to tear the session down anyway.
+///
+/// `error_code` is the error class for transition failures (an archive read or write, or a start
+/// failure). Cancellation needs no special handling here: dropping the future stops it, and the
+/// caller's own guard decides what to restore.
+pub async fn with_ephemeral_mounts_removed<T, F, Fut>(
+    session: &dyn SandboxSession,
+    mounts: Vec<(&Mount, String)>,
+    operation: F,
+    error_path: &str,
+    error_code: ErrorCode,
+    operation_error_context_key: Option<&str>,
+    restore_on_success: bool,
+) -> SandboxResult<T>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = SandboxResult<T>>,
+{
+    let transition_error = |cause: &SandboxError| {
+        SandboxError::new(
+            error_code,
+            format!("failed to detach or restore mounts for {error_path}"),
+        )
+        .with_context("path", error_path.to_string())
+        .caused_by(cause)
+        .with_context("cause", cause.message.clone())
+    };
+
+    let mut detached: Vec<(&Mount, &str)> = Vec::new();
+    let mut detach_error: Option<SandboxError> = None;
+    for (mount, path) in &mounts {
+        match mount
+            .strategy
+            .teardown_for_snapshot(mount, session, path)
+            .await
+        {
+            Ok(()) => detached.push((mount, path.as_str())),
+            Err(error) => {
+                detach_error = Some(transition_error(&error));
+                break;
+            }
+        }
+    }
+
+    let mut operation_result: Option<SandboxResult<T>> = None;
+    if detach_error.is_none() {
+        operation_result = Some(operation().await);
+    }
+
+    let operation_ok = matches!(operation_result, Some(Ok(_)));
+    let should_restore = (operation_ok && restore_on_success)
+        || detach_error.is_some()
+        || matches!(operation_result, Some(Err(_)));
+    let mut restore_error: Option<SandboxError> = None;
+    if should_restore {
+        let mut additional: Vec<String> = Vec::new();
+        for (mount, path) in detached.iter().rev() {
+            if let Err(error) = mount
+                .strategy
+                .restore_after_snapshot(mount, session, path)
+                .await
+            {
+                let current = transition_error(&error);
+                match &restore_error {
+                    None => restore_error = Some(current),
+                    Some(_) => additional.push(current.message),
+                }
+            }
+        }
+        if let Some(error) = restore_error.as_mut()
+            && !additional.is_empty()
+        {
+            error
+                .context
+                .insert("additional_remount_errors".into(), additional.join("; "));
+        }
+        // A restore that failed leaves the workspace in an unknown state.
+        if let Some(error) = restore_error.as_mut()
+            && session.shutdown().await.is_err()
+        {
+            error
+                .context
+                .insert("terminal_cleanup_failed".into(), "true".into());
+        }
+    }
+    if detach_error.is_some()
+        && restore_error.is_none()
+        && let Err(_) = session.shutdown().await
+        && let Some(error) = detach_error.as_mut()
+    {
+        error
+            .context
+            .insert("terminal_cleanup_failed".into(), "true".into());
+    }
+
+    if let Some(mut error) = restore_error {
+        if let (Some(Err(operation_error)), Some(key)) =
+            (&operation_result, operation_error_context_key)
+        {
+            error
+                .context
+                .insert(key.to_string(), operation_error.message.clone());
+        }
+        return Err(error);
+    }
+    if let Some(error) = detach_error {
+        return Err(error);
+    }
+    operation_result.expect("the operation ran when no detach failed")
+}
+
 /// Capture a session's workspace into its snapshot.
 ///
 /// Mounts whose strategy cannot be snapshotted in place are detached first and re-attached
 /// afterwards, mirroring Python's `teardown_for_snapshot` / `restore_after_snapshot` pair.
 /// Sessions without a configured snapshot are a no-op.
 pub async fn persist_session_snapshot(session: &dyn SandboxSession) -> SandboxResult<()> {
+    // Before any snapshot work, as Python's `stop()` does: refusing an unsafe mount after some
+    // mounts were already detached would leave the workspace half-way between two states.
+    session.manifest().validate_mount_credential_boundaries()?;
     let snapshot = session.snapshot();
     if snapshot.snapshot_type() == "noop" {
         return Ok(());
@@ -1383,19 +1882,17 @@ pub async fn persist_session_snapshot(session: &dyn SandboxSession) -> SandboxRe
         Some(transition) if !detached.is_empty() => Some(transition.begin()?),
         _ => None,
     };
-    for (mount, path) in &detached {
-        mount
-            .strategy
-            .teardown_for_snapshot(mount, session, path)
-            .await?;
-    }
-    let archive = session.persist_workspace().await;
-    for (mount, path) in &detached {
-        mount
-            .strategy
-            .restore_after_snapshot(mount, session, path)
-            .await?;
-    }
+    let root = session.workspace_root().to_string();
+    let archive = with_ephemeral_mounts_removed(
+        session,
+        detached,
+        || session.persist_workspace(),
+        &root,
+        ErrorCode::WorkspaceArchiveReadError,
+        Some("snapshot_error_before_remount_corruption"),
+        true,
+    )
+    .await;
     let dependencies = session.dependencies().map(Arc::as_ref);
     match snapshot.persist_with(&archive?, dependencies).await {
         Ok(()) => Ok(()),
@@ -1436,8 +1933,56 @@ pub async fn restore_session_snapshot(session: &dyn SandboxSession) -> SandboxRe
     // back. The live mounts are the exception: under them is remote storage, not workspace.
     clear_workspace_root_on_resume(session).await?;
     session.hydrate_workspace(&archive).await?;
+    // A fresh sandbox has none of the manifest's accounts, and the archive restores files, not
+    // users, so they are provisioned before the ephemeral entries that may be owned by them.
+    if !session.system_state_preserved_on_start() {
+        manifest.provision_accounts(session).await?;
+    }
     manifest.apply_ephemeral(session).await?;
     Ok(true)
+}
+
+/// Move `source` to `destination` through `exec`, the fallback every backend gets.
+async fn mv_via_exec<S: SandboxSession + ?Sized>(
+    session: &S,
+    source: &str,
+    destination: &str,
+    user: Option<&User>,
+) -> SandboxResult<()> {
+    // A move writes at both ends: it unlinks the source and creates the destination.
+    let source = session.normalize_path_for_write(source)?;
+    let destination = session.normalize_path_for_write(destination)?;
+    let script = "if [ ! -L \"$1\" ] && [ ! -f \"$1\" ]; then \
+         printf \"%s\\n\" \"Move source must be a regular file or symlink\" >&2; exit 1; fi; \
+         exec mv -fT -- \"$1\" \"$2\"";
+    let argv = vec![
+        "sh".to_string(),
+        "-c".to_string(),
+        script.to_string(),
+        "sh".to_string(),
+        source.clone(),
+        destination.clone(),
+    ];
+    let result = session
+        .exec(
+            ExecRequest::argv(argv)
+                .with_shell(ExecShell::None)
+                .with_user(user.cloned()),
+        )
+        .await?;
+    if !result.ok() {
+        // Report a placeholder for the script, the way Python does, so the message names the
+        // operation rather than a screenful of shell.
+        let shown = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "<mv>".to_string(),
+            source,
+            destination,
+        ];
+        return Err(SandboxError::exec_nonzero(&shown, &result));
+    }
+    Ok(())
 }
 
 /// Creates and releases [`SandboxSession`]s for one backend.
@@ -1448,6 +1993,30 @@ pub trait SandboxClient: Send + Sync + fmt::Debug {
 
     /// Create a fresh session that will materialize `manifest` when it starts.
     async fn create(&self, manifest: Option<Manifest>) -> SandboxResult<Arc<dyn SandboxSession>>;
+
+    /// The snapshot this client was built with, when its owner chose one.
+    ///
+    /// Python has no client-level snapshot: `create(snapshot=...)` is the only source, and the
+    /// runner fills it with the SDK default when the run config names none. A Rust client can be
+    /// configured with one up front, so the runner asks here before falling back to that default;
+    /// an explicit run-config snapshot still wins over both, as the `create` argument does.
+    fn configured_snapshot(&self) -> Option<crate::sandbox::snapshot::SnapshotSpec> {
+        None
+    }
+
+    /// Create a session whose workspace snapshots are stored at `snapshot`.
+    ///
+    /// Mirrors Python's `client.create(snapshot=...)`. The runner resolves the SDK default local
+    /// snapshot and passes it here. A backend that stores snapshots itself overrides this; the
+    /// default ignores the spec and calls [`create`](Self::create).
+    async fn create_with_snapshot(
+        &self,
+        manifest: Option<Manifest>,
+        snapshot: crate::sandbox::snapshot::SnapshotSpec,
+    ) -> SandboxResult<Arc<dyn SandboxSession>> {
+        let _ = snapshot;
+        self.create(manifest).await
+    }
 
     /// Release the backend resources behind a session created by this client.
     async fn delete(&self, session: Arc<dyn SandboxSession>) -> SandboxResult<()>;

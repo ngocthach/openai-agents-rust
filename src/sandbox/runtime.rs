@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
+use crate::Agent;
 use crate::error::{AgentsError, Result};
 use crate::items::RunInput;
 use crate::result::{RunResult, RunResultStreaming};
@@ -21,6 +22,7 @@ use crate::sandbox::memory::rollouts::{
 use crate::sandbox::session::{
     ExecRequest, SandboxClient, SandboxSession, persist_session_snapshot,
 };
+use crate::sandbox::snapshot::{SnapshotSpec, resolve_default_local_snapshot_spec};
 use crate::sandbox::state::SandboxSessionState;
 use crate::sandbox::types::SandboxArchiveLimits;
 use crate::sandbox::workspace_paths::SandboxWorkspaceScope;
@@ -67,6 +69,11 @@ pub struct SandboxRunConfig {
     /// with no SDK archive resource limits; [`SandboxArchiveLimits::new`] enables the SDK
     /// defaults.
     pub archive_limits: Option<SandboxArchiveLimits>,
+    /// Where workspace snapshots are stored.
+    ///
+    /// Mirrors Python's `SandboxRunConfig.snapshot`. `None` uses the SDK default local snapshot
+    /// directory, as Python does.
+    pub snapshot: Option<SnapshotSpec>,
 }
 
 /// How a [`SandboxAgent`] handoff graph is bound to sandbox sessions.
@@ -138,10 +145,128 @@ impl SandboxRunConfig {
         self
     }
 
+    /// Store workspace snapshots at `snapshot` instead of the SDK default local directory.
+    pub fn snapshot(mut self, snapshot: SnapshotSpec) -> Self {
+        self.snapshot = Some(snapshot);
+        self
+    }
+
     /// Apply resource limits to every archive the session extracts.
     pub fn archive_limits(mut self, limits: SandboxArchiveLimits) -> Self {
         self.archive_limits = Some(limits);
         self
+    }
+}
+
+/// Run `fut` inside a custom span named `name`, when the current trace exports spans.
+///
+/// Mirrors the `custom_span(...) if _supports_trace_spans() else nullcontext()` pattern in
+/// Python's sandbox runtime: without an active, enabled trace the work runs untraced.
+pub async fn sandbox_span<F: std::future::Future>(
+    name: &'static str,
+    data: serde_json::Value,
+    fut: F,
+) -> F::Output {
+    let exports = crate::tracing::current_trace()
+        .and_then(|trace| trace.export())
+        .is_some();
+    // The preparation and teardown futures are large; boxing keeps them off the caller's stack.
+    let fut = Box::pin(fut);
+    if exports {
+        crate::tracing::custom_span(name, data).run(fut).await
+    } else {
+        fut.await
+    }
+}
+
+/// Run a fallible sandbox operation inside a custom span named `name`, recording a failure on the
+/// span the way Python's `_apply_trace_finish_data` does.
+///
+/// On `Err` the span data gains `error.type`, `error_type`, `error_code` and (when known)
+/// `error_retryable`, and the span carries an error whose message is the error type and whose data
+/// names the operation and error code. A success leaves the span untouched.
+pub async fn sandbox_span_result<T, F>(
+    name: &'static str,
+    data: serde_json::Value,
+    fut: F,
+) -> crate::sandbox::SandboxResult<T>
+where
+    F: std::future::Future<Output = crate::sandbox::SandboxResult<T>>,
+{
+    sandbox_span_result_expecting(name, data, &[], fut).await
+}
+
+/// Like [`sandbox_span_result`], but an error whose code is in `expected` leaves the span clean.
+///
+/// Mirrors `_read_with_expected_span_errors`: a probe whose "not found" is an ordinary answer
+/// (is this skill already loaded?) must not paint the trace with an error. The error still
+/// reaches the caller, and the session's audit events still record the failure.
+pub async fn sandbox_span_result_expecting<T, F>(
+    name: &'static str,
+    data: serde_json::Value,
+    expected: &[crate::sandbox::ErrorCode],
+    fut: F,
+) -> crate::sandbox::SandboxResult<T>
+where
+    F: std::future::Future<Output = crate::sandbox::SandboxResult<T>>,
+{
+    let exports = crate::tracing::current_trace()
+        .and_then(|trace| trace.export())
+        .is_some();
+    let fut = Box::pin(fut);
+    if !exports {
+        return fut.await;
+    }
+    let span = crate::tracing::custom_span(name, data);
+    span.start();
+    let out = crate::tracing::scope::with_span(span.clone(), fut).await;
+    if let Err(error) = &out
+        && !expected.contains(&error.code)
+    {
+        record_span_error(&span, name, error);
+    }
+    span.finish();
+    out
+}
+
+fn record_span_error(
+    span: &crate::tracing::Span,
+    name: &str,
+    error: &crate::sandbox::SandboxError,
+) {
+    let operation = name.strip_prefix("sandbox.").unwrap_or(name).to_string();
+    let code = error.code.as_str();
+    span.update_data(|data| {
+        if let crate::tracing::SpanData::Custom { data, .. } = data
+            && let Some(object) = data.as_object_mut()
+        {
+            object.insert("error.type".into(), "SandboxError".into());
+            object.insert("error_type".into(), "SandboxError".into());
+            object.insert("error_code".into(), code.into());
+            if let Some(retryable) = error.retryable {
+                object.insert("error_retryable".into(), retryable.into());
+            }
+        }
+    });
+    let mut details = serde_json::json!({"operation": operation, "error_code": code});
+    if let Some(retryable) = error.retryable {
+        details["error_retryable"] = retryable.into();
+    }
+    span.set_error("SandboxError", Some(details));
+}
+
+/// Run `fut` with tracing masked when `disabled`, so the `sandbox.*` spans inside it are not
+/// recorded. Mirrors the disabled `TraceCtxManager` Python enters for cleanup when the run has
+/// `tracing_disabled` set.
+async fn masked<F: std::future::Future>(disabled: bool, fut: F) -> F::Output {
+    if disabled {
+        crate::tracing::trace("Sandbox cleanup")
+            .disabled(true)
+            .build()
+            .run(fut)
+            .await
+    } else {
+        fut.await
     }
 }
 
@@ -154,6 +279,8 @@ impl SandboxRunConfig {
 pub struct SandboxSessionGuard {
     session: Arc<dyn SandboxSession>,
     client: Option<Arc<dyn SandboxClient>>,
+    /// Whether the run that owns the guard has tracing disabled, so teardown records no spans.
+    tracing_disabled: bool,
 }
 
 impl SandboxSessionGuard {
@@ -169,13 +296,40 @@ impl SandboxSessionGuard {
 
     /// Tear down the session when the guard owns it.
     ///
-    /// PTY sessions are terminated first, so no interactive process outlives the workspace.
+    /// PTY sessions are terminated first, so no interactive process outlives the workspace. A
+    /// session with a snapshot configured is captured before it is released, as Python's
+    /// `stop()` does, so what the run produced outlives the workspace. The session is released
+    /// even when the capture fails, and the failure is reported afterwards.
     pub async fn close(self) -> Result<()> {
-        let _ = self.session.pty_terminate_all().await;
-        match self.client {
-            None => Ok(()),
-            Some(client) => Ok(client.delete(self.session).await?),
+        let owned = self.client.is_some();
+        let tracing_disabled = self.tracing_disabled;
+        let teardown = async move {
+            let _ = self.session.pty_terminate_all().await;
+            match self.client {
+                None => Ok(()),
+                Some(client) => {
+                    let persisted = persist_session_snapshot(self.session.as_ref()).await;
+                    client.delete(self.session).await?;
+                    Ok(persisted?)
+                }
+            }
+        };
+        if !owned {
+            return teardown.await;
         }
+        masked(
+            tracing_disabled,
+            sandbox_span(
+                "sandbox.cleanup",
+                serde_json::json!({}),
+                sandbox_span(
+                    "sandbox.cleanup_sessions",
+                    serde_json::json!({"session_count": 1}),
+                    teardown,
+                ),
+            ),
+        )
+        .await
     }
 
     /// Keep the session alive for a later run and return the state needed to reattach to it.
@@ -291,6 +445,18 @@ impl SandboxRunner {
         agent: &SandboxAgent<C>,
         config: &SandboxRunConfig,
     ) -> Result<PreparedSandboxRun<C>> {
+        sandbox_span(
+            "sandbox.prepare_agent",
+            serde_json::json!({"agent_name": agent.name()}),
+            Self::prepare_untraced(agent, config),
+        )
+        .await
+    }
+
+    async fn prepare_untraced<C: Send + Sync + 'static>(
+        agent: &SandboxAgent<C>,
+        config: &SandboxRunConfig,
+    ) -> Result<PreparedSandboxRun<C>> {
         let scope = SandboxWorkspaceScope::from_cwd(config.cwd.as_deref())?;
         if let Some(limits) = &config.concurrency_limits {
             limits.validate()?;
@@ -311,18 +477,50 @@ impl SandboxRunner {
                 // workspace root, the accounts and the mounts, and the capabilities only add
                 // entries to them. Mirrors Python's `_process_live_session_manifest`.
                 let processed = agent.resolved_manifest(Some(session.manifest().clone()));
+                // An unsafe manifest is refused before the session is so much as probed or
+                // started, so nothing of it ever runs.
+                validate_mount_credential_boundaries(&processed)?;
+                // A caller may hand over a session it created but never started. Starting it is
+                // the run's job; a session that is already running is left alone, so a caller
+                // that is driving the same workspace across several runs never has its
+                // workspace re-applied underneath it. Mirrors Python's `ensure_session`.
+                if !session.running().await? {
+                    session.start().await?;
+                }
                 apply_live_session_manifest(session.as_ref(), &processed).await?;
                 session.set_archive_limits(config.archive_limits);
                 (session.clone(), None)
             }
             (None, Some(client)) => {
                 let manifest = Self::effective_manifest(agent, config)?;
+                let span_data = serde_json::json!({
+                    "agent_name": agent.name(),
+                    "backend_id": client.backend_id(),
+                });
                 let session = match &config.session_state {
-                    None => client.create(Some(manifest)).await?,
-                    Some(state) => client.resume(state, manifest).await?,
+                    None => {
+                        let snapshot = Self::snapshot_spec(config, client.as_ref()).await?;
+                        sandbox_span_result(
+                            "sandbox.create_session",
+                            span_data,
+                            client.create_with_snapshot(Some(manifest), snapshot),
+                        )
+                        .await?
+                    }
+                    Some(state) => {
+                        sandbox_span_result(
+                            "sandbox.resume_session",
+                            span_data,
+                            client.resume(state, manifest),
+                        )
+                        .await?
+                    }
                 };
                 session.set_archive_limits(config.archive_limits);
-                if let Err(error) = session.start().await {
+                if let Err(error) =
+                    sandbox_span_result("sandbox.start", serde_json::json!({}), session.start())
+                        .await
+                {
                     // Release the backend resources the failed start may already hold.
                     let _ = client.delete(session.clone()).await;
                     return Err(error.into());
@@ -339,6 +537,7 @@ impl SandboxRunner {
         let guard = SandboxSessionGuard {
             session: session.clone(),
             client,
+            tracing_disabled: false,
         };
         if let Err(error) = validate_workspace_scope(session.as_ref(), &scope, agent).await {
             let _ = guard.close().await;
@@ -426,6 +625,23 @@ impl SandboxRunner {
         }
     }
 
+    /// The snapshot spec a fresh session is created with: the run config's, else one the client
+    /// was configured with, else the SDK default local snapshot directory. Mirrors
+    /// `_resolve_snapshot_spec`, which has no client-level step because a Python client takes its
+    /// snapshot only as a `create` argument.
+    async fn snapshot_spec(
+        config: &SandboxRunConfig,
+        client: &dyn SandboxClient,
+    ) -> Result<SnapshotSpec> {
+        if let Some(spec) = &config.snapshot {
+            return Ok(spec.clone());
+        }
+        if let Some(spec) = client.configured_snapshot() {
+            return Ok(spec);
+        }
+        Ok(resolve_default_local_snapshot_spec().await?)
+    }
+
     /// The manifest a session is created with, with the run config's concurrency limits applied.
     fn effective_manifest<C: Send + Sync + 'static>(
         agent: &SandboxAgent<C>,
@@ -467,7 +683,10 @@ impl SandboxRunner {
         // Each agent brings its own manifest and its own `run_as` user; only the explicit
         // `SandboxRunConfig::manifest` override is shared, as it is in Python.
         let manifest = Self::effective_manifest(node.as_ref(), config)?;
-        let session = client.create(Some(manifest)).await?;
+        let snapshot = Self::snapshot_spec(config, client.as_ref()).await?;
+        let session = client
+            .create_with_snapshot(Some(manifest), snapshot)
+            .await?;
         session.set_archive_limits(config.archive_limits);
         if let Err(error) = session.start().await {
             let _ = client.delete(session.clone()).await;
@@ -476,6 +695,7 @@ impl SandboxRunner {
         Ok(SandboxSessionGuard {
             session,
             client: Some(client.clone()),
+            tracing_disabled: false,
         })
     }
 
@@ -516,21 +736,42 @@ impl SandboxRunner {
         config: &SandboxRunConfig,
         options: RunOptions<C>,
     ) -> Result<SandboxRunOutcome<C>> {
-        let prepared = Self::prepare(agent, config).await?;
+        let tracing_disabled = options.run_config.tracing_disabled;
+        let rollout_override = Self::grouping_rollout_id(config, &options);
         let model_provider = options.run_config.model_provider.clone();
-        let options = install_per_turn_preparation(options, &prepared.graph);
-        let starting_agent = prepared.graph.starting_agent().clone();
+        let input = input.into();
+        let resuming = matches!(input, RunInput::State(_));
+        let (options, starting_agent, deferred) = begin_preparation(
+            options,
+            agent,
+            config,
+            tracing_disabled,
+            rollout_override,
+            resuming,
+        )
+        .await?;
         let result = Runner::run_with_options(starting_agent, input, options).await;
+        // A run that never prepared (a guardrail rejected the input, or preparation failed) has
+        // no session to release and no result to carry.
+        let rest = deferred.rest.lock().expect("poisoned").take();
+        let guard = deferred.guard.lock().expect("poisoned").take();
+        let (Some(prepared), Some(guard)) = (rest, guard) else {
+            return match result {
+                Err(error) => Err(error),
+                Ok(_) => Err(AgentsError::user(
+                    "the sandbox was never prepared for this run",
+                )),
+            };
+        };
 
         // Record the run as a memory rollout segment, whether it finished or paused.
-        let memory = prepared.memory_manager.clone();
+        let memory = match &result {
+            Ok(result) => active_memory_manager(&prepared, agent.name(), &result.last_agent.name),
+            Err(_) => prepared.memory_manager.clone(),
+        };
         if let (Some(manager), Ok(result)) = (&memory, &result)
             && let Err(error) = manager
-                .enqueue_result(
-                    prepared.guard.session().as_ref(),
-                    &prepared.rollout_id,
-                    result,
-                )
+                .enqueue_result(guard.session().as_ref(), &prepared.rollout_id, result)
                 .await
         {
             log::warn!(target: crate::logger::LOG_TARGET, "Failed to record the sandbox memory rollout: {error}");
@@ -541,14 +782,11 @@ impl SandboxRunner {
         // a caller-owned session is flushed by the caller.
         let mut flushed = false;
         if !suspend
-            && prepared.guard.owns_session()
+            && guard.owns_session()
             && let Some(manager) = &memory
         {
             flushed = true;
-            if let Err(error) = manager
-                .flush(prepared.guard.session().clone(), model_provider)
-                .await
-            {
+            if let Err(error) = manager.flush(guard.session().clone(), model_provider).await {
                 log::warn!(target: crate::logger::LOG_TARGET, "Failed to generate sandbox memory: {error}");
             }
         }
@@ -557,7 +795,7 @@ impl SandboxRunner {
         let sandbox_states_by_agent =
             release_agent_guards(prepared.agent_guards, suspend, &rollout_id).await;
         let sandbox_state = if suspend {
-            match prepared.guard.suspend().await {
+            match guard.suspend().await {
                 // Carry the rollout id across the suspend so the resumed half appends to the
                 // same rollout instead of starting a new one.
                 Ok(state) => Some(state.with_rollout_id(Some(rollout_id))),
@@ -567,7 +805,7 @@ impl SandboxRunner {
                 }
             }
         } else {
-            if let Err(error) = prepared.guard.close().await {
+            if let Err(error) = guard.close().await {
                 log::warn!(target: crate::logger::LOG_TARGET, "Failed to tear down the sandbox session: {error}");
             }
             None
@@ -579,6 +817,28 @@ impl SandboxRunner {
             // The manager is handed back only when this run did not flush it.
             memory_manager: if flushed { None } else { memory },
         })
+    }
+
+    /// The rollout id a run belongs to: an explicit one, the one a resumed state carries, else
+    /// the run grouping (conversation, SDK session, trace group, or a generated per-run value).
+    /// Mirrors Python's `_sandbox_memory_rollout_id`.
+    fn grouping_rollout_id<C>(
+        config: &SandboxRunConfig,
+        options: &RunOptions<C>,
+    ) -> Option<String> {
+        if config.rollout_id.is_some()
+            || config
+                .session_state
+                .as_ref()
+                .is_some_and(|state| state.rollout_id.is_some())
+        {
+            return None;
+        }
+        Some(crate::resolve_run_grouping_id(
+            options.conversation_id.as_deref(),
+            options.session.as_ref(),
+            options.run_config.group_id.as_deref(),
+        ))
     }
 
     /// Run a sandbox agent in streaming mode with a default app context.
@@ -600,32 +860,50 @@ impl SandboxRunner {
         config: &SandboxRunConfig,
         options: RunOptions<C>,
     ) -> Result<SandboxStreamedRun<C>> {
-        let prepared = Self::prepare(agent, config).await?;
+        let tracing_disabled = options.run_config.tracing_disabled;
+        let rollout_override = Self::grouping_rollout_id(config, &options);
         let model_provider = options.run_config.model_provider.clone();
-        let options = install_per_turn_preparation(options, &prepared.graph);
-        let starting_agent = prepared.graph.starting_agent().clone();
+        let input = input.into();
+        let resuming = matches!(input, RunInput::State(_));
+        let (options, starting_agent, mut deferred) = begin_preparation(
+            options,
+            agent,
+            config,
+            tracing_disabled,
+            rollout_override,
+            resuming,
+        )
+        .await?;
         let mut streaming = Runner::run_streamed_with_options(starting_agent, input, options);
 
         let sandbox_state = Arc::new(Mutex::new(None));
-        let PreparedSandboxRun {
-            guard,
-            agent_guards,
-            memory_manager,
-            rollout_id,
-            ..
-        } = prepared;
-        let agent_guards = Arc::new(Mutex::new(agent_guards));
+        let starting_name = agent.name().to_string();
+        let guard = deferred.guard.clone();
         let hook_state = sandbox_state.clone();
-        let guard = Arc::new(Mutex::new(Some(guard)));
         let hook_guard = guard.clone();
+        let prepared_slot = deferred.rest.clone();
         streaming.set_on_complete(Arc::new(move |completion| {
             let hook_state = hook_state.clone();
             let hook_guard = hook_guard.clone();
-            let hook_agent_guards = agent_guards.clone();
-            let memory_manager = memory_manager.clone();
+            let prepared_slot = prepared_slot.clone();
             let model_provider = model_provider.clone();
-            let rollout_id = rollout_id.clone();
+            let starting_name = starting_name.clone();
             Box::pin(async move {
+                // A run stopped before preparation (a rejected input) holds no session.
+                let Some(prepared) = prepared_slot.lock().expect("poisoned").take() else {
+                    return;
+                };
+                let memory_manager = active_memory_manager(
+                    &prepared,
+                    &starting_name,
+                    &completion.last_agent_name,
+                );
+                let PreparedRest {
+                    agent_guards,
+                    rollout_id,
+                    ..
+                } = prepared;
+                // The caller may have taken the guard over; then the lifecycle is theirs.
                 let Some(guard) = hook_guard.lock().expect("poisoned").take() else {
                     return;
                 };
@@ -658,8 +936,7 @@ impl SandboxRunner {
                         log::warn!(target: crate::logger::LOG_TARGET, "Failed to record the sandbox memory rollout: {error}");
                     }
                 }
-                let extra = std::mem::take(&mut *hook_agent_guards.lock().expect("poisoned"));
-                release_agent_guards(extra, completion.is_suspended(), &rollout_id).await;
+                release_agent_guards(agent_guards, completion.is_suspended(), &rollout_id).await;
                 let state = finish_sandbox_run(
                     guard,
                     completion.is_suspended(),
@@ -671,6 +948,11 @@ impl SandboxRunner {
                 *hook_state.lock().expect("poisoned") = state;
             })
         }));
+
+        // The stream runs on its own task. Wait until it has prepared the sandbox (or ended
+        // without doing so), so the session is held by the time the caller has the handle. A
+        // run whose input guardrail trips drops the hook unused, which also releases this wait.
+        let _ = std::mem::replace(&mut deferred.ready, tokio::sync::oneshot::channel().1).await;
 
         Ok(SandboxStreamedRun {
             streaming,
@@ -852,18 +1134,39 @@ fn entry_signature_map(manifest: &Manifest) -> std::collections::BTreeMap<String
 }
 
 fn manifest_topology_matches(current: &Manifest, processed: &Manifest) -> bool {
-    current.root() == processed.root()
+    host_path_grant_topology(current) == host_path_grant_topology(processed)
+        && current.root() == processed.root()
         && current.environment() == processed.environment()
         && current.users() == processed.users()
         && current.groups() == processed.groups()
 }
 
-/// The host-backed grants, as the tuple Python compares.
+/// Refuse a manifest holding a mount whose credential authority was never acknowledged.
+///
+/// Mirrors Python's `validate_manifest_mount_credential_boundaries`.
+fn validate_mount_credential_boundaries(manifest: &Manifest) -> Result<()> {
+    for (mount, path) in manifest.mount_targets() {
+        manifest.authorize_mount_activation(mount, &path)?;
+    }
+    Ok(())
+}
+
+/// The grants that describe host-backed targets, as the tuple Python compares.
+///
+/// A target is host-backed when any grant for it names a host path. Every grant for such a target
+/// is kept, path-only ones included: a path-only grant added next to a host-backed one for the
+/// same target changes what the target means.
 fn host_path_grant_topology(manifest: &Manifest) -> Vec<(String, bool, Option<String>)> {
-    manifest
+    let host_backed: std::collections::BTreeSet<&str> = manifest
         .extra_path_grants()
         .iter()
         .filter(|grant| grant.host_path.is_some())
+        .map(|grant| grant.path.as_str())
+        .collect();
+    manifest
+        .extra_path_grants()
+        .iter()
+        .filter(|grant| host_backed.contains(grant.path.as_str()))
         .map(|grant| (grant.path.clone(), grant.read_only, grant.host_path.clone()))
         .collect()
 }
@@ -996,6 +1299,185 @@ fn entry_contains_mount(entry: &Entry) -> bool {
     }
 }
 
+/// Where a deferred preparation leaves what it built.
+struct DeferredPreparation<C> {
+    /// Everything but the session guard, which has its own slot so a streamed run's caller can
+    /// take it over.
+    rest: Arc<Mutex<Option<PreparedRest<C>>>>,
+    guard: Arc<Mutex<Option<SandboxSessionGuard>>>,
+    /// Resolves once preparation has finished, failed, or the run ended without reaching it.
+    ready: tokio::sync::oneshot::Receiver<()>,
+}
+
+/// Sends the readiness signal when dropped.
+struct ReadySignal(Arc<Mutex<Option<tokio::sync::oneshot::Sender<()>>>>);
+
+impl Drop for ReadySignal {
+    fn drop(&mut self) {
+        if let Some(sender) = self.0.lock().expect("poisoned").take() {
+            let _ = sender.send(());
+        }
+    }
+}
+
+/// A prepared run without its session guard.
+struct PreparedRest<C> {
+    graph: PreparedSandboxGraph<C>,
+    agent_guards: Vec<(String, SandboxSessionGuard)>,
+    memory_manager: Option<Arc<SandboxMemoryGenerationManager>>,
+    rollout_id: String,
+}
+
+/// Prepare the sandbox into `slots`, returning the agent the run should start from.
+async fn prepare_into<C: Send + Sync + 'static>(
+    agent: &SandboxAgent<C>,
+    config: &SandboxRunConfig,
+    tracing_disabled: bool,
+    rollout_override: Option<String>,
+    graph_cell: &std::sync::OnceLock<PreparedSandboxGraph<C>>,
+    rest_slot: &Mutex<Option<PreparedRest<C>>>,
+    guard_slot: &Mutex<Option<SandboxSessionGuard>>,
+) -> Result<Arc<Agent<C>>> {
+    let mut prepared = masked(tracing_disabled, SandboxRunner::prepare(agent, config)).await?;
+    prepared.guard.tracing_disabled = tracing_disabled;
+    for (_, extra) in prepared.agent_guards.iter_mut() {
+        extra.tracing_disabled = tracing_disabled;
+    }
+    if let Some(id) = rollout_override {
+        prepared.rollout_id = id;
+    }
+    let starting = prepared.graph.starting_agent().clone();
+    let _ = graph_cell.set(prepared.graph.clone());
+    let PreparedSandboxRun {
+        graph,
+        guard,
+        agent_guards,
+        memory_manager,
+        rollout_id,
+    } = prepared;
+    *guard_slot.lock().expect("poisoned") = Some(guard);
+    *rest_slot.lock().expect("poisoned") = Some(PreparedRest {
+        graph,
+        agent_guards,
+        memory_manager,
+        rollout_id,
+    });
+    Ok(starting)
+}
+
+/// Prepare the sandbox after the first turn's blocking input guardrails have passed.
+///
+/// Python creates the session after those guardrails, so rejected input never costs a
+/// session. The run starts from the agent's plain form; the hook swaps in the prepared graph's
+/// starting agent, and the prepared run waits in the returned slots for teardown.
+///
+/// A resumed run is prepared up front instead: its saved state names the agent it stopped at,
+/// and that agent can only be found in the prepared handoff graph. Its guardrails already ran
+/// before the pause.
+async fn begin_preparation<C: Send + Sync + 'static>(
+    options: RunOptions<C>,
+    agent: &SandboxAgent<C>,
+    config: &SandboxRunConfig,
+    tracing_disabled: bool,
+    rollout_override: Option<String>,
+    resuming: bool,
+) -> Result<(RunOptions<C>, Arc<Agent<C>>, DeferredPreparation<C>)> {
+    let slot: Arc<Mutex<Option<PreparedRest<C>>>> = Arc::new(Mutex::new(None));
+    let guard_slot: Arc<Mutex<Option<SandboxSessionGuard>>> = Arc::new(Mutex::new(None));
+    let graph = Arc::new(std::sync::OnceLock::new());
+    let options = install_per_turn_preparation(options, graph.clone());
+    let (ready_tx, ready) = tokio::sync::oneshot::channel();
+    let ready_tx = Arc::new(Mutex::new(Some(ready_tx)));
+    let deferred = DeferredPreparation {
+        rest: slot.clone(),
+        guard: guard_slot.clone(),
+        ready,
+    };
+    if resuming {
+        let _signal = ReadySignal(ready_tx);
+        // Boxed so the rarely used eager path does not widen this function's own future.
+        let starting = Box::pin(prepare_into(
+            agent,
+            config,
+            tracing_disabled,
+            rollout_override,
+            &graph,
+            &slot,
+            &guard_slot,
+        ))
+        .await?;
+        return Ok((options, starting, deferred));
+    }
+    let (hook_agent, hook_config) = (agent.clone(), config.clone());
+    let options = options.prepare_agent(move |_| {
+        let ready_tx = ready_tx.clone();
+        let (slot, guard_slot, agent, config, graph, rollout) = (
+            slot.clone(),
+            guard_slot.clone(),
+            hook_agent.clone(),
+            hook_config.clone(),
+            graph.clone(),
+            rollout_override.clone(),
+        );
+        async move {
+            // However preparation ends, whoever waits on it is released.
+            let _signal = ReadySignal(ready_tx);
+            // Preparation runs on its own task: it polls from the middle of the run's poll
+            // chain, where stack headroom is smallest, and a task starts on a fresh stack. The
+            // trace scope travels with it so its spans still nest under the run.
+            let scope = crate::tracing::scope::ScopeSnapshot::capture();
+            let task = tokio::spawn(scope.enter(Box::pin(async move {
+                prepare_into(
+                    &agent,
+                    &config,
+                    tracing_disabled,
+                    rollout,
+                    &graph,
+                    &slot,
+                    &guard_slot,
+                )
+                .await
+            })));
+            match task.await {
+                Ok(result) => result,
+                Err(error) => Err(AgentsError::user(format!(
+                    "sandbox preparation did not finish: {error}"
+                ))),
+            }
+        }
+    });
+    Ok((options, Arc::new(agent.agent.clone()), deferred))
+}
+
+/// The memory manager that follows the agent active when the run ended.
+///
+/// The session's manager follows the agent that is active when the run ends, as Python's
+/// `_set_active_memory_capability` does on every preparation: a handoff target without
+/// generation stops recording, and one that adds it starts.
+fn active_memory_manager<C: Send + Sync + 'static>(
+    prepared: &PreparedRest<C>,
+    starting_name: &str,
+    last_agent_name: &str,
+) -> Option<Arc<SandboxMemoryGenerationManager>> {
+    if last_agent_name == starting_name {
+        return prepared.memory_manager.clone();
+    }
+    match prepared
+        .graph
+        .agents_by_name()
+        .get(last_agent_name)
+        .map(|active| active.memory_capability().map(|m| m.build_manager()))
+    {
+        Some(Some(Ok(manager))) => manager,
+        Some(Some(Err(error))) => {
+            log::warn!(target: crate::logger::LOG_TARGET, "Failed to build the active agent's sandbox memory manager: {error}");
+            None
+        }
+        Some(None) => None,
+        None => prepared.memory_manager.clone(),
+    }
+}
+
 /// Install the capability `process_context` chain as a per-turn model input filter.
 ///
 /// Python re-prepares a sandbox agent on every turn, which re-applies `process_context` to the
@@ -1004,9 +1486,8 @@ fn entry_contains_mount(entry: &Entry) -> bool {
 /// filter the caller already configured still runs first.
 fn install_per_turn_preparation<C: Send + Sync + 'static>(
     mut options: RunOptions<C>,
-    graph: &PreparedSandboxGraph<C>,
+    graph: Arc<std::sync::OnceLock<PreparedSandboxGraph<C>>>,
 ) -> RunOptions<C> {
-    let graph = graph.clone();
     let existing = options.run_config.call_model_input_filter.take();
     options.run_config.call_model_input_filter = Some(Arc::new(move |data| {
         let graph = graph.clone();
@@ -1024,8 +1505,14 @@ fn install_per_turn_preparation<C: Send + Sync + 'static>(
                     .await?
                 }
             };
+            // The graph exists once the sandbox has been prepared, which happens before the
+            // first model call.
+            let input = match graph.get() {
+                Some(graph) => graph.process_context(&agent_name, model_data.input),
+                None => model_data.input,
+            };
             Ok(ModelInputData {
-                input: graph.process_context(&agent_name, model_data.input),
+                input,
                 instructions: model_data.instructions,
             })
         })

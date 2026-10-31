@@ -139,6 +139,40 @@ pub trait ConfiguredMount: Send + Sync + fmt::Debug {
         Ok(())
     }
 
+    /// Check the credential fields an in-container mount writes into the sandbox.
+    ///
+    /// A half-supplied or blank credential is a misconfiguration there, because it would be
+    /// written into a configuration file as an empty value. An external provider (a Docker
+    /// volume driver) receives the same fields through the container runtime, which sorts out
+    /// its own configuration, so Python leaves them alone and so does this check.
+    fn validate_in_container_credentials(&self) -> SandboxResult<()> {
+        Ok(())
+    }
+
+    /// The credential fields that name a file inside the workspace, as `(field, path)`.
+    ///
+    /// Mirrors Python's `_AUTHORITY_FILE_FIELDS_BY_MOUNT_TYPE`. A file the manifest itself
+    /// materializes would be readable by the model, so it is not a credential source.
+    fn credential_file_fields(&self) -> Vec<(&'static str, String)> {
+        Vec::new()
+    }
+
+    /// Whether any field of this mount holds a credential or an authority identifier.
+    ///
+    /// Mirrors Python's `_AUTHORITY_FIELDS_BY_MOUNT_TYPE`, independent of how the mount is
+    /// attached.
+    fn carries_credentials(&self) -> bool {
+        false
+    }
+
+    /// The non-secret fields that say *which* storage this mount reaches.
+    ///
+    /// Folded into the manifest digest so a resume cannot swap one bucket, account or file
+    /// system for another. It never includes a credential, an endpoint or a file path.
+    fn topology_identity(&self) -> String {
+        String::new()
+    }
+
     /// What authority the credentials of this mount grant inside the sandbox.
     ///
     /// `pattern_type` is the tool attaching it, because the same storage exposes different
@@ -415,6 +449,43 @@ impl ConfiguredMountStrategy {
         Mount::new(Arc::new(self))
     }
 
+    /// The credential fields of this mount that name a workspace file, as `(field, path)`,
+    /// including an rclone `config_file_path` the pattern reads.
+    pub fn credential_file_paths(&self) -> Vec<(String, String)> {
+        let mut paths: Vec<(String, String)> = self
+            .spec
+            .credential_file_fields()
+            .into_iter()
+            .map(|(field, path)| (field.to_string(), path))
+            .collect();
+        if let ConfiguredMountBackend::InContainer(pattern) = &self.backend
+            && let Some(config_file) = pattern
+                .as_rclone()
+                .and_then(|rclone| rclone.config_file_path.as_deref())
+        {
+            paths.push((
+                "mount_strategy.pattern.config_file_path".to_string(),
+                config_file.to_string(),
+            ));
+        }
+        paths
+    }
+
+    /// What this strategy attaches and how, without any credential: the mount type, the
+    /// storage it names, and the pattern or driver that attaches it.
+    pub fn topology_identity(&self) -> String {
+        let how = match &self.backend {
+            ConfiguredMountBackend::InContainer(pattern) => pattern.pattern_type().to_string(),
+            ConfiguredMountBackend::DockerVolume { driver, .. } => driver.clone(),
+        };
+        format!(
+            "{}|{}|{}",
+            self.spec.mount_type(),
+            self.spec.topology_identity(),
+            how
+        )
+    }
+
     /// The in-container pattern, when this strategy uses one.
     pub fn pattern(&self) -> Option<&BuiltinMountPattern> {
         match &self.backend {
@@ -457,6 +528,7 @@ impl MountStrategy for ConfiguredMountStrategy {
         self.spec.validate()?;
         match &self.backend {
             ConfiguredMountBackend::InContainer(pattern) => {
+                self.spec.validate_in_container_credentials()?;
                 let pattern_type = pattern.pattern_type();
                 if !self
                     .spec
@@ -496,6 +568,18 @@ impl MountStrategy for ConfiguredMountStrategy {
             // inside the sandbox.
             ConfiguredMountBackend::DockerVolume { .. } => MountCredentialAuthority::None,
         }
+    }
+
+    fn carries_credentials(&self, _mount: &Mount) -> bool {
+        // Driver options are opaque third-party configuration: Python treats the whole field as
+        // live authority and removes it from durable state as a unit.
+        let opaque_options = matches!(
+            &self.backend,
+            ConfiguredMountBackend::DockerVolume { driver_options, .. } if !driver_options.is_empty()
+        );
+        self.credential_authority() != MountCredentialAuthority::None
+            || self.spec.carries_credentials()
+            || opaque_options
     }
 
     fn supports_native_snapshot_detach(&self) -> bool {
@@ -553,11 +637,9 @@ impl MountStrategy for ConfiguredMountStrategy {
         let ConfiguredMountBackend::InContainer(pattern) = &self.backend else {
             return Err(SandboxError::new(
                 ErrorCode::MountConfigInvalid,
-                format!(
-                    "docker-volume mounts are not supported by the `{}` sandbox backend",
-                    session.backend_id()
-                ),
-            ));
+                "docker-volume mounts are not supported by this sandbox backend",
+            )
+            .with_context("backend", session.backend_id()));
         };
         // Every route into a mount runs through here: manifest apply, the ephemeral re-apply a
         // resumed session does, and the re-attach after a snapshot. The manifest has to
@@ -758,12 +840,42 @@ impl ConfiguredMount for S3Mount {
                 "an s3 mount requires a bucket name",
             ));
         }
+        Ok(())
+    }
+
+    fn carries_credentials(&self) -> bool {
+        any_set(&[
+            self.access_key_id.as_deref(),
+            self.secret_access_key.as_deref(),
+            self.session_token.as_deref(),
+        ]) || any_inline_authority(&[self.endpoint_url.as_deref()])
+    }
+
+    fn topology_identity(&self) -> String {
+        format!(
+            "{}/{}/{}",
+            self.bucket,
+            self.prefix.as_deref().unwrap_or_default(),
+            self.region.as_deref().unwrap_or_default()
+        )
+    }
+
+    fn validate_in_container_credentials(&self) -> SandboxResult<()> {
         require_credential_pair(
             self.mount_type(),
             ("access_key_id", self.access_key_id.as_deref()),
             ("secret_access_key", self.secret_access_key.as_deref()),
         )?;
         reject_blank("session_token", self.session_token.as_deref())?;
+        // A session token only scopes an access key pair, so on its own it is a half-supplied
+        // credential set rather than a credential-free mount.
+        if self.session_token.is_some() && self.access_key_id.is_none() {
+            return Err(SandboxError::new(
+                ErrorCode::MountConfigInvalid,
+                "`s3_mount` credentials must include `access_key_id` and `secret_access_key` \
+                 when a `session_token` is set",
+            ));
+        }
         Ok(())
     }
 
@@ -1121,6 +1233,36 @@ impl ConfiguredMount for GcsMount {
                 "a gcs mount requires a bucket name",
             ));
         }
+        Ok(())
+    }
+
+    fn credential_file_fields(&self) -> Vec<(&'static str, String)> {
+        self.service_account_file
+            .iter()
+            .filter(|path| !path.is_empty())
+            .map(|path| ("service_account_file", path.clone()))
+            .collect()
+    }
+
+    fn carries_credentials(&self) -> bool {
+        any_set(&[
+            self.access_id.as_deref(),
+            self.secret_access_key.as_deref(),
+            self.service_account_file.as_deref(),
+            self.service_account_credentials.as_deref(),
+            self.access_token.as_deref(),
+        ]) || any_inline_authority(&[self.endpoint_url.as_deref()])
+    }
+
+    fn topology_identity(&self) -> String {
+        format!(
+            "{}/{}",
+            self.bucket,
+            self.prefix.as_deref().unwrap_or_default()
+        )
+    }
+
+    fn validate_in_container_credentials(&self) -> SandboxResult<()> {
         require_credential_pair(
             self.mount_type(),
             ("access_id", self.access_id.as_deref()),
@@ -1236,19 +1378,20 @@ impl ConfiguredMount for GcsMount {
             driver_option(&mut options, "path", &self.remote_path())?;
             for (key, value) in [
                 ("gcs-service-account-file", &self.service_account_file),
-                (
-                    "gcs-service-account-credentials",
-                    &self
-                        .service_account_credentials
-                        .as_deref()
-                        .map(|value| compact_json_credential("service_account_credentials", value))
-                        .transpose()?,
-                ),
                 ("gcs-access-token", &self.access_token),
             ] {
                 if let Some(value) = value {
                     driver_option(&mut options, key, value)?;
                 }
+            }
+            // The container runtime receives driver options over its API rather than through a
+            // configuration file, so a multi-line service-account key cannot add a configuration
+            // line and is passed through verbatim, as Python does.
+            if let Some(credentials) = &self.service_account_credentials {
+                options.insert(
+                    "gcs-service-account-credentials".to_string(),
+                    credentials.clone(),
+                );
             }
             return Ok(options);
         }
@@ -1382,6 +1525,21 @@ impl ConfiguredMount for R2Mount {
                 "an r2 mount requires a bucket name and an account id",
             ));
         }
+        Ok(())
+    }
+
+    fn carries_credentials(&self) -> bool {
+        any_set(&[
+            self.access_key_id.as_deref(),
+            self.secret_access_key.as_deref(),
+        ]) || any_inline_authority(&[self.custom_domain.as_deref()])
+    }
+
+    fn topology_identity(&self) -> String {
+        format!("{}/{}", self.account_id, self.bucket)
+    }
+
+    fn validate_in_container_credentials(&self) -> SandboxResult<()> {
         require_credential_pair(
             self.mount_type(),
             ("access_key_id", self.access_key_id.as_deref()),
@@ -1410,6 +1568,9 @@ impl ConfiguredMount for R2Mount {
         include_credentials: bool,
     ) -> SandboxResult<MountPatternConfig> {
         self.validate()?;
+        // Python's R2 checks the pair on every build, not only when the strategy validates, so a
+        // half-supplied credential is refused here whichever route reached the mount.
+        self.validate_in_container_credentials()?;
         let BuiltinMountPattern::Rclone(rclone) = pattern else {
             return Err(invalid_pattern(self.mount_type(), pattern.pattern_type()));
         };
@@ -1551,6 +1712,21 @@ impl ConfiguredMount for AzureBlobMount {
                 "an azure blob mount requires an account and a container",
             ));
         }
+        Ok(())
+    }
+
+    fn carries_credentials(&self) -> bool {
+        any_set(&[
+            self.identity_client_id.as_deref(),
+            self.account_key.as_deref(),
+        ]) || any_inline_authority(&[self.endpoint.as_deref()])
+    }
+
+    fn topology_identity(&self) -> String {
+        format!("{}/{}", self.account, self.container)
+    }
+
+    fn validate_in_container_credentials(&self) -> SandboxResult<()> {
         reject_blank("account_key", self.account_key.as_deref())?;
         reject_blank("identity_client_id", self.identity_client_id.as_deref())?;
         Ok(())
@@ -1832,7 +2008,29 @@ impl ConfiguredMount for BoxMount {
         MOUNT_TYPE_BOX
     }
 
-    fn validate(&self) -> SandboxResult<()> {
+    fn credential_file_fields(&self) -> Vec<(&'static str, String)> {
+        self.box_config_file
+            .iter()
+            .filter(|path| !path.is_empty())
+            .map(|path| ("box_config_file", path.clone()))
+            .collect()
+    }
+
+    fn carries_credentials(&self) -> bool {
+        any_set(&[
+            self.client_secret.as_deref(),
+            self.access_token.as_deref(),
+            self.token.as_deref(),
+            self.box_config_file.as_deref(),
+            self.config_credentials.as_deref(),
+        ])
+    }
+
+    fn topology_identity(&self) -> String {
+        self.path.clone().unwrap_or_default()
+    }
+
+    fn validate_in_container_credentials(&self) -> SandboxResult<()> {
         for (field, value) in [
             ("client_id", self.client_id.as_deref()),
             ("client_secret", self.client_secret.as_deref()),
@@ -1897,6 +2095,7 @@ impl ConfiguredMount for BoxMount {
             return Err(invalid_pattern(self.mount_type(), pattern.pattern_type()));
         };
         self.validate()?;
+        self.validate_in_container_credentials()?;
         let (config, remote_name) = rclone_config(
             self.mount_type(),
             rclone,
@@ -2036,6 +2235,14 @@ impl ConfiguredMount for S3FilesMount {
         Ok(())
     }
 
+    fn topology_identity(&self) -> String {
+        format!(
+            "{}/{}",
+            self.file_system_id,
+            self.subpath.as_deref().unwrap_or_default()
+        )
+    }
+
     fn credential_authority(
         &self,
         _pattern_type: &str,
@@ -2059,6 +2266,7 @@ impl ConfiguredMount for S3FilesMount {
             return Err(invalid_pattern(self.mount_type(), pattern.pattern_type()));
         };
         self.validate()?;
+        self.validate_in_container_credentials()?;
         let mut merged = s3files.options.extra_options.clone();
         for (key, value) in &self.extra_options {
             match merged.iter_mut().find(|(existing, _)| existing == key) {

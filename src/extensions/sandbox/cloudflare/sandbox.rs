@@ -511,13 +511,17 @@ impl CloudflareSandboxSession {
         let status = response.status();
         if !status.is_success() {
             let body = response.bytes().await.unwrap_or_default();
-            return Err(SandboxError::new(
-                ErrorCode::ExecTransportError,
-                http_error_message("POST /exec", status.as_u16(), format_response_body(&body)),
+            return Err(with_status_retryability(
+                SandboxError::new(
+                    ErrorCode::ExecTransportError,
+                    http_error_message("POST /exec", status.as_u16(), format_response_body(&body)),
+                ),
+                status.as_u16(),
             ));
         }
 
         let mut stdout: Vec<u8> = Vec::new();
+        let mut raw_stream: Vec<u8> = Vec::new();
         let mut stderr: Vec<u8> = Vec::new();
         let mut lines = SseLineDecoder::new();
         let mut events = SseDecoder::new();
@@ -526,6 +530,7 @@ impl CloudflareSandboxSession {
         while let Some(chunk) = body.next().await {
             let chunk = chunk.map_err(|error| exec_error(argv, &error))?;
             saw_bytes |= !chunk.is_empty();
+            raw_stream.extend_from_slice(&chunk);
             for line in lines.decode(&chunk) {
                 if let Some(event) = events.decode(&line)
                     && let Some(result) =
@@ -544,9 +549,18 @@ impl CloudflareSandboxSession {
             }
         }
         let _ = saw_bytes;
-        Err(SandboxError::new(
-            ErrorCode::ExecTransportError,
-            "SSE stream ended without exit event",
+        // A 200 reply whose body is not an event stream is the worker's error payload; its text
+        // is more useful than "ended without exit event".
+        let detail = (!raw_stream.is_empty() && !looks_like_sse_stream(&raw_stream))
+            .then(|| format_response_body(&raw_stream))
+            .flatten();
+        let message = match detail {
+            Some(detail) => format!("POST /exec returned non-SSE error body: {detail}"),
+            None => "SSE stream ended without exit event".to_string(),
+        };
+        Err(with_status_retryability(
+            SandboxError::new(ErrorCode::ExecTransportError, message),
+            status.as_u16(),
         ))
     }
 
@@ -680,15 +694,17 @@ impl CloudflareSandboxSession {
         let status = response.status();
         let payload = response.bytes().await.unwrap_or_default();
         if !status.is_success() {
-            return Err(SandboxError::new(
-                code,
-                http_error_message(
-                    &format!("POST /{path}"),
-                    status.as_u16(),
-                    format_response_body(&payload),
+            return Err(with_status_retryability(
+                SandboxError::new(
+                    code,
+                    http_error_message(
+                        &format!("POST /{path}"),
+                        status.as_u16(),
+                        format_response_body(&payload),
+                    ),
                 ),
-            )
-            .with_retryable(is_transient_http_status(status.as_u16())));
+                status.as_u16(),
+            ));
         }
         Self::decode_streamed_payload(&payload)
     }
@@ -1164,6 +1180,33 @@ fn apply_exec_event(
         }
         _ => Ok(None),
     }
+}
+
+/// Whether the worker documents a status as retryable.
+///
+/// Mirrors Python's `_cloudflare_retryability_for_status`: 400 and 500 fail fast, 503 is the
+/// worker's "try again" signal, and any other status is not classified.
+fn retryability_for_status(status: u16) -> Option<bool> {
+    match status {
+        400 | 500 => Some(false),
+        503 => Some(true),
+        _ => None,
+    }
+}
+
+/// Attach the worker's documented retry classification of `status` to `error`.
+fn with_status_retryability(mut error: SandboxError, status: u16) -> SandboxError {
+    error.retryable = retryability_for_status(status);
+    error
+}
+
+/// Mirrors Python's `_looks_like_sse_stream`.
+fn looks_like_sse_stream(body: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(body);
+    let text = text.trim_start();
+    ["event:", "data:", "id:", "retry:", ":"]
+        .iter()
+        .any(|prefix| text.starts_with(prefix))
 }
 
 fn exec_error(argv: &[String], error: &reqwest::Error) -> SandboxError {

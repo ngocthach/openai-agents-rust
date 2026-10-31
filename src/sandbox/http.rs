@@ -106,6 +106,48 @@ pub async fn expect_success(
     Err(http_error(code, what, status, &body))
 }
 
+/// Read a response body, stopping once `limit` bytes are held.
+///
+/// Mirrors the bounded provider reads in Python: the prefix is all the caller asked for, so the
+/// rest of an oversized body is never pulled off the socket, and dropping `response` on return
+/// closes the connection instead of draining it. `None` reads the whole body. A transport
+/// failure mid-stream is reported by `transport`, which never includes what was received.
+pub async fn read_body_prefix(
+    response: reqwest::Response,
+    limit: Option<usize>,
+    what: &str,
+) -> SandboxResult<Vec<u8>> {
+    use futures::StreamExt as _;
+
+    let mut body: Vec<u8> = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        // A read that fails mid-stream is a failed archive read, as in Python; the message is
+        // the transport's own and never includes what was received.
+        let chunk = chunk.map_err(|error| {
+            let mut mapped = transport(what, error);
+            mapped.code = ErrorCode::WorkspaceArchiveReadError;
+            mapped
+        })?;
+        match limit {
+            Some(limit) if body.len() + chunk.len() >= limit => {
+                body.extend_from_slice(&chunk[..limit - body.len()]);
+                return Ok(body);
+            }
+            _ => body.extend_from_slice(&chunk),
+        }
+    }
+    Ok(body)
+}
+
+/// The error for a bounded read asked for no bytes, which has no meaningful answer.
+pub fn bounded_read_zero() -> SandboxError {
+    SandboxError::new(
+        ErrorCode::SandboxConfigInvalid,
+        "read_bounded max_bytes must be positive",
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -263,6 +263,12 @@ impl<C: Send + Sync + 'static> SandboxAgent<C> {
         // accounts the manifest declares.
         if let Some(run_as) = &self.run_as
             && !manifest.users().iter().any(|user| user.name == run_as.name)
+            // A group member is created together with its group, so adding the account to
+            // `users` as well would provision it twice.
+            && !manifest
+                .groups()
+                .iter()
+                .any(|group| group.users.iter().any(|user| user.name == run_as.name))
         {
             manifest = manifest.with_user(run_as.clone());
         }
@@ -451,18 +457,26 @@ impl<C: Send + Sync + 'static> SandboxAgent<C> {
             .map(|c| c.capability_type().to_string())
             .collect();
         for capability in &self.capabilities {
-            let missing: Vec<&str> = capability
+            let mut missing: Vec<&str> = capability
                 .required_capability_types()
                 .into_iter()
                 .filter(|required| !available.iter().any(|a| a == required))
                 .collect();
             if !missing.is_empty() {
+                // Sorted, and named by the capability's type the way Python names its class, so
+                // the message is the same however the requirements were declared.
+                missing.sort_unstable();
+                missing.dedup();
                 return Err(AgentsError::user(format!(
-                    "Sandbox capability `{}` requires missing capabilities: {}",
-                    capability.capability_type(),
+                    "{} requires missing capabilities: {}",
+                    pascal_case(capability.capability_type()),
                     missing.join(", ")
                 )));
             }
+        }
+
+        for capability in &self.capabilities {
+            capability.check_manifest(binding.session.manifest())?;
         }
 
         let mut capability_tools = Vec::new();
@@ -722,6 +736,21 @@ fn weak_sandbox_handoff<C: Send + Sync + 'static>(
     )
 }
 
+/// `skills` -> `Skills`, `my_capability` -> `MyCapability`.
+fn pascal_case(capability_type: &str) -> String {
+    capability_type
+        .split(['_', '-'])
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let mut chars = part.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().chain(chars).collect::<String>(),
+                None => String::new(),
+            }
+        })
+        .collect()
+}
+
 fn instruction_section(title: &str, body: &str) -> String {
     format!("# {title}\n\n{body}")
 }
@@ -737,10 +766,15 @@ fn filesystem_instructions(manifest: &Manifest, binding: &CapabilityBinding) -> 
         let working_directory = format!("{root}/{cwd}");
         header.extend([
             format!("For this run, the working directory is `{working_directory}`."),
-            "Relative paths passed to the sandbox tools resolve from this directory.".to_string(),
+            "Relative paths passed to the built-in `exec_command`, `view_image`, and \
+             `apply_patch` tools resolve from this directory."
+                .to_string(),
+            "Other sandbox tools follow their own path contract.".to_string(),
             format!("The session workspace root remains `{root}`."),
             "The working directory changes path resolution; it does not isolate this run from \
              the rest of the session workspace."
+                .to_string(),
+            "Files outside the working directory may be visible to or shared with other runs."
                 .to_string(),
         ]);
     }
@@ -783,8 +817,8 @@ mod tests {
         assert_eq!(
             tool_names,
             vec![
-                "apply_patch",
                 "view_image",
+                "apply_patch",
                 "shell",
                 "exec_command",
                 "write_stdin"

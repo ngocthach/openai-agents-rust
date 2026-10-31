@@ -48,16 +48,23 @@ impl MemoryLayoutConfig {
     }
 }
 
+/// Validate one layout directory, reporting the same three reasons Python's
+/// `_validate_relative_path` does and in the same order: absolute first, then an escape, then
+/// empty. The caller needs to know which of the three it hit, so they are not one message.
 fn validate_relative_dir(name: &str, value: &str) -> SandboxResult<()> {
-    let invalid = value.trim().is_empty()
-        || value == "."
-        || value.starts_with('/')
-        || value.split('/').any(|s| s == "..");
-    if invalid {
-        return Err(SandboxError::new(
-            ErrorCode::SandboxConfigInvalid,
-            format!("{name} must be a non-empty path relative to the sandbox workspace root"),
-        ));
+    let invalid = |message: String| SandboxError::new(ErrorCode::SandboxConfigInvalid, message);
+    if value.starts_with('/') {
+        return Err(invalid(format!(
+            "{name} must be relative to the sandbox workspace root, got: {value}"
+        )));
+    }
+    if value.split('/').any(|part| part == "..") {
+        return Err(invalid(format!(
+            "{name} must not escape root, got: {value}"
+        )));
+    }
+    if value.trim().is_empty() || value == "." {
+        return Err(invalid(format!("{name} must be non-empty")));
     }
     Ok(())
 }
@@ -185,13 +192,17 @@ impl MemoryGenerateConfig {
 
     /// Validate the configured limits.
     pub fn validate(&self) -> SandboxResult<()> {
-        if self.max_raw_memories_for_consolidation == 0
-            || self.max_raw_memories_for_consolidation > 4096
-        {
+        if self.max_raw_memories_for_consolidation == 0 {
             return Err(SandboxError::new(
                 ErrorCode::SandboxConfigInvalid,
-                "MemoryGenerateConfig::max_raw_memories_for_consolidation must be between 1 and \
-                 4096",
+                "MemoryGenerateConfig.max_raw_memories_for_consolidation must be greater than 0.",
+            ));
+        }
+        if self.max_raw_memories_for_consolidation > 4096 {
+            return Err(SandboxError::new(
+                ErrorCode::SandboxConfigInvalid,
+                "MemoryGenerateConfig.max_raw_memories_for_consolidation must be less than or \
+                 equal to 4096.",
             ));
         }
         Ok(())

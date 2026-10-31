@@ -31,7 +31,7 @@ impl From<String> for User {
 }
 
 /// A sandbox group account and its members.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Group {
     /// The group name.
     pub name: String,
@@ -70,7 +70,7 @@ pub mod file_mode {
 }
 
 /// POSIX permission triplets for a manifest entry.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Permissions {
     /// Owner triplet (0-7).
     pub owner: u32,
@@ -129,6 +129,54 @@ impl Permissions {
             other: mode & 0o7,
             directory: mode & S_IFDIR != 0,
         }
+    }
+
+    /// Parse the mode field of an `ls -l` line strictly.
+    ///
+    /// Mirrors Python's `Permissions.from_str`. A trailing `.` (SELinux context), `+` (ACL) or
+    /// `@` (macOS extended attributes) is dropped first. The special bits are only valid where
+    /// the kernel puts them: `s`/`S` in the owner and group execute positions, `t`/`T` in the
+    /// other execute position. A line that puts one anywhere else is not an `ls` listing, and
+    /// reading it leniently would hand back a permission nobody granted.
+    pub fn try_from_ls_field(field: &str) -> Result<Self, String> {
+        let mut chars: Vec<char> = field.chars().collect();
+        if chars.len() == 11 && matches!(chars[10], '@' | '+' | '.') {
+            chars.pop();
+        }
+        if chars.len() != 10 {
+            return Err(format!("invalid permissions string length: {field:?}"));
+        }
+        let directory = chars[0] == 'd';
+        if !matches!(chars[0], 'd' | '-') {
+            return Err(format!("invalid permissions type: {field:?}"));
+        }
+        let triplet = |offset: usize, special: (char, char)| -> Result<u32, String> {
+            let text: String = chars[offset..offset + 3].iter().collect();
+            let mut mask = 0;
+            match chars[offset] {
+                'r' => mask |= file_mode::READ,
+                '-' => {}
+                _ => return Err(format!("invalid read flag: {text:?}")),
+            }
+            match chars[offset + 1] {
+                'w' => mask |= file_mode::WRITE,
+                '-' => {}
+                _ => return Err(format!("invalid write flag: {text:?}")),
+            }
+            let flag = chars[offset + 2];
+            if flag == 'x' || flag == special.0 {
+                mask |= file_mode::EXEC;
+            } else if flag != '-' && flag != special.1 {
+                return Err(format!("invalid exec flag: {text:?}"));
+            }
+            Ok(mask)
+        };
+        Ok(Permissions {
+            owner: triplet(1, ('s', 'S'))?,
+            group: triplet(4, ('s', 'S'))?,
+            other: triplet(7, ('t', 'T'))?,
+            directory,
+        })
     }
 
     /// The mode as a four-digit octal string, as `chmod` expects it.
@@ -253,59 +301,160 @@ pub struct FileEntry {
     pub is_symlink: bool,
 }
 
-/// Parse the output of `ls -la` into [`FileEntry`] values.
-///
-/// `base` is the absolute sandbox path that was listed; `.` and `..` are skipped.
-pub fn parse_ls_la(output: &str, base: &str) -> Vec<FileEntry> {
-    let mut entries = Vec::new();
-    for line in output.lines() {
-        let line = line.trim_end();
-        if line.is_empty() || line.starts_with("total ") {
-            continue;
-        }
-        let mut parts = line.split_whitespace();
-        let Some(mode) = parts.next() else { continue };
-        let Some(permissions) = Permissions::from_ls_field(mode) else {
-            continue;
-        };
-        // links, owner, group, size, then the date fields.
-        let fields: Vec<&str> = parts.collect();
-        if fields.len() < 5 {
-            continue;
-        }
-        let size = fields.get(3).and_then(|s| s.parse::<u64>().ok());
-        // The name starts after the mode plus the next eight whitespace-separated fields.
-        let name = name_after_fields(line, 8).unwrap_or_default();
-        let name = name.split(" -> ").next().unwrap_or(&name).to_string();
-        if name.is_empty() || name == "." || name == ".." {
-            continue;
-        }
-        let path = if base.ends_with('/') {
-            format!("{base}{name}")
-        } else {
-            format!("{base}/{name}")
-        };
-        entries.push(FileEntry {
-            name,
-            path,
-            size,
-            permissions: Some(permissions),
-            is_dir: permissions.directory,
-            is_symlink: mode.starts_with('l'),
-        });
-    }
-    entries
+/// What kind of entry a listing line describes. Mirrors Python's `EntryKind` for listings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ListingKind {
+    /// A regular file.
+    File,
+    /// A directory.
+    Directory,
+    /// A symbolic link.
+    Symlink,
+    /// A device node, socket, pipe or anything else `ls` can show.
+    Other,
 }
 
-/// Return the remainder of `line` after `count` whitespace-separated fields.
-fn name_after_fields(line: &str, count: usize) -> Option<String> {
-    let mut rest = line;
-    for _ in 0..count {
-        rest = rest.trim_start();
-        let end = rest.find(char::is_whitespace)?;
-        rest = &rest[end..];
+/// One parsed `ls -la` line, with the columns [`FileEntry`] does not carry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListingEntry {
+    /// The entry, as [`SandboxSession::ls`](crate::sandbox::SandboxSession::ls) returns it.
+    pub entry: FileEntry,
+    /// The owning user, as `ls` printed it.
+    pub owner: String,
+    /// The owning group, as `ls` printed it.
+    pub group: String,
+    /// What kind of entry the line describes.
+    pub kind: ListingKind,
+}
+
+/// Parse `ls -la` output, failing on a mode field that is not a valid `ls` mode.
+///
+/// Mirrors Python's `parse_ls_la`. Lines `ls` could not have produced (too few fields, a size
+/// that is not a number) are skipped; a mode field that is present but malformed is an error.
+pub fn try_parse_ls_la(output: &str, base: &str) -> Result<Vec<ListingEntry>, String> {
+    let mut entries = Vec::new();
+    for raw_line in output.lines() {
+        let line = raw_line.trim_matches('\n');
+        if line.is_empty() || line.starts_with("total") {
+            continue;
+        }
+        // Typical coreutils format:
+        //   drwxr-xr-x  2 root root     4096 Jan  1 00:00 dirname
+        //   lrwxrwxrwx  1 root root       12 Jan  1 00:00 link -> target
+        let parts = split_max(line, 8);
+        if parts.len() < 9 {
+            continue;
+        }
+        let mode = parts[0];
+        let owner = parts[2].to_string();
+        let group = parts[3].to_string();
+        let type_char = mode.chars().next().unwrap_or('-');
+        let size;
+        let name;
+        if matches!(type_char, 'c' | 'b') {
+            // A device reports an identifier in place of the size column, in one of two shapes.
+            // `stat` reports size 0 for them.
+            size = 0;
+            if parts[4].ends_with(',') {
+                // GNU coreutils prints "major, minor", which occupies two fields and shifts
+                // every following field by one.
+                let shifted = split_max(line, 9);
+                if shifted.len() < 10 {
+                    continue;
+                }
+                name = shifted[9].to_string();
+            } else {
+                // BSD ls prints a single hexadecimal identifier, e.g. 0x3000002.
+                name = parts[8].to_string();
+            }
+        } else {
+            let Ok(parsed) = parts[4].parse::<u64>() else {
+                continue;
+            };
+            size = parsed;
+            name = parts[8].to_string();
+        }
+        let kind = match type_char {
+            'd' => ListingKind::Directory,
+            '-' => ListingKind::File,
+            'l' => ListingKind::Symlink,
+            _ => ListingKind::Other,
+        };
+        // Permissions only track rwx bits and directory-ness; for symlink and other entries the
+        // leading type marker is normalized to `-` so the rwx bits survive.
+        let mut mode_text = mode.to_string();
+        if !matches!(type_char, 'd' | '-') && mode_text.len() >= 2 {
+            mode_text = format!("-{}", &mode_text[type_char.len_utf8()..]);
+        }
+        // Only a symlink prints " -> target"; in a regular file's name the arrow is the name.
+        let name = if kind == ListingKind::Symlink {
+            name.split(" -> ").next().unwrap_or(&name).to_string()
+        } else {
+            name
+        };
+        if name == "." || name == ".." {
+            continue;
+        }
+        let permissions = Permissions::try_from_ls_field(&mode_text)?;
+        let path = if name.starts_with('/') {
+            name.clone()
+        } else if base == "/" {
+            format!("/{name}")
+        } else {
+            format!("{}/{name}", base.trim_end_matches('/'))
+        };
+        let short_name = path.rsplit('/').next().unwrap_or(&path).to_string();
+        entries.push(ListingEntry {
+            entry: FileEntry {
+                name: short_name,
+                path,
+                size: Some(size),
+                permissions: Some(permissions),
+                is_dir: permissions.directory,
+                is_symlink: kind == ListingKind::Symlink,
+            },
+            owner,
+            group,
+            kind,
+        });
     }
-    Some(rest.trim_start().to_string())
+    Ok(entries)
+}
+
+/// Split on whitespace into at most `max_splits + 1` fields, keeping the rest of the line (inner
+/// spacing included) in the last one. Mirrors `str.split(maxsplit=n)`.
+fn split_max(line: &str, max_splits: usize) -> Vec<&str> {
+    let mut fields = Vec::new();
+    let mut rest = line.trim_start();
+    while fields.len() < max_splits && !rest.is_empty() {
+        match rest.find(char::is_whitespace) {
+            Some(end) => {
+                fields.push(&rest[..end]);
+                rest = rest[end..].trim_start();
+            }
+            None => {
+                fields.push(rest);
+                rest = "";
+            }
+        }
+    }
+    if !rest.is_empty() {
+        fields.push(rest);
+    }
+    fields
+}
+
+/// Parse the output of `ls -la` into [`FileEntry`] values.
+///
+/// `base` is the absolute sandbox path that was listed; `.` and `..` are skipped. A line whose
+/// mode field is malformed is skipped here; use [`try_parse_ls_la`] to be told about it.
+pub fn parse_ls_la(output: &str, base: &str) -> Vec<FileEntry> {
+    output
+        .lines()
+        .filter_map(|line| try_parse_ls_la(line, base).ok())
+        .flatten()
+        .map(|listing| listing.entry)
+        .collect()
 }
 
 /// A reachable host endpoint for a port exposed by a sandbox.

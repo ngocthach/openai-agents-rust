@@ -129,6 +129,56 @@ impl ErrorCode {
             ErrorCode::SnapshotNotRestorable => "snapshot_not_restorable",
         }
     }
+
+    /// Whether an error with this code is retryable, before a caller says otherwise.
+    ///
+    /// Mirrors the `retryable` default each Python error class passes to `SandboxError`: a code
+    /// that can only mean a deterministic refusal answers `Some(false)`, while a code that covers
+    /// both a transport blip and a permanent failure answers `None`, which means "unknown" rather
+    /// than "no". [`SandboxError::new`] seeds the field with this, so a caller that knows better
+    /// still overrides it with [`with_retryable`](SandboxError::with_retryable).
+    pub fn default_retryable(self) -> Option<bool> {
+        match self {
+            // Deterministic: the same call fails the same way every time.
+            ErrorCode::InvalidManifestPath
+            | ErrorCode::InvalidCompressionScheme
+            | ErrorCode::ExecNonZero
+            | ErrorCode::ExecTimeout
+            | ErrorCode::PtySessionNotFound
+            | ErrorCode::PtyStdinUnavailable
+            | ErrorCode::SessionStateMismatch
+            | ErrorCode::SessionStateInvalid
+            | ErrorCode::ApplyPatchInvalidPath
+            | ErrorCode::ApplyPatchInvalidDiff
+            | ErrorCode::ApplyPatchFileNotFound
+            | ErrorCode::ApplyPatchDecodeError
+            | ErrorCode::WorkspaceReadNotFound
+            | ErrorCode::WorkspaceWriteTypeError
+            | ErrorCode::WorkspaceRootNotFound
+            | ErrorCode::LocalFileReadError
+            | ErrorCode::LocalDirReadError
+            | ErrorCode::LocalChecksumError
+            | ErrorCode::GitMissingInImage
+            | ErrorCode::GitSubpathError
+            | ErrorCode::MountMissingTool
+            | ErrorCode::MountConfigInvalid
+            | ErrorCode::SkillsConfigInvalid
+            | ErrorCode::SandboxConfigInvalid
+            | ErrorCode::SnapshotNotRestorable => Some(false),
+            // Broad: the same code covers a dropped connection and a permanent refusal.
+            ErrorCode::ExecTransportError
+            | ErrorCode::ExposedPortUnavailable
+            | ErrorCode::MountFailed
+            | ErrorCode::WorkspaceArchiveReadError
+            | ErrorCode::WorkspaceArchiveWriteError
+            | ErrorCode::WorkspaceStartError
+            | ErrorCode::WorkspaceStopError
+            | ErrorCode::GitCloneError
+            | ErrorCode::GitCopyError
+            | ErrorCode::SnapshotPersistError
+            | ErrorCode::SnapshotRestoreError => None,
+        }
+    }
 }
 
 impl fmt::Display for ErrorCode {
@@ -230,7 +280,7 @@ impl SandboxError {
             exit_code: None,
             op: None,
             context: BTreeMap::new(),
-            retryable: None,
+            retryable: code.default_retryable(),
         }
     }
 
@@ -266,24 +316,33 @@ impl SandboxError {
     }
 
     /// Build an [`ErrorCode::ExecNonZero`] error from a failed command.
+    ///
+    /// Mirrors Python's `ExecNonZeroError`: the message is the command's own output, both streams
+    /// labelled when both are present, and only falls back to the exit code when the command said
+    /// nothing. The command, exit code and decoded streams ride in the context, where a caller
+    /// that wants them can read them without parsing the message.
     pub fn exec_nonzero(command: &[String], result: &ExecResult) -> Self {
+        let stdout = result.stdout_text();
         let stderr = result.stderr_text();
-        let detail = if stderr.trim().is_empty() {
-            result.stdout_text()
-        } else {
-            stderr
+        let message = match (stdout.is_empty(), stderr.is_empty()) {
+            (false, false) => format!("stdout: {stdout}\nstderr: {stderr}"),
+            (false, true) => stdout.clone(),
+            (true, false) => stderr.clone(),
+            (true, true) => format!("command exited with code {}", result.exit_code),
         };
+        let command_json = serde_json::to_string(command).unwrap_or_default();
         SandboxError {
             code: ErrorCode::ExecNonZero,
-            message: format!(
-                "Command `{}` exited with code {}: {}",
-                command.join(" "),
-                result.exit_code,
-                detail.trim()
-            ),
+            message,
             exit_code: Some(result.exit_code),
             op: Some(SandboxOp::Exec),
-            context: BTreeMap::new(),
+            context: BTreeMap::from([
+                ("command".to_string(), command_json),
+                ("command_str".to_string(), command.join(" ")),
+                ("exit_code".to_string(), result.exit_code.to_string()),
+                ("stdout".to_string(), stdout),
+                ("stderr".to_string(), stderr),
+            ]),
             // A command that ran and failed will fail the same way again.
             retryable: Some(false),
         }
@@ -387,6 +446,33 @@ mod tests {
             },
         );
         assert_eq!(err.exit_code, Some(2));
+        assert_eq!(err.message, "no such file\n");
         assert!(err.to_string().contains("no such file"));
+        assert_eq!(
+            err.context.get("command_str").map(String::as_str),
+            Some("ls")
+        );
+        assert_eq!(err.context.get("exit_code").map(String::as_str), Some("2"));
+        assert_eq!(err.context.get("stdout").map(String::as_str), Some(""));
+
+        let both = SandboxError::exec_nonzero(
+            &["ls".to_string()],
+            &ExecResult {
+                stdout: b"out".to_vec(),
+                stderr: b"err".to_vec(),
+                exit_code: 1,
+            },
+        );
+        assert_eq!(both.message, "stdout: out\nstderr: err");
+
+        let silent = SandboxError::exec_nonzero(
+            &["true".to_string()],
+            &ExecResult {
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+                exit_code: 3,
+            },
+        );
+        assert_eq!(silent.message, "command exited with code 3");
     }
 }

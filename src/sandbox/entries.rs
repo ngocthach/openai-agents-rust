@@ -6,9 +6,10 @@ use std::path::{Path, PathBuf};
 
 use crate::sandbox::errors::{ErrorCode, SandboxError, SandboxResult};
 use crate::sandbox::manifest::DEFAULT_MAX_LOCAL_DIR_FILE_CONCURRENCY;
-use crate::sandbox::materialization::{MaterializationResult, MaterializedFile};
+use crate::sandbox::materialization::{MaterializationResult, MaterializedFile, gather_in_order};
 use crate::sandbox::mounts::Mount;
-use crate::sandbox::session::{ExecRequest, SandboxSession, shell_quote};
+use crate::sandbox::session::{ExecRequest, ExecShell, SandboxSession};
+use crate::sandbox::types::ExecResult;
 use crate::sandbox::types::{Group, Permissions, User, file_mode};
 
 /// Default permissions for a directory entry (`rwxr-xr-x`).
@@ -117,7 +118,6 @@ impl Entry {
         Entry::with_kind(EntryKind::Mount { mount })
     }
 
-    /// Mark the entry as runtime-attached state excluded from snapshots.
     /// Copy at most `concurrency` files at once when materializing a `local_dir` entry.
     ///
     /// Mirrors `SandboxConcurrencyLimits::local_dir_files`.
@@ -126,6 +126,7 @@ impl Entry {
         self
     }
 
+    /// Mark the entry as runtime-attached state excluded from snapshots.
     pub fn with_ephemeral(mut self, ephemeral: bool) -> Self {
         self.ephemeral = ephemeral;
         self
@@ -249,12 +250,34 @@ impl Entry {
     ///
     /// Returns every file that was written, with the SHA-256 of its contents, so a caller can
     /// tell whether the workspace holds the inputs it expected.
+    ///
+    /// Host sources are confined to the process working directory, as Python's
+    /// `BaseSandboxSession._manifest_base_dir()` does: a `local_file` or `local_dir` outside it
+    /// is refused unless the session's manifest grants the path with
+    /// [`extra_path_grants`](crate::sandbox::Manifest::extra_path_grants), and a symlink on the
+    /// way to the source or inside a `local_dir` tree is refused. Nothing is written to the
+    /// sandbox before the check passes. [`apply_confined`](Self::apply_confined) names another
+    /// base directory.
     pub async fn apply(
         &self,
         session: &dyn SandboxSession,
         dest: &str,
     ) -> SandboxResult<MaterializationResult> {
-        Box::pin(self.apply_inner(session, dest.to_string(), None)).await
+        self.apply_confined(session, dest, &default_base_dir())
+            .await
+    }
+
+    /// Materialize this entry with host sources confined to `base_dir`.
+    ///
+    /// Mirrors Python's `BaseEntry.apply(session, dest, base_dir)`: a relative source resolves
+    /// against `base_dir`, and the refusals are those described on [`apply`](Self::apply).
+    pub async fn apply_confined(
+        &self,
+        session: &dyn SandboxSession,
+        dest: &str,
+        base_dir: &Path,
+    ) -> SandboxResult<MaterializationResult> {
+        Box::pin(self.apply_inner(session, dest.to_string(), None, base_dir)).await
     }
 
     /// Materialize this entry as `user` rather than as the session owner.
@@ -270,7 +293,7 @@ impl Entry {
         dest: &str,
         user: Option<&User>,
     ) -> SandboxResult<MaterializationResult> {
-        Box::pin(self.apply_inner(session, dest.to_string(), user)).await
+        Box::pin(self.apply_inner(session, dest.to_string(), user, &default_base_dir())).await
     }
 
     async fn apply_inner(
@@ -278,6 +301,7 @@ impl Entry {
         session: &dyn SandboxSession,
         dest: String,
         user: Option<&User>,
+        scope: &Path,
     ) -> SandboxResult<MaterializationResult> {
         let mut written = MaterializationResult::new();
         match &self.kind {
@@ -289,19 +313,23 @@ impl Entry {
                 session.mkdir_as(&dest, true, user).await?;
                 for (name, child) in children {
                     let child_dest = join_sandbox_path(&dest, name)?;
-                    written.extend(Box::pin(child.apply_inner(session, child_dest, user)).await?);
+                    written.extend(
+                        Box::pin(child.apply_inner(session, child_dest, user, scope)).await?,
+                    );
                 }
             }
             EntryKind::LocalFile { src } => {
-                let content = read_host_file(src).await?;
+                let src = resolve_host_source(session, src, false, scope)?;
+                let content = read_host_file(&src).await?;
                 session.write_file_as(&dest, &content, user).await?;
                 written.push(MaterializedFile::new(dest.clone(), &content));
             }
             EntryKind::LocalDir { src } => {
                 session.mkdir_as(&dest, true, user).await?;
                 if let Some(src) = src {
+                    let src = resolve_host_source(session, src, true, scope)?;
                     written.extend(
-                        copy_host_dir(session, src, &dest, self.copy_concurrency, user).await?,
+                        copy_host_dir(session, &src, &dest, self.copy_concurrency, user).await?,
                     );
                 }
             }
@@ -433,6 +461,151 @@ const fn libc_o_nofollow() -> i32 {
     }
 }
 
+/// The directory host sources are confined to by default: the process working directory.
+fn default_base_dir() -> PathBuf {
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"))
+}
+
+/// `os.path.abspath`: absolute, with `.` and `..` collapsed textually and no symlink resolved.
+fn lexical_absolute(path: &Path) -> PathBuf {
+    use std::path::Component;
+
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("/"))
+            .join(path)
+    };
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::CurDir => {}
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
+}
+
+fn host_source_error(is_dir: bool, src: &Path, message: String) -> SandboxError {
+    let code = if is_dir {
+        ErrorCode::LocalDirReadError
+    } else {
+        ErrorCode::LocalFileReadError
+    };
+    SandboxError::new(code, message).with_context("src", src.display().to_string())
+}
+
+fn symlink_not_supported(src: &Path, is_dir: bool, child: &str) -> SandboxError {
+    host_source_error(
+        is_dir,
+        src,
+        format!(
+            "Refusing to read `{}`: `{child}` is a symlink, and symlinks in a host source are \
+             not supported",
+            src.display()
+        ),
+    )
+    .with_context("reason", "symlink_not_supported")
+    .with_context("child", child)
+}
+
+/// Check a host source against `base_dir` and return the absolute path to read.
+///
+/// Mirrors Python's `LocalDir._resolve_local_dir_src_root`: containment is judged on the
+/// lexically normalized path, so a `..` cannot be used to step out and a symlink cannot be used
+/// to step out either, because every component on the way is looked at without being followed.
+fn resolve_host_source(
+    session: &dyn SandboxSession,
+    src: &Path,
+    is_dir: bool,
+    base_dir: &Path,
+) -> SandboxResult<PathBuf> {
+    let base = lexical_absolute(base_dir);
+    let input = lexical_absolute(&base.join(src));
+    let grants = session.manifest().extra_path_grants();
+    let granted = grants
+        .iter()
+        .any(|grant| input.starts_with(lexical_absolute(Path::new(grant.host_source()))));
+    if !input.starts_with(&base) && !granted {
+        let mut error = host_source_error(
+            is_dir,
+            &input,
+            format!(
+                "Refusing to read `{}`: it is outside `{}` and no extra path grant covers it",
+                input.display(),
+                base.display()
+            ),
+        )
+        .with_context("reason", "outside_base_dir")
+        .with_context("base_dir", base.display().to_string());
+        if !grants.is_empty() {
+            let paths: Vec<&str> = grants.iter().map(|grant| grant.path.as_str()).collect();
+            error = error.with_context(
+                "extra_path_grants",
+                serde_json::to_string(&paths).unwrap_or_default(),
+            );
+        }
+        return Err(error);
+    }
+    // Walk the path as written, one component at a time, without following anything.
+    let (mut current, parts): (PathBuf, Vec<std::ffi::OsString>) = if src.is_absolute() {
+        let mut components = src.components();
+        let root: PathBuf = components
+            .next()
+            .map(|component| PathBuf::from(component.as_os_str()))
+            .unwrap_or_default();
+        (
+            root,
+            components
+                .filter(|component| !matches!(component, std::path::Component::CurDir))
+                .map(|component| component.as_os_str().to_owned())
+                .collect(),
+        )
+    } else {
+        (
+            base.clone(),
+            src.components()
+                .filter(|component| !matches!(component, std::path::Component::CurDir))
+                .map(|component| component.as_os_str().to_owned())
+                .collect(),
+        )
+    };
+    for part in parts {
+        current.push(part);
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                let child = current
+                    .strip_prefix(&base)
+                    .unwrap_or(&current)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                return Err(symlink_not_supported(&input, is_dir, &child));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(host_source_error(
+                    is_dir,
+                    &input,
+                    format!("Host source `{}` does not exist", input.display()),
+                )
+                .with_context("reason", "path_not_found"));
+            }
+            Err(error) => {
+                return Err(host_source_error(
+                    is_dir,
+                    &current,
+                    format!("Failed to inspect `{}`: {error}", current.display()),
+                ));
+            }
+        }
+    }
+    Ok(input)
+}
+
 /// Copy a host directory tree into the sandbox, one file at a time.
 async fn copy_host_dir(
     session: &dyn SandboxSession,
@@ -441,12 +614,14 @@ async fn copy_host_dir(
     concurrency: usize,
     user: Option<&User>,
 ) -> SandboxResult<MaterializationResult> {
-    let mut written = MaterializationResult::new();
-    // Files are copied in bounded batches: one at a time is slow against a hosted backend where
-    // each write is a round trip, and all at once exhausts its connections.
-    let mut batch: Vec<(PathBuf, String)> = Vec::new();
+    // Files are copied with a bounded number in flight: one at a time is slow against a hosted
+    // backend where each write is a round trip, and all at once exhausts its connections. The
+    // whole tree is walked first so the copies keep the order the walk discovered them in,
+    // whatever order the backend finishes them in.
+    let mut files: Vec<(PathBuf, String)> = Vec::new();
     let mut pending = vec![(src.to_path_buf(), dest.to_string())];
     while let Some((host_dir, sandbox_dir)) = pending.pop() {
+        let mut children: Vec<(String, PathBuf, std::fs::FileType)> = Vec::new();
         let mut read_dir = tokio::fs::read_dir(&host_dir).await.map_err(|e| {
             SandboxError::new(
                 ErrorCode::LocalDirReadError,
@@ -467,49 +642,59 @@ async fn copy_host_dir(
                 )
             })?;
             let Some(entry) = entry else { break };
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let target = join_sandbox_path(&sandbox_dir, &name)?;
             let file_type = entry.file_type().await.map_err(|e| {
                 SandboxError::new(
                     ErrorCode::LocalDirReadError,
                     format!("Failed to stat `{}`: {e}", entry.path().display()),
                 )
             })?;
+            children.push((
+                entry.file_name().to_string_lossy().into_owned(),
+                entry.path(),
+                file_type,
+            ));
+        }
+        // Directory order is the filesystem's, so sort: the result lists files in the same order
+        // on every run.
+        children.sort_by(|left, right| left.0.cmp(&right.0));
+        for (name, path, file_type) in children {
+            if file_type.is_symlink() {
+                // Following a link would copy host state from outside `src`, and skipping it
+                // would hand the sandbox a tree that silently differs from the one named.
+                let child = path
+                    .strip_prefix(src)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                return Err(symlink_not_supported(src, true, &child));
+            }
+            let target = join_sandbox_path(&sandbox_dir, &name)?;
             if file_type.is_dir() {
                 session.mkdir_as(&target, true, user).await?;
-                pending.push((entry.path(), target));
+                pending.push((path, target));
             } else if file_type.is_file() {
-                batch.push((entry.path(), target));
-                if batch.len() >= concurrency.max(1) {
-                    written.extend(copy_batch(session, std::mem::take(&mut batch), user).await?);
-                }
+                files.push((path, target));
             }
-            // Symlinks are skipped: following them would copy host state from outside `src`.
         }
     }
-    written.extend(copy_batch(session, batch, user).await?);
-    Ok(written)
-}
-
-/// Copy one batch of files concurrently, preserving the order they were discovered in.
-async fn copy_batch(
-    session: &dyn SandboxSession,
-    batch: Vec<(PathBuf, String)>,
-    user: Option<&User>,
-) -> SandboxResult<MaterializationResult> {
-    if batch.is_empty() {
-        return Ok(MaterializationResult::new());
-    }
-    let copies = batch.into_iter().map(|(host_path, target)| async move {
-        let content = read_host_file(&host_path).await?;
-        session.write_file_as(&target, &content, user).await?;
-        Ok::<_, SandboxError>(MaterializedFile::new(target, &content))
+    let copies = files.into_iter().map(|(host_path, target)| {
+        move || async move {
+            let content = read_host_file(&host_path).await?;
+            session.write_file_as(&target, &content, user).await?;
+            Ok::<_, SandboxError>(MaterializedFile::new(target, &content))
+        }
     });
-    let files = futures::future::try_join_all(copies).await?;
-    Ok(MaterializationResult::from_iter(files))
+    let written = gather_in_order(copies, Some(concurrency.max(1))).await?;
+    Ok(MaterializationResult::from_iter(written))
 }
 
 /// Clone a git repository inside the sandbox with the `git` CLI.
+///
+/// Mirrors Python's `GitRepo.apply`: the repository is acquired into a scratch directory under
+/// `/tmp`, the wanted tree (the whole clone, or `subpath` inside it) is copied over `dest`, and
+/// the scratch directory is removed however the copy ends. Cloning straight into `dest` would
+/// leave a half-populated workspace behind on failure, and would put `.git` next to the files
+/// when only a subdirectory was asked for.
 async fn clone_git_repo(
     session: &dyn SandboxSession,
     host: &str,
@@ -518,6 +703,8 @@ async fn clone_git_repo(
     subpath: Option<&str>,
     dest: &str,
 ) -> SandboxResult<()> {
+    let git_subpath = validate_git_subpath(repo, subpath)?;
+
     let probe = session
         .exec(ExecRequest::shell("command -v git >/dev/null 2>&1"))
         .await?;
@@ -525,101 +712,187 @@ async fn clone_git_repo(
         return Err(SandboxError::new(
             ErrorCode::GitMissingInImage,
             "`git` is not available inside the sandbox image",
-        ));
+        )
+        .with_context("repo", repo)
+        .with_context("ref", git_ref));
     }
-    let url = format!("https://{host}/{repo}.git");
-    let clone_target = match subpath {
-        None => dest.to_string(),
-        Some(_) => format!("{}.gitclone", dest.trim_end_matches('/')),
-    };
 
+    let tmp_dir = format!(
+        "/tmp/sandbox-git-{}-{}",
+        crate::sandbox::mount_patterns::session_scratch_id(session),
+        uuid::Uuid::new_v4().simple()
+    );
+    let url = format!("https://{host}/{repo}.git");
+
+    remove_scratch_dir(session, &tmp_dir).await?;
+    let outcome = acquire_and_copy_git_repo(
+        session,
+        repo,
+        git_ref,
+        subpath,
+        git_subpath.as_deref(),
+        &url,
+        &tmp_dir,
+        dest,
+    )
+    .await;
+    // The scratch clone goes whether or not the copy worked; a failed cleanup must not hide the
+    // error that explains why the copy failed.
+    let cleanup = remove_scratch_dir(session, &tmp_dir).await;
+    outcome?;
+    cleanup
+}
+
+async fn remove_scratch_dir(session: &dyn SandboxSession, tmp_dir: &str) -> SandboxResult<()> {
+    session
+        .exec(ExecRequest::argv(["rm", "-rf", "--", tmp_dir]).with_shell(ExecShell::None))
+        .await
+        .map(|_| ())
+}
+
+async fn git(session: &dyn SandboxSession, args: &[&str]) -> SandboxResult<ExecResult> {
+    let mut command = vec!["git"];
+    command.extend_from_slice(args);
+    session
+        .exec(ExecRequest::argv(command).with_shell(ExecShell::None))
+        .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn acquire_and_copy_git_repo(
+    session: &dyn SandboxSession,
+    repo: &str,
+    git_ref: &str,
+    subpath: Option<&str>,
+    git_subpath: Option<&str>,
+    url: &str,
+    tmp_dir: &str,
+    dest: &str,
+) -> SandboxResult<()> {
     // A commit sha and a branch name need different commands: `clone --branch` does not accept a
-    // sha, and fetching a sha fails on a server that does not allow it. Mirrors Python's
-    // `_looks_like_commit_ref` fallback, which tries the fetch first for a sha and falls back to
-    // a named clone, so a tag that happens to be all hex still resolves.
-    let mut result = if looks_like_commit_ref(git_ref) {
-        let fetched = session
-            .exec(ExecRequest::shell(fetch_commit_script(
-                &clone_target,
-                &url,
-                git_ref,
-            )))
-            .await?;
+    // sha, and fetching a sha fails on a server that does not allow it. A ref that looks like a
+    // sha is fetched first and falls back to a named clone, so a tag that happens to be all hex
+    // still resolves, and the first failure is the one reported.
+    let mut first_error: Option<ExecResult> = None;
+    let mut clone = if looks_like_commit_ref(git_ref) {
+        let fetched = fetch_commit_ref(session, url, tmp_dir, git_ref).await?;
         if fetched.ok() {
             fetched
         } else {
-            session
-                .exec(ExecRequest::shell(clone_named_ref_script(
-                    &clone_target,
-                    &url,
-                    git_ref,
-                )))
-                .await?
+            first_error = Some(fetched);
+            remove_scratch_dir(session, tmp_dir).await?;
+            clone_named_ref(session, url, tmp_dir, git_ref).await?
         }
     } else {
-        session
-            .exec(ExecRequest::shell(clone_named_ref_script(
-                &clone_target,
-                &url,
-                git_ref,
-            )))
-            .await?
+        clone_named_ref(session, url, tmp_dir, git_ref).await?
     };
-    if !result.ok() && !looks_like_commit_ref(git_ref) {
-        // A named ref that is not a branch or tag may still be reachable by sha.
-        result = session
-            .exec(ExecRequest::shell(fetch_commit_script(
-                &clone_target,
-                &url,
-                git_ref,
-            )))
-            .await?;
-    }
-    if !result.ok() {
-        return Err(SandboxError::new(
+    if !clone.ok() {
+        if let Some(first) = first_error {
+            clone = first;
+        }
+        let mut error = SandboxError::new(
             ErrorCode::GitCloneError,
             format!(
                 "Failed to clone `{url}` at `{git_ref}`: {}",
-                result.stderr_text().trim()
+                clone.stderr_text().trim()
             ),
         )
         .with_op(crate::sandbox::errors::SandboxOp::Materialize)
-        .with_context("repo", repo.to_string()));
-    }
-    if let Some(subpath) = subpath {
-        let source = join_sandbox_path(&clone_target, subpath)?;
-        let script = format!(
-            "set -e\ntest -d {source}\nrm -rf {dest}\nmv {source} {dest}\nrm -rf {clone}",
-            source = shell_quote(&source),
-            dest = shell_quote(dest),
-            clone = shell_quote(&clone_target),
-        );
-        let result = session.exec(ExecRequest::shell(script)).await?;
-        if !result.ok() {
-            // Tell "the subpath is not in this tree" apart from "the copy failed": the first is
-            // the caller's manifest to fix, the second is the sandbox's filesystem.
-            let present = session
-                .exec(ExecRequest::shell(format!(
-                    "test -d {}",
-                    shell_quote(&source)
-                )))
-                .await?;
-            let code = if present.ok() {
-                ErrorCode::GitCopyError
-            } else {
-                ErrorCode::GitSubpathError
-            };
-            return Err(SandboxError::new(
-                code,
-                format!(
-                    "Subpath `{subpath}` could not be materialized from `{url}` at `{git_ref}`: {}",
-                    result.stderr_text().trim()
-                ),
-            )
-            .with_op(crate::sandbox::errors::SandboxOp::Materialize));
+        .with_context("repo", repo);
+        if let Some(subpath) = subpath {
+            error = error.with_context("subpath", subpath);
         }
+        return Err(error);
+    }
+
+    let src_root = match git_subpath {
+        Some(subpath) => format!("{tmp_dir}/{subpath}"),
+        None => tmp_dir.to_string(),
+    };
+    session.mkdir(dest, true).await?;
+    let copy = session
+        .exec(
+            ExecRequest::argv([
+                "cp".to_string(),
+                "-R".to_string(),
+                "--".to_string(),
+                format!("{src_root}/."),
+                format!("{}/", dest.trim_end_matches('/')),
+            ])
+            .with_shell(ExecShell::None),
+        )
+        .await?;
+    if !copy.ok() {
+        let mut error = SandboxError::new(
+            ErrorCode::GitCopyError,
+            format!(
+                "Failed to copy `{src_root}` to `{dest}`: {}",
+                copy.stderr_text().trim()
+            ),
+        )
+        .with_op(crate::sandbox::errors::SandboxOp::Materialize)
+        .with_context("repo", repo)
+        .with_context("ref", git_ref);
+        if let Some(subpath) = subpath {
+            error = error.with_context("subpath", subpath);
+        }
+        return Err(error);
     }
     Ok(())
+}
+
+async fn clone_named_ref(
+    session: &dyn SandboxSession,
+    url: &str,
+    tmp_dir: &str,
+    git_ref: &str,
+) -> SandboxResult<ExecResult> {
+    git(
+        session,
+        &[
+            "clone",
+            "--depth",
+            "1",
+            "--no-tags",
+            "--branch",
+            git_ref,
+            url,
+            tmp_dir,
+        ],
+    )
+    .await
+}
+
+/// Fetch exactly one commit into a fresh repository, stopping at the first step that fails.
+async fn fetch_commit_ref(
+    session: &dyn SandboxSession,
+    url: &str,
+    tmp_dir: &str,
+    git_ref: &str,
+) -> SandboxResult<ExecResult> {
+    let steps: [&[&str]; 4] = [
+        &["init", tmp_dir],
+        &["-C", tmp_dir, "remote", "add", "origin", url],
+        &[
+            "-C",
+            tmp_dir,
+            "fetch",
+            "--depth",
+            "1",
+            "--no-tags",
+            "origin",
+            git_ref,
+        ],
+        &["-C", tmp_dir, "checkout", "--detach", "FETCH_HEAD"],
+    ];
+    let mut last = ExecResult::default();
+    for step in steps {
+        last = git(session, step).await?;
+        if !last.ok() {
+            return Ok(last);
+        }
+    }
+    Ok(last)
 }
 
 /// Whether `git_ref` looks like a commit sha. Mirrors Python's `_COMMIT_REF_RE`.
@@ -627,26 +900,49 @@ fn looks_like_commit_ref(git_ref: &str) -> bool {
     (7..=40).contains(&git_ref.len()) && git_ref.chars().all(|c| c.is_ascii_hexdigit())
 }
 
-/// The script that fetches one commit into a fresh repository.
-fn fetch_commit_script(target: &str, url: &str, git_ref: &str) -> String {
-    format!(
-        "set -e\nrm -rf {target}\nmkdir -p {target}\ncd {target}\ngit init -q .\n\
-         git remote add origin {url}\ngit fetch --depth 1 --no-tags origin {git_ref}\n\
-         git checkout -q --detach FETCH_HEAD",
-        target = shell_quote(target),
-        url = shell_quote(url),
-        git_ref = shell_quote(git_ref),
-    )
-}
-
-/// The script that clones one branch or tag.
-fn clone_named_ref_script(target: &str, url: &str, git_ref: &str) -> String {
-    format!(
-        "set -e\nrm -rf {target}\ngit clone --depth 1 --no-tags --branch {git_ref} {url} {target}",
-        target = shell_quote(target),
-        url = shell_quote(url),
-        git_ref = shell_quote(git_ref),
-    )
+/// Validate a git `subpath` and reduce it to the POSIX path to copy, or `None` for the repo root.
+///
+/// Mirrors Python's `GitRepo._validate_subpath`. An empty string and every spelling of "here"
+/// (`.`, `./`, `./.`) mean the root; a blank one, an absolute one, one using Windows separators
+/// or a drive, and one that climbs out of the clone are refused before anything runs.
+fn validate_git_subpath(repo: &str, subpath: Option<&str>) -> SandboxResult<Option<String>> {
+    let Some(original) = subpath else {
+        return Ok(None);
+    };
+    if original.is_empty() {
+        return Ok(None);
+    }
+    let refuse = |reason: &str| {
+        SandboxError::new(
+            ErrorCode::GitSubpathError,
+            format!("Invalid git subpath `{original}` for `{repo}`: {reason}"),
+        )
+        .with_op(crate::sandbox::errors::SandboxOp::Materialize)
+        .with_context("repo", repo)
+        .with_context("subpath", original)
+        .with_context("reason", reason)
+    };
+    let trimmed = original.trim();
+    if trimmed.is_empty() {
+        return Err(refuse("empty"));
+    }
+    let parts: Vec<&str> = trimmed
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
+        .collect();
+    if trimmed.starts_with('/') {
+        return Err(refuse("absolute"));
+    }
+    if original.contains('\\') || crate::sandbox::workspace_paths::is_windows_absolute(trimmed) {
+        return Err(refuse("windows_path"));
+    }
+    if parts.contains(&"..") {
+        return Err(refuse("parent_traversal"));
+    }
+    if parts.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(parts.join("/")))
 }
 
 /// Manifest users and groups provisioned before entries are materialized.
@@ -671,15 +967,6 @@ mod tests {
         assert!(!looks_like_commit_ref(&"a".repeat(41)));
         assert!(!looks_like_commit_ref("main"));
         assert!(!looks_like_commit_ref("release/1.0"));
-    }
-
-    #[test]
-    fn builds_both_git_acquisition_scripts() {
-        let named = clone_named_ref_script("/tmp/t", "https://h/r.git", "main");
-        assert!(named.contains("git clone --depth 1 --no-tags --branch main"));
-        let fetched = fetch_commit_script("/tmp/t", "https://h/r.git", "deadbeef");
-        assert!(fetched.contains("git fetch --depth 1 --no-tags origin deadbeef"));
-        assert!(fetched.contains("checkout -q --detach FETCH_HEAD"));
     }
 
     #[test]

@@ -473,6 +473,15 @@ impl PtyManager {
             command.env(key, value);
         }
         if let Some(cwd) = &cwd {
+            // `portable-pty` silently starts the process in the user's home directory when the
+            // working directory is not a directory, so a command list meant for one project
+            // would run somewhere else entirely. Refuse instead.
+            if !cwd.is_dir() {
+                return Err(SandboxError::new(
+                    ErrorCode::ExecNonZero,
+                    format!("cannot start in `{}`: not a directory", cwd.display()),
+                ));
+            }
             command.cwd(cwd);
         }
 
@@ -567,7 +576,7 @@ impl PtyManager {
             std::thread::spawn(move || {
                 let status = child.wait();
                 if let Ok(status) = status {
-                    *exit_code.lock().expect("poisoned") = Some(status.exit_code() as i32);
+                    *exit_code.lock().expect("poisoned") = Some(exit_code_of(&status));
                 }
                 closed.store(true, Ordering::SeqCst);
                 notify.notify_waiters();
@@ -980,8 +989,96 @@ impl RemotePtyManager {
     }
 }
 
+/// The exit code Python reports for a PTY child.
+///
+/// A child that was killed by a signal has no exit status, and `portable-pty` flattens that to
+/// `1` plus a signal *name*. Python's subprocess reports `-signum` instead, which is what lets a
+/// caller tell `Ctrl-C` (`-2`) from an ordinary failure, so the number is recovered from the
+/// name. A signal whose name cannot be matched keeps the flattened code rather than inventing one.
+fn exit_code_of(status: &portable_pty::ExitStatus) -> i32 {
+    match status.signal().and_then(signal_number) {
+        Some(number) => -number,
+        None => status.exit_code() as i32,
+    }
+}
+
+/// The signal number for a `strsignal`-style name such as `Interrupt` or `Signal 40`.
+///
+/// The crate forbids `unsafe`, so `strsignal` cannot be called to enumerate names; the names a
+/// terminal can deliver are listed instead. The Linux (glibc) spelling and the BSD/macOS spelling
+/// differ for a few signals, so both are accepted, and a real-time signal arrives as
+/// `Real-time signal N` or `Signal N`.
+fn signal_number(name: &str) -> Option<i32> {
+    if let Some(number) = name
+        .strip_prefix("Signal ")
+        .and_then(|number| number.parse().ok())
+    {
+        return Some(number);
+    }
+    // macOS and the other BSDs spell it `Interrupt: 2`, with the number on the end.
+    if let Some(number) = name
+        .rsplit_once(": ")
+        .and_then(|(_, number)| number.parse().ok())
+    {
+        return Some(number);
+    }
+    if let Some(offset) = name
+        .strip_prefix("Real-time signal ")
+        .and_then(|number| number.parse::<i32>().ok())
+    {
+        // glibc numbers real-time signals from SIGRTMIN (34) and names them relative to it.
+        return Some(34 + offset);
+    }
+    // Numbers shared by Linux and the BSDs (macOS included).
+    let common = match name {
+        "Hangup" => Some(1),
+        "Interrupt" => Some(2),
+        "Quit" => Some(3),
+        "Illegal instruction" => Some(4),
+        "Trace/BPT trap" | "Trace/breakpoint trap" => Some(5),
+        "Aborted" | "Abort trap" => Some(6),
+        "Floating point exception" => Some(8),
+        "Killed" => Some(9),
+        "Segmentation fault" => Some(11),
+        "Broken pipe" => Some(13),
+        "Alarm clock" => Some(14),
+        "Terminated" => Some(15),
+        _ => None,
+    };
+    if common.is_some() {
+        return common;
+    }
+    // These four were assigned differently: macOS numbers SIGBUS 10 and SIGUSR1/2 30/31, Linux
+    // numbers SIGBUS 7 and SIGUSR1/2 10/12.
+    let (bus, usr1, usr2) = if cfg!(target_os = "macos") {
+        (10, 30, 31)
+    } else {
+        (7, 10, 12)
+    };
+    match name {
+        "Bus error" => Some(bus),
+        "User defined signal 1" => Some(usr1),
+        "User defined signal 2" => Some(usr2),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn recovers_the_signal_number_from_either_platform_spelling() {
+        // glibc names the signal; macOS and the BSDs append the number.
+        assert_eq!(signal_number("Interrupt"), Some(2));
+        assert_eq!(signal_number("Interrupt: 2"), Some(2));
+        assert_eq!(signal_number("Quit: 3"), Some(3));
+        assert_eq!(signal_number("Terminated"), Some(15));
+        assert_eq!(signal_number("Killed: 9"), Some(9));
+        assert_eq!(signal_number("Signal 40"), Some(40));
+        assert_eq!(signal_number("Real-time signal 2"), Some(36));
+        // An unknown name is not invented into a number.
+        assert_eq!(signal_number("Something unheard of"), None);
+    }
+
     use super::*;
 
     #[test]

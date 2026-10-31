@@ -357,29 +357,93 @@ pub fn resolve_snapshot(spec: Option<&SnapshotSpec>, snapshot_id: &str) -> Arc<d
     spec.cloned().unwrap_or_default().build(snapshot_id)
 }
 
-/// The platform directory the SDK stores default snapshots in.
-pub fn default_local_snapshot_base_dir() -> PathBuf {
-    let home = std::env::var_os("HOME").map(PathBuf::from);
-    let base = if cfg!(target_os = "macos") {
-        home.map(|h| h.join("Library").join("Application Support"))
-    } else if cfg!(windows) {
-        std::env::var_os("LOCALAPPDATA")
-            .or_else(|| std::env::var_os("APPDATA"))
-            .map(PathBuf::from)
-            .or_else(|| home.map(|h| h.join("AppData").join("Local")))
-    } else {
-        std::env::var_os("XDG_STATE_HOME")
-            .map(PathBuf::from)
-            .filter(|p| p.is_absolute())
-            .or_else(|| home.map(|h| h.join(".local").join("state")))
-    };
-    base.unwrap_or_else(std::env::temp_dir)
-        .join(DEFAULT_LOCAL_SNAPSHOT_SUBDIR)
+/// Whether `value` is absolute the way Windows reads it: a drive (`C:\`) or a UNC share.
+///
+/// Mirrors Python's `PureWindowsPath(value).is_absolute()`. A POSIX-absolute string such as
+/// `/tmp/state` is *not* absolute on Windows, and `Path::is_absolute` on a Unix host would say
+/// it is, so the check cannot be delegated to the host's path rules.
+fn is_windows_absolute(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if value.starts_with("\\\\") || value.starts_with("//") {
+        return true;
+    }
+    bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'\\' || bytes[2] == b'/')
 }
 
-/// Create the SDK-managed default snapshot directory and return a spec pointing at it.
-pub async fn resolve_default_local_snapshot_spec() -> SandboxResult<SnapshotSpec> {
-    let base_path = default_local_snapshot_base_dir();
+/// Whether `value` is absolute the way POSIX reads it.
+///
+/// Mirrors Python's `PurePosixPath(value).is_absolute()`, which is independent of the host.
+fn is_posix_absolute(value: &str) -> bool {
+    value.starts_with('/')
+}
+
+/// The platform directory the SDK stores default snapshots in, resolved from explicit inputs.
+///
+/// Mirrors Python's `default_local_snapshot_base_dir(home=, env=, platform=, os_name=)`.
+/// `platform` is the `sys.platform` spelling (`darwin`, `linux`, `win32`) and `os_name` the
+/// `os.name` spelling (`posix`, `nt`). Passing them in is what makes the platform rules testable
+/// on one host.
+pub fn default_local_snapshot_base_dir_for(
+    home: &Path,
+    env: &dyn Fn(&str) -> Option<String>,
+    platform: &str,
+    os_name: &str,
+) -> PathBuf {
+    let absolute_env = |names: &[&str], absolute: fn(&str) -> bool| -> Option<PathBuf> {
+        names.iter().find_map(|name| {
+            env(name)
+                .filter(|value| !value.is_empty() && absolute(value))
+                .map(PathBuf::from)
+        })
+    };
+    let base = if platform == "darwin" {
+        home.join("Library").join("Application Support")
+    } else if os_name == "nt" {
+        absolute_env(&["LOCALAPPDATA", "APPDATA"], is_windows_absolute)
+            .unwrap_or_else(|| home.join("AppData").join("Local"))
+    } else {
+        absolute_env(&["XDG_STATE_HOME"], is_posix_absolute)
+            .unwrap_or_else(|| home.join(".local").join("state"))
+    };
+    base.join(DEFAULT_LOCAL_SNAPSHOT_SUBDIR)
+}
+
+/// The `sys.platform` spelling of the host this build targets.
+fn host_platform() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "darwin"
+    } else if cfg!(windows) {
+        "win32"
+    } else {
+        "linux"
+    }
+}
+
+/// The platform directory the SDK stores default snapshots in.
+pub fn default_local_snapshot_base_dir() -> PathBuf {
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    default_local_snapshot_base_dir_for(
+        &home,
+        &|name| std::env::var(name).ok(),
+        host_platform(),
+        if cfg!(windows) { "nt" } else { "posix" },
+    )
+}
+
+/// Create `base_path` as the SDK-managed snapshot directory and return a spec pointing at it.
+///
+/// Mirrors the `mkdir(parents=True, exist_ok=True, mode=0o700)` + `chmod(0o700)` pair Python's
+/// `resolve_default_local_snapshot_spec` performs: the directory holds whole workspace archives,
+/// so it is never group- or world-readable. Existing files are left alone, stale ones included.
+pub async fn resolve_default_local_snapshot_spec_at(
+    base_path: PathBuf,
+) -> SandboxResult<SnapshotSpec> {
     tokio::fs::create_dir_all(&base_path).await.map_err(|e| {
         SandboxError::new(
             ErrorCode::SnapshotPersistError,
@@ -389,7 +453,18 @@ pub async fn resolve_default_local_snapshot_spec() -> SandboxResult<SnapshotSpec
             ),
         )
     })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ =
+            tokio::fs::set_permissions(&base_path, std::fs::Permissions::from_mode(0o700)).await;
+    }
     Ok(SnapshotSpec::Local { base_path })
+}
+
+/// Create the SDK-managed default snapshot directory and return a spec pointing at it.
+pub async fn resolve_default_local_snapshot_spec() -> SandboxResult<SnapshotSpec> {
+    resolve_default_local_snapshot_spec_at(default_local_snapshot_base_dir()).await
 }
 
 /// Delete stale snapshot files from the SDK-managed default directory.

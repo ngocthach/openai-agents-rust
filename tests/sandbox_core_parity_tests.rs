@@ -316,7 +316,12 @@ async fn a_raw_write_file_is_refused_under_a_read_only_grant() {
 
     let manifest = Manifest::new()
         .with_root(workspace.path().to_string_lossy().to_string())
-        .with_extra_path_grant(grant(&dataset_path, &dataset_path, true));
+        // Python's unix_local refuses any `host_path`, so a same-path grant omits it.
+        .with_extra_path_grant(
+            SandboxPathGrant::new(&dataset_path)
+                .expect("grant path")
+                .read_only(true),
+        );
     let client = UnixLocalSandboxClient::new();
     let session = client.create(Some(manifest)).await.expect("create");
     session.start().await.expect("start");
@@ -458,6 +463,27 @@ async fn a_resume_whose_workspace_still_matches_skips_the_archive() {
         .await
         .expect("persist");
     let state = session.session_state();
+    if cfg!(target_os = "macos") {
+        // On macOS a Unix-local command runs under `sandbox-exec`, exactly as Python's does, and
+        // that profile denies `/tmp`, where the fingerprint helper and its cache live. The
+        // fingerprint therefore cannot be computed: persisting still succeeds, and a resume
+        // takes the full restore rather than the fast path. The fast path is covered on every
+        // other host by the rest of this test.
+        assert_eq!(state.snapshot_fingerprint, None);
+        let resumed = client
+            .resume(&state, manifest.clone())
+            .await
+            .expect("resume");
+        assert!(
+            !openai_agents_sdk::sandbox::live_workspace_matches_snapshot_on_resume(
+                resumed.as_ref()
+            )
+            .await,
+            "without a fingerprint the archive is always restored"
+        );
+        resumed.shutdown().await.expect("shutdown");
+        return;
+    }
     assert_eq!(
         state.snapshot_fingerprint_version.as_deref(),
         Some(SNAPSHOT_FINGERPRINT_VERSION),

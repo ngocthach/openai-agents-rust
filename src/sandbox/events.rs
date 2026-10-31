@@ -76,6 +76,12 @@ impl EventPayloadPolicy {
         self
     }
 
+    /// Record how many bytes a write carried (default: true). The bytes themselves never are.
+    pub fn with_write_len(mut self, include: bool) -> Self {
+        self.include_write_len = include;
+        self
+    }
+
     /// Bound how much output is recorded.
     pub fn with_output_limits(mut self, stdout: usize, stderr: usize) -> Self {
         self.max_stdout_chars = stdout;
@@ -101,7 +107,14 @@ impl EventPayloadPolicy {
 /// Mirrors how Python stamps `trace_id` onto every sandbox event: a sandbox event stream is only
 /// useful next to the run that produced it, and the trace id is the key that joins them.
 pub fn current_trace_id() -> Option<String> {
-    crate::tracing::current_trace().map(|trace| trace.trace_id().to_string())
+    // A disabled parent span means this operation is not part of any exported trace, so there is
+    // no id that would join it to one.
+    if crate::tracing::scope::current_span().is_some_and(|span| span.is_disabled()) {
+        return None;
+    }
+    crate::tracing::current_trace()
+        .filter(|trace| !trace.is_disabled())
+        .map(|trace| trace.trace_id().to_string())
 }
 
 /// One recorded sandbox operation. Mirrors Python's `SandboxSessionEvent`.
@@ -155,6 +168,16 @@ pub struct SandboxSessionEvent {
     /// Command error output, only when [`EventPayloadPolicy::include_exec_output`] is set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stderr: Option<String>,
+    /// The raw standard output of the command, while the event is on its way to the sinks.
+    ///
+    /// Each sink may carry its own payload policy, so the bytes travel with the event until the
+    /// last decision is made. They are never serialized and never reach a sink: delivery clears
+    /// them after applying that sink's policy.
+    #[serde(skip)]
+    pub stdout_bytes: Option<Vec<u8>>,
+    /// The raw standard error of the command. See [`stdout_bytes`](Self::stdout_bytes).
+    #[serde(skip)]
+    pub stderr_bytes: Option<Vec<u8>>,
 }
 
 impl SandboxSessionEvent {
@@ -184,6 +207,8 @@ impl SandboxSessionEvent {
             error_retryable: None,
             stdout: None,
             stderr: None,
+            stdout_bytes: None,
+            stderr_bytes: None,
         }
     }
 
@@ -227,6 +252,27 @@ impl SandboxSessionEvent {
         self
     }
 
+    /// Carry the raw command output with the event, for per-sink payload policies.
+    pub fn with_raw_output(mut self, stdout: &[u8], stderr: &[u8]) -> Self {
+        self.stdout_bytes = Some(stdout.to_vec());
+        self.stderr_bytes = Some(stderr.to_vec());
+        self
+    }
+
+    /// Decide what this event shows of the command output under `policy`, then drop the raw
+    /// bytes. What the policy withholds is not recoverable from the event afterwards.
+    pub fn apply_payload_policy(mut self, policy: EventPayloadPolicy) -> Self {
+        if self.stdout_bytes.is_some() || self.stderr_bytes.is_some() {
+            let stdout = self.stdout_bytes.take().unwrap_or_default();
+            let stderr = self.stderr_bytes.take().unwrap_or_default();
+            self.stdout = policy.apply(&stdout, policy.max_stdout_chars);
+            self.stderr = policy.apply(&stderr, policy.max_stderr_chars);
+        }
+        self.stdout_bytes = None;
+        self.stderr_bytes = None;
+        self
+    }
+
     /// The event as one JSON line.
     pub fn to_json_line(&self) -> SandboxResult<String> {
         let mut line = serde_json::to_string(self).map_err(|error| {
@@ -251,11 +297,27 @@ pub trait EventSink: Send + Sync + fmt::Debug {
 
     /// Flush anything buffered. The default does nothing.
     async fn flush(&self) {}
+
+    /// The payload policy this sink wants, overriding the instrumentation's own.
+    ///
+    /// Mirrors Python's per-sink `payload_policy`: a sink that ships events off the machine may
+    /// want no command output while a local debugging sink wants all of it. `None` defers to the
+    /// per-operation policy and then to the default.
+    fn payload_policy(&self) -> Option<EventPayloadPolicy> {
+        None
+    }
+
+    /// Whether this sink hands events to others that each apply their own payload policy. A
+    /// chain does; the instrumentation then leaves the raw output on the event for it.
+    fn delivers_own_policies(&self) -> bool {
+        false
+    }
 }
 
 /// Hands each event to a closure. Mirrors Python's `CallbackSink`.
 pub struct CallbackSink {
     callback: Arc<dyn Fn(&SandboxSessionEvent) + Send + Sync>,
+    policy: Option<EventPayloadPolicy>,
 }
 
 impl CallbackSink {
@@ -266,7 +328,14 @@ impl CallbackSink {
     {
         CallbackSink {
             callback: Arc::new(callback),
+            policy: None,
         }
+    }
+
+    /// Give this sink its own payload policy.
+    pub fn with_payload_policy(mut self, policy: EventPayloadPolicy) -> Self {
+        self.policy = Some(policy);
+        self
     }
 }
 
@@ -280,6 +349,10 @@ impl fmt::Debug for CallbackSink {
 impl EventSink for CallbackSink {
     async fn emit(&self, event: &SandboxSessionEvent) {
         (self.callback)(event);
+    }
+
+    fn payload_policy(&self) -> Option<EventPayloadPolicy> {
+        self.policy
     }
 }
 
@@ -468,6 +541,7 @@ impl WorkspaceJsonlSink {
     ) -> Self {
         let workspace_relpath = workspace_relpath
             .into()
+            .replace("{session_id_hex}", &session.id().replace('-', ""))
             .replace("{session_id}", session.id());
         WorkspaceJsonlSink {
             session,
@@ -501,6 +575,19 @@ impl WorkspaceJsonlSink {
         &self.workspace_relpath
     }
 
+    /// Keep the outbox out of workspace archives, so it is a runtime artifact rather than
+    /// durable workspace content (default: false).
+    ///
+    /// Mirrors Python's `ephemeral`. The path is registered with the session, which refuses one
+    /// that overlaps a mount.
+    pub fn with_ephemeral(self, ephemeral: bool) -> SandboxResult<Self> {
+        if ephemeral {
+            self.session
+                .register_persist_workspace_skip_path(&self.workspace_relpath)?;
+        }
+        Ok(self)
+    }
+
     /// Whether an event should trigger a write.
     fn should_flush(&self, event: &SandboxSessionEvent, seen: usize) -> bool {
         if seen.is_multiple_of(self.flush_every) {
@@ -516,18 +603,31 @@ impl WorkspaceJsonlSink {
         )
     }
 
-    async fn flush_buffer(&self, state: &mut WorkspaceSinkState) {
-        if state.buffer.is_empty() {
-            return;
-        }
-        // A session that is not running cannot be written to; the buffer waits for the next
-        // event rather than being dropped.
-        if !matches!(self.session.running().await, Ok(true)) {
-            return;
-        }
-        // The outbox is workload-modifiable: the agent can append to it between flushes, so a
-        // bounded sink has to bound the *read* as well as the write. One byte over the budget
-        // is enough to prove it was exceeded without pulling in the rest.
+    /// The error that ends delivery for good. Nothing is truncated or rotated: a bounded sink
+    /// that cannot hold what is there stops rather than discarding the workload's own data.
+    fn stopped_at_limit(&self, state: &mut WorkspaceSinkState) -> SandboxError {
+        state.disabled = true;
+        state.buffer.clear();
+        SandboxError::new(
+            ErrorCode::SandboxConfigInvalid,
+            format!(
+                "WorkspaceJsonlSink exceeded max_bytes={}; delivery stopped. Use a new outbox and \
+                 sink, or JsonlFileSink/HttpProxySink.",
+                self.max_bytes
+                    .map(|max| max.to_string())
+                    .unwrap_or_else(|| "unbounded".to_string())
+            ),
+        )
+        .with_retryable(false)
+    }
+
+    /// The outbox as it is now, read no further than the budget allows.
+    ///
+    /// The outbox is workload-modifiable, so a bounded sink bounds the read as well as the
+    /// write. One byte over the budget proves it was exceeded without pulling in the rest. A
+    /// missing outbox is empty; a read that fails for any other reason fails the delivery and
+    /// leaves the pending events where they are, for the next attempt.
+    async fn read_existing_outbox(&self, state: &mut WorkspaceSinkState) -> SandboxResult<Vec<u8>> {
         let read = match self.max_bytes {
             None => self.session.read_file(&self.workspace_relpath).await,
             Some(max_bytes) => {
@@ -536,71 +636,83 @@ impl WorkspaceJsonlSink {
                     .await
             }
         };
-        let existing = match read {
-            Ok(bytes) => bytes,
-            Err(error) if error.code == ErrorCode::WorkspaceReadNotFound => Vec::new(),
+        match read {
+            Ok(bytes) => Ok(bytes),
+            Err(error) if error.code == ErrorCode::WorkspaceReadNotFound => Ok(Vec::new()),
             Err(error)
                 if error.context.get("reason").map(String::as_str)
                     == Some("bounded_read_wire_limit") =>
             {
-                state.disabled = true;
-                state.buffer.clear();
-                log::warn!(target: crate::logger::LOG_TARGET,
-                    "WorkspaceJsonlSink outbox exceeded the transport's bounded-read limit; \
-                     delivery stopped."
-                );
-                return;
+                Err(self.stopped_at_limit(state))
             }
-            Err(_) => return,
-        };
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn flush_buffer(&self, state: &mut WorkspaceSinkState) -> SandboxResult<()> {
+        if state.buffer.is_empty() {
+            return Ok(());
+        }
+        let existing = self.read_existing_outbox(state).await?;
         if let Some(max_bytes) = self.max_bytes
             && existing.len() + state.buffer.len() > max_bytes
         {
-            state.disabled = true;
-            state.buffer.clear();
-            log::warn!(target: crate::logger::LOG_TARGET,
-                "WorkspaceJsonlSink exceeded max_bytes={max_bytes}; delivery stopped. Use a new \
-                 outbox and sink, or JsonlFileSink / HttpProxySink."
-            );
-            return;
+            return Err(self.stopped_at_limit(state));
         }
         let mut payload = existing;
         payload.extend_from_slice(state.buffer.as_bytes());
-        if self
-            .session
+        self.session
             .write_file(&self.workspace_relpath, &payload)
-            .await
-            .is_ok()
-        {
-            state.buffer.clear();
+            .await?;
+        state.buffer.clear();
+        Ok(())
+    }
+
+    /// Record one event, reporting why delivery failed.
+    ///
+    /// [`EventSink::emit`] calls this and logs the failure, because a sink must not fail the
+    /// operation it describes. A caller that wants Python's `on_error="raise"` behaviour calls
+    /// this directly. A failed delivery keeps the pending events for the next attempt, except
+    /// when the budget was exceeded: that clears them and stops the sink for good.
+    pub async fn try_emit(&self, event: &SandboxSessionEvent) -> SandboxResult<()> {
+        let line = event.to_json_line()?;
+        let mut state = self.state.lock().await;
+        if state.disabled {
+            return Ok(());
         }
+        if let Some(max_bytes) = self.max_bytes
+            && state.buffer.len() + line.len() > max_bytes
+        {
+            return Err(self.stopped_at_limit(&mut state));
+        }
+        state.buffer.push_str(&line);
+        state.seen += 1;
+        if !self.should_flush(event, state.seen) {
+            return Ok(());
+        }
+        // `start` emits before the sandbox is fully running, so writes may still fail during
+        // early startup or late teardown: the buffer waits for a later event.
+        if !matches!(self.session.running().await, Ok(true)) {
+            return Ok(());
+        }
+        self.flush_buffer(&mut state).await
+    }
+
+    /// The events waiting to be written.
+    pub async fn pending_bytes(&self) -> usize {
+        self.state.lock().await.buffer.len()
     }
 }
 
 #[async_trait]
 impl EventSink for WorkspaceJsonlSink {
     async fn emit(&self, event: &SandboxSessionEvent) {
-        let Ok(line) = event.to_json_line() else {
-            return;
-        };
-        let mut state = self.state.lock().await;
-        if state.disabled {
-            return;
+        if let Err(error) = self.try_emit(event).await {
+            // Only the code and the message: the context can hold the workload's own bytes.
+            log::warn!(target: crate::logger::LOG_TARGET,
+                "WorkspaceJsonlSink delivery failed ({}): {}", error.code, error.message
+            );
         }
-        if let Some(max_bytes) = self.max_bytes
-            && state.buffer.len() + line.len() > max_bytes
-        {
-            state.disabled = true;
-            state.buffer.clear();
-            log::warn!(target: crate::logger::LOG_TARGET, "WorkspaceJsonlSink exceeded max_bytes={max_bytes}; delivery stopped.");
-            return;
-        }
-        state.buffer.push_str(&line);
-        state.seen += 1;
-        if !self.should_flush(event, state.seen) {
-            return;
-        }
-        self.flush_buffer(&mut state).await;
     }
 
     async fn flush(&self) {
@@ -608,7 +720,11 @@ impl EventSink for WorkspaceJsonlSink {
         if state.disabled {
             return;
         }
-        self.flush_buffer(&mut state).await;
+        if let Err(error) = self.flush_buffer(&mut state).await {
+            log::warn!(target: crate::logger::LOG_TARGET,
+                "WorkspaceJsonlSink flush failed ({}): {}", error.code, error.message
+            );
+        }
     }
 }
 
@@ -634,9 +750,24 @@ impl ChainedSink {
 #[async_trait]
 impl EventSink for ChainedSink {
     async fn emit(&self, event: &SandboxSessionEvent) {
+        // In order, each completing before the next starts, so a later sink can rely on an
+        // earlier one having finished with the event.
         for sink in &self.sinks {
-            sink.emit(event).await;
+            let view = match sink.payload_policy() {
+                Some(policy) => event.clone().apply_payload_policy(policy),
+                None => {
+                    let mut stripped = event.clone();
+                    stripped.stdout_bytes = None;
+                    stripped.stderr_bytes = None;
+                    stripped
+                }
+            };
+            sink.emit(&view).await;
         }
+    }
+
+    fn delivers_own_policies(&self) -> bool {
+        true
     }
 
     async fn flush(&self) {
@@ -652,6 +783,7 @@ impl EventSink for ChainedSink {
 pub struct Instrumentation {
     sink: Arc<dyn EventSink>,
     policy: EventPayloadPolicy,
+    policy_by_op: Vec<(SandboxOp, EventPayloadPolicy)>,
     session_id: String,
     backend: String,
     seq: AtomicU64,
@@ -667,6 +799,7 @@ impl Instrumentation {
         Instrumentation {
             sink,
             policy: EventPayloadPolicy::new(),
+            policy_by_op: Vec::new(),
             session_id: session_id.into(),
             backend: backend.into(),
             seq: AtomicU64::new(0),
@@ -679,9 +812,48 @@ impl Instrumentation {
         self
     }
 
+    /// Use `policy` for `op` instead of the default.
+    ///
+    /// Mirrors Python's `payload_policy_by_op`. The mapping is taken by value, so changing the
+    /// caller's copy afterwards does not change what is recorded.
+    pub fn with_policy_for_op(mut self, op: SandboxOp, policy: EventPayloadPolicy) -> Self {
+        self.policy_by_op.retain(|(existing, _)| *existing != op);
+        self.policy_by_op.push((op, policy));
+        self
+    }
+
     /// The payload policy in force.
     pub fn policy(&self) -> EventPayloadPolicy {
         self.policy
+    }
+
+    /// The policy that applies to events of `op`: its own, else the default.
+    pub fn policy_for_op(&self, op: &str) -> EventPayloadPolicy {
+        self.policy_by_op
+            .iter()
+            .find(|(candidate, _)| candidate.as_str() == op)
+            .map(|(_, policy)| *policy)
+            .unwrap_or(self.policy)
+    }
+
+    /// Deliver one event to the sinks.
+    ///
+    /// The policy decides what the event shows of the command output: the sink's own when it
+    /// has one, else the operation's, else the default. A chain applies its members' own
+    /// policies as it delivers to each. The raw bytes the event carried never reach a sink.
+    pub async fn emit(&self, event: SandboxSessionEvent) {
+        let operation_policy = self.policy_for_op(&event.op);
+        if self.sink.delivers_own_policies() {
+            // Members that have no policy of their own see what the operation's policy shows;
+            // the raw bytes stay on the event only until each member has taken its view.
+            let mut shown = event.clone().apply_payload_policy(operation_policy);
+            shown.stdout_bytes = event.stdout_bytes;
+            shown.stderr_bytes = event.stderr_bytes;
+            self.sink.emit(&shown).await;
+            return;
+        }
+        let policy = self.sink.payload_policy().unwrap_or(operation_policy);
+        self.sink.emit(&event.apply_payload_policy(policy)).await;
     }
 
     /// Emit the start event for one operation and return it, for the matching finish.
@@ -695,7 +867,7 @@ impl Instrumentation {
             op,
         );
         event.data = data;
-        self.sink.emit(&event).await;
+        self.emit(event.clone()).await;
         event
     }
 
@@ -708,21 +880,48 @@ impl Instrumentation {
     ) {
         let seq = self.seq.fetch_add(1, Ordering::SeqCst);
         let mut event = match outcome {
-            Ok((stdout, stderr)) => {
-                started
-                    .finish(true, duration_ms)
-                    .with_output(self.policy, stdout, stderr)
-            }
+            Ok((stdout, stderr)) => started
+                .finish(true, duration_ms)
+                .with_raw_output(stdout, stderr),
             Err(error) => started.finish(false, duration_ms).with_error(error),
         };
         event.seq = seq;
-        self.sink.emit(&event).await;
+        self.emit(event).await;
     }
 
     /// Flush the sink.
     pub async fn flush(&self) {
         self.sink.flush().await;
     }
+}
+
+/// The span name for an operation, `sandbox.<op>` as Python names them.
+fn span_name(op: SandboxOp) -> &'static str {
+    match op {
+        SandboxOp::Start => "sandbox.start",
+        SandboxOp::Stop => "sandbox.stop",
+        SandboxOp::Exec => "sandbox.exec",
+        SandboxOp::Read => "sandbox.read",
+        SandboxOp::Write => "sandbox.write",
+        SandboxOp::Shutdown => "sandbox.shutdown",
+        SandboxOp::Running => "sandbox.running",
+        SandboxOp::PersistWorkspace => "sandbox.persist_workspace",
+        SandboxOp::HydrateWorkspace => "sandbox.hydrate_workspace",
+        SandboxOp::ResolveExposedPort => "sandbox.resolve_exposed_port",
+        SandboxOp::Materialize => "sandbox.materialize",
+        SandboxOp::SnapshotPersist => "sandbox.snapshot_persist",
+        SandboxOp::SnapshotRestore => "sandbox.snapshot_restore",
+        SandboxOp::ApplyPatch => "sandbox.apply_patch",
+    }
+}
+
+/// The span data for an operation's recorded metadata.
+fn span_data(data: &[(String, String)]) -> serde_json::Value {
+    serde_json::Value::Object(
+        data.iter()
+            .map(|(key, value)| (key.clone(), serde_json::Value::String(value.clone())))
+            .collect(),
+    )
 }
 
 /// Wraps a session so every operation it performs is recorded.
@@ -782,9 +981,14 @@ impl InstrumentedSession {
     where
         F: std::future::Future<Output = SandboxResult<T>>,
     {
-        let started = self.instrumentation.start(op, data).await;
+        let started = self.instrumentation.start(op, data.clone()).await;
         let clock = std::time::Instant::now();
-        let outcome = operation.await;
+        let outcome = crate::sandbox::runtime::sandbox_span_result(
+            span_name(op),
+            span_data(&data),
+            operation,
+        )
+        .await;
         let elapsed = clock.elapsed().as_millis() as u64;
         match &outcome {
             Ok(_) => {
@@ -896,12 +1100,18 @@ impl crate::sandbox::session::SandboxSession for InstrumentedSession {
         request: crate::sandbox::session::ExecRequest,
     ) -> SandboxResult<crate::sandbox::types::ExecResult> {
         let argv = request.resolved_argv().join(" ");
+        let argv_for_span = argv.clone();
         let started = self
             .instrumentation
             .start(SandboxOp::Exec, vec![("argv".to_string(), argv)])
             .await;
         let clock = std::time::Instant::now();
-        let outcome = self.inner.exec(request).await;
+        let outcome = crate::sandbox::runtime::sandbox_span_result(
+            span_name(SandboxOp::Exec),
+            serde_json::json!({"argv": argv_for_span}),
+            self.inner.exec(request),
+        )
+        .await;
         let elapsed = clock.elapsed().as_millis() as u64;
         match &outcome {
             Ok(result) => {
@@ -1027,6 +1237,41 @@ impl crate::sandbox::session::SandboxSession for InstrumentedSession {
         .await
     }
 
+    async fn read_file_expecting(
+        &self,
+        path: &str,
+        user: Option<&crate::sandbox::types::User>,
+        expected: &[ErrorCode],
+    ) -> SandboxResult<Vec<u8>> {
+        let data = vec![("path".to_string(), path.to_string())];
+        let started = self
+            .instrumentation
+            .start(SandboxOp::Read, data.clone())
+            .await;
+        let clock = std::time::Instant::now();
+        let outcome = crate::sandbox::runtime::sandbox_span_result_expecting(
+            span_name(SandboxOp::Read),
+            span_data(&data),
+            expected,
+            self.inner.read_file_as(path, user),
+        )
+        .await;
+        let elapsed = clock.elapsed().as_millis() as u64;
+        match &outcome {
+            Ok(_) => {
+                self.instrumentation
+                    .finish(&started, elapsed, Ok((&[], &[])))
+                    .await
+            }
+            Err(error) => {
+                self.instrumentation
+                    .finish(&started, elapsed, Err(error))
+                    .await
+            }
+        }
+        outcome
+    }
+
     async fn write_file_as(
         &self,
         path: &str,
@@ -1118,6 +1363,71 @@ impl crate::sandbox::session::SandboxSession for InstrumentedSession {
 
     fn set_archive_limits(&self, limits: Option<crate::sandbox::types::SandboxArchiveLimits>) {
         self.inner.set_archive_limits(limits);
+    }
+
+    // Everything below is delegated for the same reason `read_file_as` is: the trait defaults
+    // would run through this wrapper's `exec`, losing the backend's native implementation (an
+    // exclusive create, an inode comparison, a bounded fetch) and, for a write, recording the
+    // file's own bytes in the audit log.
+
+    fn exposed_ports(&self) -> Vec<u16> {
+        self.inner.exposed_ports()
+    }
+
+    async fn resolve_exposed_port(
+        &self,
+        port: u16,
+    ) -> SandboxResult<crate::sandbox::types::ExposedPortEndpoint> {
+        self.inner.resolve_exposed_port(port).await
+    }
+
+    fn persist_skip_registry(
+        &self,
+    ) -> Option<&std::sync::Mutex<std::collections::BTreeSet<String>>> {
+        self.inner.persist_skip_registry()
+    }
+
+    fn register_persist_workspace_skip_path(&self, path: &str) -> SandboxResult<String> {
+        self.inner.register_persist_workspace_skip_path(path)
+    }
+
+    async fn read_bounded(&self, path: &str, max_bytes: usize) -> SandboxResult<Vec<u8>> {
+        self.record(
+            SandboxOp::Read,
+            vec![("path".to_string(), path.to_string())],
+            self.inner.read_bounded(path, max_bytes),
+        )
+        .await
+    }
+
+    async fn write_new_file(
+        &self,
+        path: &str,
+        contents: &[u8],
+        user: Option<&crate::sandbox::types::User>,
+    ) -> SandboxResult<()> {
+        let mut data = vec![("path".to_string(), path.to_string())];
+        if self.instrumentation.policy().include_write_len {
+            data.push(("bytes".to_string(), contents.len().to_string()));
+        }
+        self.record(
+            SandboxOp::Write,
+            data,
+            self.inner.write_new_file(path, contents, user),
+        )
+        .await
+    }
+
+    async fn same_file(
+        &self,
+        left: &str,
+        right: &str,
+        follow_symlinks: bool,
+        user: Option<&crate::sandbox::types::User>,
+    ) -> SandboxResult<bool> {
+        self.inner
+            .same_file(left, right, follow_symlinks, user)
+            .await
     }
 }
 

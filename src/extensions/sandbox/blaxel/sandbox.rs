@@ -1122,7 +1122,7 @@ impl BlaxelSandboxSession {
     /// Snapshots stage their archive outside the workspace the model may touch, so the path goes
     /// through [`resolve_internal_path`](SandboxSession::resolve_internal_path) rather than the
     /// workspace guard that model-provided paths meet.
-    async fn read_internal(&self, path: &str) -> SandboxResult<Vec<u8>> {
+    async fn read_internal(&self, path: &str, limit: Option<usize>) -> SandboxResult<Vec<u8>> {
         let resolved = self.resolve_internal_path(path)?;
         let resolved = resolved.as_str();
         let url_path = format!("/filesystem/{}", encode_sandbox_path(resolved));
@@ -1146,8 +1146,8 @@ impl BlaxelSandboxSession {
                 format!("`{resolved}` does not exist in the sandbox workspace"),
             ));
         }
-        let body = response.bytes().await.unwrap_or_default();
         if !status.is_success() {
+            let body = response.bytes().await.unwrap_or_default();
             return Err(SandboxError::new(
                 ErrorCode::ExecTransportError,
                 format!(
@@ -1159,7 +1159,12 @@ impl BlaxelSandboxSession {
                 ),
             ));
         }
-        Ok(body.to_vec())
+        crate::sandbox::http::read_body_prefix(
+            response,
+            limit,
+            "read a file from the Blaxel sandbox",
+        )
+        .await
     }
 
     /// Write a file the SDK itself placed, as `multipart/form-data`.
@@ -1404,7 +1409,15 @@ impl SandboxSession for BlaxelSandboxSession {
 
     async fn read_file(&self, path: &str) -> SandboxResult<Vec<u8>> {
         let resolved = self.normalize_path(path)?;
-        self.read_internal(&resolved).await
+        self.read_internal(&resolved, None).await
+    }
+
+    async fn read_bounded(&self, path: &str, max_bytes: usize) -> SandboxResult<Vec<u8>> {
+        if max_bytes == 0 {
+            return Err(crate::sandbox::http::bounded_read_zero());
+        }
+        let resolved = self.normalize_path(path)?;
+        self.read_internal(&resolved, Some(max_bytes)).await
     }
 
     async fn write_file(&self, path: &str, contents: &[u8]) -> SandboxResult<()> {
@@ -1515,7 +1528,7 @@ impl SandboxSession for BlaxelSandboxSession {
                 ),
             ));
         }
-        let archive = self.read_internal(&tar_path).await;
+        let archive = self.read_internal(&tar_path, None).await;
         let _ = self.remove_internal(&tar_path, false).await;
         archive
     }

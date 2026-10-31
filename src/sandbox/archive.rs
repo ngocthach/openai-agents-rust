@@ -144,6 +144,13 @@ pub struct TarValidationOptions {
     pub allow_symlinks: bool,
     /// Whether a symlink may point outside the archive root, or at an absolute path.
     pub allow_external_symlink_targets: bool,
+    /// Workspace-relative paths no archive member may overlap. A member under one, or a
+    /// non-directory member that is an ancestor of one, is refused. Mirrors Python's
+    /// `reject_rel_paths`.
+    pub reject_rel_paths: Vec<String>,
+    /// Workspace-relative paths that may not be symlink members themselves. Their children are
+    /// unaffected. Mirrors Python's `reject_symlink_rel_paths`.
+    pub reject_symlink_rel_paths: Vec<String>,
     /// Workspace-relative prefixes whose members are ignored instead of validated.
     pub skip_rel_paths: Vec<String>,
     /// The archive's own root directory name, when its members are nested under one.
@@ -307,6 +314,16 @@ pub fn validate_tar_members(
     members: &[TarMember],
     options: &TarValidationOptions,
 ) -> SandboxResult<()> {
+    let rejected_rel: Vec<PathBuf> = options
+        .reject_rel_paths
+        .iter()
+        .map(|path| normalize_rel(path))
+        .collect();
+    let rejected_symlink_rel: BTreeSet<PathBuf> = options
+        .reject_symlink_rel_paths
+        .iter()
+        .map(|path| normalize_rel(path))
+        .collect();
     let mut members_by_rel: BTreeMap<PathBuf, &TarMember> = BTreeMap::new();
     let mut symlink_rel: BTreeSet<PathBuf> = BTreeSet::new();
     let mut accepted: Vec<(&TarMember, PathBuf)> = Vec::new();
@@ -326,6 +343,23 @@ pub fn validate_tar_members(
         else {
             continue;
         };
+
+        let variants = tar_member_rel_variants(&member.name, options.root_name.as_deref());
+        for rejected in &rejected_rel {
+            let overlaps = variants.iter().any(|variant| {
+                is_within(variant, rejected)
+                    || (member.kind != ArchiveMemberKind::Directory && is_within(rejected, variant))
+            });
+            if overlaps {
+                return Err(unsafe_tar_member(
+                    &member.name,
+                    format!(
+                        "archive member overlaps protected path: {}",
+                        posix_display(rejected)
+                    ),
+                ));
+            }
+        }
 
         member_count += 1;
         check_member_count(member_count, &member.name, options.limits.as_ref())?;
@@ -348,6 +382,12 @@ pub fn validate_tar_members(
         if member.kind == ArchiveMemberKind::Symlink {
             if !options.allow_external_symlink_targets {
                 validate_symlink_target(member, &rel)?;
+            }
+            if rejected_symlink_rel.contains(&rel) {
+                return Err(unsafe_tar_member(
+                    &member.name,
+                    format!("symlink member not allowed: {}", posix_display(&rel)),
+                ));
             }
             symlink_rel.insert(rel.clone());
         }
@@ -583,6 +623,215 @@ fn rewrite_tar_link_targets(
     let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
     std::io::Write::write_all(&mut encoder, &out).map_err(invalid_tar_stream)?;
     encoder.finish().map_err(invalid_tar_stream)
+}
+
+/// The root-relative components of a simple absolute symlink target under `root`.
+///
+/// Mirrors Python's `tar_utils._simple_rebase_components`. Simple means every component after
+/// the root is a plain name: no `.`, `..`, empty segment or trailing separator. The root itself,
+/// a target outside it, and any target whose meaning depends on how a symlink component resolves
+/// (`alias/../x`) return `None` and stay absolute for the strict hydrate check to refuse.
+fn simple_rebase_components(linkname: &str, root: &str) -> Option<Vec<String>> {
+    if !linkname.starts_with('/') {
+        return None;
+    }
+    let target = format!("/{}", linkname.trim_start_matches('/'));
+    let prefix = format!("/{}", root.trim_matches('/'));
+    let rest = if target == prefix {
+        String::new()
+    } else if let Some(rest) = target.strip_prefix(&format!("{prefix}/")) {
+        rest.trim_start_matches('/').to_string()
+    } else {
+        return None;
+    };
+    // `/workspace/a.txt/` fails with ENOTDIR when `a.txt` is a file; dropping the separator
+    // would turn it into a working link, so it is not a simple target.
+    if rest.is_empty() || rest.ends_with('/') {
+        return None;
+    }
+    let parts: Vec<String> = rest
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .map(str::to_string)
+        .collect();
+    if parts.iter().any(|part| part == "." || part == "..") {
+        return None;
+    }
+    Some(parts)
+}
+
+/// Whether every component a rebased target walks through is an ordinary archive path.
+///
+/// Mirrors Python's `_archive_establishes`: hydration extracts into an existing root, so a
+/// directory the archive does not create could already be a symlink in the destination and
+/// redirect the restored link. Every directory the relative target climbs out of (the link's own
+/// parents) and every directory it descends into must be a directory member, and the leaf must be
+/// a regular file. A directory target stays absolute.
+fn archive_establishes(
+    parts: &[String],
+    link_name: &str,
+    members: &BTreeMap<String, ArchiveMemberKind>,
+) -> bool {
+    let link_parts = posix_parts(link_name);
+    let link_parents = &link_parts[..link_parts.len().saturating_sub(1)];
+    for depth in 1..=link_parents.len() {
+        if members.get(&link_parents[..depth].join("/")) != Some(&ArchiveMemberKind::Directory) {
+            return false;
+        }
+    }
+    for depth in 1..parts.len() {
+        if members.get(&parts[..depth].join("/")) != Some(&ArchiveMemberKind::Directory) {
+            return false;
+        }
+    }
+    members.get(&parts.join("/")) == Some(&ArchiveMemberKind::Regular)
+}
+
+/// Replace a leading member prefix with `.` and make the archive hydratable.
+///
+/// Mirrors Python's `tar_utils.strip_tar_member_prefix`. Docker archives a workspace copied to
+/// `/tmp/stage/workspace` as `workspace/...`; a portable snapshot stores the same files as `.` and
+/// `...`, independent of the source backend's root name. FIFOs and device nodes, which a staged
+/// `cp -R` legitimately carries and strict hydration refuses, are dropped. When
+/// `relativize_symlinks_under` names the workspace root, a *simple* absolute symlink target under it
+/// is rebased onto the link's own directory (see [`simple_rebase_components`] and
+/// [`archive_establishes`]); every other target stays absolute for strict hydration to refuse.
+///
+/// The result is validated with the default [`TarValidationOptions`] before it is returned, as
+/// Python does, so a member that escapes (`..`, an absolute path, a hardlink) fails here.
+pub fn strip_tar_member_prefix(
+    raw: &[u8],
+    prefix: &str,
+    relativize_symlinks_under: Option<&str>,
+) -> SandboxResult<Vec<u8>> {
+    let prefix_rel = normalize_rel(prefix);
+    if prefix_rel.as_os_str().is_empty() || prefix_rel == Path::new(".") {
+        return Err(SandboxError::new(
+            ErrorCode::SandboxConfigInvalid,
+            "tar member prefix must not be empty",
+        ));
+    }
+    let prefix_parts = posix_parts(&posix_display(&prefix_rel));
+
+    // First pass: validate each member, compute its stripped name and build the inventory the
+    // symlink rewrite needs. Dropped members never reach the inventory.
+    struct Planned {
+        original: String,
+        stripped: String,
+    }
+    let members = read_tar_members(raw)?;
+    let mut planned: Vec<Planned> = Vec::new();
+    let mut inventory: BTreeMap<String, ArchiveMemberKind> = BTreeMap::new();
+    let mut link_targets: BTreeMap<String, String> = BTreeMap::new();
+    for member in &members {
+        if member.kind == ArchiveMemberKind::Other {
+            continue;
+        }
+        let rel = safe_tar_member_rel_path(&member.name, member.kind, true)?;
+        let stripped = match rel {
+            None => ".".to_string(),
+            Some(rel) if rel == prefix_rel => ".".to_string(),
+            Some(rel) => {
+                let parts = posix_parts(&posix_display(&rel));
+                if parts.len() >= prefix_parts.len()
+                    && parts[..prefix_parts.len()] == prefix_parts[..]
+                {
+                    parts[prefix_parts.len()..].join("/")
+                } else {
+                    return Err(unsafe_tar_member(
+                        &member.name,
+                        format!(
+                            "member does not start with prefix: {}",
+                            posix_display(&prefix_rel)
+                        ),
+                    ));
+                }
+            }
+        };
+        inventory.insert(stripped.clone(), member.kind);
+        if member.kind == ArchiveMemberKind::Symlink
+            && let Some(target) = member.link_target.clone()
+        {
+            link_targets.insert(stripped.clone(), target);
+        }
+        planned.push(Planned {
+            original: member.name.clone(),
+            stripped,
+        });
+    }
+
+    // Second pass: decide which absolute targets can be rebased, now that the inventory is whole.
+    let mut rebased: BTreeMap<String, String> = BTreeMap::new();
+    if let Some(root) = relativize_symlinks_under {
+        for (name, target) in &link_targets {
+            let Some(parts) = simple_rebase_components(target, root) else {
+                continue;
+            };
+            if !archive_establishes(&parts, name, &inventory) {
+                continue;
+            }
+            let depth = posix_parts(name).len().saturating_sub(1);
+            let climb = vec![".."; depth].join("/");
+            let rest = parts.join("/");
+            rebased.insert(
+                name.clone(),
+                if climb.is_empty() {
+                    rest
+                } else {
+                    format!("{climb}/{rest}")
+                },
+            );
+        }
+    }
+
+    // Third pass: write the new archive. A rewritten long name or link target is re-emitted with
+    // whatever extension header it needs, so a stale PAX `path`/`linkpath` record cannot override it.
+    let wanted: BTreeMap<&str, &str> = planned
+        .iter()
+        .map(|planned| (planned.original.as_str(), planned.stripped.as_str()))
+        .collect();
+    let mut out: Vec<u8> = Vec::new();
+    {
+        let mut builder = tar::Builder::new(&mut out);
+        let mut archive = tar::Archive::new(tar_reader(raw)?);
+        for entry in archive.entries().map_err(invalid_tar_stream)? {
+            let mut entry = entry.map_err(invalid_tar_stream)?;
+            let original = String::from_utf8_lossy(&entry.path_bytes()).into_owned();
+            let Some(stripped) = wanted.get(original.as_str()) else {
+                continue;
+            };
+            let mut header = entry.header().clone();
+            let link_target = match rebased.get(*stripped) {
+                Some(target) => Some(PathBuf::from(target)),
+                None => entry.link_name_bytes().map(|bytes| path_from_bytes(&bytes)),
+            };
+            let path = Path::new(stripped);
+            match link_target {
+                Some(target) => builder
+                    .append_link(&mut header, path, &target)
+                    .map_err(invalid_tar_stream)?,
+                None => {
+                    let mut contents = Vec::new();
+                    entry
+                        .read_to_end(&mut contents)
+                        .map_err(invalid_tar_stream)?;
+                    builder
+                        .append_data(&mut header, path, &contents[..])
+                        .map_err(invalid_tar_stream)?;
+                }
+            }
+        }
+        builder.finish().map_err(invalid_tar_stream)?;
+    }
+    validate_tar_bytes(
+        &out,
+        &TarValidationOptions {
+            allow_symlinks: true,
+            allow_external_symlink_targets: true,
+            ..TarValidationOptions::default()
+        },
+    )?;
+    Ok(out)
 }
 
 #[cfg(unix)]

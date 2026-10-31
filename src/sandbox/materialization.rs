@@ -8,14 +8,55 @@
 //! bytes that were written.
 
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::path::Path;
 
+use futures::stream::{StreamExt, TryStreamExt};
 use sha2::{Digest, Sha256};
 
 use crate::sandbox::errors::{ErrorCode, SandboxError, SandboxResult};
 
 /// How much of a file is hashed at a time.
 const CHUNK_BYTES: usize = 1024 * 1024;
+
+/// Run `task_factories` with at most `max_concurrency` in flight, returning results in the order
+/// the factories were given. Mirrors Python's `gather_in_order`.
+///
+/// Materializing a manifest is a pile of independent round trips to a backend: running them one
+/// at a time is slow, running all of them at once exhausts the backend's connections. This bounds
+/// the middle without letting the finishing order leak into the result — a manifest's
+/// [`MaterializationResult`] must read the same whatever order the backend happened to complete
+/// the writes in.
+///
+/// Each factory is only called when a slot frees up, so a factory that opens a host file does not
+/// open it until the copy is about to run. The first error short-circuits: the remaining factories
+/// are never called and the in-flight futures are dropped, which cancels them.
+pub async fn gather_in_order<T, F, Fut>(
+    task_factories: impl IntoIterator<Item = F>,
+    max_concurrency: Option<usize>,
+) -> SandboxResult<Vec<T>>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = SandboxResult<T>>,
+{
+    // Validated before the empty-input shortcut, as Python does: an impossible limit is a
+    // configuration bug worth reporting even when there is nothing to run.
+    if max_concurrency == Some(0) {
+        return Err(SandboxError::new(
+            ErrorCode::SandboxConfigInvalid,
+            "max_concurrency must be at least 1",
+        ));
+    }
+    let factories: Vec<F> = task_factories.into_iter().collect();
+    if factories.is_empty() {
+        return Ok(Vec::new());
+    }
+    let width = max_concurrency.unwrap_or(factories.len()).max(1);
+    futures::stream::iter(factories.into_iter().map(|factory| factory()))
+        .buffered(width)
+        .try_collect()
+        .await
+}
 
 /// One file written into the sandbox workspace. Mirrors Python's `MaterializedFile`.
 #[derive(Debug, Clone, PartialEq, Eq)]

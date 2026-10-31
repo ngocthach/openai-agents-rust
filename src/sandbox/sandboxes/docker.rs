@@ -25,7 +25,7 @@ use crate::sandbox::session::{
 use crate::sandbox::snapshot::{Snapshot, SnapshotSpec, resolve_snapshot};
 use crate::sandbox::state::{SandboxSessionState, SnapshotFingerprint};
 use crate::sandbox::types::ExecResult;
-use crate::sandbox::workspace_paths::normalize_segments;
+use crate::sandbox::workspace_paths::{normalize_segments, normpath};
 
 /// The `provider_metadata` key recording whether the container has no network stack.
 pub const DOCKER_NETWORK_DISABLED_KEY: &str = "docker_network_disabled";
@@ -127,11 +127,52 @@ impl DockerSandboxClientOptions {
     }
 }
 
+/// How a Docker session reaches the daemon.
+///
+/// Every `docker` invocation a client or a session makes goes through this, so a caller — a test
+/// above all — can observe the argument vectors and the piped stdin without a daemon. The default
+/// is [`DockerCliRunner`], which spawns the real `docker` executable.
+#[async_trait]
+pub trait DockerRunner: std::fmt::Debug + Send + Sync {
+    /// Run `docker` with `argv`, optionally piping `stdin` into it.
+    async fn run(&self, argv: &[String], stdin: Option<&[u8]>) -> SandboxResult<ExecResult>;
+
+    /// The program an interactive (PTY) `docker exec` spawns.
+    ///
+    /// The PTY transport allocates a terminal itself rather than piping, so it cannot route
+    /// through [`run`](Self::run); it spawns this program with the same argument vector instead.
+    fn program(&self) -> &str {
+        "docker"
+    }
+}
+
+/// The default [`DockerRunner`]: spawns the `docker` executable.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DockerCliRunner;
+
+#[async_trait]
+impl DockerRunner for DockerCliRunner {
+    async fn run(&self, argv: &[String], stdin: Option<&[u8]>) -> SandboxResult<ExecResult> {
+        run_docker(argv, stdin).await
+    }
+}
+
 /// Creates [`DockerSandboxSession`]s with the `docker` CLI.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct DockerSandboxClient {
     options: DockerSandboxClientOptions,
     snapshot: Option<SnapshotSpec>,
+    runner: Arc<dyn DockerRunner>,
+}
+
+impl Default for DockerSandboxClient {
+    fn default() -> Self {
+        DockerSandboxClient {
+            options: DockerSandboxClientOptions::default(),
+            snapshot: None,
+            runner: Arc::new(DockerCliRunner),
+        }
+    }
 }
 
 impl DockerSandboxClient {
@@ -144,8 +185,14 @@ impl DockerSandboxClient {
     pub fn with_options(options: DockerSandboxClientOptions) -> Self {
         DockerSandboxClient {
             options,
-            snapshot: None,
+            ..Default::default()
         }
+    }
+
+    /// Reach the daemon through `runner` instead of spawning the `docker` executable.
+    pub fn with_runner(mut self, runner: Arc<dyn DockerRunner>) -> Self {
+        self.runner = runner;
+        self
     }
 
     /// Store workspace snapshots so a paused run can resume the same workspace.
@@ -177,6 +224,43 @@ impl DockerSandboxClient {
     ) -> SandboxResult<DockerSandboxSession> {
         self.options.validate()?;
         validate_docker_path_grants(&manifest)?;
+        let protected = manifest.clone();
+        // The volume names are derived from the session id, so it has to exist before the
+        // container does — and before a failure needs to clean up after it.
+        let generated = session_id.is_none();
+        let session_id = session_id.unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
+        match self
+            .create_validated_session(manifest, Some(session_id.clone()))
+            .await
+        {
+            Ok(session) => Ok(session),
+            Err(error) => {
+                // `docker create` materializes a named volume before it can fail, and a volume
+                // outlives the container that never came to exist. Python's
+                // `_cleanup_failed_create_resources` removes what this attempt generated — and
+                // only that: a replacement that reuses a paused session's identity attaches
+                // volumes that belong to the persisted state, which a failure must not delete.
+                let generated_volumes = if generated {
+                    docker_volume_names_for_manifest(&protected, Some(&session_id))
+                } else {
+                    Vec::new()
+                };
+                for volume in generated_volumes {
+                    let _ = self
+                        .runner
+                        .run(&["volume".to_string(), "rm".to_string(), volume], None)
+                        .await;
+                }
+                Err(redact_for_protected_mounts(&protected, error))
+            }
+        }
+    }
+
+    async fn create_validated_session(
+        &self,
+        manifest: Manifest,
+        session_id: Option<String>,
+    ) -> SandboxResult<DockerSandboxSession> {
         // The volume names are derived from the session id, so it has to exist before the
         // container does. A replacement container keeps the paused session's id, so the volumes
         // the first container created are the ones this one attaches — and the ones its
@@ -241,7 +325,7 @@ impl DockerSandboxClient {
             "-c".to_string(),
             "while :; do sleep 3600; done".to_string(),
         ]);
-        let output = run_docker(&argv, None).await?;
+        let output = self.runner.run(&argv, None).await?;
         if output.exit_code != 0 {
             return Err(SandboxError::new(
                 ErrorCode::WorkspaceStartError,
@@ -262,6 +346,7 @@ impl DockerSandboxClient {
         Ok(DockerSandboxSession::new(container_id, manifest)
             .with_session_id(session_id)
             .with_client_options(&self.options)
+            .with_runner(self.runner.clone())
             .with_snapshot(self.snapshot.clone()))
     }
 
@@ -295,6 +380,22 @@ impl SandboxClient for DockerSandboxClient {
             self.create_session(manifest.unwrap_or_default(), None)
                 .await?,
         ))
+    }
+
+    fn configured_snapshot(&self) -> Option<SnapshotSpec> {
+        self.snapshot.clone()
+    }
+
+    async fn create_with_snapshot(
+        &self,
+        manifest: Option<Manifest>,
+        snapshot: SnapshotSpec,
+    ) -> SandboxResult<Arc<dyn SandboxSession>> {
+        // Python's `DockerSandboxClient.create(snapshot=...)`: the runner passes the SDK default
+        // local snapshot, and the session stores the workspace there instead of dropping it.
+        let mut client = self.clone();
+        client.snapshot = Some(snapshot);
+        client.create(manifest).await
     }
 
     async fn resume(
@@ -355,7 +456,7 @@ impl SandboxClient for DockerSandboxClient {
         let attrs = if requires_fresh_resource {
             None
         } else {
-            inspect_container(&container_id).await
+            inspect_container(self.runner.as_ref(), &container_id).await
         };
         if let Some(attrs) = attrs {
             // The container has been reachable to anything that could run `docker` since the
@@ -367,10 +468,12 @@ impl SandboxClient for DockerSandboxClient {
             return Ok(Arc::new(
                 DockerSandboxSession::new(container_id, manifest)
                     .with_session_id(session_id)
+                    .with_runner(self.runner.clone())
                     .with_resume_identity(network_disabled, labels, state.exposed_ports.clone())
                     .with_snapshot(Some(state.snapshot.clone()))
                     .with_snapshot_id(state.snapshot_id.clone())
                     .resuming()
+                    .with_reused_container()
                     .with_workspace_root_ready(state.workspace_root_ready)
                     .with_snapshot_fingerprint(
                         state.snapshot_fingerprint.clone(),
@@ -382,7 +485,19 @@ impl SandboxClient for DockerSandboxClient {
         // Keep the paused session's identity unless the state's mount authority was rebound,
         // in which case a fresh resource — and fresh volumes — is the whole point.
         let replacement_session_id = (!requires_fresh_resource).then_some(session_id);
-        let replacement = self
+        // The replacement must keep the identity the paused container was created with: the
+        // network stack, the labels and the published ports come from the persisted state, not
+        // from whatever this client happens to be configured with now.
+        let mut options = self.options.clone();
+        options.network_disabled = network_disabled;
+        options.labels = labels;
+        options.exposed_ports = state.exposed_ports.clone();
+        let replacement_client = DockerSandboxClient {
+            options,
+            snapshot: self.snapshot.clone(),
+            runner: self.runner.clone(),
+        };
+        let replacement = replacement_client
             .create_session(manifest, replacement_session_id)
             .await?;
         Ok(Arc::new(
@@ -394,7 +509,19 @@ impl SandboxClient for DockerSandboxClient {
     }
 
     async fn delete(&self, session: Arc<dyn SandboxSession>) -> SandboxResult<()> {
-        session.shutdown().await
+        let manifest = session.manifest().clone();
+        // Python's runtime stops a session and then shuts it down, each as its own traced
+        // operation; a client asked to release a session performs both, so the `sandbox.stop` and
+        // `sandbox.shutdown` spans appear whichever caller does the release. A failed stop (the
+        // container is already stopped or gone) must not keep the container and its volumes from
+        // being removed, so it is logged and shutdown always runs.
+        if let Err(error) = session.stop().await {
+            log::warn!(target: crate::logger::LOG_TARGET, "Failed to stop the sandbox container before removal ({:?})", error.code);
+        }
+        session
+            .shutdown()
+            .await
+            .map_err(|error| redact_for_protected_mounts(&manifest, error))
     }
 }
 
@@ -429,6 +556,15 @@ pub struct DockerSandboxSession {
     exposed_ports: Vec<u16>,
     /// The workspace fingerprint of the snapshot this session resumes, when it has one.
     resume_fingerprint: std::sync::Mutex<Option<SnapshotFingerprint>>,
+    /// Workspace-relative paths a workspace archive leaves out.
+    persist_skip: std::sync::Mutex<std::collections::BTreeSet<String>>,
+    /// How this session reaches the daemon.
+    runner: Arc<dyn DockerRunner>,
+    /// Whether the in-container path-resolution helper is known to be installed.
+    path_helper_ready: AtomicBool,
+    /// Whether this session reattached to an existing container, whose accounts and system state
+    /// survived the pause.
+    reused_container: bool,
 }
 
 impl DockerSandboxSession {
@@ -452,7 +588,124 @@ impl DockerSandboxSession {
             labels: BTreeMap::new(),
             exposed_ports: Vec::new(),
             resume_fingerprint: std::sync::Mutex::new(None),
+            persist_skip: std::sync::Mutex::new(std::collections::BTreeSet::new()),
+            runner: Arc::new(DockerCliRunner),
+            path_helper_ready: AtomicBool::new(false),
+            reused_container: false,
         }
+    }
+
+    /// Reach the daemon through `runner` instead of spawning the `docker` executable.
+    pub fn with_runner(mut self, runner: Arc<dyn DockerRunner>) -> Self {
+        self.runner = runner;
+        self
+    }
+
+    /// Resolve `path` inside the container, following its symlinks.
+    ///
+    /// Mirrors Python's `_validate_remote_path_access`. The lexical check alone cannot see a
+    /// symlink the sandbox created, so a link that points out of the workspace would let a read
+    /// or write escape it. The helper script runs in the container, where the links are real, and
+    /// refuses a result outside the workspace root and every granted path (exit 111), and a
+    /// write that lands under a read-only grant (exit 114).
+    async fn resolve_in_container(&self, path: &str, mode: u8) -> SandboxResult<String> {
+        use crate::sandbox::runtime_helpers::RESOLVE_WORKSPACE_PATH_HELPER as HELPER;
+
+        let lexical = if mode == 0 {
+            self.normalize_path(path)?
+        } else {
+            self.normalize_path_for_write(path)?
+        };
+        if !self.path_helper_ready.load(Ordering::SeqCst) {
+            let present = self
+                .exec(ExecRequest::argv(HELPER.present_command()))
+                .await?;
+            if !present.ok() {
+                let install = self
+                    .exec(ExecRequest::argv(HELPER.install_command()))
+                    .await?;
+                if !install.ok() {
+                    return Err(SandboxError::new(
+                        ErrorCode::WorkspaceArchiveReadError,
+                        format!(
+                            "Failed to install the path resolution helper: {}",
+                            install.stderr_text().trim()
+                        ),
+                    ));
+                }
+            }
+            self.path_helper_ready.store(true, Ordering::SeqCst);
+        }
+        let mut argv = vec![
+            HELPER.install_path.clone(),
+            self.manifest.root().to_string(),
+            lexical.clone(),
+            mode.to_string(),
+        ];
+        for (grant_path, read_only) in self.workspace_path_policy()?.extra_path_grant_rules()? {
+            argv.push(grant_path);
+            argv.push(if read_only { "1" } else { "0" }.to_string());
+        }
+        let result = self.exec(ExecRequest::argv(argv)).await?;
+        let stderr = result.stderr_text();
+        match result.exit_code {
+            0 => {
+                if result.stdout_text().trim().is_empty() {
+                    return Err(SandboxError::new(
+                        ErrorCode::WorkspaceArchiveReadError,
+                        format!("the path resolution helper returned nothing for `{path}`"),
+                    ));
+                }
+                // The *requested* path is what the caller operates on, not the realpath: a leaf
+                // symlink keeps its own semantics (removing a link removes the link), and the
+                // helper has already refused any result that leaves the allowed roots.
+                Ok(lexical)
+            }
+            111 => Err(SandboxError::new(
+                ErrorCode::InvalidManifestPath,
+                format!("manifest path must not escape root: {path}"),
+            )
+            .with_context("rel", path.to_string())
+            .with_context("reason", "escape_root")),
+            114 => {
+                let field = |label: &str| {
+                    stderr
+                        .lines()
+                        .find_map(|line| line.strip_prefix(label))
+                        .map(|value| value.trim().to_string())
+                };
+                let mut error = SandboxError::new(
+                    ErrorCode::WorkspaceArchiveWriteError,
+                    format!("failed to write archive for path: {lexical}"),
+                )
+                .with_context("path", lexical.clone())
+                .with_context("reason", "read_only_extra_path_grant");
+                if let Some(grant) = field("read-only extra path grant: ") {
+                    error = error.with_context("grant_path", grant);
+                }
+                if let Some(resolved) = field("resolved path: ") {
+                    error = error.with_context("resolved_path", resolved);
+                }
+                Err(error)
+            }
+            code => Err(SandboxError::new(
+                ErrorCode::WorkspaceArchiveReadError,
+                format!(
+                    "Failed to resolve `{path}` (helper exit {code}): {}",
+                    stderr.trim()
+                ),
+            )),
+        }
+    }
+
+    /// The attributes of a `sandbox.<op>` span, as Python's `_trace_span_data` records them.
+    fn span_data(&self, op: &str) -> serde_json::Value {
+        serde_json::json!({
+            "sandbox.backend": "docker",
+            "sandbox.operation": op,
+            "sandbox.session.id": self.session_id,
+            "session_id": self.session_id,
+        })
     }
 
     /// Carry the workspace fingerprint a resumed snapshot was taken from.
@@ -516,6 +769,12 @@ impl DockerSandboxSession {
         self
     }
 
+    /// Record that this session reattached to an existing container rather than a replacement.
+    pub fn with_reused_container(mut self) -> Self {
+        self.reused_container = true;
+        self
+    }
+
     /// Whether the workspace this session resumes was fully materialized before the pause.
     ///
     /// A run interrupted mid-materialization leaves a workspace that has files in it but is not
@@ -548,7 +807,12 @@ impl DockerSandboxSession {
             argv.push(format!("{key}={value}"));
         }
         argv.push(self.container_id.clone());
-        argv.extend(request.resolved_argv());
+        // `docker exec -u` already runs the command as that user, so the `sudo` wrapper the
+        // request would add is dropped: the account may not have sudo rights, and Python's Docker
+        // backend does not use it either.
+        let mut bare = request.clone();
+        bare.user = None;
+        argv.extend(bare.resolved_argv());
         Ok(argv)
     }
 
@@ -613,16 +877,29 @@ impl DockerSandboxSession {
         let inner = format!(
             "echo $$ > {pid}; exec {argv}",
             pid = shell_quote(pid_path),
-            argv = request
-                .resolved_argv()
-                .iter()
-                .map(|a| shell_quote(a))
-                .collect::<Vec<_>>()
-                .join(" "),
+            argv = {
+                let mut bare = request.clone();
+                bare.user = None;
+                bare.resolved_argv()
+            }
+            .iter()
+            .map(|a| shell_quote(a))
+            .collect::<Vec<_>>()
+            .join(" "),
         );
-        let mut argv = vec!["docker".to_string(), "exec".to_string(), "-i".to_string()];
+        let mut argv = vec![
+            self.runner.program().to_string(),
+            "exec".to_string(),
+            "-i".to_string(),
+        ];
         if request.tty {
             argv.push("-t".to_string());
+        }
+        // Docker switches the user itself; an interactive process runs as the requested account
+        // exactly as a command does, rather than as the container's default user.
+        if let Some(user) = &request.user {
+            argv.push("-u".to_string());
+            argv.push(user.name.clone());
         }
         argv.push("-w".to_string());
         argv.push(workdir.to_string());
@@ -702,7 +979,10 @@ impl SandboxSession for DockerSandboxSession {
     }
 
     async fn start(&self) -> SandboxResult<()> {
-        let output = run_docker(&["start".to_string(), self.container_id.clone()], None).await?;
+        let output = self
+            .runner
+            .run(&["start".to_string(), self.container_id.clone()], None)
+            .await?;
         if output.exit_code != 0 {
             return Err(SandboxError::new(
                 ErrorCode::WorkspaceStartError,
@@ -748,33 +1028,43 @@ impl SandboxSession for DockerSandboxSession {
     }
 
     async fn stop(&self) -> SandboxResult<()> {
-        self.terminate_pty_sessions().await;
-        self.manifest.unmount_all(self).await?;
-        let output = run_docker(
-            &[
-                "stop".to_string(),
-                "-t".to_string(),
-                "1".to_string(),
-                self.container_id.clone(),
-            ],
-            None,
+        crate::sandbox::runtime::sandbox_span_result(
+            "sandbox.stop",
+            self.span_data("stop"),
+            async {
+                self.terminate_pty_sessions().await;
+                self.manifest.unmount_all(self).await?;
+                let output = self
+                    .runner
+                    .run(
+                        &[
+                            "stop".to_string(),
+                            "-t".to_string(),
+                            "1".to_string(),
+                            self.container_id.clone(),
+                        ],
+                        None,
+                    )
+                    .await?;
+                self.started.store(false, Ordering::SeqCst);
+                if output.exit_code != 0 {
+                    return Err(SandboxError::new(
+                        ErrorCode::WorkspaceStopError,
+                        format!(
+                            "`docker stop` failed for `{}`: {}",
+                            self.container_id,
+                            output.stderr_text().trim()
+                        ),
+                    ));
+                }
+                Ok(())
+            },
         )
-        .await?;
-        self.started.store(false, Ordering::SeqCst);
-        if output.exit_code != 0 {
-            return Err(SandboxError::new(
-                ErrorCode::WorkspaceStopError,
-                format!(
-                    "`docker stop` failed for `{}`: {}",
-                    self.container_id,
-                    output.stderr_text().trim()
-                ),
-            ));
-        }
-        Ok(())
+        .await
     }
 
     async fn shutdown(&self) -> SandboxResult<()> {
+        crate::sandbox::runtime::sandbox_span_result("sandbox.shutdown", self.span_data("shutdown"), async {
         self.terminate_pty_sessions().await;
         // The staged secrets must not outlive the container that used them.
         self.remove_resolved_environment_file().await;
@@ -787,49 +1077,89 @@ impl SandboxSession for DockerSandboxSession {
         if *removed {
             return Ok(());
         }
-        let output = run_docker(
-            &[
-                "rm".to_string(),
-                "-f".to_string(),
-                self.container_id.clone(),
-            ],
-            None,
-        )
-        .await?;
-        self.started.store(false, Ordering::SeqCst);
-        if output.exit_code != 0 {
-            return Err(SandboxError::new(
-                ErrorCode::WorkspaceStopError,
-                format!(
-                    "`docker rm` failed for `{}`: {}",
-                    self.container_id,
-                    output.stderr_text().trim()
-                ),
-            ));
-        }
-        *removed = true;
-        // A named volume outlives its container, so the storage a mount attached would leak.
-        for volume in docker_volume_names_for_manifest(&self.manifest, Some(&self.session_id)) {
-            let output = run_docker(
-                &["volume".to_string(), "rm".to_string(), volume.clone()],
+        // Python's `delete` settles every resource before it raises: a container that cannot be
+        // removed must not leave the named volumes behind, and a volume that cannot be removed
+        // must not stop the next one. The first failure is the one reported.
+        let mut first_error: Option<SandboxError> = None;
+        let removal = self
+            .runner
+            .run(
+                &[
+                    "rm".to_string(),
+                    "-f".to_string(),
+                    self.container_id.clone(),
+                ],
                 None,
             )
             .await;
-            if let Ok(output) = output
-                && output.exit_code != 0
-                && !output.stderr_text().contains("no such volume")
-            {
-                log::warn!(target: crate::logger::LOG_TARGET,
-                    "Failed to remove the sandbox Docker volume `{volume}`: {}",
-                    output.stderr_text().trim()
-                );
+        self.started.store(false, Ordering::SeqCst);
+        match removal {
+            Ok(output) if output.exit_code == 0 => *removed = true,
+            Ok(output) => {
+                first_error = Some(SandboxError::new(
+                    ErrorCode::WorkspaceStopError,
+                    format!(
+                        "`docker rm` failed for `{}`: {}",
+                        self.container_id,
+                        output.stderr_text().trim()
+                    ),
+                ));
+            }
+            Err(error) => first_error = Some(error),
+        }
+        // A named volume outlives its container, so the storage a mount attached would leak.
+        for volume in docker_volume_names_for_manifest(&self.manifest, Some(&self.session_id)) {
+            let output = self
+                .runner
+                .run(
+                    &["volume".to_string(), "rm".to_string(), volume.clone()],
+                    None,
+                )
+                .await;
+            let failure = match output {
+                Ok(output)
+                    if output.exit_code != 0
+                        && !output.stderr_text().contains("no such volume") =>
+                {
+                    Some(SandboxError::new(
+                        ErrorCode::WorkspaceStopError,
+                        format!(
+                            "Failed to remove the sandbox Docker volume `{volume}`: {}",
+                            output.stderr_text().trim()
+                        ),
+                    ))
+                }
+                Ok(_) => None,
+                Err(error) => Some(error),
+            };
+            if let Some(error) = failure {
+                log::warn!(target: crate::logger::LOG_TARGET, "{error}");
+                first_error.get_or_insert(error);
             }
         }
-        Ok(())
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+        })
+        .await
     }
 
     fn resolves_environment(&self) -> bool {
         true
+    }
+
+    /// Mirrors Python's `_set_start_state_preserved(reused_existing_container)`: a reattached
+    /// container still has the accounts provisioned before the pause, so they are not created
+    /// again, while a replacement container starts from the image and needs them.
+    fn system_state_preserved_on_start(&self) -> bool {
+        self.reused_container
+    }
+
+    fn persist_skip_registry(
+        &self,
+    ) -> Option<&std::sync::Mutex<std::collections::BTreeSet<String>>> {
+        Some(&self.persist_skip)
     }
 
     fn mount_transition(&self) -> Option<&crate::sandbox::mounts::MountTransition> {
@@ -846,6 +1176,83 @@ impl SandboxSession for DockerSandboxSession {
 
     fn exposed_ports(&self) -> Vec<u16> {
         self.exposed_ports.clone()
+    }
+
+    /// Resolve a published container port to the host endpoint the daemon assigned.
+    ///
+    /// Mirrors Python's `DockerSandboxSession._resolve_exposed_port`, which reloads the container
+    /// and reads `NetworkSettings.Ports`. The trait default refuses every port because most
+    /// backends have no mapping to hand out; Docker publishes on a daemon-assigned host port, so
+    /// the number is only knowable by asking the daemon. `HostIp` defaults to `127.0.0.1` when
+    /// the daemon reports it empty, exactly as Python's does.
+    async fn resolve_exposed_port(
+        &self,
+        port: u16,
+    ) -> SandboxResult<crate::sandbox::types::ExposedPortEndpoint> {
+        use crate::sandbox::types::{
+            ExposedPortEndpoint, ExposedPortUnavailable, exposed_port_unavailable,
+        };
+
+        let exposed = self.exposed_ports.clone();
+        if !exposed.contains(&port) {
+            // A port the client never declared can never start working, so this stays
+            // non-retryable — the detail `exposed_port_unavailable` already encodes.
+            return Err(exposed_port_unavailable(
+                self.backend_id(),
+                port,
+                &exposed,
+                ExposedPortUnavailable::NotConfigured,
+            ));
+        }
+        let unavailable = |detail: &str| {
+            exposed_port_unavailable(
+                self.backend_id(),
+                port,
+                &exposed,
+                ExposedPortUnavailable::BackendUnavailable,
+            )
+            .with_context("detail", detail)
+        };
+        let output = self
+            .runner
+            .run(
+                &[
+                    "container".to_string(),
+                    "inspect".to_string(),
+                    "-f".to_string(),
+                    "{{json .NetworkSettings.Ports}}".to_string(),
+                    self.container_id.clone(),
+                ],
+                None,
+            )
+            .await
+            .map_err(|_| unavailable("container_reload_failed"))?;
+        if output.exit_code != 0 {
+            return Err(unavailable("container_reload_failed"));
+        }
+        let parsed: serde_json::Value = serde_json::from_slice(&output.stdout)
+            .map_err(|_| unavailable("container_reload_failed"))?;
+        let port_key = format!("{port}/tcp");
+        let binding = parsed
+            .get(&port_key)
+            .and_then(serde_json::Value::as_array)
+            .and_then(|bindings| bindings.first())
+            .ok_or_else(|| unavailable("port_not_published"))?;
+        if !binding.is_object() {
+            return Err(unavailable("invalid_port_binding"));
+        }
+        let host = binding
+            .get("HostIp")
+            .and_then(serde_json::Value::as_str)
+            .filter(|host| !host.is_empty())
+            .unwrap_or("127.0.0.1");
+        let host_port = binding
+            .get("HostPort")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| value.chars().all(|c| c.is_ascii_digit()) && !value.is_empty())
+            .and_then(|value| value.parse::<u16>().ok())
+            .ok_or_else(|| unavailable("invalid_host_port"))?;
+        Ok(ExposedPortEndpoint::new(host, host_port, false))
     }
 
     fn session_state(&self) -> SandboxSessionState {
@@ -946,38 +1353,171 @@ impl SandboxSession for DockerSandboxSession {
     }
 
     async fn running(&self) -> SandboxResult<bool> {
-        let output = run_docker(
-            &[
-                "inspect".to_string(),
-                "-f".to_string(),
-                "{{.State.Running}}".to_string(),
-                self.container_id.clone(),
-            ],
-            None,
-        )
-        .await?;
+        let output = self
+            .runner
+            .run(
+                &[
+                    "inspect".to_string(),
+                    "-f".to_string(),
+                    "{{.State.Running}}".to_string(),
+                    self.container_id.clone(),
+                ],
+                None,
+            )
+            .await?;
         Ok(output.exit_code == 0 && output.stdout_text().trim() == "true")
     }
 
     async fn exec(&self, request: ExecRequest) -> SandboxResult<ExecResult> {
         let argv = self.exec_argv(&request)?;
         match request.timeout {
-            None => run_docker(&argv, None).await,
-            Some(timeout) => match tokio::time::timeout(timeout, run_docker(&argv, None)).await {
-                Ok(result) => result,
-                Err(_) => Err(SandboxError::new(
-                    ErrorCode::ExecTimeout,
-                    format!(
-                        "Command `{}` timed out after {timeout:?}",
-                        request.command.join(" ")
-                    ),
-                )),
-            },
+            None => self.runner.run(&argv, None).await,
+            Some(timeout) => {
+                match tokio::time::timeout(timeout, self.runner.run(&argv, None)).await {
+                    Ok(result) => result,
+                    Err(_) => Err(SandboxError::new(
+                        ErrorCode::ExecTimeout,
+                        format!(
+                            "Command `{}` timed out after {timeout:?}",
+                            request.command.join(" ")
+                        ),
+                    )),
+                }
+            }
         }
     }
 
+    async fn ls(&self, path: &str) -> SandboxResult<Vec<crate::sandbox::types::FileEntry>> {
+        let resolved = self.resolve_in_container(path, 0).await?;
+        let command = vec![
+            "ls".to_string(),
+            "-la".to_string(),
+            "--".to_string(),
+            resolved.clone(),
+        ];
+        let result = self.exec(ExecRequest::argv(command.clone())).await?;
+        if !result.ok() {
+            return Err(SandboxError::exec_nonzero(&command, &result));
+        }
+        Ok(crate::sandbox::types::parse_ls_la(
+            &result.stdout_text(),
+            &resolved,
+        ))
+    }
+
+    async fn mkdir(&self, path: &str, parents: bool) -> SandboxResult<()> {
+        let resolved = self.resolve_in_container(path, 1).await?;
+        let mut command = vec!["mkdir".to_string()];
+        if parents {
+            command.push("-p".to_string());
+        }
+        command.push("--".to_string());
+        command.push(resolved.clone());
+        let result = self.exec(ExecRequest::argv(command.clone())).await?;
+        if !result.ok() {
+            self.check_mkdir_access(&resolved, parents, None).await?;
+            return Err(SandboxError::exec_nonzero(&command, &result));
+        }
+        Ok(())
+    }
+
+    async fn rm(&self, path: &str, recursive: bool) -> SandboxResult<()> {
+        if recursive {
+            // A recursive removal of an ancestor is a write to every grant under it.
+            self.workspace_path_policy()?
+                .validate_recursive_remove(path)?;
+        }
+        let resolved = self
+            .resolve_in_container(path, if recursive { 2 } else { 1 })
+            .await?;
+        let command = vec![
+            "rm".to_string(),
+            if recursive { "-rf" } else { "-f" }.to_string(),
+            "--".to_string(),
+            resolved.clone(),
+        ];
+        let result = self.exec(ExecRequest::argv(command.clone())).await?;
+        if !result.ok() {
+            self.check_rm_access(&resolved, recursive, None).await?;
+            return Err(SandboxError::exec_nonzero(&command, &result));
+        }
+        Ok(())
+    }
+
+    async fn mv(&self, source: &str, destination: &str) -> SandboxResult<()> {
+        // A move writes at both ends: it unlinks the source and creates the destination.
+        let source = self.resolve_in_container(source, 1).await?;
+        let destination = self.resolve_in_container(destination, 1).await?;
+        let script = "if [ ! -L \"$1\" ] && [ ! -f \"$1\" ]; then \
+             printf \"%s\\n\" \"Move source must be a regular file or symlink\" >&2; exit 1; fi; \
+             exec mv -fT -- \"$1\" \"$2\"";
+        let argv = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            script.to_string(),
+            "sh".to_string(),
+            source.clone(),
+            destination.clone(),
+        ];
+        let result = self
+            .exec(ExecRequest::argv(argv).with_shell(crate::sandbox::session::ExecShell::None))
+            .await?;
+        if !result.ok() {
+            let shown = vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "<mv>".to_string(),
+                source,
+                destination,
+            ];
+            return Err(SandboxError::exec_nonzero(&shown, &result));
+        }
+        Ok(())
+    }
+
+    async fn read_bounded(&self, path: &str, max_bytes: usize) -> SandboxResult<Vec<u8>> {
+        if max_bytes == 0 {
+            return Err(SandboxError::new(
+                ErrorCode::SandboxConfigInvalid,
+                "read_bounded max_bytes must be positive",
+            ));
+        }
+        let resolved = self.resolve_in_container(path, 0).await?;
+        // Image-owned utilities only, independent of the manifest `PATH`, and no encoding: the
+        // container emits the prefix and `head` closes the pipe at the limit.
+        let script = "PATH=/usr/bin:/bin; export PATH; \
+                      [ -e \"$1\" ] || exit 44; [ -f \"$1\" ] || exit 45; head -c \"$2\" < \"$1\"";
+        let result = self
+            .exec(
+                ExecRequest::argv([
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    script.to_string(),
+                    "sh".to_string(),
+                    resolved,
+                    max_bytes.to_string(),
+                ])
+                .with_shell(crate::sandbox::session::ExecShell::None)
+                .with_timeout(Some(std::time::Duration::from_secs(30))),
+            )
+            .await?;
+        if result.exit_code == 44 {
+            return Err(SandboxError::new(
+                ErrorCode::WorkspaceReadNotFound,
+                format!("Workspace path `{path}` was not found"),
+            ));
+        }
+        if !result.ok() {
+            return Err(SandboxError::new(
+                ErrorCode::WorkspaceArchiveReadError,
+                format!("Failed to read `{path}`"),
+            ));
+        }
+        Ok(result.stdout)
+    }
+
     async fn read_file(&self, path: &str) -> SandboxResult<Vec<u8>> {
-        let resolved = self.normalize_path(path)?;
+        let resolved = self.resolve_in_container(path, 0).await?;
         let result = self
             .exec(ExecRequest::argv(["cat", "--", &resolved]))
             .await?;
@@ -985,7 +1525,7 @@ impl SandboxSession for DockerSandboxSession {
             let code = if result.stderr_text().contains("No such file") {
                 ErrorCode::WorkspaceReadNotFound
             } else {
-                ErrorCode::WorkspaceWriteTypeError
+                ErrorCode::WorkspaceArchiveReadError
             };
             return Err(SandboxError::new(
                 code,
@@ -996,7 +1536,7 @@ impl SandboxSession for DockerSandboxSession {
     }
 
     async fn write_file(&self, path: &str, contents: &[u8]) -> SandboxResult<()> {
-        let resolved = self.normalize_path_for_write(path)?;
+        let resolved = self.resolve_in_container(path, 1).await?;
         // The destination is passed as a positional argument, never interpolated into the
         // script, so a path containing shell metacharacters cannot inject a command.
         let script = "mkdir -p \"$(dirname \"$1\")\" && cat > \"$1\"";
@@ -1012,7 +1552,7 @@ impl SandboxSession for DockerSandboxSession {
             "sh".to_string(),
             resolved,
         ];
-        let output = run_docker(&argv, Some(contents)).await?;
+        let output = self.runner.run(&argv, Some(contents)).await?;
         if output.exit_code != 0 {
             return Err(SandboxError::new(
                 ErrorCode::WorkspaceWriteTypeError,
@@ -1023,7 +1563,39 @@ impl SandboxSession for DockerSandboxSession {
     }
 
     async fn persist_workspace_once(&self) -> SandboxResult<Vec<u8>> {
-        let raw = capture_workspace_tar(self).await?;
+        let root = self.manifest.root().to_string();
+        let trimmed_root = root.trim_end_matches('/');
+        let root_is_mounted = self
+            .manifest
+            .ephemeral_mount_targets()
+            .iter()
+            .any(|(_, path)| path.trim_end_matches('/') == trimmed_root);
+        let raw = if root_is_mounted {
+            // A mount at the workspace root makes the whole workspace remote storage. Archiving
+            // it would traverse that data, so only the (empty) root directory entry is captured.
+            let command = format!("tar -czf - --no-recursion -C {} .", shell_quote(&root));
+            let result = self
+                .exec(ExecRequest::shell(command))
+                .await
+                .map_err(|error| redact_for_protected_mounts(&self.manifest, error))?;
+            if !result.ok() {
+                return Err(redact_for_protected_mounts(
+                    &self.manifest,
+                    SandboxError::new(
+                        ErrorCode::SnapshotPersistError,
+                        format!(
+                            "Failed to archive workspace `{root}`: {}",
+                            result.stderr_text().trim()
+                        ),
+                    ),
+                ));
+            }
+            result.stdout
+        } else {
+            capture_workspace_tar(self)
+                .await
+                .map_err(|error| redact_for_protected_mounts(&self.manifest, error))?
+        };
         // A container workspace carries links recorded against its own root, and the hydrate
         // policy refuses an absolute target. Python rewrites them as it captures the archive
         // (`strip_tar_member_prefix(relativize_symlinks_under=root)`); so does this.
@@ -1052,7 +1624,7 @@ impl SandboxSession for DockerSandboxSession {
             "-c".to_string(),
             script,
         ];
-        let output = run_docker(&argv, Some(archive)).await?;
+        let output = self.runner.run(&argv, Some(archive)).await?;
         if output.exit_code != 0 {
             return Err(SandboxError::new(
                 ErrorCode::SnapshotRestoreError,
@@ -1184,17 +1756,21 @@ fn container_privilege_args(privileges: ContainerPrivileges) -> Vec<String> {
 }
 
 /// The `docker container inspect` attributes of `container_id`, or `None` when it is gone.
-async fn inspect_container(container_id: &str) -> Option<serde_json::Value> {
-    let output = run_docker(
-        &[
-            "container".to_string(),
-            "inspect".to_string(),
-            container_id.to_string(),
-        ],
-        None,
-    )
-    .await
-    .ok()?;
+async fn inspect_container(
+    runner: &dyn DockerRunner,
+    container_id: &str,
+) -> Option<serde_json::Value> {
+    let output = runner
+        .run(
+            &[
+                "container".to_string(),
+                "inspect".to_string(),
+                container_id.to_string(),
+            ],
+            None,
+        )
+        .await
+        .ok()?;
     if output.exit_code != 0 {
         return None;
     }
@@ -1215,7 +1791,7 @@ fn docker_mount_path_identity(path: &str) -> String {
             format!("/{trimmed}")
         }
     };
-    normalize_segments(&collapsed)
+    normpath(&collapsed)
 }
 
 /// Whether `path` is `root` or lies under it.
@@ -1257,6 +1833,80 @@ pub fn docker_volume_names_for_manifest(
         .iter()
         .map(|path| docker_volume_name(session_id, path))
         .collect()
+}
+
+/// What a protected-mount failure says instead of the provider's own message.
+///
+/// Mirrors Python's `_replace_protected_mount_error`: a daemon, a volume driver or a mount tool
+/// can echo the credentials it was handed in its error text, so a failure while a credentialed
+/// mount is in play carries no provider text at all.
+pub const PROTECTED_MOUNT_ERROR_MESSAGE: &str =
+    "sandbox operation failed while using a protected mount configuration";
+
+/// Whether `strategy_type` names a strategy this SDK ships.
+///
+/// Python's `_mount_class_is_trusted` treats a mount class it does not know as one that may hide
+/// credentials, so a strategy from outside the SDK is protected by default.
+fn is_known_mount_strategy(strategy_type: &str) -> bool {
+    matches!(
+        strategy_type,
+        "bind" | "docker_volume" | "in_container" | "ephemeral_only" | "blaxel_drive"
+    ) || strategy_type.ends_with("_cloud_bucket")
+        || strategy_type.ends_with("_bucket_mount")
+}
+
+/// Whether any mount in `manifest` carries credentials a provider error could echo.
+///
+/// Mirrors Python's `_manifest_has_configured_mount_authority`: a mount counts when its strategy
+/// exposes a credential inside the sandbox, when it is not a strategy the SDK ships (it may hide
+/// one), or when a Docker volume driver is handed a credential-looking `volume-opt` — the
+/// credential then goes to the daemon on the host, which Python treats as protected too.
+pub fn manifest_has_protected_mounts(manifest: &Manifest) -> bool {
+    manifest.mount_targets().into_iter().any(|(mount, path)| {
+        if mount.strategy.carries_credentials(mount)
+            || !is_known_mount_strategy(mount.strategy.strategy_type())
+        {
+            return true;
+        }
+        mount
+            .strategy
+            .docker_create_args(mount, &path)
+            .is_some_and(|args| {
+                args.iter().any(|arg| {
+                    arg.split(',').any(|field| {
+                        field.strip_prefix("volume-opt=").is_some_and(|option| {
+                            let key = option.split('=').next().unwrap_or_default().to_lowercase();
+                            [
+                                "key",
+                                "secret",
+                                "token",
+                                "password",
+                                "credential",
+                                "service-account",
+                                "sas",
+                                "config",
+                                "impersonate",
+                            ]
+                            .iter()
+                            .any(|needle| key.contains(needle))
+                        })
+                    })
+                })
+            })
+    })
+}
+
+/// Replace `error`'s provider text when `manifest` has protected mounts.
+///
+/// The error code and operation survive, because a caller branches on them; the message,
+/// context and cause — everything a provider could have put a credential in — do not.
+pub fn redact_for_protected_mounts(manifest: &Manifest, error: SandboxError) -> SandboxError {
+    if !manifest_has_protected_mounts(manifest) {
+        return error;
+    }
+    let mut safe = SandboxError::new(error.code, PROTECTED_MOUNT_ERROR_MESSAGE);
+    safe.op = error.op;
+    safe
 }
 
 /// Reject a manifest whose host path grants Docker cannot attach safely.

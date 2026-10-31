@@ -247,6 +247,17 @@ pub trait MountStrategy: Send + Sync + fmt::Debug {
         MountCredentialAuthority::None
     }
 
+    /// Whether this mount holds credentials in its own configuration, wherever they end up.
+    ///
+    /// [`credential_authority`](Self::credential_authority) answers a narrower question: what the
+    /// *sandbox* can reach. A credentialed Docker volume has `None` there because the credential
+    /// goes to the container runtime on the host, but it is still a secret the persisted session
+    /// state, provider identity and error text must never carry. Mirrors Python, which redacts
+    /// any mount whose raw fields hold authority.
+    fn carries_credentials(&self, _mount: &Mount) -> bool {
+        self.credential_authority() != MountCredentialAuthority::None
+    }
+
     /// Whether a native snapshot flow can detach this mount in place.
     fn supports_native_snapshot_detach(&self) -> bool {
         true
@@ -1345,15 +1356,16 @@ impl RcloneMountPattern {
                 format!("sandbox_{kind}_{session_id}")
             }
         };
-        // The name becomes both a `[section]` header and the `name:path` argument, so a
-        // separator inside it would silently attach the wrong remote.
-        if remote_name
-            .chars()
-            .any(|c| c.is_whitespace() || matches!(c, ':' | '/' | '[' | ']' | '\\'))
-        {
+        // The name becomes both a `[section]` header and the `name:path` argument, so anything
+        // outside the ordinary remote-name alphabet could silently attach a different remote —
+        // rclone reads a name starting with `:` as a whole on-the-fly backend definition, so
+        // `:s3,access_key_id=…,secret_access_key=…` would hand the sandbox a credential that was
+        // never declared on the mount. The name itself can therefore carry a secret, so it is
+        // never echoed back in the error.
+        if !is_usable_rclone_remote_name(&remote_name) {
             return Err(SandboxError::new(
                 ErrorCode::MountConfigInvalid,
-                format!("`{remote_name}` is not a usable rclone remote name"),
+                "the configured rclone remote name is not a usable remote name",
             ));
         }
         Ok(remote_name)
@@ -1466,6 +1478,95 @@ impl RcloneMountPattern {
     }
 }
 
+/// The configuration keys whose values are credentials.
+const RCLONE_SECRET_KEYS: &[&str] = &[
+    "access_key_id",
+    "secret_access_key",
+    "session_token",
+    "key",
+    "service_account_credentials",
+    "access_token",
+    "token",
+    "client_secret",
+    "config_credentials",
+];
+
+/// Every credential value an rclone configuration holds, for redacting the tool's output.
+fn rclone_secret_values(config_text: &str) -> Vec<String> {
+    config_text
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .filter(|(key, _)| RCLONE_SECRET_KEYS.contains(&key.trim()))
+        .map(|(_, value)| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect()
+}
+
+/// `rclone` flags that take no value and expose nothing. Mirrors Python's
+/// `_RCLONE_SAFE_FLAG_ARGS`.
+const RCLONE_SAFE_FLAG_ARGS: &[&str] = &["allow-other"];
+
+/// `rclone` options whose value is ordinary mount tuning. Mirrors Python's
+/// `_RCLONE_SAFE_VALUE_ARGS`.
+const RCLONE_SAFE_VALUE_ARGS: &[&str] = &["buffer-size", "gid", "uid"];
+
+/// Whether `name` is an rclone remote name that cannot smuggle a backend definition.
+///
+/// Mirrors Python's `_rclone_remote_name_is_safe`, except that whitespace stays rejected: a
+/// generated name never contains one and an inner space buys nothing but ambiguity.
+fn is_usable_rclone_remote_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first.is_ascii_alphanumeric() || first == '_') {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
+}
+
+/// Whether every entry of `extra_args` is a credential-free `rclone mount` option.
+///
+/// Mirrors Python's `_rclone_extra_args_analysis`. `extra_args` reaches the mount command
+/// verbatim, so an unrecognized option could point rclone at another configuration file
+/// (`--config`), switch it to ambient instance credentials (`--s3-env-auth`, `--s3-profile`,
+/// `--azureblob-use-msi`) or add an authorization header — none of which the manifest declared
+/// and none of which the credential-exposure acknowledgement covers.
+fn rclone_extra_args_are_safe(extra_args: &[String]) -> bool {
+    let mut index = 0;
+    while index < extra_args.len() {
+        let arg = extra_args[index].as_str();
+        if !arg.starts_with('-') {
+            return false;
+        }
+        let (option, value) = match arg.trim_start_matches('-').split_once('=') {
+            Some((option, value)) => (option, Some(value)),
+            None => (arg.trim_start_matches('-'), None),
+        };
+        let normalized = option.to_ascii_lowercase().replace('_', "-");
+        if RCLONE_SAFE_FLAG_ARGS.contains(&normalized.as_str()) && value.is_none() {
+            index += 1;
+            continue;
+        }
+        if RCLONE_SAFE_VALUE_ARGS.contains(&normalized.as_str()) {
+            if value.is_some_and(|value| !value.is_empty()) {
+                index += 1;
+                continue;
+            }
+            if value.is_none()
+                && extra_args
+                    .get(index + 1)
+                    .is_some_and(|next| !next.starts_with('-'))
+            {
+                index += 2;
+                continue;
+            }
+        }
+        return false;
+    }
+    true
+}
+
 #[async_trait]
 impl MountPattern for RcloneMountPattern {
     fn pattern_type(&self) -> &str {
@@ -1491,6 +1592,16 @@ impl MountPattern for RcloneMountPattern {
         mount_path: &str,
         config: &MountPatternConfig,
     ) -> SandboxResult<()> {
+        // An unsupported extra argument can redirect rclone at another credential source, so it
+        // is rejected before the sandbox is touched. The arguments can carry a secret of their
+        // own (`--header "Authorization: …"`), so none of them is echoed back.
+        if !rclone_extra_args_are_safe(&self.extra_args) {
+            return Err(SandboxError::new(
+                ErrorCode::MountConfigInvalid,
+                "the `rclone` mount pattern does not support exposing credentials to the \
+                 sandbox through `extra_args`",
+            ));
+        }
         let present = session
             .exec(ExecRequest::argv(["sh", "-lc", RCLONE_CHECK]).with_shell(ExecShell::None))
             .await?;
@@ -1606,13 +1717,19 @@ impl MountPattern for RcloneMountPattern {
         if !result.ok() {
             // The credential must not outlive the attempt that staged it.
             let _ = session.rm(&config_path, false).await;
-            // Never echo the command back: it names the remote the credentials belong to.
+            // Never echo the command back: it names the remote the credentials belong to. The
+            // tool's own output can repeat a configuration value, so every staged credential is
+            // replaced first.
+            let sensitive = rclone_secret_values(&config_text);
             return Err(SandboxError::new(
                 ErrorCode::MountFailed,
                 format!(
                     "`rclone` failed to mount `{mount_path}` with exit code {}: {}",
                     result.exit_code,
-                    result.stderr_text().trim()
+                    crate::sandbox::mount_patterns::redact_sensitive_values(
+                        result.stderr_text().trim(),
+                        &sensitive
+                    )
                 ),
             ));
         }
@@ -1733,8 +1850,11 @@ fn supplement_rclone_config_text(
         .map_or(lines.len(), |offset| start + 1 + offset);
 
     let mut section: Vec<&str> = lines[start..end].to_vec();
+    // The blank lines that separate this section from the next belong after the additions, as
+    // in Python, so the caller's layout survives the merge.
+    let mut separator: Vec<&str> = Vec::new();
     while section.last().is_some_and(|line| line.trim().is_empty()) {
-        section.pop();
+        separator.extend(section.pop());
     }
     // The provider repeats the header it generated; the caller's file already has one.
     let mut additions = required.lines().peekable();
@@ -1745,6 +1865,7 @@ fn supplement_rclone_config_text(
     let mut merged: Vec<&str> = lines[..start].to_vec();
     merged.extend(section);
     merged.extend(additions.filter(|line| !line.trim().is_empty()));
+    merged.extend(separator);
     merged.extend(&lines[end..]);
     let mut text = merged.join("\n");
     text.push('\n');
@@ -1919,7 +2040,7 @@ mod rclone_tests {
         assert_eq!(
             merged,
             "[other]\ntype = s3\nregion = us-east-1\n\n[bucket]\ntype = s3\naccess_key_id = \
-             AK\nsecret_access_key = SK\n[last]\ntype = s3\n"
+             AK\nsecret_access_key = SK\n\n[last]\ntype = s3\n"
         );
         // A configuration whose section is last keeps the settings at the end.
         let trailing =

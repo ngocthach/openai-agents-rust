@@ -69,7 +69,9 @@ use super::ports::{
     endpoint_from_authority, exposed_port_unavailable,
 };
 use crate::sandbox::errors::{ErrorCode, SandboxError, SandboxResult};
-use crate::sandbox::http::{expect_success, http_error, parse_json, transport};
+use crate::sandbox::http::{
+    bounded_read_zero, expect_success, http_error, parse_json, read_body_prefix, transport,
+};
 use crate::sandbox::manifest::Manifest;
 use crate::sandbox::mount_entries::{BuiltinMountPattern, ConfiguredMount};
 use crate::sandbox::mounts::{
@@ -1215,7 +1217,7 @@ impl E2BSandboxSession {
     /// Workspace reads go through [`read_file`](SandboxSession::read_file), which validates the
     /// path first; this is for the paths the session itself owns, such as a temporary archive
     /// under `/tmp`.
-    async fn download_at(&self, path: &str) -> SandboxResult<Vec<u8>> {
+    async fn download_at(&self, path: &str, limit: Option<usize>) -> SandboxResult<Vec<u8>> {
         let what = "read a file from the E2B sandbox";
         let response = self
             .envd(self.http.get(format!("{}/files", self.sandbox_base)))
@@ -1239,11 +1241,7 @@ impl E2BSandboxSession {
                 &body,
             ));
         }
-        Ok(response
-            .bytes()
-            .await
-            .map_err(|e| transport(what, e))?
-            .to_vec())
+        read_body_prefix(response, limit, what).await
     }
 
     /// Upload a file by its absolute sandbox path.
@@ -1440,7 +1438,15 @@ impl SandboxSession for E2BSandboxSession {
 
     async fn read_file(&self, path: &str) -> SandboxResult<Vec<u8>> {
         let resolved = self.normalize_path(path)?;
-        self.download_at(&resolved).await
+        self.download_at(&resolved, None).await
+    }
+
+    async fn read_bounded(&self, path: &str, max_bytes: usize) -> SandboxResult<Vec<u8>> {
+        if max_bytes == 0 {
+            return Err(bounded_read_zero());
+        }
+        let resolved = self.normalize_path(path)?;
+        self.download_at(&resolved, Some(max_bytes)).await
     }
 
     async fn write_file(&self, path: &str, contents: &[u8]) -> SandboxResult<()> {

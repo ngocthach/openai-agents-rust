@@ -18,13 +18,16 @@ use crate::sandbox::types::User;
 use crate::sandbox::workspace_paths::SandboxWorkspaceScope;
 use crate::tool::Tool;
 
+pub mod apply_patch_tool;
 pub mod compaction;
 pub mod filesystem;
 pub mod memory;
 pub mod pty_tools;
 pub mod shell;
 pub mod skills;
+pub(crate) mod tool_input_errors;
 
+pub use apply_patch_tool::SandboxApplyPatchTool;
 pub use compaction::{Compaction, CompactionPolicy, context_window_for_model};
 pub use filesystem::Filesystem;
 pub use memory::Memory;
@@ -85,6 +88,14 @@ where
     /// Adjust the manifest used for a fresh session.
     fn process_manifest(&self, manifest: Manifest) -> Manifest {
         manifest
+    }
+
+    /// Report a configuration problem [`process_manifest`](Self::process_manifest) could not
+    /// raise, because it cannot fail. Called with the session's manifest when an agent is
+    /// prepared. The default accepts everything.
+    fn check_manifest(&self, manifest: &Manifest) -> Result<()> {
+        let _ = manifest;
+        Ok(())
     }
 
     /// Tools exposed to the model, bound to the live session.
@@ -229,6 +240,10 @@ where
 
     fn process_manifest(&self, manifest: Manifest) -> Manifest {
         self.inner.process_manifest(manifest)
+    }
+
+    fn check_manifest(&self, manifest: &Manifest) -> Result<()> {
+        self.inner.check_manifest(manifest)
     }
 
     fn tools(&self, binding: &CapabilityBinding) -> Result<Vec<Tool<C>>> {

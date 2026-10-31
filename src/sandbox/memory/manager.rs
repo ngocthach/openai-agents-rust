@@ -97,10 +97,39 @@ pub fn validate_rollout_id(value: &str) -> SandboxResult<String> {
     if !valid {
         return Err(SandboxError::new(
             ErrorCode::SandboxConfigInvalid,
-            format!("invalid rollout id for memory: `{value}`"),
+            "Sandbox memory rollout ID must be a file-safe ID containing only letters, numbers, \
+             '.', '_', or '-'.",
         ));
     }
     Ok(id.to_string())
+}
+
+/// The rollout file name for `rollout_id`. Mirrors `_rollout_file_name_for_rollout_id`.
+pub fn rollout_file_name_for_rollout_id(rollout_id: &str) -> SandboxResult<String> {
+    Ok(format!("{}.jsonl", validate_rollout_id(rollout_id)?))
+}
+
+/// Put `rollout_id` into a payload right after `updated_at`, replacing any value already there.
+fn with_canonical_rollout_id(payload: &Value, rollout_id: &str) -> Value {
+    let Some(object) = payload.as_object() else {
+        return payload.clone();
+    };
+    let mut rebuilt = serde_json::Map::new();
+    let mut inserted = false;
+    for (key, value) in object {
+        if key == "rollout_id" {
+            continue;
+        }
+        rebuilt.insert(key.clone(), value.clone());
+        if key == "updated_at" {
+            rebuilt.insert("rollout_id".into(), Value::String(rollout_id.to_string()));
+            inserted = true;
+        }
+    }
+    if !inserted {
+        rebuilt.insert("rollout_id".into(), Value::String(rollout_id.to_string()));
+    }
+    Value::Object(rebuilt)
 }
 
 /// Manages the rollout files and the two generation phases for one sandbox session.
@@ -143,7 +172,10 @@ impl SandboxMemoryGenerationManager {
         let rollout_id = validate_rollout_id(rollout_id)?;
         self.storage.ensure_layout(session).await?;
         let file_name = format!("{rollout_id}.jsonl");
-        let line = crate::sandbox::memory::rollouts::dump_rollout_json(payload);
+        // The id the file is named after is the canonical one: it replaces whatever the payload
+        // claimed, and sits right after `updated_at` the way Python's segments order it.
+        let payload = with_canonical_rollout_id(payload, &rollout_id);
+        let line = crate::sandbox::memory::rollouts::dump_rollout_json(&payload);
         let path = self
             .storage
             .append_rollout(session, &file_name, &line)
@@ -266,26 +298,43 @@ impl SandboxMemoryGenerationManager {
         }
 
         let slug = normalize_rollout_slug(&artifacts.rollout_slug)?;
-        let summary_file = format!("{slug}.md");
-        let updated_at = chrono::Utc::now().to_rfc3339();
-        let terminal_state = contents
+        // The summary file is named after both halves, so two rollouts that happened to produce
+        // the same slug do not overwrite each other's summary.
+        let summary_file = format!("rollout_summaries/{rollout_id}_{slug}.md");
+        // The timestamps come from the recorded segment, not from the clock reading them back:
+        // the artifact describes when the rollout happened, not when it was consolidated.
+        let last_payload = contents
             .lines()
             .rfind(|line| !line.trim().is_empty())
-            .and_then(|line| serde_json::from_str::<Value>(line).ok())
-            .and_then(|payload| {
-                payload
-                    .get("terminal_metadata")
-                    .and_then(|m| m.get("terminal_state"))
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-            })
-            .unwrap_or_else(|| "unknown".to_string());
+            .and_then(|line| serde_json::from_str::<Value>(line).ok());
+        let field = |payload: Option<&Value>, path: &[&str]| -> String {
+            payload
+                .and_then(|payload| {
+                    path.iter()
+                        .try_fold(payload, |value, key| value.get(key))
+                        .and_then(Value::as_str)
+                        .filter(|value| !value.is_empty())
+                })
+                .unwrap_or("unknown")
+                .to_string()
+        };
+        let updated_at = field(last_payload.as_ref(), &["updated_at"]);
+        let terminal_state = field(
+            last_payload.as_ref(),
+            &["terminal_metadata", "terminal_state"],
+        );
 
+        let summary = format!(
+            "session_id: {}\nupdated_at: {updated_at}\nrollout_path: {rollout_path}\n\
+             terminal_state: {terminal_state}\n\n{}\n",
+            session.id(),
+            artifacts.rollout_summary.trim()
+        );
         self.storage
             .write_text(
                 session,
-                &format!("{}/{summary_file}", self.storage.rollout_summaries_dir()),
-                artifacts.rollout_summary.trim(),
+                &format!("{}/{summary_file}", self.storage.memories_dir()),
+                &summary,
             )
             .await?;
         let header = format!(

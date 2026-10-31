@@ -17,6 +17,8 @@ Requests (`op` selects the operation):
      "env": {...}}
         -> {"exit_code": 0, "stdout": "<base64>", "stderr": "<base64>"}
     {"op": "read_file", "sandbox_id": ..., "path": ...} -> {"data": "<base64>"}
+    {"op": "read_bounded", "sandbox_id": ..., "path": ..., "max_bytes": ...}
+        -> {"data": "<base64>"}
     {"op": "write_file", "sandbox_id": ..., "path": ..., "data": "<base64>"} -> {"ok": true}
     {"op": "poll", "sandbox_id": ...} -> {"running": true}
     {"op": "terminate", "sandbox_id": ...} -> {"ok": true}
@@ -196,6 +198,78 @@ async def _op_read_file(modal: Any, request: dict[str, Any]) -> dict[str, Any]:
     return {"data": base64.b64encode(data or b"").decode("ascii")}
 
 
+_RETRYABLE_MODAL_ERRORS = ("ConnectionError", "InternalError", "InternalFailure", "ServiceError")
+_NON_RETRYABLE_MODAL_ERRORS = (
+    "AlreadyExistsError",
+    "AuthError",
+    "ConflictError",
+    "InvalidError",
+    "LogsFetchError",
+    "NotFoundError",
+    "PermissionDeniedError",
+    "RequestSizeError",
+    "UnimplementedError",
+    "VersionError",
+)
+_MODAL_MAX_READ = 100 * 1024 * 1024
+
+
+def _modal_retryability(error: BaseException) -> bool | None:
+    seen = 0
+    candidate: BaseException | None = error
+    while candidate is not None and seen < 8:
+        name = type(candidate).__name__
+        if name in _NON_RETRYABLE_MODAL_ERRORS or name.startswith("SandboxFilesystem"):
+            return False
+        if name in _RETRYABLE_MODAL_ERRORS:
+            return True
+        status = getattr(candidate, "status_code", None) or getattr(candidate, "status", None)
+        if isinstance(status, int) and status in (500, 502, 503, 504):
+            return True
+        candidate = candidate.__cause__ or candidate.__context__
+        seen += 1
+    return None
+
+
+async def _op_read_bounded(modal: Any, request: dict[str, Any]) -> dict[str, Any]:
+    """Read at most `max_bytes` through the sandbox filesystem API and close the descriptor.
+
+    Each read is one remote operation, so a request uses Modal's 100 MiB per-read ceiling while
+    respecting the caller's remaining byte budget. Failures carry no provider text: the caller
+    only learns the reason and whether a retry may help.
+    """
+    max_bytes = int(request["max_bytes"])
+    try:
+        sandbox = await _sandbox(modal, request)
+        stream = await sandbox.open.aio(request["path"], "rb")
+        completed = False
+        try:
+            result = bytearray()
+            while len(result) < max_bytes:
+                chunk = await stream.read.aio(min(_MODAL_MAX_READ, max_bytes - len(result)))
+                if not chunk:
+                    break
+                result.extend(chunk)
+            payload = bytes(result)
+            completed = True
+        finally:
+            try:
+                await asyncio.wait_for(stream.close.aio(), timeout=5.0)
+            except Exception:
+                # An active read failure wins; a close failure still fails a completed read.
+                if completed:
+                    raise
+    except FileNotFoundError:
+        return {"error": "not found", "code": "not_found"}
+    except Exception as error:
+        return {
+            "error": "bounded read failed",
+            "code": "bounded_read_failed",
+            "retryable": _modal_retryability(error),
+        }
+    return {"data": base64.b64encode(payload).decode("ascii")}
+
+
 async def _op_write_file(modal: Any, request: dict[str, Any]) -> dict[str, Any]:
     sandbox = await _sandbox(modal, request)
     path = request["path"]
@@ -350,6 +424,7 @@ _OPS = {
     "create": _op_create,
     "exec": _op_exec,
     "read_file": _op_read_file,
+    "read_bounded": _op_read_bounded,
     "write_file": _op_write_file,
     "poll": _op_poll,
     "terminate": _op_terminate,

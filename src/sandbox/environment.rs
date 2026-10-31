@@ -141,15 +141,22 @@ impl Environment {
 
     /// Resolve every variable.
     ///
-    /// Mirrors Python's `Environment.resolve`. Resolution runs sequentially and stops at the
-    /// first failure: these are caller-supplied lookups that can reach a secret store, and a
-    /// manifest that has already failed should not keep fetching secrets it will not use.
+    /// Mirrors Python's `Environment.resolve`: the lookups run concurrently, and the first
+    /// failure is returned at once with the others dropped, which cancels them at their next
+    /// await point. These are caller-supplied lookups that can reach a secret store, so a
+    /// manifest that has already failed must not leave other secret fetches in flight.
     pub async fn resolve(&self) -> SandboxResult<BTreeMap<String, String>> {
-        let mut resolved = BTreeMap::new();
-        for (key, entry) in &self.entries {
-            resolved.insert(key.clone(), entry.value.resolve().await?);
-        }
-        Ok(resolved)
+        let lookups = self.entries.iter().map(|(key, entry)| async move {
+            entry
+                .value
+                .resolve()
+                .await
+                .map(|value| (key.clone(), value))
+        });
+        Ok(futures::future::try_join_all(lookups)
+            .await?
+            .into_iter()
+            .collect())
     }
 }
 

@@ -1,21 +1,25 @@
 //! The PTY-backed `exec_command` and `write_stdin` tools. Mirrors
 //! `agents.sandbox.capabilities.tools.shell_tool`.
 
+use crate::sandbox::capabilities::tool_input_errors::{FieldKind, FieldSpec, tool_with_safe_input};
 use std::sync::Arc;
 
 use schemars::JsonSchema;
 use serde::Deserialize;
 
+use std::time::Duration;
+
 use crate::error::AgentsError;
-use crate::sandbox::errors::ErrorCode;
+use crate::sandbox::errors::{ErrorCode, SandboxError, SandboxResult};
 use crate::sandbox::pty::{
     DEFAULT_EXEC_YIELD_TIME_MS, DEFAULT_WRITE_STDIN_YIELD_TIME_MS, PtyExecRequest, PtyExecUpdate,
     PtyWriteRequest,
 };
-use crate::sandbox::session::{ExecShell, SandboxSession};
+use crate::sandbox::session::{ExecRequest, ExecShell, SandboxSession};
 use crate::sandbox::types::User;
+use crate::sandbox::util::formatted_truncate_text_with_token_count;
 use crate::sandbox::workspace_paths::SandboxWorkspaceScope;
-use crate::tool::{FunctionTool, Tool};
+use crate::tool::Tool;
 
 /// The name of the PTY command tool.
 pub const EXEC_COMMAND_TOOL_NAME: &str = "exec_command";
@@ -82,6 +86,23 @@ pub struct WriteStdinArgs {
     pub max_output_tokens: Option<usize>,
 }
 
+const EXEC_COMMAND_FIELDS: &[FieldSpec] = &[
+    ("cmd", FieldKind::Str { non_empty: true }),
+    ("workdir", FieldKind::OptStr),
+    ("shell", FieldKind::OptStr),
+    ("login", FieldKind::Bool),
+    ("tty", FieldKind::Bool),
+    ("yield_time_ms", FieldKind::DefaultedInt { min: 0 }),
+    ("max_output_tokens", FieldKind::OptInt { min: 1 }),
+];
+
+const WRITE_STDIN_FIELDS: &[FieldSpec] = &[
+    ("session_id", FieldKind::Int { min: 0 }),
+    ("chars", FieldKind::DefaultedStr),
+    ("yield_time_ms", FieldKind::DefaultedInt { min: 0 }),
+    ("max_output_tokens", FieldKind::OptInt { min: 1 }),
+];
+
 /// Resolve the shell prefix the way Python's `_resolve_shell` does.
 fn resolve_shell(shell: Option<&str>, login: bool) -> ExecShell {
     match shell {
@@ -92,6 +113,62 @@ fn resolve_shell(shell: Option<&str>, login: bool) -> ExecShell {
             if login { "-lc" } else { "-c" }.to_string(),
         ]),
     }
+}
+
+/// Join a command's two streams the way Python's `_normalize_output` does.
+///
+/// A command that wrote to both streams gets them concatenated, with a newline inserted only
+/// when stdout did not already end in one, so interleaved output does not run two lines
+/// together. A command that wrote to one stream gets that stream unchanged.
+fn normalize_output(stdout: &str, stderr: &str) -> String {
+    if !stdout.is_empty() && !stderr.is_empty() {
+        let joiner = if stdout.ends_with('\n') { "" } else { "\n" };
+        return format!("{stdout}{joiner}{stderr}");
+    }
+    if stdout.is_empty() {
+        stderr.to_string()
+    } else {
+        stdout.to_string()
+    }
+}
+
+/// Put `notice` above `output`, or use it alone when there was no output.
+fn prepend_notice(output: &str, notice: &str) -> String {
+    if output.is_empty() {
+        notice.to_string()
+    } else {
+        format!("{notice}\n{output}")
+    }
+}
+
+/// Whether a PTY transport failure may be retried as a plain one-shot command.
+///
+/// Mirrors Python's `_supports_transport_fallback`: only a transport that says the command
+/// never started can be re-run, because re-running one that did would repeat its side effects.
+fn supports_transport_fallback(error: &SandboxError) -> bool {
+    error.context.get("retry_safe").map(String::as_str) == Some("true")
+}
+
+/// The result of one command run outside a PTY: output, exit code and pre-truncation tokens.
+async fn run_one_shot_exec(
+    session: &dyn SandboxSession,
+    command: String,
+    timeout: Option<Duration>,
+    shell: ExecShell,
+    cwd: Option<String>,
+    user: Option<User>,
+    max_output_tokens: Option<usize>,
+) -> SandboxResult<(String, Option<i32>, Option<usize>)> {
+    let request = ExecRequest::shell(command)
+        .with_shell(shell)
+        .with_timeout(timeout)
+        .with_cwd(cwd)
+        .with_user(user);
+    let result = session.exec(request).await?;
+    let output = normalize_output(&result.stdout_text(), &result.stderr_text());
+    let (output, original_token_count) =
+        formatted_truncate_text_with_token_count(&output, max_output_tokens);
+    Ok((output, Some(result.exit_code), original_token_count))
 }
 
 /// Format a PTY result the way the Python tool does.
@@ -140,9 +217,10 @@ pub fn exec_command_tool<C: Send + Sync + 'static>(
     scope: SandboxWorkspaceScope,
     needs_approval: bool,
 ) -> Tool<C> {
-    let tool = FunctionTool::<C>::new(
+    let tool = tool_with_safe_input::<C, ExecCommandArgs, _, _, _>(
         EXEC_COMMAND_TOOL_NAME,
         EXEC_COMMAND_DESCRIPTION,
+        EXEC_COMMAND_FIELDS,
         move |_ctx, args: ExecCommandArgs| {
             let session = session.clone();
             let run_as = run_as.clone();
@@ -152,22 +230,81 @@ pub fn exec_command_tool<C: Send + Sync + 'static>(
                 // empty directories where mounted storage should be.
                 session.ensure_mounts_settled()?;
                 let started = std::time::Instant::now();
-                let workdir = match args.workdir.as_deref().map(str::trim) {
+                let requested_workdir = match args.workdir.as_deref().map(str::trim) {
                     None | Some("") => scope.cwd().map(str::to_string),
                     Some(workdir) => Some(scope.anchor(workdir)),
                 };
-                if let Some(workdir) = &workdir
-                    && session.normalize_path(workdir).is_err()
-                {
-                    return Ok::<_, AgentsError>(
-                        "Invalid workdir. Use a path within the workspace.".to_string(),
-                    );
+                // The backend receives the resolved absolute sandbox path, not the relative
+                // spelling the model used: a backend that resolves a relative directory against
+                // its own process cwd would run the command somewhere else entirely.
+                let workdir = match &requested_workdir {
+                    Some(workdir) => match session.normalize_path(workdir) {
+                        Ok(resolved) => Some(resolved),
+                        Err(_) => {
+                            return Ok::<_, AgentsError>(
+                                "Invalid workdir. Use a path within the workspace or an \
+                                 explicitly granted path."
+                                    .to_string(),
+                            );
+                        }
+                    },
+                    None => None,
+                };
+                let shell = resolve_shell(args.shell.as_deref(), args.login);
+                let timeout = Duration::from_millis(args.yield_time_ms);
+                let one_shot = async |notice: Option<&str>| -> Result<String, SandboxError> {
+                    let (output, exit_code, original_token_count) = run_one_shot_exec(
+                        session.as_ref(),
+                        args.cmd.clone(),
+                        Some(timeout),
+                        shell.clone(),
+                        workdir.clone(),
+                        run_as.clone(),
+                        args.max_output_tokens,
+                    )
+                    .await?;
+                    let output = match notice {
+                        Some(notice) => prepend_notice(&output, notice),
+                        None => output,
+                    };
+                    Ok(format_response(
+                        &output,
+                        started.elapsed().as_secs_f64(),
+                        exit_code,
+                        None,
+                        original_token_count,
+                    ))
+                };
+                let timed_out = |elapsed: f64| {
+                    format_response(
+                        &format!(
+                            "Command timed out after {:.3} seconds.",
+                            args.yield_time_ms as f64 / 1000.0
+                        ),
+                        elapsed,
+                        None,
+                        None,
+                        None,
+                    )
+                };
+
+                // A session without a PTY runs the command once and reports its exit code,
+                // which is what Python's `exec_command` does on the same backend.
+                if !session.supports_pty() {
+                    return match one_shot(None).await {
+                        Ok(response) => Ok(response),
+                        Err(error) if error.is_timeout() => {
+                            Ok(timed_out(started.elapsed().as_secs_f64()))
+                        }
+                        Err(error) => Err(AgentsError::from(error)),
+                    };
                 }
-                let request = PtyExecRequest::new(args.cmd)
-                    .with_shell(resolve_shell(args.shell.as_deref(), args.login))
+
+                let request = PtyExecRequest::new(args.cmd.clone())
+                    .with_shell(shell.clone())
                     .with_tty(args.tty)
-                    .with_user(run_as)
-                    .with_cwd(workdir)
+                    .with_user(run_as.clone())
+                    .with_cwd(workdir.clone())
                     .with_yield_time_ms(args.yield_time_ms)
                     .with_max_output_tokens(args.max_output_tokens);
                 match session.pty_exec_start(request).await {
@@ -175,16 +312,30 @@ pub fn exec_command_tool<C: Send + Sync + 'static>(
                         &update,
                         started.elapsed().as_secs_f64(),
                     )),
-                    Err(error) if error.is_timeout() => Ok(format_response(
-                        &format!(
-                            "Command timed out after {:.3} seconds.",
-                            args.yield_time_ms as f64 / 1000.0
-                        ),
-                        started.elapsed().as_secs_f64(),
-                        None,
-                        None,
-                        None,
-                    )),
+                    Err(error) if error.is_timeout() => {
+                        Ok(timed_out(started.elapsed().as_secs_f64()))
+                    }
+                    // A transport that dropped before the session opened never ran the command,
+                    // so running it once more cannot repeat a side effect. A `tty=true` call
+                    // asked for an interactive session, which one-shot exec cannot give it.
+                    Err(error)
+                        if !args.tty
+                            && error.code == ErrorCode::ExecTransportError
+                            && supports_transport_fallback(&error) =>
+                    {
+                        match one_shot(Some(
+                            "PTY transport failed before the interactive session opened; fell \
+                             back to one-shot exec.",
+                        ))
+                        .await
+                        {
+                            Ok(response) => Ok(response),
+                            Err(error) if error.is_timeout() => {
+                                Ok(timed_out(started.elapsed().as_secs_f64()))
+                            }
+                            Err(error) => Err(AgentsError::from(error)),
+                        }
+                    }
                     Err(error) => Err(AgentsError::from(error)),
                 }
             }
@@ -200,9 +351,10 @@ pub fn write_stdin_tool<C: Send + Sync + 'static>(
     session: Arc<dyn SandboxSession>,
     needs_approval: bool,
 ) -> Tool<C> {
-    let tool = FunctionTool::<C>::new(
+    let tool = tool_with_safe_input::<C, WriteStdinArgs, _, _, _>(
         WRITE_STDIN_TOOL_NAME,
         WRITE_STDIN_DESCRIPTION,
+        WRITE_STDIN_FIELDS,
         move |_ctx, args: WriteStdinArgs| {
             let session = session.clone();
             async move {

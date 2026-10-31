@@ -71,13 +71,15 @@ impl TerminalState {
 pub struct RolloutTerminalMetadata {
     /// How the segment ended.
     pub terminal_state: TerminalState,
-    /// The error type, when the segment failed.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// The error type, when the segment failed. Serialized as `null` when absent, as Python's
+    /// `model_dump(mode="json")` does, so the rollout JSON has one shape for every segment.
+    #[serde(default)]
     pub exception_type: Option<String>,
     /// The error message, when the segment failed.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub exception_message: Option<String>,
     /// Whether the segment produced a final output.
+    #[serde(default)]
     pub has_final_output: bool,
 }
 
@@ -134,10 +136,12 @@ fn error_type_name(error: &crate::error::AgentsError) -> &'static str {
 
 /// Whether an item belongs in a memory rollout.
 pub fn should_include_memory_item(item: &Value) -> bool {
+    // Mirrors `_should_include_memory_item`: the roles settle it, and anything else (including
+    // a role it does not know) falls through to the item type.
     match item.get("role").and_then(Value::as_str) {
         Some("developer") | Some("system") => return false,
-        Some(_) => return true,
-        None => {}
+        Some("assistant") | Some("tool") | Some("user") => return true,
+        _ => {}
     }
     let Some(item_type) = item.get("type").and_then(Value::as_str) else {
         return false;
@@ -153,12 +157,68 @@ pub fn dump_rollout_json(payload: &Value) -> String {
     format!("{}\n", serde_json::to_string(payload).unwrap_or_default())
 }
 
+/// Serialize one paused approval the way the rollout records it.
+///
+/// Mirrors Python's `_serialize_interruption_raw_item`: the raw tool call, with the `type`
+/// discriminator the model emitted it under, so a later phase can tell what was waiting.
+pub fn serialize_interruption(interruption: &crate::items::ToolApprovalItem) -> Value {
+    let mut value = serde_json::to_value(&interruption.raw_item).unwrap_or_else(|_| json!({}));
+    if let Some(object) = value.as_object_mut() {
+        object
+            .entry("type")
+            .or_insert_with(|| json!("function_call"));
+    }
+    value
+}
+
 /// Build the memory rollout payload of one run segment.
+///
+/// `interruption_count` records how many approvals the segment paused on. A caller that still
+/// holds the approval items themselves should use
+/// [`build_rollout_payload_with_interruptions`], which records what was waiting rather than only
+/// how much.
 pub fn build_rollout_payload(
     input: &[InputItem],
     new_items: &[RunItem],
     final_output: Option<&Value>,
     interruption_count: usize,
+    terminal_metadata: &RolloutTerminalMetadata,
+) -> Value {
+    build_payload(
+        input,
+        new_items,
+        final_output,
+        (interruption_count > 0).then(|| json!(interruption_count)),
+        terminal_metadata,
+    )
+}
+
+/// Build the memory rollout payload of one run segment, recording the paused approvals.
+pub fn build_rollout_payload_with_interruptions(
+    input: &[InputItem],
+    new_items: &[RunItem],
+    final_output: Option<&Value>,
+    interruptions: &[crate::items::ToolApprovalItem],
+    terminal_metadata: &RolloutTerminalMetadata,
+) -> Value {
+    let serialized: Vec<Value> = interruptions.iter().map(serialize_interruption).collect();
+    build_payload(
+        input,
+        new_items,
+        final_output,
+        (!serialized.is_empty()).then(|| json!(serialized)),
+        terminal_metadata,
+    )
+}
+
+/// The shared body. The key order is Python's: `updated_at`, `input`, `generated_items`, then
+/// `interruptions` only when the segment paused, `terminal_metadata`, and `final_output` only
+/// when the segment produced one.
+fn build_payload(
+    input: &[InputItem],
+    new_items: &[RunItem],
+    final_output: Option<&Value>,
+    interruptions: Option<Value>,
     terminal_metadata: &RolloutTerminalMetadata,
 ) -> Value {
     let filtered_input: Vec<Value> = input
@@ -171,30 +231,74 @@ pub fn build_rollout_payload(
         .map(|item| item.to_input_item().0)
         .filter(should_include_memory_item)
         .collect();
-    json!({
-        "updated_at": chrono::Utc::now().to_rfc3339(),
-        "input": filtered_input,
-        "generated_items": generated_items,
-        "final_output": final_output.cloned().unwrap_or(Value::Null),
-        "interruptions": interruption_count,
-        "terminal_metadata": terminal_metadata,
-    })
+    let mut payload = serde_json::Map::new();
+    payload.insert("updated_at".into(), json!(chrono::Utc::now().to_rfc3339()));
+    payload.insert("input".into(), json!(filtered_input));
+    payload.insert("generated_items".into(), json!(generated_items));
+    if let Some(interruptions) = interruptions {
+        payload.insert("interruptions".into(), interruptions);
+    }
+    payload.insert(
+        "terminal_metadata".into(),
+        serde_json::to_value(terminal_metadata).unwrap_or_else(|_| json!({})),
+    );
+    if let Some(final_output) = final_output {
+        payload.insert("final_output".into(), final_output.clone());
+    }
+    Value::Object(payload)
 }
 
 /// Build the memory rollout payload from a finished [`RunResult`].
 pub fn build_rollout_payload_from_result<C>(result: &RunResult<C>) -> Value {
-    let terminal_metadata = if result.interruptions.is_empty() {
-        RolloutTerminalMetadata::new(TerminalState::Completed, result.final_output.is_some())
-    } else {
+    let terminal_metadata = if result.final_output.is_some() {
+        RolloutTerminalMetadata::new(TerminalState::Completed, true)
+    } else if !result.interruptions.is_empty() {
         RolloutTerminalMetadata::new(TerminalState::Interrupted, false)
+    } else {
+        RolloutTerminalMetadata::new(TerminalState::Failed, false)
     };
-    build_rollout_payload(
+    build_rollout_payload_with_interruptions(
         &result.input,
         &result.new_items,
         result.final_output.as_ref(),
-        result.interruptions.len(),
+        &result.interruptions,
         &terminal_metadata,
     )
+}
+
+/// Render `value` the way Python's `json.dumps(value, sort_keys=True, separators=(",", ":"),
+/// indent=2)` does: two-space indentation, keys in sorted order and no space after the colon.
+///
+/// `serde_json`'s own pretty printer writes `": "`, so the phase-1 prompt would differ from the
+/// one Python builds for the same rollout.
+fn dump_sorted_indented_json(value: &Value, depth: usize) -> String {
+    let pad = "  ".repeat(depth + 1);
+    let close_pad = "  ".repeat(depth);
+    match value {
+        Value::Object(map) if !map.is_empty() => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            let body: Vec<String> = keys
+                .into_iter()
+                .map(|key| {
+                    format!(
+                        "{pad}{}:{}",
+                        serde_json::to_string(key).unwrap_or_default(),
+                        dump_sorted_indented_json(&map[key], depth + 1)
+                    )
+                })
+                .collect();
+            format!("{{\n{}\n{close_pad}}}", body.join(",\n"))
+        }
+        Value::Array(items) if !items.is_empty() => {
+            let body: Vec<String> = items
+                .iter()
+                .map(|item| format!("{pad}{}", dump_sorted_indented_json(item, depth + 1)))
+                .collect();
+            format!("[\n{}\n{close_pad}]", body.join(",\n"))
+        }
+        other => serde_json::to_string(other).unwrap_or_default(),
+    }
 }
 
 /// Build the phase-1 user prompt from a rollout file's JSONL contents.
@@ -226,8 +330,7 @@ pub fn render_phase_one_prompt(rollout_contents: &str, token_limit: usize) -> Op
                 .collect::<Vec<_>>(),
         })
     };
-    let terminal_metadata_json =
-        serde_json::to_string_pretty(&terminal_metadata).unwrap_or_default();
+    let terminal_metadata_json = dump_sorted_indented_json(&terminal_metadata, 0);
     let (truncated, _) = truncate_text_by_tokens(rollout_contents, Some(token_limit));
     let truncated = if truncated == rollout_contents {
         truncated
@@ -294,7 +397,7 @@ mod tests {
             100_000,
         )
         .unwrap();
-        assert!(single.contains("\"terminal_state\": \"completed\""));
+        assert!(single.contains("\"terminal_state\":\"completed\""));
         assert!(!single.contains("segment_count"));
 
         let multi = render_phase_one_prompt(
@@ -303,7 +406,7 @@ mod tests {
             100_000,
         )
         .unwrap();
-        assert!(multi.contains("\"segment_count\": 2"));
+        assert!(multi.contains("\"segment_count\":2"));
         assert!(multi.contains("interrupted"));
 
         let long = "{\"terminal_metadata\":{}}\n".repeat(500);

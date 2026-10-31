@@ -31,7 +31,7 @@ use sha2::{Digest, Sha256};
 use crate::sandbox::entries::EntryKind;
 use crate::sandbox::errors::{ErrorCode, SandboxError, SandboxResult};
 use crate::sandbox::manifest::Manifest;
-use crate::sandbox::mounts::MountCredentialAuthority;
+use crate::sandbox::mount_entries::ConfiguredMountStrategy;
 use crate::sandbox::snapshot::SnapshotSpec;
 
 /// The serde default for fields that older states did not carry.
@@ -171,13 +171,22 @@ impl SandboxSessionState {
             exposed_ports: Vec::new(),
             rollout_id: None,
             workspace_root_ready: false,
-            // The live manifest is the only place a grant or a credential may live, so a
-            // resumed state always needs the caller to supply them again.
-            path_grants_require_rebind: !manifest.host_path_grants().is_empty()
-                || !manifest.extra_path_grants().is_empty(),
-            mount_authority_redacted: manifest.mount_targets().iter().any(|(mount, _)| {
-                mount.strategy.credential_authority() != MountCredentialAuthority::None
-            }),
+            // The live manifest is the only place a *host* path or a credential may live, so a
+            // resumed state needs the caller to supply those again. A grant that names only a
+            // path inside the sandbox carries no host authority, so it travels in the state as
+            // it is and a resume from it needs nothing re-supplied.
+            path_grants_require_rebind: manifest
+                .mount_targets()
+                .iter()
+                .any(|(mount, _)| mount.strategy.host_path_grant(mount).is_some())
+                || manifest
+                    .extra_path_grants()
+                    .iter()
+                    .any(|grant| grant.host_path.is_some()),
+            mount_authority_redacted: manifest
+                .mount_targets()
+                .iter()
+                .any(|(mount, _)| mount.strategy.carries_credentials(mount)),
             mount_authority_rebound: false,
             redacted_host_path_grant_paths: manifest
                 .extra_path_grants()
@@ -189,6 +198,22 @@ impl SandboxSessionState {
             snapshot_fingerprint_version: None,
             provider_metadata: serde_json::Map::new(),
         }
+    }
+
+    /// Record the sandbox-side ports the session exposes.
+    ///
+    /// Duplicates are dropped and the first occurrence keeps its place, mirroring the
+    /// normalization Python's `exposed_ports` validator applies.
+    pub fn with_exposed_ports<I>(mut self, ports: I) -> Self
+    where
+        I: IntoIterator<Item = u16>,
+    {
+        let mut seen = std::collections::BTreeSet::new();
+        self.exposed_ports = ports
+            .into_iter()
+            .filter(|port| seen.insert(*port))
+            .collect();
+        self
     }
 
     /// Record the workspace fingerprint the snapshot was taken from.
@@ -228,6 +253,11 @@ impl SandboxSessionState {
     /// manifest had must be supplied again by application code or the resume is refused:
     /// otherwise a hand-edited state could widen what the sandbox reaches.
     pub fn rebind_path_grants(&self, trusted: &Manifest) -> SandboxResult<Self> {
+        // Authority is only handed back to a manifest with exactly the credential-free topology
+        // the state was written from (Python: "exactly matching").
+        if self.mount_authority_redacted {
+            self.verify_manifest(trusted)?;
+        }
         if !self.path_grants_require_rebind {
             let mut rebound = self.clone();
             if rebound.mount_authority_redacted {
@@ -380,6 +410,15 @@ impl SandboxSessionState {
                 ),
             ));
         }
+        // Port 0 is representable but never a port a backend can expose, so a persisted state
+        // claiming it is malformed rather than merely odd. Mirrors Python's
+        // `exposed_ports entries must be between 1 and 65535`.
+        if state.exposed_ports.contains(&0) {
+            return Err(SandboxError::new(
+                ErrorCode::SessionStateInvalid,
+                "exposed_ports entries must be between 1 and 65535",
+            ));
+        }
         Ok(state)
     }
 
@@ -467,6 +506,17 @@ pub fn manifest_digest(manifest: &Manifest) -> String {
         if let Some(mount) = entry.as_mount() {
             hasher.update(mount.strategy.strategy_type().as_bytes());
             hasher.update([0x1f]);
+            // The same strategy kind can attach different storage (an rclone S3 bucket or a
+            // GCS one, another bucket, another driver), and a resume must not swap one for the
+            // other. Python compares the credential-free mount configuration exactly.
+            if let Some(configured) = mount
+                .strategy
+                .as_any()
+                .and_then(|any| any.downcast_ref::<ConfiguredMountStrategy>())
+            {
+                hasher.update(configured.topology_identity().as_bytes());
+                hasher.update([0x1f]);
+            }
             hasher.update(mount.mount_path.as_deref().unwrap_or("").as_bytes());
             hasher.update([u8::from(mount.read_only)]);
         }

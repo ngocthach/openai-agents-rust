@@ -21,8 +21,8 @@ const SHELL_INSTRUCTIONS: &str = "When using the shell:
 - Avoid using Python scripts just to print large file chunks.";
 
 const PTY_INSTRUCTIONS: &str = "When using the shell:
-- Use `shell` for one-shot command batches, and `exec_command` when you need a PTY or an \
-interactive session.
+- Use `shell` for one-shot command batches, and `exec_command` for a single command, or when you \
+need a PTY or an interactive session (set `tty=true`).
 - If available, use `write_stdin` to interact with or poll running sessions.
 - To interrupt a long-running process via `write_stdin`, start it with `tty=true` in \
 `exec_command` and send Ctrl-C (`\\u0003`).
@@ -141,17 +141,22 @@ impl<C: Send + Sync + 'static> Capability<C> for Shell {
             tool = tool.with_name(name.clone());
         }
         let mut tools = vec![Tool::Shell(Arc::new(tool))];
-        if self.pty && binding.session.supports_pty() {
+        if self.pty {
+            // Python's shell capability always exposes `exec_command`; on a session without a
+            // PTY the tool runs the command once through `exec`. Dropping it here would leave
+            // the model with instructions naming a tool it cannot call.
             tools.push(exec_command_tool(
                 binding.session.clone(),
                 binding.run_as.clone(),
                 binding.scope.clone(),
                 self.needs_approval,
             ));
-            tools.push(write_stdin_tool(
-                binding.session.clone(),
-                self.needs_approval,
-            ));
+            if binding.session.supports_pty() {
+                tools.push(write_stdin_tool(
+                    binding.session.clone(),
+                    self.needs_approval,
+                ));
+            }
         }
         Ok(tools)
     }

@@ -79,6 +79,21 @@ impl PhaseTwoSelectionItem {
     }
 }
 
+/// Rank a raw memory's `updated_at` so rollouts whose timestamp is unknown come last.
+///
+/// Mirrors Python's `_updated_at_sort_key`. A literal `unknown` and a missing value are the same
+/// thing, and both must rank below every real timestamp: comparing the strings as they are would
+/// sort `unknown` *above* every ISO timestamp, which would make the newest known rollouts the
+/// first ones a capped selection drops.
+pub fn updated_at_sort_key(updated_at: &str) -> (u8, String) {
+    let value = updated_at.trim();
+    if value.is_empty() || value == "unknown" {
+        (0, String::new())
+    } else {
+        (1, value.to_string())
+    }
+}
+
 /// Which phase-1 artifacts phase 2 should consolidate.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PhaseTwoInputSelection {
@@ -321,7 +336,7 @@ impl SandboxMemoryStorage {
         let Ok(entries) = session.ls(&dir).await else {
             return Ok(Vec::new());
         };
-        let mut items: Vec<(String, String, PhaseTwoSelectionItem)> = Vec::new();
+        let mut items: Vec<((u8, String), String, PhaseTwoSelectionItem)> = Vec::new();
         for entry in entries {
             if entry.is_dir || !entry.name.ends_with(".md") {
                 continue;
@@ -334,7 +349,11 @@ impl SandboxMemoryStorage {
             else {
                 continue;
             };
-            items.push((item.updated_at.clone(), item.rollout_id.clone(), item));
+            items.push((
+                updated_at_sort_key(&item.updated_at),
+                item.rollout_id.clone(),
+                item,
+            ));
         }
         // Newest first, breaking ties on the rollout id so the order is deterministic.
         items.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));

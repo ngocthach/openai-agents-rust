@@ -4,7 +4,7 @@
 //! before it reaches a session. Absolute paths outside the root, Windows-style absolute paths
 //! and `..` segments are rejected.
 
-use crate::sandbox::errors::{ErrorCode, SandboxError, SandboxResult};
+use crate::sandbox::errors::{ErrorCode, SandboxError, SandboxOp, SandboxResult};
 
 /// Normalize a path to POSIX separators without resolving it.
 pub fn to_posix(path: &str) -> String {
@@ -41,6 +41,94 @@ pub fn normalize_segments(path: &str) -> String {
         ".".to_string()
     } else {
         joined
+    }
+}
+
+/// Resolve `.`, `..` and redundant separators lexically, the way `posixpath.normpath` does.
+///
+/// A `..` that cannot be popped is kept, so a relative path may still begin with `..` and the
+/// caller can recognise an escape. Nothing on the filesystem is consulted: a `..` that crosses a
+/// symlink is resolved textually here, exactly as Python does, and symlink containment is
+/// checked separately by the backends that have a real host directory to look at.
+pub fn normpath(path: &str) -> String {
+    let posix = to_posix(path);
+    let absolute = posix.starts_with('/');
+    let mut parts: Vec<&str> = Vec::new();
+    for segment in posix.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                match parts.last() {
+                    // An unpoppable `..` is kept so a relative path can still escape.
+                    Some(&"..") | None if !absolute => parts.push(".."),
+                    // Above the root there is nowhere to go, so `/..` stays `/`.
+                    None => {}
+                    Some(_) => {
+                        parts.pop();
+                    }
+                }
+            }
+            other => parts.push(other),
+        }
+    }
+    let joined = parts.join("/");
+    if absolute {
+        format!("/{joined}")
+    } else if joined.is_empty() {
+        ".".to_string()
+    } else {
+        joined
+    }
+}
+
+/// The error Python raises for a manifest path that is absolute or escapes the workspace root.
+///
+/// `rel` is the caller's own path, not the normalized one: the message has to name the path the
+/// caller actually wrote, or it reads as being about a path they never mentioned.
+fn invalid_manifest_path(rel: &str) -> SandboxError {
+    let rel = to_posix(rel);
+    let absolute = rel.starts_with('/') || is_windows_absolute(&rel);
+    let (reason, message) = if absolute {
+        ("absolute", format!("manifest path must be relative: {rel}"))
+    } else {
+        (
+            "escape_root",
+            format!("manifest path must not escape root: {rel}"),
+        )
+    };
+    SandboxError::new(ErrorCode::InvalidManifestPath, message)
+        .with_op(SandboxOp::Materialize)
+        .with_context("rel", rel)
+        .with_context("reason", reason)
+}
+
+/// Resolve `path` against the real filesystem as far as it exists, keeping the rest lexically.
+///
+/// Mirrors Python's `Path.resolve(strict=False)`: the longest existing prefix is canonicalized —
+/// which is what makes a symlinked parent visible — and the segments that do not exist yet are
+/// appended unchanged, so a path can be validated before the file it names is created.
+fn resolve_existing_prefix(path: &str) -> String {
+    let posix = normpath(path);
+    let mut existing = std::path::PathBuf::from(&posix);
+    let mut trailing: Vec<String> = Vec::new();
+    loop {
+        if let Ok(canonical) = std::fs::canonicalize(&existing) {
+            let mut resolved = canonical.to_string_lossy().into_owned();
+            for segment in trailing.iter().rev() {
+                resolved = format!("{}/{segment}", resolved.trim_end_matches('/'));
+            }
+            return normpath(&resolved);
+        }
+        let Some(name) = existing
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+        else {
+            return posix;
+        };
+        trailing.push(name);
+        if !existing.pop() {
+            return posix;
+        }
     }
 }
 
@@ -100,71 +188,47 @@ pub fn is_provider_scratch_path(path: &str) -> bool {
 
 pub fn resolve_workspace_path(root: &str, path: &str) -> SandboxResult<String> {
     if is_windows_absolute(path) {
-        return Err(SandboxError::new(
-            ErrorCode::InvalidManifestPath,
-            format!("sandbox path `{path}` must use POSIX separators and stay workspace-relative"),
-        ));
+        return Err(invalid_manifest_path(path));
     }
-    let root = {
-        let trimmed = to_posix(root);
-        let trimmed = trimmed.trim_end_matches('/').to_string();
-        if trimmed.is_empty() {
-            "/".to_string()
-        } else {
-            trimmed
-        }
-    };
-    let candidate = normalize_segments(path);
-    if candidate.split('/').any(|s| s == "..") {
-        return Err(SandboxError::new(
-            ErrorCode::InvalidManifestPath,
-            format!("sandbox path `{path}` must not contain parent segments"),
-        ));
-    }
-    let resolved = if candidate.starts_with('/') {
-        candidate
-    } else if candidate == "." {
-        root.clone()
+    let root = normpath(root);
+    let posix = to_posix(path);
+    // Mirrors Python's `_absolute_posix_path`: anchor first, then collapse `..` lexically, so a
+    // `..` that stays inside the workspace (`pkg/../secret.txt`) resolves instead of being
+    // refused, and only a path that really leaves the root is rejected.
+    let resolved = if posix.starts_with('/') {
+        normpath(&posix)
     } else {
-        format!("{}/{}", root.trim_end_matches('/'), candidate)
+        normpath(&format!("{}/{posix}", root.trim_end_matches('/')))
     };
     if !is_within(&root, &resolved) {
-        return Err(SandboxError::new(
-            ErrorCode::InvalidManifestPath,
-            format!("sandbox path `{path}` escapes the workspace root `{root}`"),
-        ));
+        return Err(invalid_manifest_path(path));
     }
     Ok(resolved)
 }
 
 /// Validate and normalize a run working directory relative to the workspace root.
 pub fn normalize_sandbox_cwd(cwd: &str) -> SandboxResult<String> {
+    let invalid =
+        |message: &str| SandboxError::new(ErrorCode::SandboxConfigInvalid, message.to_string());
+    // The separator check comes first because a backslash path is not a cwd that happens to be
+    // malformed, it is a cwd written in the wrong path language.
+    if cwd.contains('\\') {
+        return Err(invalid("sandbox.cwd must use POSIX path separators"));
+    }
     if cwd.trim().is_empty() {
-        return Err(SandboxError::new(
-            ErrorCode::SandboxConfigInvalid,
-            "sandbox cwd must be non-empty",
-        ));
+        return Err(invalid("sandbox.cwd must be non-empty"));
     }
-    if cwd.contains('\\') || is_windows_absolute(cwd) {
-        return Err(SandboxError::new(
-            ErrorCode::SandboxConfigInvalid,
-            "sandbox cwd must use POSIX path separators",
-        ));
+    if is_windows_absolute(cwd) {
+        return Err(invalid("sandbox.cwd must be workspace-relative"));
     }
-    let normalized = normalize_segments(cwd);
-    if normalized.starts_with('/') {
-        return Err(SandboxError::new(
-            ErrorCode::SandboxConfigInvalid,
-            "sandbox cwd must be workspace-relative",
-        ));
+    if cwd.starts_with('/') {
+        return Err(invalid("sandbox.cwd must be workspace-relative"));
     }
-    if normalized.split('/').any(|s| s == "..") {
-        return Err(SandboxError::new(
-            ErrorCode::SandboxConfigInvalid,
-            "sandbox cwd must not contain parent segments",
-        ));
+    // Checked before normalizing, so `tasks/../a` is refused rather than quietly becoming `a`.
+    if cwd.split('/').any(|s| s == "..") {
+        return Err(invalid("sandbox.cwd must not contain parent segments"));
     }
-    Ok(normalized)
+    Ok(normpath(cwd))
 }
 
 /// Access to an absolute path outside the sandbox workspace. Mirrors Python's
@@ -226,34 +290,94 @@ impl SandboxPathGrant {
     }
 }
 
+/// The validated native host directory behind a grant. Mirrors Python's
+/// `sandbox_path_grant_host_path`.
+///
+/// Symlinks are followed before the check, because a grant pointed at a link to `/` would
+/// otherwise hand the sandbox the whole filesystem under an innocuous-looking path. The resolved
+/// path is returned, so a caller that later re-points the link still works from what was checked.
+pub fn sandbox_path_grant_host_path(grant: &SandboxPathGrant) -> SandboxResult<String> {
+    let raw = grant.host_source();
+    if grant.host_path.is_some() && !raw.starts_with('/') {
+        return Err(SandboxError::new(
+            ErrorCode::InvalidManifestPath,
+            format!("sandbox path grant host_path must be absolute on the current host: {raw}"),
+        ));
+    }
+    let resolved = resolve_existing_prefix(raw);
+    if resolved == "/" {
+        return Err(SandboxError::new(
+            ErrorCode::SandboxConfigInvalid,
+            "sandbox path grant path must not resolve to filesystem root",
+        ));
+    }
+    Ok(resolved)
+}
+
 /// Validate one absolute path on a [`SandboxPathGrant`].
 fn validate_grant_path(field: &str, value: &str) -> SandboxResult<String> {
     let invalid = |message: String| SandboxError::new(ErrorCode::InvalidManifestPath, message);
-    if value.starts_with("\\\\") || value.starts_with("//") {
+    let is_host = field == "host_path";
+    if is_host && (value.starts_with("\\\\") || value.starts_with("//")) {
+        // A `host_path` is handed to the platform as written, so anything starting `//` or `\\`
+        // is a UNC or device path, which no sandbox grant can stand for.
         return Err(invalid(format!(
             "sandbox path grant {field} does not support UNC or device paths"
         )));
     }
-    if is_windows_absolute(value) {
+    if !is_host && value.starts_with("\\\\") {
+        // A backslash UNC path is a Windows path; the sandbox-side `path` is always POSIX.
         return Err(invalid(format!(
             "sandbox path grant {field} must be POSIX absolute"
         )));
     }
-    if value.split(['/', '\\']).any(|part| part == "..") {
+    if is_host && value.split(['/', '\\']).any(|part| part == "..") {
+        // A host path is handed to the platform as written, so a parent segment in one is a
+        // request the SDK cannot vouch for. The sandbox-side `path` is normalized instead.
         return Err(invalid(format!(
             "sandbox path grant {field} must not contain parent segments"
         )));
     }
-    if !value.starts_with('/') {
-        return Err(invalid(format!(
-            "sandbox path grant {field} must be an absolute path"
-        )));
+    if is_windows_absolute(value) {
+        let bytes = value.as_bytes();
+        let drive_rooted = bytes.len() >= 3 && matches!(bytes[2], b'/' | b'\\');
+        if !is_host || !drive_rooted {
+            return Err(invalid(format!(
+                "sandbox path grant {field} must be POSIX absolute"
+            )));
+        }
+        // A drive-qualified host path is a legitimate native path on a Windows host. It is kept
+        // in Windows spelling, as `PureWindowsPath` would render it, rather than being forced
+        // through POSIX normalization.
+        let drive = &value[..2];
+        let rest: Vec<&str> = value[2..]
+            .split(['/', '\\'])
+            .filter(|part| !part.is_empty() && *part != ".")
+            .collect();
+        if rest.is_empty() {
+            return Err(invalid(format!(
+                "sandbox path grant {field} must not be filesystem root"
+            )));
+        }
+        return Ok(format!("{drive}\\{}", rest.join("\\")));
     }
-    let normalized = normalize_segments(value);
+    if !value.starts_with('/') {
+        return Err(invalid(if is_host {
+            format!("sandbox path grant {field} must be an absolute host path")
+        } else {
+            format!("sandbox path grant {field} must be POSIX absolute")
+        }));
+    }
+    let mut normalized = normpath(value);
     if normalized == "/" || normalized.is_empty() {
         return Err(invalid(format!(
-            "sandbox path grant {field} must not be the filesystem root"
+            "sandbox path grant {field} must not be filesystem root"
         )));
+    }
+    // `posixpath.normpath` keeps exactly two leading slashes (POSIX leaves their meaning to the
+    // implementation) and collapses three or more, so `//server/share` stays as written.
+    if value.starts_with("//") && !value.starts_with("///") {
+        normalized.insert(0, '/');
     }
     Ok(normalized)
 }
@@ -329,10 +453,10 @@ impl SandboxWorkspaceScope {
         if posix.starts_with('/') || is_windows_absolute(&posix) {
             return Err(SandboxError::new(
                 ErrorCode::InvalidManifestPath,
-                "a workspace-relative display path must not be absolute",
+                "workspace-relative display paths must not be absolute",
             ));
         }
-        let normalized = normalize_segments(&posix);
+        let normalized = normpath(&posix);
         let Some(cwd) = &self.cwd else {
             return Ok(normalized);
         };
@@ -356,24 +480,40 @@ impl SandboxWorkspaceScope {
                 "session resource paths must use POSIX path separators",
             ));
         }
+        if is_windows_absolute(workspace_relative_path) {
+            return Err(invalid("session resource paths must be workspace-relative"));
+        }
         if workspace_relative_path.starts_with('/') {
             return Err(invalid("session resource paths must be workspace-relative"));
         }
-        let normalized = normalize_segments(workspace_relative_path);
-        if normalized.split('/').any(|part| part == "..") {
+        if workspace_relative_path.split('/').any(|part| part == "..") {
             return Err(invalid("session resource paths must be workspace-relative"));
         }
+        let normalized = normpath(workspace_relative_path);
         if normalized.is_empty() || normalized == "." {
             return Err(invalid("session resource paths must be non-empty"));
         }
         let Some(_) = &self.cwd else {
             return Ok(normalized);
         };
-        let root = to_posix(workspace_root);
-        if !root.starts_with('/') {
-            return Err(invalid("sandbox workspace root must be POSIX absolute"));
-        }
-        Ok(format!("{}/{normalized}", root.trim_end_matches('/')))
+        // A drive-qualified root is a legitimate workspace root that simply is not written in
+        // POSIX; it is accepted and re-spelled, while a bare backslash path is not.
+        let root = if is_windows_absolute(workspace_root) {
+            to_posix(workspace_root)
+        } else {
+            if workspace_root.contains('\\') {
+                return Err(invalid("sandbox workspace root must be POSIX absolute"));
+            }
+            let root = workspace_root.to_string();
+            if !root.starts_with('/') {
+                return Err(invalid("sandbox workspace root must be POSIX absolute"));
+            }
+            root
+        };
+        Ok(normpath(&format!(
+            "{}/{normalized}",
+            root.trim_end_matches('/')
+        )))
     }
 
     /// Render a tool-result path, keeping the shape the model used in its request.
@@ -395,17 +535,21 @@ impl SandboxWorkspaceScope {
     /// Anchor a model-provided path: relative paths resolve from `cwd`, absolute paths pass
     /// through for the session to validate against the workspace root.
     pub fn anchor(&self, path: &str) -> String {
-        let posix = to_posix(path);
-        if posix.starts_with('/') || is_windows_absolute(&posix) {
-            return posix;
+        // The model's own spelling is preserved, backslashes included: anchoring decides *where*
+        // a relative path starts, and rewriting separators here would silently change which file
+        // a tool was asked about. The session's policy is what normalizes and validates it.
+        // A leading backslash is a root once separators are normalized, so `\workspace\x` is as
+        // absolute as `/workspace/x`.
+        if path.starts_with('/') || path.starts_with('\\') || is_windows_absolute(path) {
+            return path.to_string();
         }
         match &self.cwd {
-            None => posix,
+            None => path.to_string(),
             Some(cwd) => {
-                if posix.is_empty() || posix == "." {
+                if path.is_empty() || path == "." {
                     cwd.clone()
                 } else {
-                    format!("{cwd}/{posix}")
+                    format!("{cwd}/{path}")
                 }
             }
         }
@@ -426,18 +570,26 @@ mod tests {
         assert!(grant.read_only);
         assert_eq!(grant.host_source(), "/srv/data");
 
-        for refused in [
-            "/",
-            "relative/path",
-            "/srv/../etc",
-            "//server/share",
-            "C:\\data",
-        ] {
+        for refused in ["/", "//", "relative/path", "C:\\data", "\\\\server\\share"] {
             assert!(
                 SandboxPathGrant::new(refused).is_err(),
                 "accepted `{refused}`"
             );
         }
+        // `//server/share` is an ordinary absolute POSIX path here, as `posixpath.normpath` keeps it.
+        assert_eq!(
+            SandboxPathGrant::new("//server/share").unwrap().path,
+            "//server/share"
+        );
+        // A parent segment in the sandbox-side path is collapsed, as Python's validator does.
+        assert_eq!(SandboxPathGrant::new("/srv/../etc").unwrap().path, "/etc");
+        // A host path is used as written, so a parent segment in one is still refused.
+        assert!(
+            SandboxPathGrant::new("/mnt/data")
+                .unwrap()
+                .with_host_path("/srv/../secret")
+                .is_err()
+        );
     }
 
     #[test]
@@ -656,6 +808,69 @@ impl WorkspacePathPolicy {
         Ok(resolved)
     }
 
+    /// A validated absolute host path, following symlinks on the real filesystem.
+    ///
+    /// Mirrors Python's `normalize_path(resolve_symlinks=True)`. Only a backend whose workspace
+    /// really is a local directory may use this: a lexical check cannot see that `outside-link`
+    /// in the workspace points at `/etc`, so a path that reaches outside the root or any grant
+    /// through a symlink is refused here rather than at the point it is opened.
+    ///
+    /// `for_write` additionally refuses a path whose effective grant is read-only, after
+    /// resolution — so an alias of a read-only grant is still read-only.
+    pub fn normalize_host_path(&self, path: &str, for_write: bool) -> SandboxResult<String> {
+        if is_windows_absolute(path) {
+            return Err(invalid_manifest_path(path));
+        }
+        let workspace_root = resolve_existing_prefix(&self.root);
+        let posix = to_posix(path);
+        let absolute = if posix.starts_with('/') {
+            normpath(&posix)
+        } else {
+            // A relative path is anchored and containment-checked lexically first, exactly as
+            // Python does, so `../x` is refused before the filesystem is consulted at all.
+            self.absolute_workspace_path(&posix)?
+        };
+        let resolved = resolve_existing_prefix(&absolute);
+        let grant = if is_within(&workspace_root, &resolved) {
+            None
+        } else {
+            match self.matching_resolved_grant(&resolved)? {
+                Some(grant) => Some(grant),
+                None => return Err(invalid_manifest_path(path)),
+            }
+        };
+        if for_write {
+            self.raise_if_read_only(&resolved, grant)?;
+        }
+        Ok(resolved)
+    }
+
+    /// The effective grant for an already-resolved host path, matching on resolved grant roots.
+    fn matching_resolved_grant(&self, path: &str) -> SandboxResult<Option<&SandboxPathGrant>> {
+        let mut best: Option<(&SandboxPathGrant, usize)> = None;
+        for grant in &self.extra_path_grants {
+            // A drive-qualified host path names a directory on a Windows host; it cannot be
+            // resolved, or match anything, on this one.
+            if !grant.host_source().starts_with('/') {
+                continue;
+            }
+            let grant_root = resolve_existing_prefix(grant.host_source());
+            if grant_root == "/" {
+                return Err(SandboxError::new(
+                    ErrorCode::SandboxConfigInvalid,
+                    "sandbox path grant path must not resolve to filesystem root",
+                ));
+            }
+            if is_within(&grant_root, path) {
+                let depth = grant_root.len();
+                if best.is_none_or(|(_, best_depth)| depth > best_depth) {
+                    best = Some((grant, depth));
+                }
+            }
+        }
+        Ok(best.map(|(grant, _)| grant))
+    }
+
     /// Refuse a recursive removal that would delete a read-only grant inside the tree.
     ///
     /// Mirrors Python's `validate_recursive_remove`: `rm -rf` on an ancestor is a write to every
@@ -685,11 +900,11 @@ impl WorkspacePathPolicy {
                     "sandbox path grant path must be POSIX absolute",
                 ));
             }
-            let root = normalize_segments(&to_posix(&grant.path));
+            let root = normpath(&grant.path);
             if root == "/" {
                 return Err(SandboxError::new(
                     ErrorCode::SandboxConfigInvalid,
-                    "sandbox path grant must not be the filesystem root",
+                    "sandbox path grant path must not be filesystem root",
                 ));
             }
             rules.push((root, grant.read_only));
@@ -699,10 +914,16 @@ impl WorkspacePathPolicy {
 
     /// The effective grant for an already-normalized path, longest root first.
     pub fn matching_grant(&self, path: &str) -> Option<&SandboxPathGrant> {
-        self.extra_path_grants
-            .iter()
-            .filter(|grant| is_within(&normalize_segments(&to_posix(&grant.path)), path))
-            .max_by_key(|grant| normalize_segments(&to_posix(&grant.path)).len())
+        // The most specific grant wins and the first declared wins a tie, as Python's `max`
+        // does; `max_by_key` would keep the last of equals.
+        let mut best: Option<(&SandboxPathGrant, usize)> = None;
+        for grant in &self.extra_path_grants {
+            let root = normpath(&grant.path);
+            if is_within(&root, path) && best.is_none_or(|(_, depth)| root.len() > depth) {
+                best = Some((grant, root.len()));
+            }
+        }
+        best.map(|(grant, _)| grant)
     }
 
     fn resolve_with_grant(&self, path: &str) -> SandboxResult<(String, Option<&SandboxPathGrant>)> {
@@ -736,11 +957,9 @@ impl WorkspacePathPolicy {
         }
         Err(SandboxError::new(
             ErrorCode::WorkspaceArchiveWriteError,
-            format!(
-                "sandbox path `{path}` is under the read-only path grant `{}`",
-                grant.path
-            ),
+            format!("failed to write archive for path: {path}"),
         )
+        .with_context("path", path.to_string())
         .with_context("reason", "read_only_extra_path_grant")
         .with_context("grant_path", grant.path.clone()))
     }

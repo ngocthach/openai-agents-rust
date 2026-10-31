@@ -2,16 +2,18 @@
 //! `agents.sandbox.manifest` and `agents.sandbox.manifest_render`.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 
 use crate::sandbox::entries::{Entry, EntryKind};
 use crate::sandbox::environment::{EnvEntry, Environment};
 use crate::sandbox::errors::{ErrorCode, SandboxError, SandboxResult};
-use crate::sandbox::materialization::MaterializationResult;
+use crate::sandbox::materialization::{MaterializationResult, gather_in_order};
+use crate::sandbox::mount_entries::ConfiguredMountStrategy;
 use crate::sandbox::mounts::{HostPathGrant, Mount, MountCredentialAuthority};
 use crate::sandbox::session::{ExecRequest, SandboxSession};
 use crate::sandbox::types::{Group, User};
-use crate::sandbox::workspace_paths::resolve_workspace_path;
 use crate::sandbox::workspace_paths::{SandboxPathGrant, to_posix as to_posix_path};
+use crate::sandbox::workspace_paths::{is_windows_absolute, normpath, resolve_workspace_path};
 
 /// Commands the model may run on remote mounts by default. Mirrors
 /// `DEFAULT_REMOTE_MOUNT_COMMAND_ALLOWLIST`.
@@ -28,7 +30,7 @@ pub const DEFAULT_MANIFEST_ROOT: &str = "/workspace";
 pub const MAX_MANIFEST_DESCRIPTION_CHARS: usize = 5000;
 
 /// Depth of the rendered workspace layout.
-const MANIFEST_DESCRIPTION_DEPTH: usize = 3;
+const MANIFEST_DESCRIPTION_DEPTH: usize = 1;
 
 /// The default number of manifest entries materialized at once.
 pub const DEFAULT_MAX_MANIFEST_ENTRY_CONCURRENCY: usize = 4;
@@ -109,6 +111,9 @@ pub struct Manifest {
     version: u8,
     root: String,
     entries: BTreeMap<String, Entry>,
+    /// The order top-level entries were added in, which a Python dict keeps and a `BTreeMap`
+    /// cannot. A replaced key keeps its original position.
+    entry_order: Vec<String>,
     environment: BTreeMap<String, String>,
     resolved_environment: Environment,
     concurrency_limits: SandboxConcurrencyLimits,
@@ -126,6 +131,7 @@ impl Default for Manifest {
             version: 1,
             root: DEFAULT_MANIFEST_ROOT.to_string(),
             entries: BTreeMap::new(),
+            entry_order: Vec::new(),
             environment: BTreeMap::new(),
             resolved_environment: Environment::new(),
             concurrency_limits: SandboxConcurrencyLimits::new(),
@@ -192,8 +198,24 @@ impl Manifest {
 
     /// Add or replace a top-level entry.
     pub fn with_entry(mut self, path: impl Into<String>, entry: Entry) -> Self {
-        self.entries.insert(path.into(), entry);
+        let path = path.into();
+        if self.entries.insert(path.clone(), entry).is_none() {
+            self.entry_order.push(path);
+        }
         self
+    }
+
+    /// The top-level entries in the order they were added, as Python's dict iterates them.
+    ///
+    /// [`entries`](Self::entries) is the key-ordered view for lookup. Materialization, mount
+    /// ordering and re-applying ephemeral entries follow this order, so a manifest that lists a
+    /// directory before the mount inside it is applied the way it was written. The rendered
+    /// layout and [`manifest_digest`](crate::sandbox::manifest_digest) stay key-ordered: Python
+    /// sorts names when it renders, and a digest must not depend on how a manifest was built.
+    pub fn entries_in_order(&self) -> impl Iterator<Item = (&String, &Entry)> {
+        self.entry_order
+            .iter()
+            .filter_map(|path| self.entries.get_key_value(path))
     }
 
     /// Variables whose values are fetched when the session starts.
@@ -288,6 +310,11 @@ impl Manifest {
     /// An in-container mount whose pattern writes a credential inside the sandbox cannot be
     /// activated until its exact mount path is acknowledged here. This is trusted
     /// application-side policy: it is runtime-only and never serialized into session state.
+    ///
+    /// A path Python would reject (empty, the workspace root, a wildcard, a `..` segment or a
+    /// backslash) acknowledges nothing here, so a mistake fails closed. Use
+    /// [`try_with_in_container_mount_credential_exposure_acknowledged`](Self::try_with_in_container_mount_credential_exposure_acknowledged)
+    /// to be told about it.
     pub fn with_in_container_mount_credential_exposure_acknowledged<I, S>(
         mut self,
         mount_paths: I,
@@ -296,13 +323,17 @@ impl Manifest {
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
-        self.credential_exposure_acknowledged
-            .extend(mount_paths.into_iter().map(Into::into));
+        for path in mount_paths {
+            if let Ok(Some(key)) = self.credential_policy_key(&path.into(), true) {
+                self.credential_exposure_acknowledged.insert(key);
+            }
+        }
         self
     }
 
     /// Acknowledge broad credential exposure (managed or workload identity, external credential
-    /// files) for exact in-container mount paths.
+    /// files) for exact in-container mount paths. Invalid paths acknowledge nothing; see
+    /// [`with_in_container_mount_credential_exposure_acknowledged`](Self::with_in_container_mount_credential_exposure_acknowledged).
     pub fn with_in_container_mount_broad_credential_exposure_acknowledged<I, S>(
         mut self,
         mount_paths: I,
@@ -311,14 +342,166 @@ impl Manifest {
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
-        self.broad_credential_exposure_acknowledged
-            .extend(mount_paths.into_iter().map(Into::into));
+        for path in mount_paths {
+            if let Ok(Some(key)) = self.credential_policy_key(&path.into(), true) {
+                self.broad_credential_exposure_acknowledged.insert(key);
+            }
+        }
         self
     }
 
+    /// Like [`with_in_container_mount_credential_exposure_acknowledged`](Self::with_in_container_mount_credential_exposure_acknowledged),
+    /// but rejects what Python rejects: no path at all, an empty path, the workspace root, a
+    /// backslash, wildcard syntax (`*`, `?`, `[`, `]`) and `..` segments.
+    pub fn try_with_in_container_mount_credential_exposure_acknowledged<I, S>(
+        mut self,
+        mount_paths: I,
+    ) -> SandboxResult<Self>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let keys = self.credential_policy_keys(mount_paths)?;
+        self.credential_exposure_acknowledged.extend(keys);
+        Ok(self)
+    }
+
+    /// The broad-authority counterpart of
+    /// [`try_with_in_container_mount_credential_exposure_acknowledged`](Self::try_with_in_container_mount_credential_exposure_acknowledged).
+    pub fn try_with_in_container_mount_broad_credential_exposure_acknowledged<I, S>(
+        mut self,
+        mount_paths: I,
+    ) -> SandboxResult<Self>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let keys = self.credential_policy_keys(mount_paths)?;
+        self.broad_credential_exposure_acknowledged.extend(keys);
+        Ok(self)
+    }
+
+    fn credential_policy_keys<I, S>(&self, mount_paths: I) -> SandboxResult<Vec<String>>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let mut keys = Vec::new();
+        for path in mount_paths {
+            if let Some(key) = self.credential_policy_key(&path.into(), true)? {
+                keys.push(key);
+            }
+        }
+        if keys.is_empty() {
+            return Err(SandboxError::new(
+                ErrorCode::MountConfigInvalid,
+                "at least one in-container mount path is required",
+            ));
+        }
+        Ok(keys)
+    }
+
+    /// The policy key for an acknowledged path, mirroring Python's
+    /// `_mount_credential_exposure_policy_key`. `Ok(None)` is the root (only reachable when
+    /// `reject_root` is false, which is the lookup side).
+    fn credential_policy_key(
+        &self,
+        text: &str,
+        reject_root: bool,
+    ) -> SandboxResult<Option<String>> {
+        let invalid = |message: &str| SandboxError::new(ErrorCode::MountConfigInvalid, message);
+        let root_error = "mount credential exposure path must identify a non-root path";
+        if text.is_empty() {
+            return if reject_root {
+                Err(invalid(root_error))
+            } else {
+                Ok(None)
+            };
+        }
+        if text.contains('\\') {
+            return Err(invalid(
+                "mount credential exposure paths must use '/' separators",
+            ));
+        }
+        if reject_root && text.contains(['*', '?', '[', ']']) {
+            return Err(invalid(
+                "mount credential exposure paths must not contain wildcard syntax",
+            ));
+        }
+        if reject_root && text.split('/').any(|part| part == "..") {
+            return Err(invalid(
+                "mount credential exposure paths must not contain parent segments",
+            ));
+        }
+        let normalized = normpath(text);
+        if text.starts_with('/') {
+            let root = self.normalized_root();
+            if normalized == "/" || normalized == root {
+                return if reject_root {
+                    Err(invalid(root_error))
+                } else {
+                    Ok(None)
+                };
+            }
+            return Ok(Some(format!("absolute:{normalized}")));
+        }
+        if normalized == "." || normalized.is_empty() {
+            return if reject_root {
+                Err(invalid(root_error))
+            } else {
+                Ok(None)
+            };
+        }
+        if normalized == ".." || normalized.starts_with("../") {
+            return Err(invalid("mount credential exposure path escapes the root"));
+        }
+        Ok(Some(format!("relative:{normalized}")))
+    }
+
+    fn normalized_root(&self) -> String {
+        let root = normpath(&self.root);
+        if root == "/" {
+            root
+        } else {
+            root.trim_end_matches('/').to_string()
+        }
+    }
+
+    /// Whether `mount_path` is covered by an acknowledgement in `acknowledged`, in either its
+    /// absolute or its root-relative spelling.
+    fn acknowledges(&self, acknowledged: &BTreeSet<String>, mount_path: &str) -> bool {
+        let Ok(Some(key)) = self.credential_policy_key(mount_path, false) else {
+            return false;
+        };
+        let mut lookup = vec![key.clone()];
+        let root = self.normalized_root();
+        if let Some(absolute) = key.strip_prefix("absolute:") {
+            let prefix = format!("{}/", root.trim_end_matches('/'));
+            if let Some(relative) = absolute.strip_prefix(prefix.as_str()) {
+                lookup.push(format!("relative:{relative}"));
+            }
+        } else if let Some(relative) = key.strip_prefix("relative:") {
+            lookup.push(format!(
+                "absolute:{}/{relative}",
+                root.trim_end_matches('/')
+            ));
+        }
+        lookup.iter().any(|key| acknowledged.contains(key))
+    }
+
     /// Visit every entry, including the children of directory entries, with its absolute
-    /// workspace path.
+    /// workspace path, in key order.
     pub fn iter_entries(&self) -> Vec<(String, &Entry)> {
+        self.walk_entries(false)
+    }
+
+    /// The same walk in insertion order, for work that has to follow how the manifest was
+    /// written.
+    fn iter_entries_ordered(&self) -> Vec<(String, &Entry)> {
+        self.walk_entries(true)
+    }
+
+    fn walk_entries(&self, ordered: bool) -> Vec<(String, &Entry)> {
         fn walk<'a>(out: &mut Vec<(String, &'a Entry)>, dest: String, entry: &'a Entry) {
             out.push((dest.clone(), entry));
             if let EntryKind::Dir { children } = &entry.kind {
@@ -332,7 +515,7 @@ impl Manifest {
             }
         }
         let mut out = Vec::new();
-        if let Ok(validated) = self.validated_entries() {
+        if let Ok(validated) = self.validate_top_level(ordered) {
             for (_, dest, entry) in validated {
                 walk(&mut out, dest, entry);
             }
@@ -341,19 +524,91 @@ impl Manifest {
     }
 
     /// Every mount in the manifest with its resolved mount path, deepest first.
+    ///
+    /// A mount whose path cannot be resolved is left out; [`try_mount_targets`](Self::try_mount_targets)
+    /// reports it instead.
     pub fn mount_targets(&self) -> Vec<(&Mount, String)> {
-        let mut mounts: Vec<(&Mount, String)> = Vec::new();
-        for (dest, entry) in self.iter_entries() {
+        self.collect_mount_targets(false)
+            .map(|targets| {
+                targets
+                    .into_iter()
+                    .map(|(_, mount, path)| (mount, path))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Like [`mount_targets`](Self::mount_targets), but a mount path that is absolute in
+    /// Windows syntax, or that climbs out of the workspace root, is an error rather than a
+    /// silent omission. Mirrors Python's `mount_targets`, which raises
+    /// `InvalidManifestPathError`.
+    pub fn try_mount_targets(&self) -> SandboxResult<Vec<(&Mount, String)>> {
+        Ok(self
+            .collect_mount_targets(true)?
+            .into_iter()
+            .map(|(_, mount, path)| (mount, path))
+            .collect())
+    }
+
+    fn collect_mount_targets(&self, strict: bool) -> SandboxResult<Vec<(&Entry, &Mount, String)>> {
+        let mut mounts: Vec<(&Entry, &Mount, String)> = Vec::new();
+        for (dest, entry) in self.iter_entries_ordered() {
             let Some(mount) = entry.as_mount() else {
                 continue;
             };
-            let Ok(path) = mount.resolve_mount_path(&self.root, &dest) else {
-                continue;
-            };
-            mounts.push((mount, path));
+            match self.resolve_mount_target(mount, &dest) {
+                Ok(path) => mounts.push((entry, mount, path)),
+                Err(error) if strict => return Err(error),
+                Err(_) => {}
+            }
         }
-        mounts.sort_by_key(|(_, path)| std::cmp::Reverse(path.matches('/').count()));
-        mounts
+        mounts.sort_by_key(|(_, _, path)| std::cmp::Reverse(path.matches('/').count()));
+        Ok(mounts)
+    }
+
+    /// Where `mount` attaches: its explicit `mount_path` (relative ones are taken inside the
+    /// workspace root) or the entry's own path.
+    ///
+    /// A `..` that stays inside the workspace is collapsed (`/workspace/repo/../actual` is
+    /// `/workspace/actual`) and one that leaves it is refused, as Python's
+    /// `_normalize_in_workspace_path` does. An absolute path outside the root is kept as given.
+    fn resolve_mount_target(&self, mount: &Mount, dest: &str) -> SandboxResult<String> {
+        let Some(path) = &mount.mount_path else {
+            return Ok(dest.to_string());
+        };
+        if is_windows_absolute(path) {
+            return Err(invalid_manifest_path(path));
+        }
+        let posix = to_posix_path(path);
+        let root = self.root.trim_end_matches('/');
+        let raw = if posix.starts_with('/') {
+            posix
+        } else {
+            format!("{root}/{posix}")
+        };
+        let Some(relative) = raw
+            .strip_prefix(root)
+            .filter(|rest| rest.is_empty() || rest.starts_with('/'))
+        else {
+            return Ok(raw);
+        };
+        let mut parts: Vec<&str> = Vec::new();
+        for part in relative.split('/') {
+            match part {
+                "" | "." => {}
+                ".." => {
+                    if parts.pop().is_none() {
+                        return Err(manifest_path_error(&raw, "escape_root"));
+                    }
+                }
+                other => parts.push(other),
+            }
+        }
+        if parts.is_empty() {
+            Ok(root.to_string())
+        } else {
+            Ok(format!("{root}/{}", parts.join("/")))
+        }
     }
 
     /// Host paths the SDK may use directly.
@@ -402,34 +657,54 @@ impl Manifest {
     /// Mirrors Python's `ephemeral_entry_paths`. These are the manifest keys, not resolved
     /// paths, which is the form a caller comparing two manifests works in.
     pub fn ephemeral_entry_paths(&self) -> Vec<String> {
+        // Nested children count: a `dir` entry holding one ephemeral file has to put that one
+        // file on the skip list, not the whole directory and not nothing at all.
         let mut paths: Vec<String> = self
-            .entries
-            .iter()
+            .iter_relative_entries()
+            .into_iter()
             .filter(|(_, entry)| entry.ephemeral)
-            .map(|(path, _)| path.clone())
+            .map(|(path, _)| path)
             .collect();
         paths.sort_unstable();
         paths.dedup();
         paths
     }
 
+    /// Visit every entry, children included, with its path relative to the workspace root.
+    ///
+    /// Mirrors Python's `iter_entries`, which yields manifest-relative paths. The absolute form
+    /// is [`iter_entries`](Self::iter_entries).
+    pub fn iter_relative_entries(&self) -> Vec<(String, &Entry)> {
+        fn walk<'a>(out: &mut Vec<(String, &'a Entry)>, rel: String, entry: &'a Entry) {
+            out.push((rel.clone(), entry));
+            if let EntryKind::Dir { children } = &entry.kind {
+                for (name, child) in children {
+                    walk(
+                        out,
+                        format!("{}/{}", rel.trim_end_matches('/'), name.trim_matches('/')),
+                        child,
+                    );
+                }
+            }
+        }
+        let mut out = Vec::new();
+        for (path, entry) in self.entries_in_order() {
+            walk(&mut out, path.trim_matches('/').to_string(), entry);
+        }
+        out
+    }
+
     /// The mounts declared by ephemeral entries, with the paths they attach at.
     pub fn ephemeral_mount_targets(&self) -> Vec<(&Mount, String)> {
-        let mut mounts: Vec<(&Mount, String)> = Vec::new();
-        for (dest, entry) in self.iter_entries() {
-            if !entry.ephemeral {
-                continue;
-            }
-            let Some(mount) = entry.as_mount() else {
-                continue;
-            };
-            let Ok(path) = mount.resolve_mount_path(&self.root, &dest) else {
-                continue;
-            };
-            mounts.push((mount, path));
-        }
-        mounts.sort_by_key(|(_, path)| std::cmp::Reverse(path.matches('/').count()));
-        mounts
+        self.collect_mount_targets(false)
+            .map(|targets| ephemeral_only(targets))
+            .unwrap_or_default()
+    }
+
+    /// Like [`ephemeral_mount_targets`](Self::ephemeral_mount_targets), but an unresolvable mount
+    /// path is an error. Mirrors Python's `ephemeral_mount_targets`.
+    pub fn try_ephemeral_mount_targets(&self) -> SandboxResult<Vec<(&Mount, String)>> {
+        Ok(ephemeral_only(self.collect_mount_targets(true)?))
     }
 
     /// The workspace-relative paths a persistence pass has to skip.
@@ -438,9 +713,19 @@ impl Manifest {
     /// mounts actually landed, which can differ from the entry's own path when a mount sets an
     /// explicit `mount_path`.
     pub fn ephemeral_persistence_paths(&self) -> Vec<String> {
+        self.persistence_paths_from(self.ephemeral_mount_targets())
+    }
+
+    /// Like [`ephemeral_persistence_paths`](Self::ephemeral_persistence_paths), but an
+    /// unresolvable mount path is an error. Mirrors Python's `ephemeral_persistence_paths`.
+    pub fn try_ephemeral_persistence_paths(&self) -> SandboxResult<Vec<String>> {
+        Ok(self.persistence_paths_from(self.try_ephemeral_mount_targets()?))
+    }
+
+    fn persistence_paths_from(&self, targets: Vec<(&Mount, String)>) -> Vec<String> {
         let root = self.root.trim_end_matches('/');
         let mut paths = self.ephemeral_entry_paths();
-        for (_, path) in self.ephemeral_mount_targets() {
+        for (_, path) in targets {
             if let Some(relative) = path.strip_prefix(root) {
                 let relative = relative.trim_start_matches('/');
                 if !relative.is_empty() {
@@ -453,24 +738,102 @@ impl Manifest {
         paths
     }
 
+    /// Validate every mount's credential-exposure policy before anything has a side effect.
+    ///
+    /// Mirrors Python's `validate_manifest_mount_credential_boundaries`, which `stop()` runs
+    /// before it touches the snapshot: a manifest that was changed after the session started
+    /// could now hold a mount that exposes credentials at a path nobody acknowledged, and finding
+    /// that out half-way through detaching mounts would leave the workspace in a state that is
+    /// neither the old one nor the new one. The error is
+    /// [`ErrorCode::MountConfigInvalid`] and, as with activation, never carries the mount
+    /// configuration.
+    pub fn validate_mount_credential_boundaries(&self) -> SandboxResult<()> {
+        self.validate_mount_credential_files()?;
+        for (mount, path) in self.mount_targets() {
+            self.authorize_mount_activation(mount, &path)?;
+        }
+        Ok(())
+    }
+
+    /// Refuse a mount whose credential file is one the manifest itself materializes.
+    ///
+    /// Mirrors Python's `_manifest_materializes_path`: a `service_account_file`, a
+    /// `box_config_file` or an rclone `config_file_path` that names a path some entry fills
+    /// (a file, a git clone, a host copy, a mount) would be readable by the model, so
+    /// credentials have to come from outside the manifest. Plain directories only structure the
+    /// tree and are allowed.
+    pub fn validate_mount_credential_files(&self) -> SandboxResult<()> {
+        let entries = self.iter_entries();
+        for (mount, _) in self.mount_targets() {
+            let Some(strategy) = mount
+                .strategy
+                .as_any()
+                .and_then(|any| any.downcast_ref::<ConfiguredMountStrategy>())
+            else {
+                continue;
+            };
+            for (field, path) in strategy.credential_file_paths() {
+                let target = self.absolute_workspace_path(&path);
+                let overlaps = entries.iter().any(|(dest, entry)| {
+                    let dest = normpath(dest);
+                    let covers = target == dest || target.starts_with(&format!("{dest}/"));
+                    let structural = match &entry.kind {
+                        EntryKind::Dir { .. } => true,
+                        EntryKind::LocalDir { src } => src.is_none(),
+                        _ => false,
+                    };
+                    covers && !structural
+                });
+                if overlaps {
+                    return Err(SandboxError::new(
+                        ErrorCode::MountConfigInvalid,
+                        "credential files stored in the manifest are not supported for cloud \
+                         mounts; configure credentials outside the sandbox manifest",
+                    )
+                    .with_context(
+                        "mount_type",
+                        strategy
+                            .topology_identity()
+                            .split('|')
+                            .next()
+                            .unwrap_or_default()
+                            .to_string(),
+                    )
+                    .with_context("credential_field", field));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn absolute_workspace_path(&self, path: &str) -> String {
+        if path.starts_with('/') {
+            normpath(path)
+        } else {
+            normpath(&format!(
+                "{}/{path}",
+                self.normalized_root().trim_end_matches('/')
+            ))
+        }
+    }
+
     /// Check that activating `mount` at `mount_path` respects the credential-exposure policy.
     ///
     /// Returns [`ErrorCode::MountConfigInvalid`] when the mount would write a credential into
     /// the sandbox at a path the application has not acknowledged. The error text never
     /// includes the mount configuration.
     pub fn authorize_mount_activation(&self, mount: &Mount, mount_path: &str) -> SandboxResult<()> {
+        self.validate_mount_credential_files()?;
         let authority = mount.strategy.credential_authority();
         let acknowledged = match authority {
             MountCredentialAuthority::None => return Ok(()),
             MountCredentialAuthority::MountScoped => {
-                self.credential_exposure_acknowledged.contains(mount_path)
-                    || self
-                        .broad_credential_exposure_acknowledged
-                        .contains(mount_path)
+                self.acknowledges(&self.credential_exposure_acknowledged, mount_path)
+                    || self.acknowledges(&self.broad_credential_exposure_acknowledged, mount_path)
             }
-            MountCredentialAuthority::Broad => self
-                .broad_credential_exposure_acknowledged
-                .contains(mount_path),
+            MountCredentialAuthority::Broad => {
+                self.acknowledges(&self.broad_credential_exposure_acknowledged, mount_path)
+            }
         };
         if acknowledged {
             return Ok(());
@@ -487,8 +850,23 @@ impl Manifest {
 
     /// Validate every entry path against the workspace root.
     pub fn validated_entries(&self) -> SandboxResult<Vec<(String, String, &Entry)>> {
-        let mut validated = Vec::with_capacity(self.entries.len());
-        for (path, entry) in &self.entries {
+        self.validate_top_level(true)
+    }
+
+    fn validate_top_level(&self, ordered: bool) -> SandboxResult<Vec<(String, String, &Entry)>> {
+        let top_level: Vec<(&String, &Entry)> = if ordered {
+            self.entries_in_order().collect()
+        } else {
+            self.entries.iter().collect()
+        };
+        // Every entry in the tree is checked, children included: a `dir` whose child is named
+        // `../outside.txt` would otherwise pass here and only fail, with a different message,
+        // halfway through materialization.
+        for (path, entry) in &top_level {
+            validate_entry_tree(path, entry)?;
+        }
+        let mut validated = Vec::with_capacity(top_level.len());
+        for (path, entry) in top_level {
             let resolved = resolve_workspace_path(&self.root, path)?;
             validated.push((path.clone(), resolved, entry));
         }
@@ -497,13 +875,33 @@ impl Manifest {
 
     /// Materialize the manifest into a started session.
     ///
-    /// Accounts are provisioned first (best effort, as in Python: a sandbox without `useradd`
-    /// simply keeps running), then the workspace root, then every entry.
+    /// The workspace root is created first, then accounts are provisioned (a failing command
+    /// stops the apply), then every entry.
     pub async fn apply(
         &self,
         session: &dyn SandboxSession,
     ) -> SandboxResult<MaterializationResult> {
-        self.apply_entries(session, false).await
+        self.apply_entries(session, false, true, None).await
+    }
+
+    /// Materialize the manifest with every `local_file` and `local_dir` source confined to
+    /// `base_dir`. See [`Entry::apply_confined`] for what that refuses.
+    pub async fn apply_confined(
+        &self,
+        session: &dyn SandboxSession,
+        base_dir: &Path,
+    ) -> SandboxResult<MaterializationResult> {
+        self.apply_entries(session, false, true, Some(base_dir))
+            .await
+    }
+
+    /// Materialize the manifest without creating its users and groups, for a backend that
+    /// provisions accounts itself or refuses to. Mirrors Python's `provision_accounts=False`.
+    pub async fn apply_without_account_provisioning(
+        &self,
+        session: &dyn SandboxSession,
+    ) -> SandboxResult<MaterializationResult> {
+        self.apply_entries(session, false, false, None).await
     }
 
     /// Re-apply only the ephemeral entries, as a resumed session does after restoring a snapshot.
@@ -511,15 +909,18 @@ impl Manifest {
         &self,
         session: &dyn SandboxSession,
     ) -> SandboxResult<MaterializationResult> {
-        self.apply_entries(session, true).await
+        self.apply_entries(session, true, false, None).await
     }
 
     async fn apply_entries(
         &self,
         session: &dyn SandboxSession,
         only_ephemeral: bool,
+        provision_accounts: bool,
+        base_dir: Option<&Path>,
     ) -> SandboxResult<MaterializationResult> {
         let validated = self.validated_entries()?;
+        self.validate_mount_credential_files()?;
         if !self.resolved_environment.is_empty() && !session.resolves_environment() {
             return Err(SandboxError::new(
                 ErrorCode::SandboxConfigInvalid,
@@ -532,8 +933,8 @@ impl Manifest {
             ));
         }
         session.mkdir(&self.root, true).await?;
-        if !only_ephemeral {
-            self.provision_accounts(session).await;
+        if provision_accounts && !only_ephemeral {
+            self.provision_accounts(session).await?;
         }
         let mut written = MaterializationResult::new();
         // Entries materialize concurrently, in batches. Two entries may only share a batch when
@@ -542,28 +943,43 @@ impl Manifest {
         // child is created. Everything inside a batch is independent, so a batch is bounded only
         // by `concurrency_limits.manifest_entries`.
         let width = self.concurrency_limits.manifest_entry_width();
-        let mut batch: Vec<(String, Entry)> = Vec::new();
-        for (_, dest, entry) in validated {
-            if only_ephemeral && !entry.ephemeral {
-                continue;
+        let queued: Vec<(String, Entry)> = if only_ephemeral {
+            // Resume re-applies the ephemeral entries wherever they sit, so the whole tree is
+            // walked: a `dir` entry holding one ephemeral file must have that file re-applied,
+            // and only that file. An entry that is itself ephemeral is re-applied whole,
+            // children and all.
+            let mut collected: Vec<(String, &Entry)> = Vec::new();
+            for (path, entry) in self.entries_in_order() {
+                collect_ephemeral_entries(&mut collected, path.trim_matches('/'), entry);
             }
+            let mut resolved = Vec::with_capacity(collected.len());
+            for (rel, entry) in collected {
+                resolved.push((resolve_workspace_path(&self.root, &rel)?, entry.clone()));
+            }
+            resolved
+        } else {
+            validated
+                .into_iter()
+                .map(|(_, dest, entry)| (dest, entry.clone()))
+                .collect()
+        };
+        let mut batch: Vec<(String, Entry)> = Vec::new();
+        for (dest, entry) in queued {
             // The manifest owns the limits, so an entry built before they were set still
             // honours them.
-            let entry = entry
-                .clone()
-                .with_copy_concurrency(self.concurrency_limits.local_dir_file_width());
+            let entry = entry.with_copy_concurrency(self.concurrency_limits.local_dir_file_width());
             let is_mount = entry.as_mount().is_some();
             let overlaps = batch.iter().any(|(queued, _)| paths_overlap(queued, &dest));
             if is_mount || overlaps {
-                written.extend(apply_entry_batch(session, &mut batch, width).await?);
+                written.extend(apply_entry_batch(session, &mut batch, width, base_dir).await?);
             }
             if is_mount {
-                written.extend(entry.apply(session, &dest).await?);
+                written.extend(apply_one(session, &entry, &dest, base_dir).await?);
                 continue;
             }
             batch.push((dest, entry));
         }
-        written.extend(apply_entry_batch(session, &mut batch, width).await?);
+        written.extend(apply_entry_batch(session, &mut batch, width, base_dir).await?);
         Ok(written)
     }
 
@@ -580,36 +996,60 @@ impl Manifest {
         Ok(())
     }
 
-    async fn provision_accounts(&self, session: &dyn SandboxSession) {
+    /// Create the manifest's groups, users and memberships inside the sandbox.
+    ///
+    /// A failing command stops provisioning and surfaces: a workspace whose files were meant to
+    /// be owned by an account that does not exist would otherwise fail later, far from the cause.
+    /// Mirrors Python's `ManifestApplier.provision_accounts`, which runs every command checked.
+    ///
+    /// [`apply`](Self::apply) already calls this. It is public for the one path that does not go
+    /// through `apply`: restoring a snapshot into a fresh sandbox brings the files back but not
+    /// the operating-system accounts that own them, so Python's
+    /// `_restore_snapshot_and_reapply_ephemeral_on_resume` provisions them again, unless the
+    /// backend reports that it kept its system state (a reused Docker container).
+    pub async fn provision_accounts(&self, session: &dyn SandboxSession) -> SandboxResult<()> {
+        let mut commands: Vec<Vec<String>> = Vec::new();
         for group in &self.groups {
-            let _ = session
-                .exec(ExecRequest::argv(["groupadd", "-f", &group.name]))
-                .await;
+            commands.push(vec!["groupadd".to_string(), group.name.clone()]);
         }
         let mut user_names: BTreeSet<&str> = self.users.iter().map(|u| u.name.as_str()).collect();
         for group in &self.groups {
             user_names.extend(group.users.iter().map(|u| u.name.as_str()));
         }
         for name in user_names {
-            let _ = session
-                .exec(ExecRequest::argv(["useradd", "-m", name]))
-                .await;
+            // Python's exact account shape: a group of the user's own name, no home directory,
+            // and no login shell. These accounts exist to own files and run commands, not to be
+            // logged into, so giving them a home and a shell widens what a compromised sandbox
+            // process can do for no benefit.
+            commands.push(
+                ["useradd", "-U", "-M", "-s", "/usr/sbin/nologin", name]
+                    .map(String::from)
+                    .to_vec(),
+            );
         }
         for group in &self.groups {
             for user in &group.users {
-                let _ = session
-                    .exec(ExecRequest::argv([
-                        "usermod",
-                        "-aG",
-                        &group.name,
-                        &user.name,
-                    ]))
-                    .await;
+                commands.push(
+                    ["usermod", "-aG", &group.name, &user.name]
+                        .map(String::from)
+                        .to_vec(),
+                );
             }
         }
+        for command in commands {
+            let result = session.exec(ExecRequest::argv(command.clone())).await?;
+            if !result.ok() {
+                return Err(SandboxError::exec_nonzero(&command, &result)
+                    .with_context("command_str", command.join(" "))
+                    .with_context("stdout", result.stdout_text())
+                    .with_context("stderr", result.stderr_text()));
+            }
+        }
+        Ok(())
     }
 
-    /// Render the workspace layout for the model, truncated to
+    /// Render the workspace layout for the model. Mirrors Python's `Manifest.describe()`: the
+    /// tree of [`render_tree`](Self::render_tree), one level deep, truncated to
     /// [`MAX_MANIFEST_DESCRIPTION_CHARS`].
     pub fn describe(&self) -> String {
         self.render(
@@ -619,52 +1059,265 @@ impl Manifest {
     }
 
     /// Render the workspace layout with an explicit depth and character budget.
+    ///
+    /// A zero `depth` or `max_chars` renders nothing; [`render_tree`](Self::render_tree) reports
+    /// it as an error instead.
     pub fn render(&self, depth: usize, max_chars: Option<usize>) -> String {
-        let mut out = String::new();
-        out.push_str(self.root.trim_end_matches('/'));
-        if out.is_empty() {
-            out.push('/');
+        self.render_tree(Some(depth), max_chars).unwrap_or_default()
+    }
+
+    /// Render the workspace layout as the tree Python's `describe` produces: box-drawing
+    /// connectors, one `# <absolute path>` comment per node (with ` — <description>` when the
+    /// entry has one), the columns aligned.
+    ///
+    /// `depth` limits how many levels are shown (`None` shows all) and `max_chars` truncates the
+    /// result with the same marker [`truncate_manifest_description`] uses. A zero `depth` or
+    /// `max_chars` is rejected, as Python rejects it. Mirrors `render_manifest_description`.
+    pub fn render_tree(
+        &self,
+        depth: Option<usize>,
+        max_chars: Option<usize>,
+    ) -> SandboxResult<String> {
+        if depth == Some(0) {
+            return Err(SandboxError::new(
+                ErrorCode::SandboxConfigInvalid,
+                "depth must be a non-zero positive integer or None",
+            ));
         }
-        out.push_str("/\n");
+        if max_chars == Some(0) {
+            return Err(SandboxError::new(
+                ErrorCode::SandboxConfigInvalid,
+                "max_chars must be a non-zero positive integer or None",
+            ));
+        }
+        let root = match self.root.trim_end_matches('/') {
+            "" => "/".to_string(),
+            trimmed => trimmed.to_string(),
+        };
+        let root_prefix = root.trim_end_matches('/').to_string();
+        let mut tree = TreeNode::default();
         for (path, entry) in &self.entries {
-            render_entry(&mut out, path, entry, 1, depth);
+            let parts = path_parts(path);
+            let full_path = entry.as_mount().map(|mount| match &mount.mount_path {
+                Some(mount_path) if mount_path.starts_with('/') => mount_path.clone(),
+                Some(mount_path) => format!("{root_prefix}/{mount_path}"),
+                None => format!("{root_prefix}/{}", parts.join("/")),
+            });
+            insert_entry_tree(&mut tree, &parts, entry, full_path, depth);
         }
-        match max_chars {
-            Some(max) if out.chars().count() > max => {
-                let marker = "\n... (truncated)\nThe filesystem layout above was truncated. Use \
-                              `ls` to explore specific directories before relying on omitted \
-                              paths.\n";
-                let keep = max.saturating_sub(marker.chars().count());
-                let mut truncated: String = out.chars().take(keep).collect();
-                truncated.push_str(marker);
-                truncated
+        let mut collected: Vec<TreeLine> = Vec::new();
+        collect_tree_lines(
+            &tree,
+            "",
+            depth,
+            &mut Vec::new(),
+            &root_prefix,
+            &mut collected,
+        );
+        let mut lines = vec![root];
+        if let Some(max_width) = collected
+            .iter()
+            .map(|line| line.prefix.chars().count() + line.name.chars().count())
+            .max()
+        {
+            for line in &collected {
+                let used = line.prefix.chars().count() + line.name.chars().count();
+                let spacer = " ".repeat(max_width - used + 2);
+                let comment = match line.description.as_deref() {
+                    Some(description) if !description.is_empty() => {
+                        format!("# {} \u{2014} {description}", line.full_path)
+                    }
+                    _ => format!("# {}", line.full_path),
+                };
+                lines.push(format!("{}{}{spacer}{comment}", line.prefix, line.name));
             }
-            _ => out,
         }
+        let description = format!("{}\n", lines.join("\n"));
+        Ok(truncate_manifest_description(&description, max_chars))
     }
 }
 
-fn render_entry(out: &mut String, name: &str, entry: &Entry, level: usize, depth: usize) {
-    if level > depth {
+/// Cut a rendered layout to `max_chars`, ending in a marker that says how much was dropped and
+/// tells the model to explore with `ls`. `None` leaves the text alone. The result is never longer
+/// than `max_chars`, even when the marker itself does not fit. Mirrors Python's
+/// `_truncate_manifest_description`.
+pub fn truncate_manifest_description(description: &str, max_chars: Option<usize>) -> String {
+    let Some(max_chars) = max_chars else {
+        return description.to_string();
+    };
+    let total = description.chars().count();
+    if total <= max_chars {
+        return description.to_string();
+    }
+    if max_chars == 0 {
+        return String::new();
+    }
+    // The marker states how many characters were omitted, and how many are omitted depends on
+    // how much room the marker leaves, so iterate until the two agree.
+    let mut omitted = total - max_chars;
+    let mut marker;
+    let mut keep;
+    let mut settled = 0;
+    loop {
+        marker = format!(
+            "\n... (truncated {omitted} chars)\n\nThe filesystem layout above was truncated. Use \
+             `ls` to explore specific directories before relying on omitted paths.\n"
+        );
+        keep = max_chars.saturating_sub(marker.chars().count());
+        let actual = total - keep;
+        settled += 1;
+        if actual == omitted || settled >= 16 {
+            break;
+        }
+        omitted = actual;
+    }
+    if marker.chars().count() >= max_chars {
+        return marker.chars().take(max_chars).collect();
+    }
+    let kept: String = description.chars().take(keep).collect();
+    let mut truncated = format!("{}{marker}", kept.trim_end());
+    if truncated.chars().count() > max_chars {
+        truncated = truncated.chars().take(max_chars).collect();
+    }
+    truncated
+}
+
+#[derive(Default)]
+struct TreeNode {
+    children: BTreeMap<String, TreeNode>,
+    description: Option<String>,
+    is_dir: bool,
+    full_path: Option<String>,
+}
+
+struct TreeLine {
+    prefix: String,
+    name: String,
+    full_path: String,
+    description: Option<String>,
+}
+
+/// The non-empty, non-`.` segments of a manifest path, without any leading `/`.
+fn path_parts(path: &str) -> Vec<String> {
+    to_posix_path(path)
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
+        .map(str::to_string)
+        .collect()
+}
+
+fn insert_tree_path(
+    root: &mut TreeNode,
+    parts: &[String],
+    description: Option<&str>,
+    is_dir: bool,
+    full_path: Option<String>,
+    max_depth: Option<usize>,
+) {
+    if parts.is_empty() {
         return;
     }
-    let indent = "  ".repeat(level);
-    let suffix = if entry.is_dir() { "/" } else { "" };
-    out.push_str(&indent);
-    out.push_str(name.trim_matches('/'));
-    out.push_str(suffix);
-    if entry.as_mount().is_some() {
-        out.push_str(" (mount)");
-    }
-    if let Some(description) = &entry.description {
-        out.push_str(" - ");
-        out.push_str(description);
-    }
-    out.push('\n');
-    if let EntryKind::Dir { children } = &entry.kind {
-        for (child_name, child) in children {
-            render_entry(out, child_name, child, level + 1, depth);
+    let limit = max_depth.map_or(parts.len(), |depth| depth.min(parts.len()));
+    let mut node = root;
+    for (index, part) in parts[..limit].iter().enumerate() {
+        node = node.children.entry(part.clone()).or_default();
+        if index < parts.len() - 1 {
+            node.is_dir = true;
         }
+    }
+    if limit == parts.len() {
+        if node.description.is_none() {
+            node.description = description.map(str::to_string);
+        }
+        if full_path.is_some() {
+            node.full_path = full_path;
+        }
+    }
+    if is_dir || limit < parts.len() {
+        node.is_dir = true;
+    }
+}
+
+fn insert_entry_tree(
+    root: &mut TreeNode,
+    parts: &[String],
+    entry: &Entry,
+    full_path: Option<String>,
+    depth: Option<usize>,
+) {
+    insert_tree_path(
+        root,
+        parts,
+        entry.description.as_deref(),
+        entry.permissions.directory,
+        full_path.clone(),
+        depth,
+    );
+    let EntryKind::Dir { children } = &entry.kind else {
+        return;
+    };
+    if depth.is_some_and(|depth| parts.len() >= depth) {
+        return;
+    }
+    for (name, child) in children {
+        let mut child_parts = parts.to_vec();
+        child_parts.extend(path_parts(name));
+        let child_full = full_path.as_ref().map(|full| {
+            format!(
+                "{}/{}",
+                full.trim_end_matches('/'),
+                path_parts(name).join("/")
+            )
+        });
+        insert_entry_tree(root, &child_parts, child, child_full, depth);
+    }
+}
+
+fn collect_tree_lines(
+    node: &TreeNode,
+    prefix: &str,
+    remaining: Option<usize>,
+    rel_parts: &mut Vec<String>,
+    root_prefix: &str,
+    out: &mut Vec<TreeLine>,
+) {
+    if remaining == Some(0) {
+        return;
+    }
+    let next_remaining = remaining.map(|remaining| remaining - 1);
+    let count = node.children.len();
+    for (index, (name, child)) in node.children.iter().enumerate() {
+        let is_last = index + 1 == count;
+        let connector = if is_last {
+            "\u{2514}\u{2500}\u{2500} "
+        } else {
+            "\u{251c}\u{2500}\u{2500} "
+        };
+        rel_parts.push(name.clone());
+        let is_dir = child.is_dir || !child.children.is_empty();
+        out.push(TreeLine {
+            prefix: format!("{prefix}{connector}"),
+            name: if is_dir {
+                format!("{name}/")
+            } else {
+                name.clone()
+            },
+            full_path: child
+                .full_path
+                .clone()
+                .unwrap_or_else(|| format!("{root_prefix}/{}", rel_parts.join("/"))),
+            description: child.description.clone(),
+        });
+        let extension = if is_last { "    " } else { "\u{2502}   " };
+        collect_tree_lines(
+            child,
+            &format!("{prefix}{extension}"),
+            next_remaining,
+            rel_parts,
+            root_prefix,
+            out,
+        );
+        rel_parts.pop();
     }
 }
 
@@ -677,6 +1330,19 @@ fn paths_overlap(left: &str, right: &str) -> bool {
         || left.starts_with(&format!("{right}/"))
 }
 
+/// Apply one entry, confining its host sources to `base_dir` when there is one.
+async fn apply_one(
+    session: &dyn SandboxSession,
+    entry: &Entry,
+    dest: &str,
+    base_dir: Option<&Path>,
+) -> SandboxResult<MaterializationResult> {
+    match base_dir {
+        Some(base_dir) => entry.apply_confined(session, dest, base_dir).await,
+        None => entry.apply(session, dest).await,
+    }
+}
+
 /// Materialize a batch of independent entries concurrently and drain it.
 ///
 /// The results are collected in the batch's own order, so a manifest's materialization result is
@@ -685,27 +1351,110 @@ async fn apply_entry_batch(
     session: &dyn SandboxSession,
     batch: &mut Vec<(String, Entry)>,
     width: usize,
+    base_dir: Option<&Path>,
 ) -> SandboxResult<MaterializationResult> {
     let mut written = MaterializationResult::new();
     if batch.is_empty() {
         return Ok(written);
     }
     let queued = std::mem::take(batch);
-    for chunk in queued.chunks(width.max(1)) {
-        let results = futures::future::join_all(chunk.iter().map(|(dest, entry)| async move {
+    let applications = queued.iter().map(|(dest, entry)| {
+        move || async move {
             if entry.is_dir() {
                 session.mkdir(dest, true).await?;
             } else if let Some(parent) = parent_path(dest) {
                 session.mkdir(&parent, true).await?;
             }
-            entry.apply(session, dest).await
-        }))
-        .await;
-        for result in results {
-            written.extend(result?);
+            apply_one(session, entry, dest, base_dir).await
         }
+    });
+    for result in gather_in_order(applications, Some(width.max(1))).await? {
+        written.extend(result);
     }
     Ok(written)
+}
+
+/// The error Python raises for a manifest-relative path that is absolute or climbs out of the
+/// workspace. `rel` is the path as the caller wrote it, with POSIX separators.
+fn invalid_manifest_path(rel: &str) -> SandboxError {
+    let posix = to_posix_path(rel);
+    let reason = if posix.starts_with('/') || is_windows_absolute(&posix) {
+        "absolute"
+    } else {
+        "escape_root"
+    };
+    manifest_path_error(&posix, reason)
+}
+
+/// The same error with the reason named by the caller, for a path that is absolute in form but
+/// refused because of where it leads (a mount path that climbs out of the workspace root).
+fn manifest_path_error(rel: &str, reason: &str) -> SandboxError {
+    let message = match reason {
+        "absolute" => format!("manifest path must be relative: {rel}"),
+        _ => format!("manifest path must not escape root: {rel}"),
+    };
+    SandboxError::new(ErrorCode::InvalidManifestPath, message)
+        .with_op(crate::sandbox::errors::SandboxOp::Materialize)
+        .with_context("rel", rel)
+        .with_context("reason", reason)
+}
+
+/// Check one manifest-relative path: no Windows drive, no leading `/`, no `..` segment.
+/// Mirrors Python's `Manifest._validate_rel_path`.
+fn validate_rel_path(rel: &str) -> SandboxResult<()> {
+    let posix = to_posix_path(rel);
+    if is_windows_absolute(rel) || posix.starts_with('/') || posix.split('/').any(|s| s == "..") {
+        return Err(invalid_manifest_path(rel));
+    }
+    Ok(())
+}
+
+/// Validate `rel` and, for a directory, every child path beneath it.
+///
+/// A child name joins the way `PurePath` joins: an absolute child replaces the parent path, so
+/// it is reported as absolute rather than being quietly nested.
+fn validate_entry_tree(rel: &str, entry: &Entry) -> SandboxResult<()> {
+    validate_rel_path(rel)?;
+    if let EntryKind::Dir { children } = &entry.kind {
+        for (name, child) in children {
+            let posix = to_posix_path(name);
+            let child_rel = if is_windows_absolute(name) || posix.starts_with('/') {
+                name.clone()
+            } else {
+                format!("{}/{name}", rel.trim_end_matches('/'))
+            };
+            validate_entry_tree(&child_rel, child)?;
+        }
+    }
+    Ok(())
+}
+
+/// Keep the mounts whose entry is ephemeral.
+fn ephemeral_only<'a>(targets: Vec<(&'a Entry, &'a Mount, String)>) -> Vec<(&'a Mount, String)> {
+    targets
+        .into_iter()
+        .filter(|(entry, _, _)| entry.ephemeral)
+        .map(|(_, mount, path)| (mount, path))
+        .collect()
+}
+
+/// Collect the entries a resume has to re-apply, with their manifest-relative paths.
+///
+/// An ephemeral entry is taken whole and its subtree is not descended into, so a directory marked
+/// ephemeral is re-created with every child it declares. A non-ephemeral directory is descended
+/// into, so only the ephemeral entries inside it are re-applied. Mirrors Python's
+/// `ManifestApplier._collect_ephemeral_entries`.
+fn collect_ephemeral_entries<'a>(out: &mut Vec<(String, &'a Entry)>, rel: &str, entry: &'a Entry) {
+    if entry.ephemeral {
+        out.push((rel.to_string(), entry));
+        return;
+    }
+    if let EntryKind::Dir { children } = &entry.kind {
+        for (name, child) in children {
+            let child_rel = format!("{}/{}", rel.trim_end_matches('/'), name.trim_matches('/'));
+            collect_ephemeral_entries(out, &child_rel, child);
+        }
+    }
 }
 
 /// The parent of an absolute sandbox path, when it has one.
@@ -727,7 +1476,8 @@ mod tests {
         use crate::sandbox::sandboxes::unix_local::UnixLocalSandboxClient;
         use crate::sandbox::session::SandboxClient;
 
-        let host = tempfile::tempdir().unwrap();
+        // Host sources are confined to the working directory.
+        let host = tempfile::tempdir_in(".").unwrap();
         for index in 0..9 {
             tokio::fs::write(
                 host.path().join(format!("f{index}.txt")),
@@ -827,10 +1577,13 @@ mod tests {
             )
             .with_entry("notes.txt", Entry::text_file("hi"));
         let rendered = manifest.describe();
-        assert!(rendered.starts_with("/workspace/\n"));
-        assert!(rendered.contains("  repo/ - staged repository\n"));
-        assert!(rendered.contains("    task.md\n"));
-        assert!(rendered.contains("  notes.txt\n"));
+        assert!(rendered.starts_with("/workspace\n"));
+        assert!(rendered.contains("repo/"));
+        assert!(rendered.contains("# /workspace/repo \u{2014} staged repository"));
+        // The default depth stops at the manifest's own entries.
+        assert!(!rendered.contains("task.md"));
+        assert!(rendered.contains("notes.txt"));
+        assert!(manifest.render(2, None).contains("task.md"));
     }
 
     #[test]
@@ -860,6 +1613,6 @@ mod tests {
         }
         let rendered = manifest.describe();
         assert!(rendered.chars().count() <= MAX_MANIFEST_DESCRIPTION_CHARS);
-        assert!(rendered.contains("(truncated)"));
+        assert!(rendered.contains("(truncated "));
     }
 }

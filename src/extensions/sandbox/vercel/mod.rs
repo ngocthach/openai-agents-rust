@@ -75,7 +75,9 @@ use super::ports::{
     ExposedPortEndpoint, ExposedPortUnavailable, assert_exposed_port_configured, endpoint_from_url,
     exposed_port_unavailable,
 };
-use crate::sandbox::http::{expect_success, http_error, parse_json, transport};
+use crate::sandbox::http::{
+    bounded_read_zero, expect_success, http_error, parse_json, read_body_prefix, transport,
+};
 
 pub mod mounts;
 pub mod tar_gz;
@@ -855,6 +857,14 @@ fn mount_path_key(mount_path: &str) -> String {
     }
 }
 
+/// Whether the Vercel API documents a status as worth retrying.
+///
+/// Mirrors Python's `_vercel_provider_retryability` table: request timeouts (408), too-early
+/// (425), rate limits (429) and server errors retry; every other client error does not.
+fn vercel_status_is_retryable(status: u16) -> bool {
+    matches!(status, 408 | 425 | 429) || (500..=599).contains(&status)
+}
+
 /// Split the `<sandbox name>:<session id>` pair stored in the persisted state.
 fn split_provider_id(provider_id: &str) -> SandboxResult<(String, String)> {
     provider_id
@@ -1231,12 +1241,9 @@ impl VercelSandboxSession {
             if !response.status().is_success() {
                 let status = response.status();
                 let text = response.text().await.unwrap_or_default();
-                return Err(http_error(
-                    ErrorCode::ExecTransportError,
-                    what,
-                    status,
-                    &text,
-                ));
+                let mut error = http_error(ErrorCode::ExecTransportError, what, status, &text);
+                error.retryable = Some(vercel_status_is_retryable(status.as_u16()));
+                return Err(error);
             }
             let text = response.text().await.map_err(|e| transport(what, e))?;
             parse_command_stream(&text)
@@ -1258,7 +1265,7 @@ impl VercelSandboxSession {
     /// Workspace reads go through [`read_file`](SandboxSession::read_file), which validates the
     /// path first; this is for the paths the session itself owns, such as a temporary archive
     /// under `/tmp`.
-    async fn download_at(&self, path: &str) -> SandboxResult<Vec<u8>> {
+    async fn download_at(&self, path: &str, limit: Option<usize>) -> SandboxResult<Vec<u8>> {
         let what = "read a file from the Vercel sandbox";
         let response = self
             .request(self.http.post(self.session_url("/fs/read")))
@@ -1282,11 +1289,7 @@ impl VercelSandboxSession {
                 &body,
             ));
         }
-        Ok(response
-            .bytes()
-            .await
-            .map_err(|e| transport(what, e))?
-            .to_vec())
+        read_body_prefix(response, limit, what).await
     }
 
     /// Upload a gzipped tar archive, extracting it under `extract_dir`.
@@ -1526,7 +1529,15 @@ impl SandboxSession for VercelSandboxSession {
 
     async fn read_file(&self, path: &str) -> SandboxResult<Vec<u8>> {
         let resolved = self.normalize_path(path)?;
-        self.download_at(&resolved).await
+        self.download_at(&resolved, None).await
+    }
+
+    async fn read_bounded(&self, path: &str, max_bytes: usize) -> SandboxResult<Vec<u8>> {
+        if max_bytes == 0 {
+            return Err(bounded_read_zero());
+        }
+        let resolved = self.normalize_path(path)?;
+        self.download_at(&resolved, Some(max_bytes)).await
     }
 
     fn exposed_ports(&self) -> Vec<u16> {
@@ -1616,6 +1627,16 @@ impl SandboxSession for VercelSandboxSession {
             )
             .await?;
         if !result.ok() {
+            // The scratch tarball may be partly written; it must not outlive the failure.
+            let _ = self
+                .run_command(
+                    vec!["rm".into(), "-f".into(), "--".into(), archive_path.clone()],
+                    "/".to_string(),
+                    &self.command_envs(),
+                    None,
+                    false,
+                )
+                .await;
             return Err(SandboxError::new(
                 ErrorCode::SnapshotPersistError,
                 format!(
@@ -1624,7 +1645,7 @@ impl SandboxSession for VercelSandboxSession {
                 ),
             ));
         }
-        let archive = self.download_at(&archive_path).await;
+        let archive = self.download_at(&archive_path, None).await;
         let _ = self
             .run_command(
                 vec!["rm".into(), "-f".into(), "--".into(), archive_path.clone()],

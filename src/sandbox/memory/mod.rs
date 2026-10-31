@@ -13,6 +13,11 @@ pub mod rollouts;
 pub mod storage;
 
 pub use config::{MemoryGenerateConfig, MemoryLayoutConfig, MemoryReadConfig};
-pub use manager::{RolloutExtractionArtifacts, SandboxMemoryGenerationManager};
+pub use manager::{
+    RolloutExtractionArtifacts, SandboxMemoryGenerationManager, normalize_rollout_slug,
+    rollout_file_name_for_rollout_id, validate_rollout_id,
+};
 pub use rollouts::{RolloutTerminalMetadata, TerminalState, build_rollout_payload_from_result};
-pub use storage::{PhaseTwoInputSelection, PhaseTwoSelectionItem, SandboxMemoryStorage};
+pub use storage::{
+    PhaseTwoInputSelection, PhaseTwoSelectionItem, SandboxMemoryStorage, updated_at_sort_key,
+};

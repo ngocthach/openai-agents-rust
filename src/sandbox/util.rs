@@ -177,16 +177,16 @@ impl TruncationPolicy {
         }
     }
 
-    /// The marker written where the elided middle was.
-    fn marker(self, removed: usize) -> String {
+    /// The marker written where the elided middle was. Mirrors `format_truncation_marker`.
+    pub fn marker(self, removed: usize) -> String {
         match self.mode {
             TruncationMode::Tokens => format!("…{removed} tokens truncated…"),
             TruncationMode::Bytes => format!("…{removed} chars truncated…"),
         }
     }
 
-    /// How much was removed, in the unit this policy reports.
-    fn removed_units(self, removed_bytes: usize, removed_chars: usize) -> usize {
+    /// How much was removed, in the unit this policy reports. Mirrors `removed_units_for_source`.
+    pub fn removed_units(self, removed_bytes: usize, removed_chars: usize) -> usize {
         match self.mode {
             TruncationMode::Tokens => approx_tokens_from_byte_count(removed_bytes),
             TruncationMode::Bytes => removed_chars,
@@ -195,7 +195,7 @@ impl TruncationPolicy {
 }
 
 /// Split a budget into a head half and a tail half. Mirrors `split_budget`.
-fn split_budget(budget: usize) -> (usize, usize) {
+pub fn split_budget(budget: usize) -> (usize, usize) {
     let left = budget / 2;
     (left, budget - left)
 }
@@ -205,7 +205,7 @@ fn split_budget(budget: usize) -> (usize, usize) {
 /// Mirrors `split_string`. Both halves end on character boundaries, so the result is always
 /// valid UTF-8 even when the budget falls inside a multi-byte character. Returns the number of
 /// characters dropped from the middle.
-fn split_string(text: &str, head_bytes: usize, tail_bytes: usize) -> (usize, &str, &str) {
+pub fn split_string(text: &str, head_bytes: usize, tail_bytes: usize) -> (usize, &str, &str) {
     if text.is_empty() {
         return (0, "", "");
     }
@@ -274,14 +274,58 @@ fn truncate_middle(text: &str, policy: TruncationPolicy, prefix: &str) -> String
 }
 
 /// Truncate `text` under `policy`, eliding the middle. Mirrors `truncate_text`.
+///
+/// The two modes do not share an implementation, because they answer different questions. A
+/// token budget is an estimate the model has to live inside, so the marker is paid for out of
+/// the budget; a byte budget says how much *content* to keep, so the marker is added on top.
 pub fn truncate_text(text: &str, policy: TruncationPolicy) -> String {
+    match policy.mode {
+        TruncationMode::Bytes => truncate_with_byte_estimate(text, policy),
+        TruncationMode::Tokens => truncate_with_token_budget(text, policy).0,
+    }
+}
+
+/// Truncate `text` to a token budget, reporting the original token count when it was cut.
+///
+/// Mirrors `truncate_with_token_budget`: the marker comes out of the budget, so the result
+/// stays inside it.
+pub fn truncate_with_token_budget(text: &str, policy: TruncationPolicy) -> (String, Option<usize>) {
+    if text.is_empty() {
+        return (String::new(), None);
+    }
+    let max_tokens = policy.token_budget();
+    if max_tokens > 0 && text.len() <= approx_bytes_for_tokens(max_tokens) {
+        return (text.to_string(), None);
+    }
+    let approx_total = approx_token_count(text);
+    let truncated = truncate_middle(text, policy, "");
+    if truncated == text {
+        return (truncated, None);
+    }
+    (truncated, Some(approx_total))
+}
+
+/// Keep `policy.byte_budget()` bytes of `text` and report the elided characters.
+///
+/// Mirrors `truncate_with_byte_estimate`. The head and the tail together fill the whole budget
+/// and the marker is appended between them, so a zero budget still yields the marker rather
+/// than an empty string that looks like a command which printed nothing.
+pub fn truncate_with_byte_estimate(text: &str, policy: TruncationPolicy) -> String {
     if text.is_empty() {
         return String::new();
     }
-    if text.len() <= policy.byte_budget() {
+    let total_chars = text.chars().count();
+    let max_bytes = policy.byte_budget();
+    if max_bytes == 0 {
+        return policy.marker(policy.removed_units(text.len(), total_chars));
+    }
+    if text.len() <= max_bytes {
         return text.to_string();
     }
-    truncate_middle(text, policy, "")
+    let (head_budget, tail_budget) = split_budget(max_bytes);
+    let (removed_chars, head, tail) = split_string(text, head_budget, tail_budget);
+    let marker = policy.marker(policy.removed_units(text.len() - max_bytes, removed_chars));
+    format!("{head}{marker}{tail}")
 }
 
 /// Truncate `text` under `policy` and prepend the total line count. Mirrors

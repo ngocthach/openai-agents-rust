@@ -11,12 +11,14 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 
 use crate::error::Result;
-use crate::sandbox::capabilities::{Capability, CapabilityBinding};
+use crate::sandbox::capabilities::tool_input_errors::{FieldKind, tool_with_safe_input};
+use crate::sandbox::capabilities::{Capability, CapabilityBinding, SandboxApplyPatchTool};
 use crate::sandbox::editor::SandboxEditor;
+use crate::sandbox::errors::ErrorCode;
 use crate::sandbox::util::{
     MAX_IMAGE_BYTES, MAX_IMAGE_SIZE_LABEL, base64_encode, detect_image_media_type,
 };
-use crate::tool::{ApplyPatchTool, FunctionTool, Tool, ToolOutput, ToolOutputPart};
+use crate::tool::{ApplyPatchTool, Tool, ToolOutput, ToolOutputPart};
 
 /// The name of the image inspection tool.
 pub const VIEW_IMAGE_TOOL_NAME: &str = "view_image";
@@ -32,11 +34,12 @@ pub struct ViewImageArgs {
     pub path: String,
 }
 
-/// Exposes `apply_patch` and `view_image`, both bound to the live sandbox session.
+/// Exposes `view_image` and `apply_patch`, both bound to the live sandbox session.
 #[derive(Debug, Clone)]
 pub struct Filesystem {
     apply_patch_needs_approval: bool,
     include_view_image: bool,
+    custom_apply_patch: bool,
 }
 
 impl Default for Filesystem {
@@ -51,7 +54,25 @@ impl Filesystem {
         Filesystem {
             apply_patch_needs_approval: false,
             include_view_image: true,
+            custom_apply_patch: true,
         }
+    }
+
+    /// Choose the `apply_patch` flavour (default: the freeform custom tool, as in Python).
+    ///
+    /// The custom tool takes one raw `*** Begin Patch` string that can combine several file
+    /// operations, validates every path before applying the first, and checks approval per
+    /// operation. `false` selects the native `apply_patch_call` tool instead, which Python's
+    /// capability does not offer; it stays available for a model or a recorded conversation
+    /// built around native `apply_patch_call` items.
+    pub fn with_custom_apply_patch(mut self, custom: bool) -> Self {
+        self.custom_apply_patch = custom;
+        self
+    }
+
+    /// Expose the native `apply_patch_call` tool instead of the freeform custom tool.
+    pub fn with_native_apply_patch(self) -> Self {
+        self.with_custom_apply_patch(false)
     }
 
     /// Require human approval for every `apply_patch` call.
@@ -77,16 +98,26 @@ impl<C: Send + Sync + 'static> Capability<C> for Filesystem {
         let editor = SandboxEditor::new(binding.session.clone())
             .with_scope(binding.scope.clone())
             .with_run_as(binding.run_as.clone());
-        let apply_patch =
-            ApplyPatchTool::<C>::new(editor).with_needs_approval(self.apply_patch_needs_approval);
-        let mut tools = vec![Tool::ApplyPatch(Arc::new(apply_patch))];
+        let apply_patch_tool: Tool<C> = if self.custom_apply_patch {
+            let custom = SandboxApplyPatchTool::<C>::new(editor)
+                .with_needs_approval(self.apply_patch_needs_approval)
+                .into_custom_tool();
+            Tool::Custom(Arc::new(custom))
+        } else {
+            let apply_patch = ApplyPatchTool::<C>::new(editor)
+                .with_needs_approval(self.apply_patch_needs_approval);
+            Tool::ApplyPatch(Arc::new(apply_patch))
+        };
+        // Python lists `view_image` first, then `apply_patch`.
+        let mut tools: Vec<Tool<C>> = Vec::new();
         if self.include_view_image {
             let session = binding.session.clone();
             let scope = binding.scope.clone();
             let run_as = binding.run_as.clone();
-            let view_image = FunctionTool::<C>::new(
+            let view_image = tool_with_safe_input::<C, ViewImageArgs, _, _, _>(
                 VIEW_IMAGE_TOOL_NAME,
                 VIEW_IMAGE_DESCRIPTION,
+                &[("path", FieldKind::Str { non_empty: true })],
                 move |_ctx, args: ViewImageArgs| {
                     let session = session.clone();
                     let scope = scope.clone();
@@ -98,30 +129,38 @@ impl<C: Send + Sync + 'static> Capability<C> for Filesystem {
                             Ok(resolved) => resolved,
                             Err(_) => {
                                 return Ok(ToolOutput::Text(
-                                    "Invalid path. Use a path within the sandbox workspace."
+                                    "Invalid path. Use a path within the workspace or an \
+                                     explicitly granted path."
                                         .to_string(),
                                 ));
                             }
                         };
-                        // Check the size before reading: a multi-gigabyte file would be held
-                        // in memory, and on a hosted backend pulled over the wire, only to be
-                        // refused afterwards.
-                        if let Ok(entries) = session.ls(&resolved).await
-                            && let Some(size) = entries.first().and_then(|entry| entry.size)
-                            && size > MAX_IMAGE_BYTES as u64
-                        {
-                            return Ok(ToolOutput::Text(format!(
-                                "image path `{}` exceeded the allowed size of {}; resize or \
-                                 compress the image and try again",
-                                args.path, MAX_IMAGE_SIZE_LABEL
-                            )));
-                        }
-                        let bytes = match session.read_file_as(&resolved, run_as.as_ref()).await {
+                        // The model sees the path it asked about, in the shape it used: a
+                        // provider-private root or the run's cwd prefix never reaches it.
+                        let display = session
+                            .workspace_path_policy()
+                            .and_then(|policy| policy.relative_path(&anchored))
+                            .ok()
+                            .and_then(|relative| scope.display_path(&anchored, &relative).ok())
+                            .unwrap_or_else(|| resolved.clone());
+                        // Read one byte past the limit: that is enough to know the file is too
+                        // big without holding or fetching all of it. A run-as read goes through
+                        // `exec`, which has no bounded form, so it reads whole.
+                        let read = match run_as.as_ref() {
+                            None => session.read_bounded(&resolved, MAX_IMAGE_BYTES + 1).await,
+                            Some(user) => session.read_file_as(&resolved, Some(user)).await,
+                        };
+                        let bytes = match read {
                             Ok(bytes) => bytes,
+                            Err(error) if error.code == ErrorCode::WorkspaceReadNotFound => {
+                                return Ok(ToolOutput::Text(format!(
+                                    "image path `{display}` was not found"
+                                )));
+                            }
                             Err(error) => {
                                 return Ok(ToolOutput::Text(format!(
-                                    "Could not read `{}`: {}",
-                                    args.path, error.message
+                                    "unable to read image at `{display}`: {}",
+                                    error.code
                                 )));
                             }
                         };
@@ -129,17 +168,16 @@ impl<C: Send + Sync + 'static> Capability<C> for Filesystem {
                         // spend the whole context on a single tool call.
                         if bytes.len() > MAX_IMAGE_BYTES {
                             return Ok(ToolOutput::Text(format!(
-                                "image path `{}` exceeded the allowed size of {}; resize or \
-                                 compress the image and try again",
-                                args.path, MAX_IMAGE_SIZE_LABEL
+                                "image path `{display}` exceeded the allowed size of {}; resize \
+                                 or compress the image and try again",
+                                MAX_IMAGE_SIZE_LABEL
                             )));
                         }
                         // The file's own bytes decide the media type: a name is not evidence,
                         // and labelling a text file `image/png` only confuses the model.
                         let Some(media_type) = detect_image_media_type(&resolved, &bytes) else {
                             return Ok(ToolOutput::Text(format!(
-                                "image path `{}` is not a supported image file",
-                                args.path
+                                "image path `{display}` is not a supported image file"
                             )));
                         };
                         let data_url =
@@ -153,6 +191,7 @@ impl<C: Send + Sync + 'static> Capability<C> for Filesystem {
             .with_strict_json_schema(false);
             tools.push(Tool::Function(Arc::new(view_image)));
         }
+        tools.push(apply_patch_tool);
         Ok(tools)
     }
 }

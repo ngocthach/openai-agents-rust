@@ -88,7 +88,9 @@ use super::ports::{
     ExposedPortEndpoint, ExposedPortUnavailable, assert_exposed_port_configured, endpoint_from_url,
     exposed_port_unavailable,
 };
-use crate::sandbox::http::{expect_success, http_error, parse_json, transport};
+use crate::sandbox::http::{
+    bounded_read_zero, expect_success, http_error, parse_json, read_body_prefix, transport,
+};
 
 /// The backend identifier reported by this client and its sessions.
 pub const BACKEND_ID: &str = "daytona";
@@ -988,7 +990,7 @@ impl DaytonaSandboxSession {
     /// Workspace reads go through [`read_file`](SandboxSession::read_file), which validates the
     /// path first; this is for the paths the session itself owns, such as a temporary archive
     /// under `/tmp`.
-    async fn download_at(&self, path: &str) -> SandboxResult<Vec<u8>> {
+    async fn download_at(&self, path: &str, limit: Option<usize>) -> SandboxResult<Vec<u8>> {
         let what = "read a file from the Daytona sandbox";
         let response = self
             .authorize(self.http.get(self.toolbox("/files/download")))
@@ -1013,11 +1015,7 @@ impl DaytonaSandboxSession {
                 &body,
             ));
         }
-        Ok(response
-            .bytes()
-            .await
-            .map_err(|e| transport(what, e))?
-            .to_vec())
+        read_body_prefix(response, limit, what).await
     }
 
     /// Upload a file by its absolute sandbox path.
@@ -1274,7 +1272,15 @@ impl SandboxSession for DaytonaSandboxSession {
 
     async fn read_file(&self, path: &str) -> SandboxResult<Vec<u8>> {
         let resolved = self.normalize_path(path)?;
-        self.download_at(&resolved).await
+        self.download_at(&resolved, None).await
+    }
+
+    async fn read_bounded(&self, path: &str, max_bytes: usize) -> SandboxResult<Vec<u8>> {
+        if max_bytes == 0 {
+            return Err(bounded_read_zero());
+        }
+        let resolved = self.normalize_path(path)?;
+        self.download_at(&resolved, Some(max_bytes)).await
     }
 
     async fn write_file(&self, path: &str, contents: &[u8]) -> SandboxResult<()> {
@@ -1528,7 +1534,7 @@ impl SandboxSession for DaytonaSandboxSession {
                 ),
             ));
         }
-        let archive = self.download_at(&archive_path).await;
+        let archive = self.download_at(&archive_path, None).await;
         let _ = self.remove_at(&archive_path, false).await;
         archive.map_err(|error| {
             SandboxError::new(

@@ -487,6 +487,19 @@ impl ModalHelper {
                 Some("not_found") => ErrorCode::WorkspaceReadNotFound,
                 Some("write_failed") => ErrorCode::WorkspaceWriteTypeError,
                 Some("snapshot_failed") => ErrorCode::SnapshotPersistError,
+                Some("bounded_read_failed") => {
+                    // Nothing the provider said is repeated: only the reason and whether a
+                    // retry may help.
+                    let mut error = SandboxError::new(
+                        ErrorCode::WorkspaceArchiveReadError,
+                        "Failed to read the workspace path",
+                    )
+                    .with_context("reason", "bounded_read_failed");
+                    if let Some(retryable) = response.get("retryable").and_then(Value::as_bool) {
+                        error = error.with_retryable(retryable);
+                    }
+                    return Err(error);
+                }
                 _ => ErrorCode::ExecTransportError,
             };
             return Err(SandboxError::new(
@@ -1320,6 +1333,26 @@ impl SandboxSession for ModalSandboxSession {
                 "op": "read_file",
                 "sandbox_id": self.sandbox_id(),
                 "path": resolved,
+            }))
+            .await?;
+        decode_base64_field(&response, "data")
+    }
+
+    async fn read_bounded(&self, path: &str, max_bytes: usize) -> SandboxResult<Vec<u8>> {
+        if max_bytes == 0 {
+            return Err(SandboxError::new(
+                ErrorCode::SandboxConfigInvalid,
+                "read_bounded max_bytes must be positive",
+            ));
+        }
+        let resolved = self.normalize_path(path)?;
+        let response = self
+            .helper
+            .call(json!({
+                "op": "read_bounded",
+                "sandbox_id": self.sandbox_id(),
+                "path": resolved,
+                "max_bytes": max_bytes,
             }))
             .await?;
         decode_base64_field(&response, "data")

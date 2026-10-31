@@ -549,11 +549,21 @@ impl FuseMountPattern {
         container: &str,
     ) -> SandboxResult<String> {
         if let Some(cache_path) = &self.cache_path {
-            if cache_path.starts_with('/') || cache_path.split('/').any(|part| part == "..") {
+            let windows_absolute = crate::sandbox::workspace_paths::is_windows_absolute(cache_path);
+            if windows_absolute
+                || cache_path.starts_with('/')
+                || cache_path.split('/').any(|part| part == "..")
+            {
+                let shown = if windows_absolute {
+                    cache_path.replace('\\', "/")
+                } else {
+                    cache_path.clone()
+                };
                 return Err(SandboxError::new(
                     ErrorCode::MountConfigInvalid,
-                    "a blobfuse `cache_path` must be relative to the workspace root",
-                ));
+                    "blobfuse cache_path must be relative to the workspace root",
+                )
+                .with_context("cache_path", shown));
             }
             return Ok(cache_path.clone());
         }
@@ -711,8 +721,10 @@ impl MountPattern for FuseMountPattern {
         if is_inside(&cache_dir, &normalized_mount) {
             return Err(SandboxError::new(
                 ErrorCode::MountConfigInvalid,
-                "a blobfuse `cache_path` must be outside the mount path",
-            ));
+                "blobfuse cache_path must be outside the mount path",
+            )
+            .with_context("mount_path", normalized_mount.clone())
+            .with_context("cache_path", cache_dir.clone()));
         }
         let config_dir = session.normalize_path(&format!("{BLOBFUSE_CONFIG_DIR}/{scratch_id}"))?;
         let config_path = format!(
@@ -911,6 +923,22 @@ impl MountPattern for MountpointMountPattern {
         mount_path: &str,
         config: &MountPatternConfig,
     ) -> SandboxResult<()> {
+        // An endpoint pinned on the pattern is not part of the mount's own configuration, so it
+        // never reaches the credential-authority classification and no acknowledgement covers
+        // it. One carrying its own authority would therefore hand the sandbox a credential the
+        // manifest never declared. The value is the secret, so it is not echoed back.
+        if self
+            .options
+            .endpoint_url
+            .as_deref()
+            .is_some_and(url_contains_inline_authority)
+        {
+            return Err(SandboxError::new(
+                ErrorCode::MountConfigInvalid,
+                "the `mountpoint` mount pattern does not support exposing credentials to the \
+                 sandbox through `mount_strategy.pattern.options.endpoint_url`",
+            ));
+        }
         let bucket = require(config, MOUNTPOINT_OPTION_BUCKET)?.to_string();
         let access_key_id = secret(config, MOUNTPOINT_SECRET_ACCESS_KEY_ID);
         let secret_access_key = secret(config, MOUNTPOINT_SECRET_SECRET_ACCESS_KEY);
