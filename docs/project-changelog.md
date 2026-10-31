@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.10.0 (2026-11-01)
+
+Closes the findings of an independent audit of the Python-only bucket in the parity ledger. The audit sampled
+40 files and found about 10% of the sampled "cannot exist in Rust" cases hid real behaviour
+(`plans/reports/py-test-parity-python-only-audit.md`); the named files are fixed and 47 more Python cases are
+now ported. Measured state: 12,641 Python test cases, 8,083 ported, 604 covered, 3,954 Python-only, 0 not
+ported, 0 unaccounted. The rest of the Python-only bucket was not re-audited, so some reasons may still be
+too generous. Notes by area: `plans/reports/py-test-parity-core7-*.md`.
+
+Fixes:
+
+- Sandbox `local_dir` copy (unix) walks the tree with directory file descriptors, so a source root,
+  subdirectory or file swapped for a symlink after validation fails with `LocalDirReadError`
+  (`symlink_not_supported` or `path_changed_during_copy`) instead of being followed. This adds a unix-only
+  `rustix` dependency under the `sandbox` feature.
+- Realtime: every server event is validated, and a malformed or unknown event becomes an `Error` event
+  (`Failed to validate server event`); a raw client message that is not a known client event is dropped and
+  logged instead of sent. The error names the offending field and type, not the value.
+- A bare legacy Vercel provider id resumes, as in Python. Live sandbox sessions honour the run config's
+  concurrency limits (`SandboxSession::set_concurrency_limits`, defaulted).
+- Shutdown on Cloudflare, Daytona and Modal swallows a failed provider stop or delete, as Python does.
+
+Breaking changes: `SessionSettings` rejects unknown keys when deserialized; `RunState::from_json` rejects a
+`pending_input` that is not a list; realtime mock servers and fixtures must send complete events; shutdown no
+longer reports a rejected stop or delete on Cloudflare, Daytona and Modal.
+
+Known differences: an expired-during-compaction history makes Rust skip the replacement with a warning
+where Python raises; `Manifest` has no serde surface, so the manifest config tests stay Python-only;
+`test_schema_1_13_hosted_mcp_orphaned_call_decisions_require_reapproval` is classified Python-only without a
+port; a tar nested-path case is skipped on macOS (needs GNU tar). The tar `--no-wildcards` difference
+reported earlier does not exist: Rust and Python pass the flag in the same places.
+
 ## 0.9.1 (2026-11-01)
 
 Corrects the 0.9.0 parity count and ports the last cases. The 0.9.0 entry said 69 cases were not ported;

@@ -1,6 +1,6 @@
 # Python test suite vs Rust port: reconciled parity ledger
 
-> **Round 6 update (0.9.1).** The CSV is rebuilt: each round-6 per-area CSV replaces its files' rows (a later agent's row wins where two agents covered one file), the old GROUP row is dropped because its files are listed individually, and every row's buckets sum to its total. Measured whole-suite state: **12,641 cases in 425 files = 8,036 ported (63.6%) + 604 covered (4.8%) + 4,001 python-only (31.7%) + 0 not ported + 0 unaccounted.** Ported + covered = 8,640 (68.3%); every case is classified. The tables below are the pre-round-6 snapshot kept for history.
+> **Round 7 update (0.10.0).** Rebuilt from the per-area CSVs, then a skeptical audit of the Python-only reasons moved 47 cases to ported. Measured whole-suite state: **12,641 cases in 425 files = 8,083 ported (63.9%) + 604 covered (4.8%) + 3,954 python-only (31.3%) + 0 not ported + 0 unaccounted.** The independent audit sampled 40 files and found about 10% of the sampled python-only cases hid uncovered behaviour (`py-test-parity-python-only-audit.md`); the files it named are fixed, the rest of the bucket was not re-audited, so some python-only reasons may still be too generous. The tables below are the pre-round-6 snapshot kept for history.
 
 
 Generated read-only from `/Users/ngocthach/myGit/openai-agents-python/tests/` (424 `.py` files), the 50 `plans/reports/py-test-parity-*.md` reports and `tests/*.rs`. Companion data: `py-test-parity-ledger.csv` (one row per Python file plus one GROUP row).

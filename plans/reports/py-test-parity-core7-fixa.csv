@@ -1,0 +1,13 @@
+path,moved_to_ported,remaining_python_only
+tests/sandbox/test_entries.py,4,3
+tests/test_run_state_compatibility_corpus.py,8,68
+tests/test_items_helpers.py,1,4
+tests/memory/test_sqlalchemy_compaction.py,11,7
+tests/extensions/memory/test_sqlalchemy_session.py,0,13
+tests/sandbox/test_manifest.py,0,11
+tests/sandbox/test_manifest_config.py,0,18
+tests/test_run_state.py,0,165
+tests/test_run_state_pending_input.py,0,11
+tests/test_run_state_hook_identity.py,0,2
+tests/test_run_state_agent_identity.py,0,3
+tests/test_run_state_pydantic_context.py,0,8

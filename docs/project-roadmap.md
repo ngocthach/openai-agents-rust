@@ -28,6 +28,11 @@ Last updated: 2026-10-29.
 - MCP legacy HTTP+SSE transport
 - Extensions: tool output trimmer, Codex tool, hosted multi-agent (experimental)
 
+## 0.10.0 (released)
+
+- Audit of the Python-only parity bucket: race-safe sandbox local-dir copy, full realtime event validation,
+  Vercel legacy ids, live-session concurrency limits, provider shutdown semantics; 47 more cases ported
+
 ## 0.9.1 (released)
 
 - Last 7 Python compaction cases ported; parity ledger corrected: 0 not ported, 0 unaccounted
