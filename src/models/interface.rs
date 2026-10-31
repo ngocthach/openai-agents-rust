@@ -50,6 +50,10 @@ pub struct FunctionToolSpec {
     pub allowed_callers: Option<Vec<String>>,
     /// Strict JSON object schema of the tool's output (Responses API only).
     pub output_json_schema: Option<Value>,
+    /// Whether the SDK may pause the run to ask for approval before running the tool (a static
+    /// `true` or a per-call check). A model that cannot restore a paused response rejects such
+    /// tools before any transport.
+    pub needs_approval: bool,
 }
 
 impl FunctionToolSpec {

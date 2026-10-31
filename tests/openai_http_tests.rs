@@ -374,11 +374,13 @@ async fn chat_completions_stream_tool_call_arguments_incrementally() {
         .unwrap();
     assert_eq!(added["item"]["name"], "forecast");
     assert_eq!(added["item"]["arguments"], "");
-    let done = events
-        .iter()
-        .find(|e| e["type"] == "response.function_call_arguments.done")
-        .unwrap();
-    assert_eq!(done["arguments"], "{\"city\":\"Hue\"}");
+    // Python's Chat Completions stream never emits `response.function_call_arguments.done`; the
+    // complete arguments arrive with the `response.output_item.done` event instead.
+    assert!(
+        !events
+            .iter()
+            .any(|e| e["type"] == "response.function_call_arguments.done")
+    );
 
     // Buffered: the call surfaces once, complete.
     let (base, _) = mock_server(vec![Reply::Sse(chunks())]).await;

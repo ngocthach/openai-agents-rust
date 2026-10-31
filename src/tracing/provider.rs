@@ -115,7 +115,13 @@ pub fn set_export_api_key(key: impl Into<String>) {
 }
 
 pub(crate) fn tracing_export_api_key() -> Option<String> {
-    EXPORT_API_KEY.read().expect("provider poisoned").clone()
+    // An empty key means "unset", so `set_export_api_key("")` clears the global key and the
+    // exporter falls back to the environment, as `BackendSpanExporter::set_api_key("")` does.
+    EXPORT_API_KEY
+        .read()
+        .expect("provider poisoned")
+        .clone()
+        .filter(|k| !k.is_empty())
 }
 
 impl DefaultTraceProvider {
@@ -201,6 +207,9 @@ impl TraceProvider for DefaultTraceProvider {
     }
 
     fn force_flush(&self) {
+        // Python's `force_flush` refreshes the disabled flag, which pins the environment value
+        // on first use; flushing must not change whether a later trace is recorded.
+        let _ = self.env_disabled_cached();
         for p in self.processors() {
             isolate("force_flush", &p, || p.force_flush());
         }

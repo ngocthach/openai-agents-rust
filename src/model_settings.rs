@@ -101,8 +101,8 @@ pub struct ModelRetryBackoffSettings {
 impl Default for ModelRetryBackoffSettings {
     fn default() -> Self {
         ModelRetryBackoffSettings {
-            initial_delay: 0.5,
-            max_delay: 5.0,
+            initial_delay: 0.25,
+            max_delay: 2.0,
             multiplier: 2.0,
             jitter: true,
         }

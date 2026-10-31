@@ -83,7 +83,18 @@ impl TraceBuilder {
     }
     /// Build the trace without starting it.
     pub fn build(self) -> Trace {
+        if scope::current_trace().is_some() {
+            log::warn!(
+                target: crate::logger::LOG_TARGET,
+                "Trace already exists. Creating a new trace, but this is probably a mistake."
+            );
+        }
         let disabled = self.disabled || provider().is_disabled();
+        if disabled {
+            log::debug!(target: crate::logger::LOG_TARGET, "Tracing is disabled. Not creating trace");
+        } else {
+            log::debug!(target: crate::logger::LOG_TARGET, "Creating trace");
+        }
         Trace::new(
             self.name,
             self.trace_id,
@@ -285,17 +296,76 @@ impl SpanBuilder {
                 (current_span.as_ref(), current_trace.as_ref())
             }
         };
-        let span = Span::with_id(
-            trace,
+        let forced_off = self.disabled || provider().is_disabled();
+        log_span_decision(
+            &self.data,
+            self.span_id.as_deref(),
             parent_span,
-            self.data,
-            self.disabled || provider().is_disabled(),
-            self.span_id,
+            trace,
+            forced_off,
+            self.parent.is_none(),
         );
+        let span = Span::with_id(trace, parent_span, self.data, forced_off, self.span_id);
         if self.metadata.is_some() {
             span.set_data_metadata(self.metadata);
         }
         span
+    }
+}
+
+/// Emit the debug line `create_span` logs for this span.
+///
+/// The span data is kept out of the message whenever the logging policy forbids model or tool
+/// data, exactly as `_debug.DONT_LOG_MODEL_DATA` / `DONT_LOG_TOOL_DATA` do in Python, so a
+/// workflow that disables tracing never leaks a span name into the log.
+fn log_span_decision(
+    data: &SpanData,
+    span_id: Option<&str>,
+    parent_span: Option<&Span>,
+    trace: Option<&Trace>,
+    forced_off: bool,
+    implicit_parent: bool,
+) {
+    const TARGET: &str = crate::logger::LOG_TARGET;
+    let may_log = crate::logger::may_log_model_data(true);
+    if forced_off {
+        if may_log {
+            log::debug!(target: TARGET, "Tracing is disabled. Not creating span {data:?}");
+        } else {
+            log::debug!(target: TARGET, "Tracing is disabled. Not creating span");
+        }
+        return;
+    }
+    if span_id == Some("no-op") {
+        log::debug!(target: TARGET, "Span id is no-op, returning NoOpSpan");
+        return;
+    }
+    if implicit_parent && trace.is_none() {
+        log::debug!(
+            target: TARGET,
+            "No active trace. Make sure to start a trace with `trace()` first Returning NoOpSpan."
+        );
+        return;
+    }
+    let noop_parent = parent_span
+        .is_some_and(|p| p.is_disabled() || p.span_id() == "no-op" || p.trace_id() == "no-op")
+        || trace.is_some_and(|t| t.is_disabled() || t.trace_id() == "no-op");
+    if noop_parent {
+        if may_log {
+            log::debug!(target: TARGET, "Parent {parent_span:?} or {trace:?} is no-op, returning NoOpSpan");
+        } else {
+            log::debug!(target: TARGET, "Current trace parent is no-op, returning NoOpSpan");
+        }
+        return;
+    }
+    if may_log {
+        log::debug!(
+            target: TARGET,
+            "Creating span {data:?} with id {}",
+            span_id.unwrap_or("<generated>")
+        );
+    } else {
+        log::debug!(target: TARGET, "Creating span");
     }
 }
 
@@ -406,6 +476,8 @@ pub fn response_span(disabled: bool) -> Span {
         SpanData::Response {
             response_id: None,
             usage: None,
+            response: None,
+            input: None,
         },
         None,
         disabled,

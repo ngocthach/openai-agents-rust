@@ -218,6 +218,12 @@ impl fmt::Debug for Span {
     }
 }
 
+/// The reserved id a span or trace carries when tracing is off. Mirrors `_is_noop_id`: a span
+/// built under such a parent, or asked for this id, records nothing.
+fn is_noop_id(id: &str) -> bool {
+    id == "no-op"
+}
+
 impl Span {
     pub(crate) fn with_id(
         trace: Option<&Trace>,
@@ -240,9 +246,14 @@ impl Span {
             (None, None) => ("no-op".to_string(), None, None),
         };
         let disabled = disabled
+            || span_id.as_deref().is_some_and(is_noop_id)
             || (parent.is_none() && trace.is_none())
-            || parent.map(|p| p.0.disabled).unwrap_or(false)
-            || trace.map(|t| t.is_disabled()).unwrap_or(false);
+            || parent
+                .map(|p| p.0.disabled || is_noop_id(&p.0.span_id) || is_noop_id(&p.0.trace_id))
+                .unwrap_or(false)
+            || trace
+                .map(|t| t.is_disabled() || is_noop_id(t.trace_id()))
+                .unwrap_or(false);
         Span(Arc::new(SpanInner {
             trace_id,
             span_id: span_id.unwrap_or_else(gen_span_id),

@@ -197,6 +197,8 @@ struct Active {
     completed_response: Option<Value>,
     fallback_input: Vec<Value>,
     accumulated_usage: Option<Value>,
+    /// Usage of each underlying request that reported any, for per-request breakdowns.
+    request_usages: Vec<Value>,
     request_count: u64,
     last_sequence_number: i64,
 }
@@ -288,6 +290,25 @@ impl OpenAIHostedMultiAgentModel {
                 "OpenAI hosted multi-agent cannot be combined with SDK handoffs. Use local \
                  function tools or agents-as-tools instead.",
             ));
+        }
+        let mut approval_tools: Vec<&str> = request
+            .tools
+            .iter()
+            .filter_map(|t| match t {
+                crate::models::interface::ToolSpec::Function(f) if f.needs_approval => {
+                    Some(f.name.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        if !approval_tools.is_empty() {
+            approval_tools.sort_unstable();
+            return Err(AgentsError::user(format!(
+                "OpenAI hosted multi-agent does not support SDK tool approval interruptions \
+                 because an active hosted response cannot be restored from serialized RunState. \
+                 Remove needs_approval from these tools: {}.",
+                approval_tools.join(", ")
+            )));
         }
         let s = &request.model_settings;
         let extra_args = s.extra_args.as_ref();
@@ -436,9 +457,13 @@ impl OpenAIHostedMultiAgentModel {
     }
 
     /// Run one logical model turn, sending Responses-style events to `tx`.
-    async fn run_turn(&self, request: ModelRequest, tx: mpsc::Sender<Result<Value>>) -> Result<()> {
+    async fn run_turn(
+        &self,
+        request: ModelRequest,
+        owner: Option<crate::models::run_context::ModelRunOwner>,
+        tx: mpsc::Sender<Result<Value>>,
+    ) -> Result<()> {
         let frame = self.build_frame(&request)?;
-        let owner = crate::models::run_context::get_model_run_owner();
         let mut guard = self.active.clone().lock_owned().await;
         if let Some(active) = guard.as_ref()
             && active.owner.is_some()
@@ -464,6 +489,7 @@ impl OpenAIHostedMultiAgentModel {
                 completed_response: None,
                 fallback_input: Vec::new(),
                 accumulated_usage: None,
+                request_usages: Vec::new(),
                 request_count: 1,
                 last_sequence_number: 0,
             });
@@ -512,6 +538,7 @@ impl OpenAIHostedMultiAgentModel {
                         })?
                         .to_string();
                     if let Some(u) = response.get("usage").filter(|u| !u.is_null()) {
+                        active.request_usages.push(u.clone());
                         active.accumulated_usage =
                             Some(merge_usage(active.accumulated_usage.as_ref(), u));
                     }
@@ -553,13 +580,22 @@ impl OpenAIHostedMultiAgentModel {
                     item_key(i).is_none_or(|k| !active.delivered_item_keys.contains(&k))
                 });
                 normalized["output"] = Value::Array(normalize_output(&output));
+                if let Some(u) = response.get("usage").filter(|u| !u.is_null()) {
+                    active.request_usages.push(u.clone());
+                }
                 let usage = match response.get("usage").filter(|u| !u.is_null()) {
                     Some(u) => Some(merge_usage(active.accumulated_usage.as_ref(), u)),
                     None => active.accumulated_usage.clone(),
                 };
+                // A continuation made more than one request even when none reported usage.
+                let usage = usage.or_else(|| (active.request_count > 1).then(|| json!({})));
                 if let Some(mut u) = usage {
                     if active.request_count > 1 {
                         u["requests"] = json!(active.request_count);
+                        if !active.request_usages.is_empty() {
+                            u["request_usage_entries"] =
+                                Value::Array(active.request_usages.clone());
+                        }
                     }
                     normalized["usage"] = u;
                 }
@@ -643,14 +679,10 @@ impl OpenAIHostedMultiAgentModel {
                 _ => {}
             }
 
-            // Forward the event, dropping hosted-only items.
-            let is_item_event = matches!(
-                ty.as_str(),
-                "response.output_item.added" | "response.output_item.done"
-            );
-            let visible =
-                !is_item_event || event.get("item").and_then(normalize_output_item).is_some();
-            if visible && tx.send(Ok(event.clone())).await.is_err() {
+            // Forward every event. Hosted items stay visible to a raw-event consumer, as in
+            // Python; only the completed response (the one the runner builds items from) is
+            // normalized to the root agent's output.
+            if tx.send(Ok(event.clone())).await.is_err() {
                 return Err(AgentsError::other("Hosted multi-agent stream was dropped."));
             }
             if ty != "response.output_item.done" {
@@ -706,10 +738,12 @@ impl Model for OpenAIHostedMultiAgentModel {
         let preserve = request.model_settings.preserve_raw_usage.unwrap_or(false);
         let mut stream = self.stream_response(request).await?;
         let mut last: Option<Value> = None;
+        let mut paused = false;
         while let Some(ev) = stream.next().await {
             let ev = ev?;
             if ev.get("type").and_then(Value::as_str) == Some("response.completed") {
                 last = ev.get("response").cloned();
+                paused = ev.get("hosted_multi_agent_pause").is_some();
             }
         }
         let response = last.ok_or_else(|| {
@@ -718,8 +752,31 @@ impl Model for OpenAIHostedMultiAgentModel {
             )
         })?;
         let mut parsed = parse_response(&response, None, preserve)?;
+        if paused {
+            // A logical pause carries no usage of its own: the request is counted once, on the
+            // response that finishes it.
+            parsed.usage.requests = 0;
+        }
         if let Some(n) = response.pointer("/usage/requests").and_then(Value::as_u64) {
             parsed.usage.requests = n;
+        }
+        if let Some(entries) = response
+            .pointer("/usage/request_usage_entries")
+            .and_then(Value::as_array)
+        {
+            parsed.usage.request_usage_entries = entries
+                .iter()
+                .map(|e| {
+                    let u = crate::usage::Usage::from_responses_usage(e);
+                    crate::usage::RequestUsage {
+                        input_tokens: u.input_tokens,
+                        output_tokens: u.output_tokens,
+                        total_tokens: u.total_tokens,
+                        input_tokens_details: u.input_tokens_details,
+                        output_tokens_details: u.output_tokens_details,
+                    }
+                })
+                .collect();
         }
         Ok(parsed)
     }
@@ -727,9 +784,12 @@ impl Model for OpenAIHostedMultiAgentModel {
     async fn stream_response(&self, request: ModelRequest) -> Result<ResponseEventStream> {
         let (tx, rx) = mpsc::channel(64);
         let this = self.clone();
+        // The run owner is a task-local, which a spawned task does not inherit: read it here,
+        // on the caller's task, and hand it to the turn.
+        let owner = crate::models::run_context::get_model_run_owner();
         tokio::spawn(async move {
             let err_tx = tx.clone();
-            if let Err(e) = this.run_turn(request, tx).await {
+            if let Err(e) = this.run_turn(request, owner, tx).await {
                 let _ = err_tx.send(Err(e)).await;
             }
         });

@@ -39,6 +39,12 @@ pub enum SpanData {
     Response {
         response_id: Option<String>,
         usage: Option<Value>,
+        /// The model response, recorded when tracing includes data. Like Python's
+        /// `ResponseSpanData.response` it is not part of the exported payload; it is there for
+        /// custom processors.
+        response: Option<Value>,
+        /// The request input, recorded when tracing includes data (not exported either).
+        input: Option<Value>,
     },
     /// A handoff between agents.
     Handoff {
@@ -157,7 +163,9 @@ impl SpanData {
                 "model_config": model_config,
                 "usage": usage,
             }),
-            SpanData::Response { response_id, usage } => json!({
+            SpanData::Response {
+                response_id, usage, ..
+            } => json!({
                 "type": "response",
                 "response_id": response_id,
                 "usage": usage,

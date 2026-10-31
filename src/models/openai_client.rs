@@ -644,9 +644,12 @@ fn parse_event(event: &str) -> SseEvent {
     }
     match serde_json::from_str::<Value>(&data) {
         Ok(v) => {
-            if event_name.as_deref() == Some("error")
-                || v.get("type").and_then(Value::as_str) == Some("error")
-            {
+            // A Responses `{"type": "error"}` frame is an event like any other: the model
+            // yields it to the consumer and then raises `ModelBehaviorError`, as Python does,
+            // so it must reach the model intact. Chat Completions error frames (`event: error`
+            // or a bare `{"error": ...}` body) have no such event and still fail the stream.
+            let is_responses_error_event = v.get("type").and_then(Value::as_str) == Some("error");
+            if !is_responses_error_event && event_name.as_deref() == Some("error") {
                 let msg = v
                     .pointer("/error/message")
                     .or_else(|| v.get("message"))
@@ -687,9 +690,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn error_events_become_errors() {
+    async fn responses_error_events_are_yielded_for_the_model_to_raise() {
+        // Python yields a Responses `error` event and the model then raises
+        // `ModelBehaviorError`, so the transport must hand the frame over intact.
         let chunks: Vec<std::result::Result<Vec<u8>, AgentsError>> = vec![Ok(
             b"data: {\"type\":\"error\",\"message\":\"boom\"}\n\n".to_vec(),
+        )];
+        let items: Vec<_> = sse_stream(futures::stream::iter(chunks)).collect().await;
+        let event = items[0].as_ref().expect("the frame is an event");
+        assert_eq!(event["type"], "error");
+        assert_eq!(event["message"], "boom");
+    }
+
+    #[tokio::test]
+    async fn named_error_events_still_fail_the_stream() {
+        // A Chat Completions stream has no `error` event type: an `event: error` frame is a
+        // transport failure.
+        let chunks: Vec<std::result::Result<Vec<u8>, AgentsError>> = vec![Ok(
+            b"event: error\ndata: {\"error\":{\"message\":\"boom\"}}\n\n".to_vec(),
         )];
         let items: Vec<_> = sse_stream(futures::stream::iter(chunks)).collect().await;
         assert!(items[0].is_err());

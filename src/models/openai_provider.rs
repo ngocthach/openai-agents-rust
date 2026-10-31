@@ -97,6 +97,11 @@ impl OpenAIProvider {
         self
     }
 
+    /// Whether Chat Completions models from this provider buffer streamed tool calls.
+    pub fn buffer_streamed_tool_calls(&self) -> bool {
+        self.buffer_streamed_tool_calls
+    }
+
     /// Close the cached WebSocket models (and their connections).
     #[cfg(feature = "websocket")]
     pub async fn close_websocket_models(&self) {
@@ -119,8 +124,11 @@ impl OpenAIProvider {
             .unwrap_or_else(OpenAIClient::from_env)
     }
 
+    /// The Responses WebSocket base URL this provider hands to its models: the one set with
+    /// [`with_websocket_base_url`](Self::with_websocket_base_url), otherwise
+    /// `OPENAI_WEBSOCKET_BASE_URL`.
     #[cfg(feature = "websocket")]
-    fn websocket_base_url(&self) -> Option<String> {
+    pub fn websocket_base_url(&self) -> Option<String> {
         self.websocket_base_url.clone().or_else(|| {
             std::env::var("OPENAI_WEBSOCKET_BASE_URL")
                 .ok()

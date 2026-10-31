@@ -201,18 +201,25 @@ impl Usage {
         }
     }
 
-    /// Usage in the shape used by generation spans (`input_tokens`, `output_tokens`, `details`).
+    /// Usage in the shape tracing span data carries. Mirrors `model_usage_to_span_usage`: a flat
+    /// object with the request count, the token totals and both detail objects.
+    ///
+    /// The OpenAI traces exporter folds everything except the input/output token counts under a
+    /// `details` key on the wire (see `tracing::processors::sanitize_for_openai`); the span keeps
+    /// the full shape for custom processors.
     pub fn to_span_usage(&self) -> Value {
         serde_json::json!({
+            "requests": self.requests,
             "input_tokens": self.input_tokens,
             "output_tokens": self.output_tokens,
-            "details": {
-                "requests": self.requests,
-                "total_tokens": self.total_tokens,
-                "cached_input_tokens": self.input_tokens_details.cached_tokens,
-                "cache_write_input_tokens": self.input_tokens_details.cache_write_tokens,
-                "reasoning_output_tokens": self.output_tokens_details.reasoning_tokens,
-            }
+            "total_tokens": self.total_tokens,
+            "input_tokens_details": {
+                "cached_tokens": self.input_tokens_details.cached_tokens,
+                "cache_write_tokens": self.input_tokens_details.cache_write_tokens,
+            },
+            "output_tokens_details": {
+                "reasoning_tokens": self.output_tokens_details.reasoning_tokens,
+            },
         })
     }
 }

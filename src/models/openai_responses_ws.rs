@@ -6,14 +6,13 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use tokio::net::TcpStream;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OwnedMutexGuard, watch};
 use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -23,7 +22,8 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use super::interface::{Model, ModelRequest, ResponseEventStream};
 use super::openai_client::OpenAIClient;
 use super::openai_responses::{
-    OpenAIResponsesModel, SpanGuard, finish_response_span, parse_response,
+    OpenAIResponsesModel, SpanGuard, deliver_terminal_failures, finish_response_span,
+    parse_response,
 };
 use super::response_terminal::{is_terminal_failure_event, terminal_failure_error};
 use super::retry_runtime::should_disable_websocket_pre_event_retries;
@@ -62,6 +62,92 @@ const TIMEOUT_PHASES: &[&str] = &["request lock wait", "connect", "send", "recei
 struct Connection {
     identity: String,
     socket: Ws,
+}
+
+type ConnectionGuard = OwnedMutexGuard<Option<Connection>>;
+
+/// The request lock plus the connection it protects, for a request still reading events.
+///
+/// If the stream is abandoned before a terminal event (the consumer stopped early, or the
+/// future was cancelled), unread frames are still queued on the socket, so the connection is
+/// dropped instead of being reused by the next request.
+struct InFlight {
+    guard: Option<ConnectionGuard>,
+}
+
+impl InFlight {
+    fn connection(&mut self) -> Option<&mut Option<Connection>> {
+        self.guard.as_deref_mut()
+    }
+
+    /// Hand the connection back to the cache after a terminal event.
+    fn release(mut self) {
+        self.guard.take();
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        if let Some(guard) = self.guard.as_deref_mut() {
+            *guard = None;
+        }
+    }
+}
+
+/// Whether `close_connection` ran since `rx` was created.
+fn was_closed(rx: &watch::Receiver<u64>) -> bool {
+    rx.has_changed().unwrap_or(false)
+}
+
+/// Resolves when `close_connection` runs. If the model is dropped instead, no close can ever
+/// arrive, so this never resolves.
+async fn close_signal(rx: &mut watch::Receiver<u64>) {
+    if rx.changed().await.is_err() {
+        std::future::pending::<()>().await;
+    }
+}
+
+/// Whether a cached socket can still carry a request. A server close, a stray frame or a dead
+/// transport is noticed here, before the request frame is written. `websockets` learns the same
+/// thing from its background reader; tungstenite has none, so the socket is polled once.
+///
+/// The runtime is yielded to first: tokio only learns that a socket became readable when its
+/// reactor runs, so a close that arrived since the last turn can still look like "nothing to
+/// read". Without the yield, a busy runtime reports a closed connection alive and the request is
+/// written into it.
+async fn connection_is_alive(socket: &mut Ws) -> bool {
+    use futures::FutureExt;
+    tokio::task::yield_now().await;
+    match socket.next().now_or_never() {
+        None => true,
+        Some(Some(Ok(Message::Ping(_) | Message::Pong(_)))) => true,
+        Some(_) => false,
+    }
+}
+
+/// Why a handshake failed.
+enum ConnectFailure {
+    /// The peer dropped the connection before completing the upgrade; a retry may succeed.
+    Disconnected,
+    /// The server answered, but not with a usable upgrade.
+    Rejected(AgentsError),
+}
+
+fn is_transient_handshake_error(error: &tokio_tungstenite::tungstenite::Error) -> bool {
+    use tokio_tungstenite::tungstenite::Error;
+    use tokio_tungstenite::tungstenite::error::ProtocolError;
+    match error {
+        Error::ConnectionClosed | Error::AlreadyClosed => true,
+        Error::Protocol(ProtocolError::HandshakeIncomplete) => true,
+        Error::Io(io) => matches!(
+            io.kind(),
+            std::io::ErrorKind::UnexpectedEof
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::BrokenPipe
+        ),
+        _ => false,
+    }
 }
 
 /// Low-level connection options for the Responses WebSocket transport.
@@ -176,9 +262,10 @@ pub struct OpenAIResponsesWSModel {
     websocket_base_url: Option<String>,
     options: OpenAIResponsesWebSocketOptions,
     connection: Arc<Mutex<Option<Connection>>>,
-    /// Bumped by [`OpenAIResponsesWSModel::close_connection`]; a request whose generation
-    /// changed mid-flight failed because the caller closed the model, not because of the wire.
-    close_generation: Arc<AtomicU64>,
+    /// Bumped by [`OpenAIResponsesWSModel::close_connection`]. A request subscribes when it
+    /// starts, so a change mid-flight means the caller closed the model: the request fails as an
+    /// abort instead of as a transport error, and it never waits for `close_connection`.
+    close_generation: Arc<watch::Sender<u64>>,
 }
 
 impl std::fmt::Debug for OpenAIResponsesWSModel {
@@ -239,7 +326,7 @@ impl OpenAIResponsesWSModel {
             websocket_base_url: None,
             options: OpenAIResponsesWebSocketOptions::default(),
             connection: Arc::new(Mutex::new(None)),
-            close_generation: Arc::new(AtomicU64::new(0)),
+            close_generation: Arc::new(watch::channel(0).0),
         }
     }
 
@@ -278,24 +365,32 @@ impl OpenAIResponsesWSModel {
         Ok(frame)
     }
 
+    /// The handshake URL: the base URL's path with `/responses` appended, and its own query,
+    /// the client's default query and the request's `extra_query` merged (later wins).
+    /// Port of `_prepare_websocket_url`.
     fn url(&self, extra_query: Option<&HashMap<String, String>>) -> Result<String> {
-        let base = self
-            .websocket_base_url
-            .clone()
-            .unwrap_or_else(|| websocket_url(self.client.base_url()));
-        let mut url = format!("{}/responses", base.trim_end_matches('/'));
-        let mut pairs: Vec<(String, String)> = self
-            .client
-            .default_query()
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        if let Some(q) = extra_query {
-            for (k, v) in q {
-                pairs.retain(|(existing, _)| existing != k);
-                pairs.push((k.clone(), v.clone()));
-            }
+        let base = match &self.websocket_base_url {
+            Some(url) => websocket_url(url),
+            None => self.client.websocket_base_url(),
+        };
+        let base = base.split('#').next().unwrap_or_default();
+        let (origin_and_path, query) = base.split_once('?').unwrap_or((base, ""));
+        let mut pairs: Vec<(String, String)> = Vec::new();
+        let mut put = |k: String, v: String| {
+            pairs.retain(|(existing, _)| *existing != k);
+            pairs.push((k, v));
+        };
+        for part in query.split('&').filter(|p| !p.is_empty()) {
+            let (k, v) = part.split_once('=').unwrap_or((part, ""));
+            put(decode(k), decode(v));
         }
+        for (k, v) in self.client.default_query() {
+            put(k.clone(), v.clone());
+        }
+        for (k, v) in extra_query.into_iter().flatten() {
+            put(k.clone(), v.clone());
+        }
+        let mut url = format!("{}/responses", origin_and_path.trim_end_matches('/'));
         if !pairs.is_empty() {
             pairs.sort();
             let qs = pairs
@@ -313,28 +408,45 @@ impl OpenAIResponsesWSModel {
         &self,
         url: &str,
         extra_headers: Option<&HashMap<String, String>>,
-    ) -> Result<Ws> {
-        let mut req = url
-            .into_client_request()
-            .map_err(|e| AgentsError::user(format!("Invalid Responses websocket URL: {e}")))?;
-        for (k, v) in self.client.headers(extra_headers)?.iter() {
+    ) -> std::result::Result<Ws, ConnectFailure> {
+        let mut req = url.into_client_request().map_err(|e| {
+            ConnectFailure::Rejected(AgentsError::user(format!(
+                "Invalid Responses websocket URL: {e}"
+            )))
+        })?;
+        let headers = self
+            .client
+            .headers(extra_headers)
+            .map_err(ConnectFailure::Rejected)?;
+        for (k, v) in headers.iter() {
             req.headers_mut().insert(k.clone(), v.clone());
         }
         crate::util::ensure_crypto_provider();
-        let (socket, _) = tokio_tungstenite::connect_async_with_config(
+        match tokio_tungstenite::connect_async_with_config(
             req,
             Some(self.options.websocket_config()),
             false,
         )
         .await
-        .map_err(|e| AgentsError::other(format!("Responses websocket connect failed: {e}")))?;
-        Ok(socket)
+        {
+            Ok((socket, _)) => Ok(socket),
+            Err(e) if is_transient_handshake_error(&e) => Err(ConnectFailure::Disconnected),
+            Err(e) => Err(ConnectFailure::Rejected(AgentsError::other(format!(
+                "Responses websocket connect failed: {e}"
+            )))),
+        }
     }
 
     /// Close the cached connection.
+    ///
+    /// Never waits for an in-flight request: it is told to abort (it observes the bumped
+    /// generation and fails as a close, not as a transport error) and drops its own connection.
     pub async fn close_connection(&self) {
-        self.close_generation.fetch_add(1, Ordering::SeqCst);
-        if let Some(mut c) = self.connection.lock().await.take() {
+        self.close_generation
+            .send_modify(|generation| *generation += 1);
+        if let Ok(mut idle) = self.connection.clone().try_lock_owned()
+            && let Some(mut c) = idle.take()
+        {
             let _ = c.socket.close(None).await;
         }
     }
@@ -349,11 +461,13 @@ impl OpenAIResponsesWSModel {
             .clone()
             .unwrap_or_default()
             .into_iter()
+            .map(|(k, v)| (k.to_ascii_lowercase(), v))
             .collect();
         headers.sort();
         let identity = format!("{url}|{headers:?}");
         let text = serde_json::to_string(&frame)?;
-        let generation = self.close_generation.load(Ordering::SeqCst);
+        let mut closed = self.close_generation.subscribe();
+        let close_invalidated = || AgentsError::other(WS_CLOSE_INVALIDATED_MESSAGE);
 
         let mut guard = with_timeout(
             timeouts.lock,
@@ -361,27 +475,58 @@ impl OpenAIResponsesWSModel {
             self.connection.clone().lock_owned(),
         )
         .await?;
-        // A cached connection may have been closed by the server; reconnect once if the frame
-        // could not be sent on it (the request was never transmitted, so replay is safe).
+        // A pre-event disconnect (a handshake the peer dropped) is retried once, unless the
+        // caller disabled that retry.
         let mut pre_event_retry = !should_disable_websocket_pre_event_retries();
         loop {
-            let reuse = guard.as_ref().is_some_and(|c| c.identity == identity);
+            if was_closed(&closed) {
+                *guard = None;
+                return Err(close_invalidated());
+            }
+            // A cached connection the server has since closed is replaced; nothing was sent.
+            let reuse = match guard.as_mut() {
+                Some(c) if c.identity == identity => connection_is_alive(&mut c.socket).await,
+                _ => false,
+            };
             if !reuse {
                 if let Some(mut old) = guard.take() {
                     let _ = old.socket.close(None).await;
                 }
-                let socket = with_timeout(
-                    timeouts.connect,
-                    "connect",
-                    self.connect(&url, settings.extra_headers.as_ref()),
-                )
-                .await??;
-                *guard = Some(Connection {
-                    identity: identity.clone(),
-                    socket,
-                });
+                let connected = tokio::select! {
+                    r = with_timeout(
+                        timeouts.connect,
+                        "connect",
+                        self.connect(&url, settings.extra_headers.as_ref()),
+                    ) => r?,
+                    _ = close_signal(&mut closed) => return Err(close_invalidated()),
+                };
+                match connected {
+                    Ok(socket) => {
+                        *guard = Some(Connection {
+                            identity: identity.clone(),
+                            socket,
+                        });
+                    }
+                    Err(ConnectFailure::Disconnected) if pre_event_retry => {
+                        pre_event_retry = false;
+                        continue;
+                    }
+                    // The retry also failed: the frame was never sent, so replay is safe.
+                    Err(ConnectFailure::Disconnected) => {
+                        return Err(AgentsError::other(WS_PRE_EVENT_DISCONNECT_MESSAGE));
+                    }
+                    Err(ConnectFailure::Rejected(e)) => return Err(e),
+                }
+                // `close_connection` ran while connecting: discard what was just acquired.
+                if was_closed(&closed) {
+                    if let Some(mut c) = guard.take() {
+                        let _ = c.socket.close(None).await;
+                    }
+                    return Err(close_invalidated());
+                }
             }
             let conn = guard.as_mut().expect("connection");
+            // From here the frame may have reached the server, so a failure is never replayed.
             let sent = with_timeout(
                 timeouts.send,
                 "send",
@@ -395,34 +540,29 @@ impl OpenAIResponsesWSModel {
                     *guard = None;
                     return Err(e);
                 }
-                Ok(Err(e)) => {
+                Ok(Err(_)) => {
                     *guard = None;
-                    if !reuse || !pre_event_retry {
-                        if self.close_generation.load(Ordering::SeqCst) != generation {
-                            return Err(AgentsError::other(WS_CLOSE_INVALIDATED_MESSAGE));
-                        }
-                        // Nothing reached the server, so replaying the request is safe.
-                        return Err(AgentsError::other(format!(
-                            "Responses websocket send failed: {e}"
-                        )));
-                    }
-                    pre_event_retry = false;
+                    return Err(AgentsError::other(format!(
+                        "{WS_PRE_EVENT_DISCONNECT_MESSAGE}{REQUEST_SENT_SUFFIX}"
+                    )));
                 }
             }
         }
 
         let options = self.options.clone();
-        let close_generation = self.close_generation.clone();
-        let state = (Some(guard), false, generation);
+        let state = (Some(InFlight { guard: Some(guard) }), false, closed);
         let stream = futures::stream::unfold(state, move |state| {
             let options = options.clone();
-            let close_generation = close_generation.clone();
             async move {
-                let (guard, mut received_any_event, generation) = state;
-                let mut guard = guard?;
+                let (inflight, mut received_any_event, mut closed) = state;
+                let mut inflight = inflight?;
                 loop {
-                    let conn = guard.as_mut()?;
-                    let next = recv_next(&mut conn.socket, &options, timeouts.recv).await;
+                    let slot = inflight.connection()?;
+                    let conn = slot.as_mut()?;
+                    let next = tokio::select! {
+                        r = recv_next(&mut conn.socket, &options, timeouts.recv) => r,
+                        _ = close_signal(&mut closed) => Err(AgentsError::other(WS_CLOSE_INVALIDATED_MESSAGE)),
+                    };
                     let frame = match next {
                         Ok(None) | Ok(Some(Message::Close(_))) => {
                             Err(AgentsError::other(WS_AMBIGUOUS_REPLAY_MESSAGE))
@@ -433,10 +573,10 @@ impl OpenAIResponsesWSModel {
                     let frame = match frame {
                         Ok(f) => f,
                         Err(e) => {
-                            *guard = None;
-                            let invalidated = close_generation.load(Ordering::SeqCst) != generation;
+                            *slot = None;
+                            let invalidated = was_closed(&closed);
                             let e = classify_stream_failure(e, received_any_event, invalidated);
-                            return Some((Err(e), (None, received_any_event, generation)));
+                            return Some((Err(e), (None, received_any_event, closed)));
                         }
                     };
                     let text = match frame {
@@ -447,8 +587,8 @@ impl OpenAIResponsesWSModel {
                     let payload: Value = match serde_json::from_str(&text) {
                         Ok(v) => v,
                         Err(e) => {
-                            *guard = None;
-                            return Some((Err(e.into()), (None, received_any_event, generation)));
+                            *slot = None;
+                            return Some((Err(e.into()), (None, received_any_event, closed)));
                         }
                     };
                     let ty = payload
@@ -457,18 +597,16 @@ impl OpenAIResponsesWSModel {
                         .unwrap_or_default()
                         .to_string();
                     if ty == "error" || ty == "response.error" {
-                        *guard = None;
-                        return Some((
-                            Err(ws_error(&payload)),
-                            (None, received_any_event, generation),
-                        ));
+                        *slot = None;
+                        return Some((Err(ws_error(&payload)), (None, received_any_event, closed)));
                     }
                     received_any_event = true;
                     // The connection stays cached for the next request after a terminal event.
                     let next_state = if is_terminal(&ty) {
-                        (None, received_any_event, generation)
+                        inflight.release();
+                        (None, received_any_event, closed)
                     } else {
-                        (Some(guard), received_any_event, generation)
+                        (Some(inflight), received_any_event, closed)
                     };
                     return Some((Ok(payload), next_state));
                 }
@@ -491,6 +629,13 @@ fn classify_stream_failure(
     let message = error.to_string();
     if websocket_timeout_phase(&message).is_some() && !received_any_event {
         return error;
+    }
+    // A transport failure before any event, after the frame was written, is a disconnect the
+    // server may have acted on: the same classification as a clean close.
+    if !received_any_event && message.starts_with("Responses websocket transport error") {
+        return AgentsError::other(format!(
+            "{WS_PRE_EVENT_DISCONNECT_MESSAGE}{REQUEST_SENT_SUFFIX}"
+        ));
     }
     if received_any_event {
         // Events were emitted but no terminal event arrived: the server acted on the request.
@@ -653,11 +798,6 @@ pub fn websocket_retry_advice(
             retry(None)
         });
     }
-    if message.starts_with("Responses websocket send failed")
-        || message.starts_with("Responses websocket connect failed")
-    {
-        return Some(retry(Some(ReplaySafety::Safe)));
-    }
     if message.starts_with("Responses websocket error:")
         && let Some(payload) = ws_error_payload(&message)
     {
@@ -670,6 +810,34 @@ pub fn websocket_retry_advice(
         }
     }
     crate::retry::get_openai_retry_advice(request)
+}
+
+/// Percent-decode a query component (`+` is a space, as in a query string).
+fn decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => out.push(b' '),
+            b'%' => {
+                let digits = bytes
+                    .get(i + 1..i + 3)
+                    .and_then(|h| std::str::from_utf8(h).ok())
+                    .and_then(|h| u8::from_str_radix(h, 16).ok());
+                match digits {
+                    Some(byte) => {
+                        out.push(byte);
+                        i += 2;
+                    }
+                    None => out.push(b'%'),
+                }
+            }
+            b => out.push(b),
+        }
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn encode(s: &str) -> String {
@@ -694,6 +862,9 @@ impl Model for OpenAIResponsesWSModel {
             while let Some(ev) = stream.next().await {
                 let ev = ev?;
                 let ty = ev.get("type").and_then(Value::as_str).unwrap_or_default();
+                if matches!(ty, "response.failed" | "response.incomplete") {
+                    return Err(terminal_failure_error(ty, &ev));
+                }
                 if is_terminal(ty) {
                     let r = ev.get("response").cloned().unwrap_or(Value::Null);
                     return parse_response(&r, None, preserve);
@@ -706,7 +877,7 @@ impl Model for OpenAIResponsesWSModel {
         .await;
         let include_data = request.tracing.include_data();
         match &result {
-            Ok(resp) => finish_response_span(&span, resp, true),
+            Ok(resp) => finish_response_span(&span, resp, include_data, &request.input),
             Err(e) => {
                 record_model_error_on_span(&span, "Error getting response", e, include_data);
                 crate::logger::log_model_action_error("Error getting response", e);
@@ -729,49 +900,45 @@ impl Model for OpenAIResponsesWSModel {
                 return Err(e);
             }
         };
+        let span_input = request.input.clone();
         let guard = SpanGuard(span);
-        Ok(stream
-            .map(move |ev| {
-                let span = &guard.0;
-                match ev {
-                    Ok(event) => {
-                        let ty = event
-                            .get("type")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default();
-                        if ty == "response.completed" {
-                            if let Some(r) = event.get("response")
-                                && let Ok(parsed) = parse_response(r, None, false)
-                            {
-                                finish_response_span(span, &parsed, true);
-                            }
-                            return Ok(event);
+        Ok(deliver_terminal_failures(stream, move |ev| {
+            let span = &guard.0;
+            match ev {
+                Ok(event) => {
+                    let ty = event
+                        .get("type")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    if ty == "response.completed" {
+                        if let Some(r) = event.get("response")
+                            && let Ok(parsed) = parse_response(r, None, false)
+                        {
+                            finish_response_span(span, &parsed, include_data, &span_input);
                         }
-                        if is_terminal_failure_event(ty) {
-                            let err = terminal_failure_error(ty, &event);
-                            record_model_error_on_span(
-                                span,
-                                "Error streaming response",
-                                &err,
-                                include_data,
-                            );
-                            return Err(err);
-                        }
-                        Ok(event)
+                        return (vec![Ok(event)], true);
                     }
-                    Err(e) => {
+                    if is_terminal_failure_event(&ty) {
+                        let err = terminal_failure_error(&ty, &event);
                         record_model_error_on_span(
                             span,
                             "Error streaming response",
-                            &e,
+                            &err,
                             include_data,
                         );
-                        crate::logger::log_model_action_error("Error streaming response", &e);
-                        Err(e)
+                        // The consumer sees the terminal event first; the error follows.
+                        return (vec![Ok(event), Err(err)], true);
                     }
+                    (vec![Ok(event)], false)
                 }
-            })
-            .boxed())
+                Err(e) => {
+                    record_model_error_on_span(span, "Error streaming response", &e, include_data);
+                    crate::logger::log_model_action_error("Error streaming response", &e);
+                    (vec![Err(e)], false)
+                }
+            }
+        }))
     }
 
     fn model_name(&self) -> Option<String> {
@@ -815,6 +982,8 @@ impl Model for OpenAIResponsesWSModel {
 #[derive(Debug, Clone)]
 pub struct ResponsesWebSocketSession {
     provider: super::openai_provider::OpenAIProvider,
+    openai_prefix_mode: super::multi_provider::PrefixMode,
+    unknown_prefix_mode: super::multi_provider::PrefixMode,
 }
 
 impl ResponsesWebSocketSession {
@@ -825,6 +994,8 @@ impl ResponsesWebSocketSession {
                 .with_client(client)
                 .with_use_responses(true)
                 .with_responses_websocket(true),
+            openai_prefix_mode: Default::default(),
+            unknown_prefix_mode: Default::default(),
         }
     }
 
@@ -839,14 +1010,34 @@ impl ResponsesWebSocketSession {
         self
     }
 
+    /// How `openai/...` model names are routed. `Alias` (the default) strips the prefix;
+    /// `ModelId` sends the literal namespaced id.
+    pub fn with_openai_prefix_mode(mut self, mode: super::multi_provider::PrefixMode) -> Self {
+        self.openai_prefix_mode = mode;
+        self
+    }
+
+    /// How model names with an unknown prefix are routed. `Alias` (the default) rejects them;
+    /// `ModelId` sends the literal namespaced id to the OpenAI provider.
+    pub fn with_unknown_prefix_mode(mut self, mode: super::multi_provider::PrefixMode) -> Self {
+        self.unknown_prefix_mode = mode;
+        self
+    }
+
     /// The WebSocket-enabled provider.
     pub fn provider(&self) -> &super::openai_provider::OpenAIProvider {
         &self.provider
     }
 
-    /// A run config whose model provider is this session's provider.
+    /// A run config whose model provider is a [`MultiProvider`](super::MultiProvider) around
+    /// this session's provider, so prefix routing (`openai/gpt-4.1`) keeps working while every
+    /// turn shares one WebSocket connection per model.
     pub fn run_config<C: Send + Sync + 'static>(&self) -> crate::run_config::RunConfig<C> {
-        crate::run_config::RunConfig::new().with_model_provider(Arc::new(self.provider.clone()))
+        let provider = super::multi_provider::MultiProvider::new()
+            .with_openai_provider(self.provider.clone())
+            .with_openai_prefix_mode(self.openai_prefix_mode)
+            .with_unknown_prefix_mode(self.unknown_prefix_mode);
+        crate::run_config::RunConfig::new().with_model_provider(Arc::new(provider))
     }
 
     /// Close cached models and their WebSocket connections.
@@ -859,6 +1050,7 @@ impl ResponsesWebSocketSession {
 mod tests {
     use super::*;
     use crate::retry::ModelRetryAdviceRequest;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     fn maybe_advice(error: &AgentsError, stateful: bool) -> Option<ModelRetryAdvice> {
         websocket_retry_advice(&ModelRetryAdviceRequest {
@@ -960,11 +1152,15 @@ mod tests {
         assert_eq!(a.suggested, Some(false));
         assert!(a.normalized.expect("normalized").is_abort);
 
-        // Nothing was transmitted: safe to replay.
-        let never_sent = AgentsError::other("Responses websocket send failed: broken pipe");
+        // The peer dropped the handshake: nothing was transmitted, so replay is safe.
+        let never_sent = AgentsError::other(WS_PRE_EVENT_DISCONNECT_MESSAGE);
         let a = advice(&never_sent, true);
         assert_eq!(a.suggested, Some(true));
         assert_eq!(a.replay_safety, Some(ReplaySafety::Safe));
+
+        // A rejected handshake (bad status, malformed response) is left to the HTTP rules.
+        let rejected = AgentsError::other("Responses websocket connect failed: malformed");
+        assert!(maybe_advice(&rejected, true).is_none());
 
         // Timeouts: the phases before the frame is sent are safe.
         assert_eq!(

@@ -8,7 +8,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::mpsc::{self, RecvTimeoutError};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -125,7 +125,8 @@ impl TracingExporter for ConsoleSpanExporter {
 #[derive(Clone)]
 pub struct BackendSpanExporter {
     endpoint: String,
-    api_key: Option<String>,
+    /// The explicit key, shared by every clone so `set_api_key` is visible through all of them.
+    api_key: Arc<RwLock<Option<String>>>,
     organization: Option<String>,
     project: Option<String>,
     max_retries: u32,
@@ -154,7 +155,7 @@ impl BackendSpanExporter {
     pub fn new() -> Self {
         BackendSpanExporter {
             endpoint: OPENAI_TRACING_INGEST_ENDPOINT.to_string(),
-            api_key: None,
+            api_key: Arc::new(RwLock::new(None)),
             organization: std::env::var("OPENAI_ORG_ID").ok(),
             project: std::env::var("OPENAI_PROJECT_ID").ok(),
             max_retries: 3,
@@ -166,9 +167,26 @@ impl BackendSpanExporter {
     }
 
     /// Use a fixed API key.
-    pub fn with_api_key(mut self, key: impl Into<String>) -> Self {
-        self.api_key = Some(key.into());
+    pub fn with_api_key(self, key: impl Into<String>) -> Self {
+        self.set_api_key(key);
         self
+    }
+
+    /// Replace the explicit API key. Mirrors `BackendSpanExporter.set_api_key`.
+    ///
+    /// An empty key clears the explicit value, so the environment fallback applies again.
+    pub fn set_api_key(&self, key: impl Into<String>) {
+        let key = key.into();
+        *self.api_key.write().expect("exporter api key poisoned") =
+            Some(key).filter(|k| !k.is_empty());
+    }
+
+    /// The key this exporter would authenticate with right now.
+    ///
+    /// Mirrors the `api_key` property: a key found in the environment is remembered, but a
+    /// missing one is not, so a key that appears after a keyless export is still picked up.
+    pub fn api_key(&self) -> Option<String> {
+        self.resolve_api_key()
     }
 
     /// Use a custom endpoint.
@@ -208,15 +226,29 @@ impl BackendSpanExporter {
     }
 
     fn resolve_api_key(&self) -> Option<String> {
-        self.api_key
+        if let Some(explicit) = self
+            .api_key
+            .read()
+            .expect("exporter api key poisoned")
             .clone()
-            .or_else(super::provider::tracing_export_api_key)
-            .or_else(crate::models::default_openai_key)
-            .or_else(|| {
-                std::env::var("OPENAI_API_KEY")
-                    .ok()
-                    .filter(|k| !k.is_empty())
-            })
+        {
+            return Some(explicit);
+        }
+        if let Some(key) = super::provider::tracing_export_api_key() {
+            return Some(key);
+        }
+        if let Some(key) = crate::models::default_openai_key() {
+            return Some(key);
+        }
+        let from_env = std::env::var("OPENAI_API_KEY")
+            .ok()
+            .filter(|k| !k.is_empty());
+        if let Some(key) = &from_env {
+            // Keep a key once the environment has one, as the `api_key` property does; a lookup
+            // that finds nothing writes nothing, so it cannot discard a concurrent `set_api_key`.
+            *self.api_key.write().expect("exporter api key poisoned") = Some(key.clone());
+        }
+        from_env
     }
 
     fn is_openai_endpoint(&self) -> bool {
@@ -493,9 +525,42 @@ fn omit_generation_reasoning(value: &Value) -> Value {
     )
 }
 
-/// Enforce OpenAI traces ingest limits: truncate large fields and keep usage only on
-/// generation spans.
-pub(crate) fn sanitize_for_openai(mut payload: Value) -> Value {
+/// Reduce a generation span's usage to what the OpenAI traces API accepts.
+///
+/// Mirrors `_sanitize_generation_usage_for_openai_tracing_api`: both token counts must be
+/// numbers, they stay top-level, and every other non-null key (including the contents of an
+/// existing `details` object) moves under `details`.
+fn sanitize_generation_usage(usage: &Value) -> Option<Value> {
+    let usage = usage.as_object()?;
+    let input = usage.get("input_tokens").filter(|v| v.is_number())?;
+    let output = usage.get("output_tokens").filter(|v| v.is_number())?;
+    let mut details = serde_json::Map::new();
+    if let Some(existing) = usage.get("details").and_then(Value::as_object) {
+        details.extend(existing.iter().map(|(k, v)| (k.clone(), v.clone())));
+    }
+    for (key, value) in usage {
+        if matches!(key.as_str(), "input_tokens" | "output_tokens" | "details") || value.is_null() {
+            continue;
+        }
+        details.insert(key.clone(), value.clone());
+    }
+    let mut clean = serde_json::Map::new();
+    clean.insert("input_tokens".into(), input.clone());
+    clean.insert("output_tokens".into(), output.clone());
+    if !details.is_empty() {
+        clean.insert("details".into(), Value::Object(details));
+    }
+    Some(Value::Object(clean))
+}
+
+/// The filter [`BackendSpanExporter`] applies to a span payload bound for the OpenAI traces
+/// endpoint: large fields are truncated, usage is kept only on generation spans, and a
+/// generation span's assistant reasoning is dropped.
+///
+/// The reasoning stays in the span itself, so the next turn can still replay it; only the copy
+/// that leaves the process is filtered. A custom endpoint receives the payload unfiltered, which
+/// is why this is applied by the exporter rather than by the span.
+pub fn sanitize_for_openai(mut payload: Value) -> Value {
     let Some(span_data) = payload.get_mut("span_data").and_then(Value::as_object_mut) else {
         return payload;
     };
@@ -514,16 +579,13 @@ pub(crate) fn sanitize_for_openai(mut payload: Value) -> Value {
     if !is_generation {
         span_data.remove("usage");
     } else if let Some(usage) = span_data.get("usage").cloned() {
-        let valid = usage
-            .get("input_tokens")
-            .map(Value::is_number)
-            .unwrap_or(false)
-            && usage
-                .get("output_tokens")
-                .map(Value::is_number)
-                .unwrap_or(false);
-        if !valid {
-            span_data.remove("usage");
+        match sanitize_generation_usage(&usage) {
+            Some(clean) => {
+                span_data.insert("usage".into(), clean);
+            }
+            None => {
+                span_data.remove("usage");
+            }
         }
     }
     payload

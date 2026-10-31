@@ -36,6 +36,17 @@ pub fn model_config_for_trace(
     tracing: ModelTracing,
     base_url: Option<&str>,
 ) -> Value {
+    model_config_for_trace_with_extra(model_settings, tracing, base_url, None)
+}
+
+/// [`model_config_for_trace`] plus caller-supplied entries (Python's `extra_config`), merged
+/// over the sanitized settings.
+pub fn model_config_for_trace_with_extra(
+    model_settings: &ModelSettings,
+    tracing: ModelTracing,
+    base_url: Option<&str>,
+    extra_config: Option<&Map<String, Value>>,
+) -> Value {
     let mut config = match model_settings.to_traceable_value() {
         Value::Object(map) => map,
         _ => Map::new(),
@@ -48,6 +59,11 @@ pub fn model_config_for_trace(
             "base_url".into(),
             Value::String(sanitize_url_for_trace(base_url)),
         );
+    }
+    if let Some(extra) = extra_config {
+        for (k, v) in extra {
+            config.insert(k.clone(), v.clone());
+        }
     }
     Value::Object(config)
 }

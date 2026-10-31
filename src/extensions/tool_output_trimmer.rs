@@ -213,7 +213,11 @@ impl ToolOutputTrimmer {
         }
     }
 
-    fn find_recent_boundary(&self, items: &[InputItem]) -> usize {
+    /// Index of the first item that belongs to the last `recent_turns` user messages.
+    ///
+    /// Everything from here on is left untouched; `0` means nothing is old enough to trim.
+    /// Port of `_find_recent_boundary`.
+    pub fn find_recent_boundary(&self, items: &[InputItem]) -> usize {
         let mut count = 0;
         for i in (0..items.len()).rev() {
             if items[i].0.get("role").and_then(Value::as_str) == Some("user") {
@@ -297,7 +301,7 @@ impl ToolOutputTrimmer {
         let summary = if max < minimal.len() {
             minimal[..max].to_string()
         } else {
-            let budget = max - minimal.len() - 1;
+            let budget = max.saturating_sub(minimal.len() + 1);
             let text_len = chars(&text);
             let preview_len = text_len.min(self.preview_chars).min(budget);
             let mut body = if preview_len > 0 {

@@ -109,6 +109,12 @@ impl MultiProvider {
         self
     }
 
+    /// The OpenAI provider names without a prefix (and `openai/...`) resolve through.
+    /// Mirrors `MultiProvider.openai_provider`.
+    pub fn openai_provider(&self) -> &OpenAIProvider {
+        &self.openai
+    }
+
     /// Register a provider for a prefix (e.g. `"litellm"` handles `litellm/...`).
     pub fn with_provider(
         mut self,

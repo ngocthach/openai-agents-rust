@@ -15,7 +15,9 @@ use crate::model_settings::ToolChoice;
 use crate::tracing::{Span, SpanData, record_model_error_on_span, response_span};
 use crate::usage::Usage;
 
-use super::response_terminal::{is_terminal_failure_event, terminal_failure_error};
+use super::response_terminal::{
+    is_terminal_failure_event, response_terminal_failure_error, terminal_failure_error,
+};
 
 /// A model that calls `POST /responses`.
 #[derive(Debug, Clone)]
@@ -35,7 +37,14 @@ impl OpenAIResponsesModel {
         }
     }
 
-    pub(crate) fn with_explicit(mut self, explicit: bool) -> Self {
+    pub(crate) fn with_explicit(self, explicit: bool) -> Self {
+        self.with_explicit_model(explicit)
+    }
+
+    /// Whether the caller chose this model name explicitly. Port of `model_is_explicit`: a
+    /// prompt-managed request from a non-explicit model omits `model` so the prompt's own
+    /// model wins.
+    pub fn with_explicit_model(mut self, explicit: bool) -> Self {
         self.model_is_explicit = explicit;
         self
     }
@@ -61,8 +70,30 @@ impl OpenAIResponsesModel {
             .get("model")
             .and_then(Value::as_str)
             .map(str::to_string);
-        let (mut tools, mut includes) =
-            convert_tools(&req.tools, request_model.as_deref(), s.tool_choice.as_ref())?;
+        let surfaces = ToolSurfaces::collect(&req.tools, &req.handoffs);
+        // Python resolves the computer-tool model to `None` when no computer tool is present,
+        // so the wire shape is never inferred from a model that cannot use it.
+        let computer_model = if surfaces.has_computer_tool {
+            request_model.clone()
+        } else {
+            None
+        };
+        // Python validates the tool choice before converting the tools, so a bad choice wins.
+        let converted_tool_choice = match &s.tool_choice {
+            Some(tc) => Some(convert_tool_choice_for_request(
+                tc,
+                &surfaces,
+                computer_model.as_deref(),
+            )?),
+            None => None,
+        };
+        let (mut tools, mut includes) = convert_tools(
+            &req.tools,
+            computer_model.as_deref(),
+            s.tool_choice.as_ref(),
+            &surfaces,
+            req.prompt.is_some(),
+        )?;
         for h in &req.handoffs {
             tools.push(h.to_responses_param());
         }
@@ -82,13 +113,7 @@ impl OpenAIResponsesModel {
                 json!(includes.into_iter().collect::<Vec<_>>()),
             );
         }
-        if let Some(tc) = &s.tool_choice {
-            let mut converted = convert_tool_choice(tc);
-            if converted.get("type").and_then(Value::as_str) == Some("computer_use_preview")
-                && !use_preview_computer_tool(request_model.as_deref(), Some(tc))
-            {
-                converted = json!({"type": "computer"});
-            }
+        if let Some(converted) = converted_tool_choice {
             let omit = req.prompt.is_some() && !has_tools && converted.is_object();
             if !omit {
                 body.insert("tool_choice".into(), converted);
@@ -188,6 +213,259 @@ impl OpenAIResponsesModel {
     }
 }
 
+/// The tool surfaces a tool choice is validated against. Port of the name sets that
+/// `Converter._validate_named_function_tool_choice` and `validate_responses_*` build.
+#[derive(Debug, Default)]
+pub struct ToolSurfaces {
+    top_level_function_names: BTreeSet<String>,
+    all_local_function_names: BTreeSet<String>,
+    deferred_only_function_names: BTreeSet<String>,
+    namespaced_function_names: BTreeSet<String>,
+    namespace_names: BTreeSet<String>,
+    /// Any `ToolSearchTool()` in the tool list.
+    has_hosted_tool_search: bool,
+    has_computer_tool: bool,
+    has_shell_tool: bool,
+    has_apply_patch_tool: bool,
+    has_programmatic_tool: bool,
+    /// A surface that stops being reachable without `ToolSearchTool()`.
+    has_required_tool_search_surface: bool,
+    /// A surface `ToolSearchTool()` can actually search.
+    has_tool_search_surface: bool,
+    /// At least one tool advertises `programmatic` in `allowed_callers`.
+    has_programmatic_caller: bool,
+    /// Tools that allow only programmatic callers, by display name.
+    programmatic_only_names: Vec<String>,
+    computer_tool_count: usize,
+    tool_search_count: usize,
+    programmatic_tool_count: usize,
+    no_tools: bool,
+    no_handoffs: bool,
+    /// Every function tool as (name, explicit namespace, defer_loading), in request order.
+    functions: Vec<(String, Option<String>, bool)>,
+}
+
+/// Record a tool's `allowed_callers` against the programmatic-tool-calling contract.
+fn note_allowed_callers(s: &mut ToolSurfaces, callers: Option<&Value>, display_name: &str) {
+    let Some(list) = callers.and_then(Value::as_array) else {
+        return;
+    };
+    let has = |c: &str| list.iter().any(|v| v.as_str() == Some(c));
+    if !has("programmatic") {
+        return;
+    }
+    s.has_programmatic_caller = true;
+    if !has("direct") {
+        s.programmatic_only_names.push(display_name.to_string());
+    }
+}
+
+impl ToolSurfaces {
+    /// Collect the surfaces a tool choice is validated against.
+    pub fn collect(specs: &[ToolSpec], handoffs: &[super::interface::FunctionToolSpec]) -> Self {
+        let mut s = ToolSurfaces {
+            no_tools: specs.is_empty(),
+            no_handoffs: handoffs.is_empty(),
+            ..Default::default()
+        };
+        for h in handoffs {
+            s.top_level_function_names.insert(h.name.clone());
+            s.all_local_function_names.insert(h.name.clone());
+        }
+        for t in specs {
+            match t {
+                ToolSpec::Function(f) => {
+                    s.functions
+                        .push((f.name.clone(), f.namespace.clone(), f.defer_loading));
+                    s.all_local_function_names.insert(f.name.clone());
+                    match &f.namespace {
+                        Some(ns) => {
+                            s.namespaced_function_names.insert(f.name.clone());
+                            s.namespace_names.insert(ns.clone());
+                            s.has_tool_search_surface = true;
+                        }
+                        None if f.defer_loading => {
+                            s.deferred_only_function_names.insert(f.name.clone());
+                        }
+                        None => {
+                            s.top_level_function_names.insert(f.name.clone());
+                        }
+                    }
+                    if f.defer_loading {
+                        s.has_required_tool_search_surface = true;
+                        s.has_tool_search_surface = true;
+                    }
+                    let qualified = match &f.namespace {
+                        Some(ns) => format!("{ns}.{}", f.name),
+                        None => f.name.clone(),
+                    };
+                    let callers = f.allowed_callers.as_ref().map(|c| json!(c));
+                    note_allowed_callers(&mut s, callers.as_ref(), &qualified);
+                }
+                ToolSpec::Hosted { param, .. } => {
+                    let ty = param
+                        .get("type")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    let deferred =
+                        param.get("defer_loading").and_then(Value::as_bool) == Some(true);
+                    match ty {
+                        "tool_search" => {
+                            s.has_hosted_tool_search = true;
+                            s.tool_search_count += 1;
+                        }
+                        "computer" => {
+                            s.has_computer_tool = true;
+                            s.computer_tool_count += 1;
+                        }
+                        "shell" => s.has_shell_tool = true,
+                        "apply_patch" => s.has_apply_patch_tool = true,
+                        "programmatic_tool_calling" => {
+                            s.has_programmatic_tool = true;
+                            s.programmatic_tool_count += 1;
+                        }
+                        "mcp" if deferred => {
+                            s.has_required_tool_search_surface = true;
+                            s.has_tool_search_surface = true;
+                        }
+                        _ => {}
+                    }
+                    if deferred && ty != "mcp" {
+                        s.has_required_tool_search_surface = true;
+                        s.has_tool_search_surface = true;
+                    }
+                    let display = if ty == "mcp" {
+                        format!(
+                            "hosted MCP server `{}`",
+                            param
+                                .get("server_label")
+                                .and_then(Value::as_str)
+                                .unwrap_or("unknown")
+                        )
+                    } else {
+                        param
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or(ty)
+                            .to_string()
+                    };
+                    note_allowed_callers(&mut s, param.get("allowed_callers"), &display);
+                }
+            }
+        }
+        s
+    }
+}
+
+/// `required` is only rejected when a deferred surface would leave no callable tool.
+/// Port of `Converter._validate_required_tool_choice`.
+fn validate_required_tool_choice(surfaces: &ToolSurfaces) -> Result<()> {
+    if surfaces.no_tools || surfaces.has_hosted_tool_search {
+        return Ok(());
+    }
+    if surfaces.has_required_tool_search_surface {
+        return Err(AgentsError::user(
+            "tool_choice='required' is not currently supported when deferred-loading Responses \
+             tools are configured without ToolSearchTool() on the OpenAI Responses API. Add \
+             ToolSearchTool() or use `auto`.",
+        ));
+    }
+    Ok(())
+}
+
+/// Port of `Converter._validate_named_function_tool_choice`.
+fn validate_named_function_tool_choice(choice: &str, surfaces: &ToolSurfaces) -> Result<()> {
+    if surfaces.no_tools && surfaces.no_handoffs {
+        return Ok(());
+    }
+    if choice == "tool_search" && !surfaces.all_local_function_names.contains("tool_search") {
+        return Err(AgentsError::user(if surfaces.has_hosted_tool_search {
+            "tool_choice='tool_search' is not supported for ToolSearchTool() on the OpenAI \
+             Responses API. Use `auto` or `required`, or target a real top-level function tool \
+             named `tool_search`."
+        } else {
+            "tool_choice='tool_search' requires ToolSearchTool() or a real top-level function \
+             tool named `tool_search` on the OpenAI Responses API."
+        }));
+    }
+    let top_level = surfaces.top_level_function_names.contains(choice);
+    if !top_level
+        && (surfaces.namespaced_function_names.contains(choice)
+            || surfaces.namespace_names.contains(choice))
+    {
+        return Err(AgentsError::user(
+            "Named tool_choice must target a callable tool, not a namespace wrapper or bare \
+             inner name from tool_namespace(), on the OpenAI Responses API. Use `auto`, \
+             `required`, `none`, or target a top-level or qualified namespaced function tool.",
+        ));
+    }
+    if !top_level && surfaces.deferred_only_function_names.contains(choice) {
+        return Err(AgentsError::user(
+            "Named tool_choice is not currently supported for deferred-loading function tools \
+             on the OpenAI Responses API. Use `auto`, `required`, `none`, or load the tool via \
+             ToolSearchTool() first.",
+        ));
+    }
+    Ok(())
+}
+
+/// Port of `Converter._convert_builtin_computer_tool_choice`.
+fn convert_builtin_computer_tool_choice(choice: &str, model: Option<&str>) -> Value {
+    let preview = model.is_some_and(|m| m.starts_with("computer-use-preview"))
+        || use_preview_computer_tool_name(model, Some(choice));
+    if preview {
+        json!({"type": "computer_use_preview"})
+    } else {
+        json!({"type": "computer"})
+    }
+}
+
+/// Convert a tool choice in the context of the request's tools and handoffs.
+/// Port of `Converter.convert_tool_choice`.
+pub fn convert_tool_choice_for_request(
+    tc: &ToolChoice,
+    surfaces: &ToolSurfaces,
+    model: Option<&str>,
+) -> Result<Value> {
+    let name = match tc {
+        ToolChoice::Mcp(m) => {
+            return Ok(json!({"type": "mcp", "server_label": m.server_label, "name": m.name}));
+        }
+        ToolChoice::Named(n) => n.as_str(),
+    };
+    match name {
+        "required" => {
+            validate_required_tool_choice(surfaces)?;
+            Ok(Value::String("required".into()))
+        }
+        "auto" | "none" => Ok(Value::String(name.to_string())),
+        "programmatic_tool_calling"
+        | "file_search"
+        | "web_search"
+        | "web_search_preview"
+        | "image_generation"
+        | "code_interpreter"
+        | "mcp" => Ok(json!({"type": name})),
+        "computer" | "computer_use" | "computer_use_preview" if surfaces.has_computer_tool => {
+            Ok(convert_builtin_computer_tool_choice(name, model))
+        }
+        "computer_use_preview" => Ok(json!({"type": "computer_use_preview"})),
+        "shell" if surfaces.has_shell_tool => Ok(json!({"type": "shell"})),
+        "apply_patch" if surfaces.has_apply_patch_tool => Ok(json!({"type": "apply_patch"})),
+        other => {
+            validate_named_function_tool_choice(other, surfaces)?;
+            Ok(json!({"type": "function", "name": other}))
+        }
+    }
+}
+
+fn use_preview_computer_tool_name(model: Option<&str>, tool_choice: Option<&str>) -> bool {
+    match model {
+        Some(m) => m.starts_with("computer-use-preview"),
+        None => !matches!(tool_choice, Some("computer") | Some("computer_use")),
+    }
+}
+
 fn use_preview_computer_tool(model: Option<&str>, tool_choice: Option<&ToolChoice>) -> bool {
     match model {
         Some(m) => m.starts_with("computer-use-preview"),
@@ -203,47 +481,200 @@ fn use_preview_computer_tool(model: Option<&str>, tool_choice: Option<&ToolChoic
 /// Convert tool specs to Responses tool params: namespaced function tools are grouped into
 /// `namespace` tools, the computer tool gets its GA or preview shape, and deferred tools are
 /// validated against the presence of a `tool_search` tool.
+/// Validate a file-search tool's `max_num_results`: zero or an integer from 1 to 50. Zero and
+/// `None` both leave the key out so the provider default applies, as in Python.
+fn convert_file_search_param(param: &Value) -> Result<Value> {
+    let mut param = param.clone();
+    let Some(limit) = param.get("max_num_results").filter(|v| !v.is_null()) else {
+        if let Some(map) = param.as_object_mut() {
+            map.remove("max_num_results");
+        }
+        return Ok(param);
+    };
+    match limit.as_u64().filter(|n| *n <= 50) {
+        None => {
+            return Err(AgentsError::user(
+                "FileSearchTool max_num_results must be zero, an integer between 1 and 50, or \
+                 None.",
+            ));
+        }
+        Some(0) => {
+            if let Some(map) = param.as_object_mut() {
+                map.remove("max_num_results");
+            }
+        }
+        Some(_) => {}
+    }
+    Ok(param)
+}
+
+/// Reject function-tool combinations that are ambiguous on the Responses wire.
+/// Port of `validate_function_tool_lookup_configuration`.
+fn validate_function_tool_lookup_configuration(surfaces: &ToolSurfaces) -> Result<()> {
+    let mut qualified_owners: std::collections::HashMap<String, Option<&str>> = Default::default();
+    let mut deferred_top_level: BTreeSet<&str> = BTreeSet::new();
+    for (name, namespace, defer_loading) in &surfaces.functions {
+        // A tool in a namespace of its own name collides with the synthetic namespace
+        // tool search reserves for deferred top-level function tools.
+        if namespace.as_deref() == Some(name.as_str()) {
+            return Err(AgentsError::user(format!(
+                "Responses tool-search reserves the synthetic namespace `{name}.{name}` for \
+                 deferred top-level function tools. Rename the namespace or tool name to avoid \
+                 ambiguous dispatch."
+            )));
+        }
+        if namespace.is_none() && *defer_loading && !deferred_top_level.insert(name) {
+            return Err(AgentsError::user(format!(
+                "Ambiguous function tool configuration: the deferred top-level tool name \
+                 `{name}` is used by multiple tools. Rename one of the deferred-loading \
+                 top-level function tools to avoid ambiguous dispatch."
+            )));
+        }
+        let qualified = match namespace {
+            Some(ns) => format!("{ns}.{name}"),
+            None => name.clone(),
+        };
+        match qualified_owners.get(&qualified) {
+            None => {
+                qualified_owners.insert(qualified, namespace.as_deref());
+            }
+            // Repeated bare names are resolved by the name-collision policy elsewhere.
+            Some(None) if namespace.is_none() => {}
+            Some(_) => {
+                return Err(AgentsError::user(format!(
+                    "Ambiguous function tool configuration: the qualified name `{qualified}` is \
+                     used by multiple tools. Rename the namespace-wrapped function or dotted \
+                     top-level tool to avoid ambiguous dispatch."
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Port of `validate_responses_tool_search_configuration`.
+fn validate_tool_search_configuration(
+    surfaces: &ToolSurfaces,
+    allow_opaque_search_surface: bool,
+) -> Result<()> {
+    if surfaces.tool_search_count > 1 {
+        return Err(AgentsError::user(
+            "Only one ToolSearchTool() is allowed when using OpenAI Responses models.",
+        ));
+    }
+    validate_function_tool_lookup_configuration(surfaces)?;
+    if surfaces.has_required_tool_search_surface && !surfaces.has_hosted_tool_search {
+        return Err(AgentsError::user(
+            "Deferred-loading Responses tools require ToolSearchTool() when using OpenAI \
+             Responses models.",
+        ));
+    }
+    if surfaces.has_hosted_tool_search
+        && !surfaces.has_tool_search_surface
+        && !allow_opaque_search_surface
+    {
+        return Err(AgentsError::user(
+            "ToolSearchTool() requires at least one searchable Responses surface: a \
+             tool_namespace(...) function tool, a deferred-loading function tool \
+             (`function_tool(..., defer_loading=True)`), or a deferred-loading hosted MCP \
+             server (`HostedMCPTool(tool_config={..., 'defer_loading': True})`).",
+        ));
+    }
+    Ok(())
+}
+
+/// Port of `validate_responses_programmatic_tool_calling_configuration`.
+fn validate_programmatic_tool_calling_configuration(
+    surfaces: &ToolSurfaces,
+    tool_choice: Option<&ToolChoice>,
+    allow_opaque_tool_search_surface: bool,
+) -> Result<()> {
+    if surfaces.programmatic_tool_count > 1 {
+        return Err(AgentsError::user(
+            "Only one ProgrammaticToolCallingTool() is allowed when using OpenAI Responses \
+             models.",
+        ));
+    }
+    let chose_programmatic = matches!(
+        tool_choice,
+        Some(ToolChoice::Named(n)) if n == "programmatic_tool_calling"
+    );
+    if chose_programmatic && !surfaces.has_programmatic_tool {
+        return Err(AgentsError::user(
+            "tool_choice='programmatic_tool_calling' requires ProgrammaticToolCallingTool() \
+             when using OpenAI Responses models.",
+        ));
+    }
+    if !surfaces.has_programmatic_tool
+        && let Some(name) = surfaces.programmatic_only_names.first()
+    {
+        return Err(AgentsError::user(format!(
+            "Tool `{name}` only allows programmatic callers and requires \
+             ProgrammaticToolCallingTool() when using OpenAI Responses models."
+        )));
+    }
+    if surfaces.has_programmatic_tool
+        && !surfaces.has_programmatic_caller
+        && !surfaces.has_hosted_tool_search
+        && !allow_opaque_tool_search_surface
+    {
+        return Err(AgentsError::user(
+            "ProgrammaticToolCallingTool() requires at least one tool whose allowed_callers \
+             includes 'programmatic', a ToolSearchTool(), or an opaque prompt-managed tool \
+             surface.",
+        ));
+    }
+    Ok(())
+}
+
 fn convert_tools(
     specs: &[ToolSpec],
     model: Option<&str>,
     tool_choice: Option<&ToolChoice>,
+    surfaces: &ToolSurfaces,
+    allow_opaque_tool_search_surface: bool,
 ) -> Result<(Vec<Value>, BTreeSet<String>)> {
+    validate_tool_search_configuration(surfaces, allow_opaque_tool_search_surface)?;
+    validate_programmatic_tool_calling_configuration(
+        surfaces,
+        tool_choice,
+        allow_opaque_tool_search_surface,
+    )?;
+    if surfaces.computer_tool_count > 1 {
+        return Err(AgentsError::user(format!(
+            "You can only provide one computer tool. Got {}",
+            surfaces.computer_tool_count
+        )));
+    }
     let mut tools: Vec<Value> = Vec::new();
     let mut includes = BTreeSet::new();
     let mut namespaces: Vec<(String, String, usize)> = Vec::new();
     let mut namespace_members: std::collections::HashMap<String, Vec<Value>> =
         std::collections::HashMap::new();
-    let mut tool_search_count = 0;
-    let mut needs_tool_search = false;
     for t in specs {
         match t {
-            ToolSpec::Function(f) => {
-                if f.defer_loading {
-                    needs_tool_search = true;
-                }
-                match &f.namespace {
-                    Some(ns) => {
-                        let desc = f.namespace_description.clone().unwrap_or_default();
-                        match namespaces.iter().find(|(n, _, _)| n == ns) {
-                            Some((_, d, _)) if *d != desc => {
-                                return Err(AgentsError::user(format!(
-                                    "All tools in namespace '{ns}' must share the same description."
-                                )));
-                            }
-                            Some(_) => {}
-                            None => {
-                                namespaces.push((ns.clone(), desc, tools.len()));
-                                tools.push(Value::Null);
-                            }
+            ToolSpec::Function(f) => match &f.namespace {
+                Some(ns) => {
+                    let desc = f.namespace_description.clone().unwrap_or_default();
+                    match namespaces.iter().find(|(n, _, _)| n == ns) {
+                        Some((_, d, _)) if *d != desc => {
+                            return Err(AgentsError::user(format!(
+                                "All tools in namespace '{ns}' must share the same description."
+                            )));
                         }
-                        namespace_members
-                            .entry(ns.clone())
-                            .or_default()
-                            .push(f.to_responses_param());
+                        Some(_) => {}
+                        None => {
+                            namespaces.push((ns.clone(), desc, tools.len()));
+                            tools.push(Value::Null);
+                        }
                     }
-                    None => tools.push(f.to_responses_param()),
+                    namespace_members
+                        .entry(ns.clone())
+                        .or_default()
+                        .push(f.to_responses_param());
                 }
-            }
+                None => tools.push(f.to_responses_param()),
+            },
             ToolSpec::Hosted {
                 param,
                 includes: inc,
@@ -252,12 +683,6 @@ fn convert_tools(
                     .get("type")
                     .and_then(Value::as_str)
                     .unwrap_or_default();
-                if ty == "tool_search" {
-                    tool_search_count += 1;
-                }
-                if param.get("defer_loading").and_then(Value::as_bool) == Some(true) {
-                    needs_tool_search = true;
-                }
                 if ty == "computer" {
                     if use_preview_computer_tool(model, tool_choice) {
                         let (Some(env), Some(w), Some(h)) = (
@@ -275,23 +700,14 @@ fn convert_tools(
                     } else {
                         tools.push(json!({"type": "computer"}));
                     }
+                } else if ty == "file_search" {
+                    tools.push(convert_file_search_param(param)?);
                 } else {
                     tools.push(param.clone());
                 }
                 includes.extend(inc.iter().cloned());
             }
         }
-    }
-    if tool_search_count > 1 {
-        return Err(AgentsError::user(
-            "Only one ToolSearchTool() is allowed when using OpenAI Responses models.",
-        ));
-    }
-    if needs_tool_search && tool_search_count == 0 {
-        return Err(AgentsError::user(
-            "Deferred-loading Responses tools require ToolSearchTool() when using OpenAI \
-             Responses models.",
-        ));
     }
     for (name, description, index) in namespaces {
         tools[index] = json!({
@@ -304,31 +720,8 @@ fn convert_tools(
     Ok((tools, includes))
 }
 
-/// Convert a `ToolChoice` to the Responses API format.
-pub(crate) fn convert_tool_choice(tc: &ToolChoice) -> Value {
-    match tc {
-        ToolChoice::Mcp(m) => {
-            json!({"type": "mcp", "server_label": m.server_label, "name": m.name})
-        }
-        ToolChoice::Named(n) => match n.as_str() {
-            "auto" | "required" | "none" => Value::String(n.clone()),
-            "file_search"
-            | "web_search"
-            | "web_search_preview"
-            | "image_generation"
-            | "code_interpreter"
-            | "mcp"
-            | "tool_search"
-            | "programmatic_tool_calling"
-            | "computer_use_preview" => json!({"type": n}),
-            "computer" | "computer_use" => json!({"type": "computer_use_preview"}),
-            other => json!({"type": "function", "name": other}),
-        },
-    }
-}
-
 /// Remove placeholder ids and provider-specific fields before sending to OpenAI.
-pub(crate) fn clean_input_for_openai(items: &[InputItem]) -> Vec<Value> {
+pub fn clean_input_for_openai(items: &[InputItem]) -> Vec<Value> {
     items
         .iter()
         .filter_map(|item| {
@@ -349,31 +742,18 @@ pub(crate) fn clean_input_for_openai(items: &[InputItem]) -> Vec<Value> {
 }
 
 /// Parse a Responses API `response` object.
-pub(crate) fn parse_response(
+pub fn parse_response(
     v: &Value,
     request_id: Option<String>,
     preserve_raw_usage: bool,
 ) -> Result<ModelResponse> {
-    match v.get("status").and_then(Value::as_str) {
-        Some("failed") => {
-            let detail = v
-                .pointer("/error/message")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown error");
-            return Err(AgentsError::model_behavior(format!(
-                "Responses API returned terminal status failed: {detail}"
-            )));
-        }
-        Some("incomplete") => {
-            let reason = v
-                .pointer("/incomplete_details/reason")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown");
-            return Err(AgentsError::model_behavior(format!(
-                "Responses API returned terminal status incomplete: {reason}"
-            )));
-        }
-        _ => {}
+    // Python raises `response_terminal_failure_error("response.{status}", response)` for a
+    // non-streamed response whose status is terminal-but-unsuccessful.
+    if let Some(status @ ("failed" | "incomplete")) = v.get("status").and_then(Value::as_str) {
+        return Err(response_terminal_failure_error(
+            &format!("response.{status}"),
+            Some(v),
+        ));
     }
     let output = v
         .get("output")
@@ -381,8 +761,14 @@ pub(crate) fn parse_response(
         .map(|a| a.iter().cloned().map(OutputItem::from_value).collect())
         .unwrap_or_default();
     let usage_v = v.get("usage").filter(|u| !u.is_null());
+    // Python reads `total_tokens` as reported (a null count is 0) rather than deriving it, so a
+    // provider that omits the total is not credited with input + output.
     let usage = usage_v
-        .map(Usage::from_responses_usage)
+        .map(|u| {
+            let mut usage = Usage::from_responses_usage(u);
+            usage.total_tokens = u.get("total_tokens").and_then(Value::as_u64).unwrap_or(0);
+            usage
+        })
         .unwrap_or_else(|| Usage {
             requests: 1,
             ..Default::default()
@@ -426,15 +812,65 @@ pub fn attach_stream_request_id(event: &mut Value, request_id: Option<&str>) {
     }
 }
 
-pub(crate) fn finish_response_span(span: &Span, resp: &ModelResponse, include_data: bool) {
+/// Record a finished response on its span.
+///
+/// Mirrors Python: the usage is always recorded; the response and the request input only when
+/// tracing includes data (neither is part of the exported payload).
+pub(crate) fn finish_response_span(
+    span: &Span,
+    resp: &ModelResponse,
+    include_data: bool,
+    input: &[InputItem],
+) {
     span.update_data(|d| {
-        if let SpanData::Response { response_id, usage } = d {
+        if let SpanData::Response {
+            response_id,
+            usage,
+            response,
+            input: span_input,
+        } = d
+        {
             *response_id = resp.response_id.clone();
+            *usage = Some(resp.usage.to_span_usage());
             if include_data {
-                *usage = Some(resp.usage.to_span_usage());
+                *response = serde_json::to_value(resp).ok();
+                *span_input = serde_json::to_value(input).ok();
             }
         }
     });
+}
+
+/// Expand each stream item into zero or more items, optionally ending the stream afterwards.
+///
+/// Python yields a terminal event to the consumer and then stops reading the stream: a
+/// terminal failure is raised after the event, and any transport trouble after a terminal
+/// event is never seen. A plain `map` cannot emit the event and the error from one source item,
+/// and a `take_while` would still poll the source once more, so `f` returns the items to emit
+/// plus whether this was the last source item, and the stream ends without touching the source
+/// again.
+pub(crate) fn deliver_terminal_failures(
+    stream: ResponseEventStream,
+    f: impl FnMut(Result<Value>) -> (Vec<Result<Value>>, bool) + Send + 'static,
+) -> ResponseEventStream {
+    let state = (stream, std::collections::VecDeque::new(), false, f);
+    futures::stream::unfold(
+        state,
+        |(mut inner, mut queue, mut stopped, mut f)| async move {
+            loop {
+                if let Some(item) = queue.pop_front() {
+                    return Some((item, (inner, queue, stopped, f)));
+                }
+                if stopped {
+                    return None;
+                }
+                let item = inner.next().await?;
+                let (items, stop) = f(item);
+                queue.extend(items);
+                stopped = stop;
+            }
+        },
+    )
+    .boxed()
 }
 
 /// Ensures a span is finished when a stream is dropped early.
@@ -475,7 +911,7 @@ impl Model for OpenAIResponsesModel {
         .await;
         let include_data = request.tracing.include_data();
         match &result {
-            Ok(resp) => finish_response_span(&span, resp, true),
+            Ok(resp) => finish_response_span(&span, resp, include_data, &request.input),
             Err(e) => {
                 record_model_error_on_span(&span, "Error getting response", e, include_data);
                 crate::logger::log_model_action_error("Error getting response", e);
@@ -508,8 +944,9 @@ impl Model for OpenAIResponsesModel {
                 return Err(e);
             }
         };
+        let span_input = request.input.clone();
         let guard = SpanGuard(span);
-        let mapped = stream.map(move |ev| {
+        let mapped = deliver_terminal_failures(stream, move |ev| {
             let span = &guard.0;
             match ev {
                 Ok(mut event) => {
@@ -517,35 +954,37 @@ impl Model for OpenAIResponsesModel {
                     let ty = event
                         .get("type")
                         .and_then(Value::as_str)
-                        .unwrap_or_default();
+                        .unwrap_or_default()
+                        .to_string();
                     if ty == "response.completed" {
                         if let Some(r) = event.get("response")
                             && let Ok(parsed) = parse_response(r, None, false)
                         {
-                            finish_response_span(span, &parsed, true);
+                            finish_response_span(span, &parsed, include_data, &span_input);
                         }
-                        return Ok(event);
+                        return (vec![Ok(event)], true);
                     }
-                    if is_terminal_failure_event(ty) {
-                        let err = terminal_failure_error(ty, &event);
+                    if is_terminal_failure_event(&ty) {
+                        let err = terminal_failure_error(&ty, &event);
                         record_model_error_on_span(
                             span,
                             "Error streaming response",
                             &err,
                             include_data,
                         );
-                        return Err(err);
+                        // The consumer sees the terminal event first; the error follows.
+                        return (vec![Ok(event), Err(err)], true);
                     }
-                    Ok(event)
+                    (vec![Ok(event)], false)
                 }
                 Err(e) => {
                     record_model_error_on_span(span, "Error streaming response", &e, include_data);
                     crate::logger::log_model_action_error("Error streaming response", &e);
-                    Err(e)
+                    (vec![Err(e)], false)
                 }
             }
         });
-        Ok(mapped.boxed())
+        Ok(mapped)
     }
 
     fn model_name(&self) -> Option<String> {
@@ -598,6 +1037,7 @@ mod tests {
             namespace_description: ns.map(|_| "ns desc".to_string()),
             allowed_callers: None,
             output_json_schema: None,
+            needs_approval: false,
         })
     }
 

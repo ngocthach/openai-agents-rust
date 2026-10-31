@@ -47,7 +47,7 @@ pub mod auth;
 
 use crate::error::{AgentsError, Result};
 use crate::items::ModelResponse;
-use crate::model_settings::ModelSettings;
+use crate::model_settings::{ModelSettings, Reasoning};
 use crate::models::interface::{Model, ModelProvider, ModelRequest, ResponseEventStream};
 use crate::models::openai_chatcompletions::{
     OpenAIChatCompletionsModel, ShouldReplayReasoningContent,
@@ -980,14 +980,69 @@ fn default_settings_for(model: &str) -> ModelSettings {
     crate::models::default_models::get_default_model_settings(Some(name))
 }
 
+/// Resolve the single `reasoning_effort` the Chat Completions body should carry, in LiteLLM's
+/// documented precedence, and strip the losing copies. Port of
+/// `LitellmModel._get_reasoning_effort` together with the `extra_body`/`extra_kwargs` pops that
+/// follow it.
+///
+/// Order: `ModelSettings.reasoning.effort`, then `extra_body["reasoning_effort"]`, then
+/// `extra_args["reasoning_effort"]`. Without this the request body would take whichever copy is
+/// merged last, and an effort set in both `reasoning` and `extra_args` would be rejected as a
+/// duplicate keyword argument.
+fn normalize_reasoning_effort(settings: &mut ModelSettings) {
+    let mut effort = settings.reasoning.as_ref().and_then(|r| r.effort.clone());
+    if effort.is_some()
+        && settings
+            .reasoning
+            .as_ref()
+            .is_some_and(|r| r.summary.is_some())
+    {
+        log::warn!(
+            target: crate::logger::LOG_TARGET,
+            "LitellmModel does not forward Reasoning.summary on the LiteLLM chat-completions \
+             path; ignoring summary and passing reasoning_effort only."
+        );
+    }
+    for source in [&settings.extra_body, &settings.extra_args] {
+        if effort.is_none() {
+            effort = source
+                .as_ref()
+                .and_then(|m| m.get("reasoning_effort"))
+                .and_then(Value::as_str)
+                .map(str::to_string);
+        }
+    }
+    let Some(effort) = effort else { return };
+    for map in [&mut settings.extra_body, &mut settings.extra_args]
+        .into_iter()
+        .flatten()
+    {
+        map.remove("reasoning_effort");
+    }
+    settings
+        .reasoning
+        .get_or_insert_with(Reasoning::default)
+        .effort = Some(effort);
+}
+
 macro_rules! delegate_model {
     ($ty:ident) => {
+        delegate_model!($ty, |_request: &mut ModelRequest| {});
+    };
+    ($ty:ident, $prepare:expr) => {
         #[async_trait]
         impl Model for $ty {
-            async fn get_response(&self, request: ModelRequest) -> Result<ModelResponse> {
+            async fn get_response(&self, mut request: ModelRequest) -> Result<ModelResponse> {
+                #[allow(clippy::redundant_closure_call)]
+                ($prepare)(&mut request);
                 self.inner.get_response(request).await
             }
-            async fn stream_response(&self, request: ModelRequest) -> Result<ResponseEventStream> {
+            async fn stream_response(
+                &self,
+                mut request: ModelRequest,
+            ) -> Result<ResponseEventStream> {
+                #[allow(clippy::redundant_closure_call)]
+                ($prepare)(&mut request);
                 self.inner.stream_response(request).await
             }
             fn model_name(&self) -> Option<String> {
@@ -1103,7 +1158,9 @@ impl LitellmModel {
     }
 }
 
-delegate_model!(LitellmModel);
+delegate_model!(LitellmModel, |request: &mut ModelRequest| {
+    normalize_reasoning_effort(&mut request.model_settings);
+});
 
 /// Resolves `provider/model` names to [`LitellmModel`]s. Port of `LitellmProvider`.
 #[derive(Debug, Clone, Default)]
