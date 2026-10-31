@@ -358,8 +358,9 @@ async fn failed_refresh_does_not_replace_cache_and_next_call_starts_fresh() {
 
     let error = server.list_tools().await.unwrap_err();
     assert!(error.to_string().contains("exceeded max_list_pages"));
-    // A failed refresh leaves no cache behind.
-    assert!(server.cached_tools().await.is_none());
+    // A failed refresh does not replace the invalidated list (Python keeps `_tools_list`
+    // and only marks it dirty), and the next call still refetches.
+    assert_eq!(server.cached_tools().await, Some(original.clone()));
 
     let refreshed = server.list_tools().await.unwrap();
     assert_eq!(

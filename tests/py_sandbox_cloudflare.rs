@@ -48,7 +48,7 @@ fn exec_ok(stdout: &str, stderr: &str, exit_code: i64) -> MockResponse {
 fn worker(
     handler: impl Fn(&Recorded) -> MockResponse + Send + Sync + 'static,
 ) -> impl std::future::Future<Output = MockServer> {
-    MockServer::start(move |request: &Recorded| {
+    support::start_resolving(support::Resolver::Cloudflare, move |request: &Recorded| {
         if request.method == "POST" && request.path == "/v1/sandbox" {
             return MockResponse::json(json!({ "id": "sbx-1" }));
         }
@@ -66,8 +66,10 @@ async fn session(server: &MockServer) -> Arc<dyn SandboxSession> {
 /// `test_cloudflare_create_calls_post_sandbox_for_id`: the id comes from `POST /v1/sandbox`.
 #[tokio::test]
 async fn cloudflare_create_calls_post_sandbox_for_id() {
-    let server =
-        MockServer::start(|_| MockResponse::json(json!({ "id": "server2generated3id" }))).await;
+    let server = support::start_resolving(support::Resolver::Cloudflare, |_| {
+        MockResponse::json(json!({ "id": "server2generated3id" }))
+    })
+    .await;
 
     let session = session(&server).await;
 
@@ -126,7 +128,10 @@ async fn cloudflare_create_rejects_a_non_workspace_root() {
 /// `test_cloudflare_create_raises_on_post_sandbox_failure`
 #[tokio::test]
 async fn cloudflare_create_raises_on_post_sandbox_failure() {
-    let server = MockServer::start(|_| MockResponse::error(500, "boom")).await;
+    let server = support::start_resolving(support::Resolver::Cloudflare, |_| {
+        MockResponse::error(500, "boom")
+    })
+    .await;
     let client =
         CloudflareSandboxClient::new(CloudflareSandboxClientOptions::new(&server.base_url));
 
@@ -140,7 +145,10 @@ async fn cloudflare_create_raises_on_post_sandbox_failure() {
 /// A reply without a usable id is refused.
 #[tokio::test]
 async fn cloudflare_create_rejects_a_reply_without_an_id() {
-    let server = MockServer::start(|_| MockResponse::json(json!({ "id": "" }))).await;
+    let server = support::start_resolving(support::Resolver::Cloudflare, |_| {
+        MockResponse::json(json!({ "id": "" }))
+    })
+    .await;
     let client =
         CloudflareSandboxClient::new(CloudflareSandboxClientOptions::new(&server.base_url));
 
@@ -524,16 +532,17 @@ async fn cloudflare_supports_pty() {
 #[tokio::test]
 async fn cloudflare_resume_reuses_a_running_sandbox_and_replaces_a_missing_one() {
     for (running, expected_creates) in [(true, 0usize), (false, 1)] {
-        let server = MockServer::start(move |request: &Recorded| {
-            if request.method == "POST" && request.path == "/v1/sandbox" {
-                return MockResponse::json(json!({ "id": "sbx-new" }));
-            }
-            if request.path.ends_with("/running") {
-                return MockResponse::json(json!({ "running": running }));
-            }
-            MockResponse::empty(204)
-        })
-        .await;
+        let server =
+            support::start_resolving(support::Resolver::Cloudflare, move |request: &Recorded| {
+                if request.method == "POST" && request.path == "/v1/sandbox" {
+                    return MockResponse::json(json!({ "id": "sbx-new" }));
+                }
+                if request.path.ends_with("/running") {
+                    return MockResponse::json(json!({ "running": running }));
+                }
+                MockResponse::empty(204)
+            })
+            .await;
         let client =
             CloudflareSandboxClient::new(CloudflareSandboxClientOptions::new(&server.base_url));
         let state = openai_agents_sdk::sandbox::SandboxSessionState::new(

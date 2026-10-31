@@ -505,3 +505,238 @@ impl<T: Default> Default for Shared<T> {
         Shared::new(T::default())
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// In-sandbox path resolver
+// ---------------------------------------------------------------------------------------------
+
+/// The wire format a provider answers a command with, for [`start_resolving`].
+#[derive(Clone, Copy)]
+#[allow(dead_code)]
+pub enum Resolver {
+    /// Cloudflare: a Server-Sent Events stream with `stdout` and `exit` events.
+    Cloudflare,
+    /// E2B: Connect-framed `process.Process/Start` events.
+    E2b,
+    /// Daytona: a toolbox session command result.
+    Daytona,
+}
+
+const RESOLVER_HELPER_PATH: &str = "resolve-workspace-path";
+
+/// The reply the in-sandbox resolver (and its presence probe) gets from a healthy sandbox.
+#[allow(dead_code)]
+pub fn resolver_reply(kind: Resolver) -> MockResponse {
+    resolver_result(kind, 0, "/resolved\n", "")
+}
+
+/// A command result with the given exit code and output, in the wire format of `kind`.
+pub fn resolver_result(kind: Resolver, exit_code: i64, stdout: &str, stderr: &str) -> MockResponse {
+    match kind {
+        Resolver::Cloudflare => {
+            let mut body = String::new();
+            if !stdout.is_empty() {
+                body.push_str(&format!("event: stdout\ndata: {}\n\n", b64(stdout)));
+            }
+            if !stderr.is_empty() {
+                body.push_str(&format!("event: stderr\ndata: {}\n\n", b64(stderr)));
+            }
+            body.push_str(&format!(
+                "event: exit\ndata: {{\"exit_code\":{exit_code}}}\n\n"
+            ));
+            MockResponse::text(body).with_content_type("text/event-stream")
+        }
+        Resolver::E2b => {
+            fn frame(flags: u8, value: serde_json::Value) -> Vec<u8> {
+                let payload = serde_json::to_vec(&value).expect("serializable");
+                let mut frame = vec![flags];
+                frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+                frame.extend_from_slice(&payload);
+                frame
+            }
+            let mut body = frame(0, serde_json::json!({ "event": { "start": { "pid": 1 } } }));
+            body.extend(frame(
+                0,
+                serde_json::json!({ "event": { "data": { "stdout": b64(stdout), "stderr": b64(stderr) } } }),
+            ));
+            body.extend(frame(
+                0,
+                serde_json::json!({ "event": { "end": { "exited": true, "exitCode": exit_code } } }),
+            ));
+            body.extend(frame(2, serde_json::json!({})));
+            MockResponse {
+                status: 200,
+                content_type: "application/connect+json",
+                body,
+                stream: Vec::new(),
+                headers: Vec::new(),
+            }
+        }
+        Resolver::Daytona => MockResponse::json(serde_json::json!({
+            "output": stdout, "stdout": stdout, "stderr": stderr, "exitCode": exit_code,
+        })),
+    }
+}
+
+/// Whether `request` runs (or probes for) the in-sandbox path resolver.
+#[allow(dead_code)]
+pub fn is_resolver_request(request: &Recorded) -> bool {
+    request.method == "POST" && request.text().contains(RESOLVER_HELPER_PATH)
+}
+
+/// Start a mock server that plays the sandbox's own path resolver before `handler` sees a request.
+///
+/// Every read, write, mkdir, rm, ls and mv first runs the resolver inside the sandbox, as Python
+/// does, so a provider mock has to answer it.
+#[allow(dead_code)]
+pub async fn start_resolving<F>(kind: Resolver, handler: F) -> MockServer
+where
+    F: Fn(&Recorded) -> MockResponse + Send + Sync + 'static,
+{
+    MockServer::start(move |request: &Recorded| {
+        if is_resolver_request(request) {
+            return resolver_reply(kind);
+        }
+        handler(request)
+    })
+    .await
+}
+
+/// The argument vector of a command a provider was asked to run, whatever its wire format.
+pub fn command_argv(request: &Recorded) -> Vec<String> {
+    let body = if request.body.len() > 5 && request.body[0] == 0 {
+        // A Connect envelope: a flag byte, a length, then the JSON payload.
+        serde_json::from_slice::<serde_json::Value>(&request.body[5..]).unwrap_or_default()
+    } else {
+        request.json()
+    };
+    if let Some(argv) = body.get("argv").and_then(|v| v.as_array()) {
+        return argv
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect();
+    }
+    if let Some(process) = body.get("process") {
+        let mut argv = vec![process["cmd"].as_str().unwrap_or_default().to_string()];
+        argv.extend(
+            process["args"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|v| v.as_str().map(str::to_string)),
+        );
+        return argv;
+    }
+    body.get("command")
+        .and_then(|v| v.as_str())
+        .map(shell_split)
+        .unwrap_or_default()
+}
+
+/// Split a command line quoted the way the SDK quotes it (single quotes, `'\''` escapes).
+pub fn shell_split(command: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut started = false;
+    let mut in_quote = false;
+    let mut chars = command.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' => {
+                in_quote = !in_quote;
+                started = true;
+            }
+            '\\' if !in_quote => {
+                if let Some(next) = chars.next() {
+                    current.push(next);
+                    started = true;
+                }
+            }
+            c if c.is_whitespace() && !in_quote => {
+                if started {
+                    words.push(std::mem::take(&mut current));
+                    started = false;
+                }
+            }
+            c => {
+                current.push(c);
+                started = true;
+            }
+        }
+    }
+    if started {
+        words.push(current);
+    }
+    words
+}
+
+/// The path resolver as a sandbox with the given workspace symlinks (`link -> target`) runs it:
+/// the exit code, stdout and stderr of `resolve-workspace-path root path mode [grant ro]...`.
+pub fn fake_resolve(
+    symlinks: &HashMap<String, String>,
+    request: &Recorded,
+) -> (i64, String, String) {
+    let argv = command_argv(request);
+    let Some(at) = argv
+        .iter()
+        .position(|a| a.contains("resolve-workspace-path"))
+    else {
+        return (0, "/resolved\n".to_string(), String::new());
+    };
+    let tokens = &argv[at + 1..];
+    if tokens.len() < 3 {
+        return (0, "/resolved\n".to_string(), String::new());
+    }
+    let (root, lexical, mode) = (tokens[0].as_str(), tokens[1].as_str(), tokens[2].as_str());
+    let mut resolved = lexical.to_string();
+    for (link, target) in symlinks {
+        if lexical == link || lexical.starts_with(&format!("{link}/")) {
+            resolved = format!("{target}{}", &lexical[link.len()..]);
+        }
+    }
+    let within = |path: &str, base: &str| {
+        path == base || path.starts_with(&format!("{}/", base.trim_end_matches('/')))
+    };
+    let grants: Vec<(&str, bool)> = tokens[3..]
+        .chunks(2)
+        .filter(|pair| pair.len() == 2)
+        .map(|pair| (pair[0].as_str(), pair[1] == "1"))
+        .collect();
+    if mode != "0"
+        && let Some((grant, _)) = grants
+            .iter()
+            .find(|(grant, read_only)| *read_only && within(&resolved, grant))
+    {
+        return (
+            114,
+            String::new(),
+            format!("read-only extra path grant: {grant}\nresolved path: {resolved}\n"),
+        );
+    }
+    let allowed =
+        within(&resolved, root) || grants.iter().any(|(grant, _)| within(&resolved, grant));
+    if !allowed {
+        return (111, String::new(), format!("workspace escape: {resolved}"));
+    }
+    (0, resolved, String::new())
+}
+
+/// Like [`start_resolving`], but the resolver follows `symlinks` the way a real sandbox does.
+pub async fn start_resolving_links<F>(
+    kind: Resolver,
+    symlinks: Shared<HashMap<String, String>>,
+    handler: F,
+) -> MockServer
+where
+    F: Fn(&Recorded) -> MockResponse + Send + Sync + 'static,
+{
+    MockServer::start(move |request: &Recorded| {
+        if is_resolver_request(request) {
+            let links = symlinks.get();
+            let (code, out, err) = fake_resolve(&links, request);
+            return resolver_result(kind, code, &out, &err);
+        }
+        handler(request)
+    })
+    .await
+}

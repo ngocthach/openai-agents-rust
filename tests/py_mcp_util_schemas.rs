@@ -425,7 +425,6 @@ fn free_forms() -> Vec<Value> {
 }
 
 #[tokio::test]
-#[ignore = "cross-area: src/strict_schema.rs has no reject-open-objects mode (Python _reject_open_objects); expected to pass once added"]
 async fn free_form_object_argument_falls_back_to_non_strict() {
     for free in free_forms() {
         let schema = json!({"type": "object",
@@ -436,7 +435,6 @@ async fn free_form_object_argument_falls_back_to_non_strict() {
 }
 
 #[tokio::test]
-#[ignore = "cross-area: src/strict_schema.rs has no reject-open-objects mode (Python _reject_open_objects); expected to pass once added"]
 async fn free_form_root_falls_back_to_non_strict() {
     for schema in free_forms() {
         let f = convert(schema.clone(), true).await;
@@ -448,7 +446,6 @@ async fn free_form_root_falls_back_to_non_strict() {
 }
 
 #[tokio::test]
-#[ignore = "cross-area: src/strict_schema.rs has no reject-open-objects mode (Python _reject_open_objects); expected to pass once added"]
 async fn free_form_object_in_array_items_and_supported_nodes() {
     assert_non_strict_original(
         json!({"type": "object", "properties": {"entries": {"type": "array",
@@ -483,7 +480,6 @@ async fn strictable_closed_and_shaped_objects_stay_strict() {
 }
 
 #[tokio::test]
-#[ignore = "cross-area: src/strict_schema.rs has no reject-open-objects mode (Python _reject_open_objects); expected to pass once added"]
 async fn advanced_open_root_and_nullable_root_fall_back() {
     for schema in [
         json!({"type": "object", "allOf": [{"type": "object", "properties": {"value": {"type": "string"}}}]}),
@@ -498,7 +494,6 @@ async fn advanced_open_root_and_nullable_root_fall_back() {
 }
 
 #[tokio::test]
-#[ignore = "cross-area: src/strict_schema.rs has no reject-open-objects mode (Python _reject_open_objects); expected to pass once added"]
 async fn preserved_pure_refs_fall_back_to_non_strict() {
     for (r, defs) in [
         ("#/$defs/value", json!({"value": {"type": "string"}})),

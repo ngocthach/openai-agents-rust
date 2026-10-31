@@ -330,9 +330,11 @@ fn created_sandbox() -> Value {
 /// public traffic, and a pause-on-timeout sandbox carries the auto-resume lifecycle.
 #[tokio::test]
 async fn e2b_client_create_enables_public_traffic_for_exposed_ports() {
-    let server = MockServer::start(move |request| match request.path.as_str() {
-        "/v2/sandboxes" => MockResponse::json(created_sandbox()),
-        _ => MockResponse::json(json!({})),
+    let server = support::start_resolving(support::Resolver::E2b, move |request| {
+        match request.path.as_str() {
+            "/v2/sandboxes" => MockResponse::json(created_sandbox()),
+            _ => MockResponse::json(json!({})),
+        }
     })
     .await;
 
@@ -358,7 +360,10 @@ async fn e2b_client_create_enables_public_traffic_for_exposed_ports() {
 /// auto-paused and carries no auto-resume lifecycle.
 #[tokio::test]
 async fn e2b_client_create_omits_auto_resume_for_kill_timeout() {
-    let server = MockServer::start(move |_| MockResponse::json(created_sandbox())).await;
+    let server = support::start_resolving(support::Resolver::E2b, move |_| {
+        MockResponse::json(created_sandbox())
+    })
+    .await;
 
     let client = E2BSandboxClient::with_options(
         E2BSandboxClientOptions::new()
@@ -379,7 +384,10 @@ async fn e2b_client_create_omits_auto_resume_for_kill_timeout() {
 /// unchanged, including the nested per-server options.
 #[tokio::test]
 async fn e2b_client_create_passes_mcp_config() {
-    let server = MockServer::start(move |_| MockResponse::json(created_sandbox())).await;
+    let server = support::start_resolving(support::Resolver::E2b, move |_| {
+        MockResponse::json(created_sandbox())
+    })
+    .await;
 
     let client = E2BSandboxClient::with_options(
         E2BSandboxClientOptions::new()
@@ -416,7 +424,10 @@ async fn e2b_client_create_passes_mcp_config() {
 /// The create body carries the template, timeout, metadata and the merged environment.
 #[tokio::test]
 async fn e2b_client_create_sends_the_template_metadata_and_environment() {
-    let server = MockServer::start(move |_| MockResponse::json(created_sandbox())).await;
+    let server = support::start_resolving(support::Resolver::E2b, move |_| {
+        MockResponse::json(created_sandbox())
+    })
+    .await;
 
     let client = E2BSandboxClient::with_options(
         E2BSandboxClientOptions::new()
@@ -454,7 +465,10 @@ async fn e2b_client_create_defaults_the_template_to_the_sandbox_type() {
         (E2BSandboxType::E2B, "base"),
         (E2BSandboxType::CodeInterpreter, "code-interpreter-v1"),
     ] {
-        let server = MockServer::start(move |_| MockResponse::json(created_sandbox())).await;
+        let server = support::start_resolving(support::Resolver::E2b, move |_| {
+            MockResponse::json(created_sandbox())
+        })
+        .await;
         let client = E2BSandboxClient::with_options(
             E2BSandboxClientOptions::new()
                 .with_api_key("e2b_test")
@@ -490,7 +504,7 @@ fn session_handler(stdout: &'static str, exit_code: i64) -> impl Fn(&Recorded) -
 /// from `/`, and only then do commands run with the root as their `cwd`.
 #[tokio::test]
 async fn e2b_start_prepares_workspace_root_for_command_cwd() {
-    let server = MockServer::start(session_handler("", 0)).await;
+    let server = support::start_resolving(support::Resolver::E2b, session_handler("", 0)).await;
     let session = client(&server.base_url).create(None).await.expect("create");
 
     session.start().await.expect("start");
@@ -504,7 +518,11 @@ async fn e2b_start_prepares_workspace_root_for_command_cwd() {
     assert_eq!(make_dir.header("e2b-sandbox-id"), Some("sb-123"));
     assert_eq!(make_dir.header("x-access-token"), Some("envd-token"));
 
-    let starts = start_requests(&server);
+    // The path resolver's own probe is not one of the commands under test.
+    let starts: Vec<Recorded> = start_requests(&server)
+        .into_iter()
+        .filter(|request| !support::is_resolver_request(request))
+        .collect();
     assert_eq!(start_command(&starts[0]), "mkdir -p -- /workspace");
     assert_eq!(start_request(&starts[0])["process"]["cwd"], "/");
     assert_eq!(start_command(&starts[1]), "pwd");
@@ -515,7 +533,7 @@ async fn e2b_start_prepares_workspace_root_for_command_cwd() {
 /// `test_e2b_start_raises_on_nonzero_workspace_root_setup_exit`
 #[tokio::test]
 async fn e2b_start_raises_on_nonzero_workspace_root_setup_exit() {
-    let server = MockServer::start(session_handler("", 2)).await;
+    let server = support::start_resolving(support::Resolver::E2b, session_handler("", 2)).await;
     let session = client(&server.base_url).create(None).await.expect("create");
 
     let error = session.start().await.expect_err("the root setup failed");
@@ -532,14 +550,18 @@ async fn e2b_start_raises_on_nonzero_workspace_root_setup_exit() {
 /// A filesystem API that refuses the root fails `start` rather than running commands blind.
 #[tokio::test]
 async fn e2b_start_raises_when_the_filesystem_api_refuses_the_root() {
-    let server = MockServer::start(move |request: &Recorded| match request.path.as_str() {
-        "/v2/sandboxes" => MockResponse::json(created_sandbox()),
-        "/filesystem.Filesystem/MakeDir" => {
-            MockResponse::status(500, json!({ "code": "internal", "message": "nope" }))
-        }
-        _ => MockResponse::json(json!({})),
-    })
-    .await;
+    let server =
+        support::start_resolving(
+            support::Resolver::E2b,
+            move |request: &Recorded| match request.path.as_str() {
+                "/v2/sandboxes" => MockResponse::json(created_sandbox()),
+                "/filesystem.Filesystem/MakeDir" => {
+                    MockResponse::status(500, json!({ "code": "internal", "message": "nope" }))
+                }
+                _ => MockResponse::json(json!({})),
+            },
+        )
+        .await;
     let session = client(&server.base_url).create(None).await.expect("create");
 
     let error = session
@@ -561,7 +583,7 @@ async fn e2b_start_raises_when_the_filesystem_api_refuses_the_root() {
 /// and carries the session environment.
 #[tokio::test]
 async fn e2b_exec_uses_the_manifest_root_and_session_environment() {
-    let server = MockServer::start(session_handler("out", 0)).await;
+    let server = support::start_resolving(support::Resolver::E2b, session_handler("out", 0)).await;
     let options = E2BSandboxClientOptions::new()
         .with_api_key("e2b_test")
         .with_api_base_url(&server.base_url)
@@ -595,7 +617,7 @@ async fn e2b_exec_uses_the_manifest_root_and_session_environment() {
 async fn e2b_exec_sends_the_user_as_basic_auth_rather_than_sudo() {
     use openai_agents_sdk::sandbox::types::User;
 
-    let server = MockServer::start(session_handler("", 0)).await;
+    let server = support::start_resolving(support::Resolver::E2b, session_handler("", 0)).await;
     let session = client(&server.base_url).create(None).await.expect("create");
 
     session
@@ -616,7 +638,7 @@ async fn e2b_exec_sends_the_user_as_basic_auth_rather_than_sudo() {
 /// A command that envd reports as failing keeps its exit code rather than raising.
 #[tokio::test]
 async fn e2b_exec_reports_a_nonzero_exit_code() {
-    let server = MockServer::start(session_handler("", 3)).await;
+    let server = support::start_resolving(support::Resolver::E2b, session_handler("", 3)).await;
     let session = client(&server.base_url).create(None).await.expect("create");
 
     let result = session
@@ -633,15 +655,19 @@ async fn e2b_exec_reports_a_nonzero_exit_code() {
 /// that keeps the provider's own message.
 #[tokio::test]
 async fn e2b_exec_transport_preserves_provider_details() {
-    let server = MockServer::start(move |request: &Recorded| match request.path.as_str() {
-        "/v2/sandboxes" => MockResponse::json(created_sandbox()),
-        "/process.Process/Start" => MockResponse::status(
-            502,
-            json!({ "code": "unavailable", "message": "sandbox gone" }),
-        ),
-        _ => MockResponse::json(json!({})),
-    })
-    .await;
+    let server =
+        support::start_resolving(
+            support::Resolver::E2b,
+            move |request: &Recorded| match request.path.as_str() {
+                "/v2/sandboxes" => MockResponse::json(created_sandbox()),
+                "/process.Process/Start" => MockResponse::status(
+                    502,
+                    json!({ "code": "unavailable", "message": "sandbox gone" }),
+                ),
+                _ => MockResponse::json(json!({})),
+            },
+        )
+        .await;
     let session = client(&server.base_url).create(None).await.expect("create");
 
     let error = session
@@ -658,18 +684,22 @@ async fn e2b_exec_transport_preserves_provider_details() {
 /// exit code is simply not known.
 #[tokio::test]
 async fn e2b_exec_refuses_a_stream_without_an_end_event() {
-    let server = MockServer::start(move |request: &Recorded| match request.path.as_str() {
-        "/v2/sandboxes" => MockResponse::json(created_sandbox()),
-        "/process.Process/Start" => MockResponse {
-            status: 200,
-            content_type: "application/connect+json",
-            body: connect_frame(0, json!({ "event": { "start": { "pid": 1 } } })),
-            stream: Vec::new(),
-            headers: Vec::new(),
-        },
-        _ => MockResponse::json(json!({})),
-    })
-    .await;
+    let server =
+        support::start_resolving(
+            support::Resolver::E2b,
+            move |request: &Recorded| match request.path.as_str() {
+                "/v2/sandboxes" => MockResponse::json(created_sandbox()),
+                "/process.Process/Start" => MockResponse {
+                    status: 200,
+                    content_type: "application/connect+json",
+                    body: connect_frame(0, json!({ "event": { "start": { "pid": 1 } } })),
+                    stream: Vec::new(),
+                    headers: Vec::new(),
+                },
+                _ => MockResponse::json(json!({})),
+            },
+        )
+        .await;
     let session = client(&server.base_url).create(None).await.expect("create");
 
     let error = session
@@ -690,22 +720,26 @@ async fn e2b_exec_refuses_a_stream_without_an_end_event() {
 /// `ExecTimeout`, and the message names the command and the limit.
 #[tokio::test]
 async fn e2b_exec_timeout_preserves_provider_details() {
-    let server = MockServer::start(move |request: &Recorded| match request.path.as_str() {
-        "/v2/sandboxes" => MockResponse::json(created_sandbox()),
-        // The body never finishes, so the client's own timeout has to fire.
-        "/process.Process/Start" => MockResponse::streamed(
-            "application/connect+json",
-            vec![
-                (
-                    connect_frame(0, json!({ "event": { "start": { "pid": 1 } } })),
-                    0,
+    let server =
+        support::start_resolving(
+            support::Resolver::E2b,
+            move |request: &Recorded| match request.path.as_str() {
+                "/v2/sandboxes" => MockResponse::json(created_sandbox()),
+                // The body never finishes, so the client's own timeout has to fire.
+                "/process.Process/Start" => MockResponse::streamed(
+                    "application/connect+json",
+                    vec![
+                        (
+                            connect_frame(0, json!({ "event": { "start": { "pid": 1 } } })),
+                            0,
+                        ),
+                        (Vec::new(), 5_000),
+                    ],
                 ),
-                (Vec::new(), 5_000),
-            ],
-        ),
-        _ => MockResponse::json(json!({})),
-    })
-    .await;
+                _ => MockResponse::json(json!({})),
+            },
+        )
+        .await;
     let session = client(&server.base_url).create(None).await.expect("create");
 
     let error = session
@@ -727,17 +761,21 @@ async fn e2b_exec_timeout_preserves_provider_details() {
 /// contract is `mkdir -p` and `rm -f`, which is what the vendor SDK gives Python.
 #[tokio::test]
 async fn e2b_tolerates_an_existing_directory_and_a_missing_path() {
-    let server = MockServer::start(move |request: &Recorded| match request.path.as_str() {
-        "/v2/sandboxes" => MockResponse::json(created_sandbox()),
-        "/filesystem.Filesystem/MakeDir" => {
-            MockResponse::status(409, json!({ "code": "already_exists" }))
-        }
-        "/filesystem.Filesystem/Remove" => {
-            MockResponse::status(404, json!({ "code": "not_found" }))
-        }
-        _ => MockResponse::json(json!({})),
-    })
-    .await;
+    let server =
+        support::start_resolving(
+            support::Resolver::E2b,
+            move |request: &Recorded| match request.path.as_str() {
+                "/v2/sandboxes" => MockResponse::json(created_sandbox()),
+                "/filesystem.Filesystem/MakeDir" => {
+                    MockResponse::status(409, json!({ "code": "already_exists" }))
+                }
+                "/filesystem.Filesystem/Remove" => {
+                    MockResponse::status(404, json!({ "code": "not_found" }))
+                }
+                _ => MockResponse::json(json!({})),
+            },
+        )
+        .await;
     let session = client(&server.base_url).create(None).await.expect("create");
 
     session
@@ -762,14 +800,18 @@ async fn e2b_tolerates_an_existing_directory_and_a_missing_path() {
 /// Any other filesystem error is still an error.
 #[tokio::test]
 async fn e2b_surfaces_a_filesystem_error_that_is_not_tolerated() {
-    let server = MockServer::start(move |request: &Recorded| match request.path.as_str() {
-        "/v2/sandboxes" => MockResponse::json(created_sandbox()),
-        "/filesystem.Filesystem/MakeDir" => {
-            MockResponse::status(403, json!({ "code": "permission_denied" }))
-        }
-        _ => MockResponse::json(json!({})),
-    })
-    .await;
+    let server =
+        support::start_resolving(
+            support::Resolver::E2b,
+            move |request: &Recorded| match request.path.as_str() {
+                "/v2/sandboxes" => MockResponse::json(created_sandbox()),
+                "/filesystem.Filesystem/MakeDir" => {
+                    MockResponse::status(403, json!({ "code": "permission_denied" }))
+                }
+                _ => MockResponse::json(json!({})),
+            },
+        )
+        .await;
     let session = client(&server.base_url).create(None).await.expect("create");
 
     let error = session
@@ -786,7 +828,7 @@ async fn e2b_surfaces_a_filesystem_error_that_is_not_tolerated() {
 #[tokio::test]
 async fn e2b_running_reads_the_platform_state() {
     for (state, expected) in [("running", true), ("paused", false)] {
-        let server = MockServer::start(move |request: &Recorded| {
+        let server = support::start_resolving(support::Resolver::E2b, move |request: &Recorded| {
             if request.method == "GET" {
                 MockResponse::json(json!({ "state": state }))
             } else {
@@ -805,7 +847,7 @@ async fn e2b_running_reads_the_platform_state() {
 /// A platform that cannot be reached reports "not running" rather than failing the caller.
 #[tokio::test]
 async fn e2b_running_reports_false_when_the_platform_refuses() {
-    let server = MockServer::start(move |request: &Recorded| {
+    let server = support::start_resolving(support::Resolver::E2b, move |request: &Recorded| {
         if request.method == "GET" {
             MockResponse::empty(503)
         } else {
@@ -823,7 +865,10 @@ async fn e2b_running_reports_false_when_the_platform_refuses() {
 /// and the configured domain, over TLS on 443, with no round trip.
 #[tokio::test]
 async fn e2b_resolve_exposed_port_uses_backend_host() {
-    let server = MockServer::start(move |_| MockResponse::json(created_sandbox())).await;
+    let server = support::start_resolving(support::Resolver::E2b, move |_| {
+        MockResponse::json(created_sandbox())
+    })
+    .await;
     let session = E2BSandboxClient::with_options(
         E2BSandboxClientOptions::new()
             .with_api_key("e2b_test")
@@ -847,7 +892,10 @@ async fn e2b_resolve_exposed_port_uses_backend_host() {
 /// A port that was never configured is refused, naming the ports that were.
 #[tokio::test]
 async fn e2b_resolve_exposed_port_refuses_an_unconfigured_port() {
-    let server = MockServer::start(move |_| MockResponse::json(created_sandbox())).await;
+    let server = support::start_resolving(support::Resolver::E2b, move |_| {
+        MockResponse::json(created_sandbox())
+    })
+    .await;
     let session = E2BSandboxClient::with_options(
         E2BSandboxClientOptions::new()
             .with_api_key("e2b_test")
@@ -881,14 +929,18 @@ fn resumable_state() -> SandboxSessionState {
 /// by id, and no replacement is created.
 #[tokio::test]
 async fn e2b_resume_reconnects_to_the_recorded_sandbox() {
-    let server = MockServer::start(move |request: &Recorded| match request.path.as_str() {
-        "/v2/sandboxes/sb-persisted/connect" => MockResponse::json(json!({
-            "sandboxID": "sb-persisted",
-            "envdAccessToken": "fresh-token",
-        })),
-        _ => MockResponse::json(created_sandbox()),
-    })
-    .await;
+    let server =
+        support::start_resolving(
+            support::Resolver::E2b,
+            move |request: &Recorded| match request.path.as_str() {
+                "/v2/sandboxes/sb-persisted/connect" => MockResponse::json(json!({
+                    "sandboxID": "sb-persisted",
+                    "envdAccessToken": "fresh-token",
+                })),
+                _ => MockResponse::json(created_sandbox()),
+            },
+        )
+        .await;
 
     let session = client(&server.base_url)
         .resume(&resumable_state(), Manifest::new())
@@ -914,12 +966,16 @@ async fn e2b_resume_reconnects_to_the_recorded_sandbox() {
 /// template, timeout and MCP servers.
 #[tokio::test]
 async fn e2b_resume_recreates_a_sandbox_that_cannot_be_reattached() {
-    let server = MockServer::start(move |request: &Recorded| match request.path.as_str() {
-        "/v2/sandboxes/sb-persisted/connect" => MockResponse::empty(404),
-        "/v2/sandboxes" => MockResponse::json(json!({ "sandboxID": "sb-recreated" })),
-        _ => MockResponse::json(json!({})),
-    })
-    .await;
+    let server =
+        support::start_resolving(
+            support::Resolver::E2b,
+            move |request: &Recorded| match request.path.as_str() {
+                "/v2/sandboxes/sb-persisted/connect" => MockResponse::empty(404),
+                "/v2/sandboxes" => MockResponse::json(json!({ "sandboxID": "sb-recreated" })),
+                _ => MockResponse::json(json!({})),
+            },
+        )
+        .await;
 
     let client = E2BSandboxClient::with_options(
         E2BSandboxClientOptions::new()
@@ -943,7 +999,10 @@ async fn e2b_resume_recreates_a_sandbox_that_cannot_be_reattached() {
 /// A state another backend wrote is refused before any request is made.
 #[tokio::test]
 async fn e2b_resume_rejects_a_foreign_backend_state() {
-    let server = MockServer::start(move |_| MockResponse::json(created_sandbox())).await;
+    let server = support::start_resolving(support::Resolver::E2b, move |_| {
+        MockResponse::json(created_sandbox())
+    })
+    .await;
     let state = SandboxSessionState::new("daytona", "session-1", "/workspace", &Manifest::new())
         .with_provider_id(Some("sb-1".to_string()));
 
@@ -960,7 +1019,10 @@ async fn e2b_resume_rejects_a_foreign_backend_state() {
 /// A state without a sandbox id cannot be resumed.
 #[tokio::test]
 async fn e2b_resume_requires_a_recorded_sandbox_id() {
-    let server = MockServer::start(move |_| MockResponse::json(created_sandbox())).await;
+    let server = support::start_resolving(support::Resolver::E2b, move |_| {
+        MockResponse::json(created_sandbox())
+    })
+    .await;
     let state = SandboxSessionState::new("e2b", "session-1", "/workspace", &Manifest::new());
 
     let error = client(&server.base_url)
@@ -992,12 +1054,16 @@ async fn e2b_persist_workspace_excludes_ephemeral_paths() {
     let archive = encoder.finish().expect("finish the gzip");
     let encoded = support::b64(&archive);
 
-    let server = MockServer::start(move |request: &Recorded| match request.path.as_str() {
-        "/v2/sandboxes" => MockResponse::json(created_sandbox()),
-        "/process.Process/Start" => process_stream(&encoded, 0),
-        _ => MockResponse::json(json!({})),
-    })
-    .await;
+    let server =
+        support::start_resolving(
+            support::Resolver::E2b,
+            move |request: &Recorded| match request.path.as_str() {
+                "/v2/sandboxes" => MockResponse::json(created_sandbox()),
+                "/process.Process/Start" => process_stream(&encoded, 0),
+                _ => MockResponse::json(json!({})),
+            },
+        )
+        .await;
     let manifest = Manifest::new().with_entry(
         "cache",
         openai_agents_sdk::sandbox::entries::Entry::dir().with_ephemeral(true),
@@ -1023,7 +1089,7 @@ async fn e2b_persist_workspace_excludes_ephemeral_paths() {
 /// `test_e2b_persist_workspace_raises_on_nonzero_snapshot_exit`
 #[tokio::test]
 async fn e2b_persist_workspace_raises_on_nonzero_snapshot_exit() {
-    let server = MockServer::start(session_handler("", 1)).await;
+    let server = support::start_resolving(support::Resolver::E2b, session_handler("", 1)).await;
     let session = client(&server.base_url).create(None).await.expect("create");
 
     let error = session
@@ -1044,7 +1110,7 @@ async fn e2b_persist_workspace_raises_on_nonzero_snapshot_exit() {
 /// session returns a reference to the platform snapshot instead of a tar.
 #[tokio::test]
 async fn e2b_persist_workspace_native_snapshot_returns_a_snapshot_reference() {
-    let server = MockServer::start(move |request: &Recorded| {
+    let server = support::start_resolving(support::Resolver::E2b, move |request: &Recorded| {
         if request.path.ends_with("/snapshots") {
             MockResponse::json(json!({ "snapshotID": "snap-123" }))
         } else {
@@ -1083,7 +1149,7 @@ async fn e2b_persist_workspace_native_snapshot_returns_a_snapshot_reference() {
 async fn e2b_hydrate_workspace_native_snapshot_recreates_from_the_snapshot_id() {
     // The first create backs the session; the second is the replacement built from the snapshot.
     let creates = support::Counter::new();
-    let server = MockServer::start(move |request: &Recorded| {
+    let server = support::start_resolving(support::Resolver::E2b, move |request: &Recorded| {
         if request.path.ends_with("/snapshots") {
             return MockResponse::json(json!({ "snapshotID": "snap-123" }));
         }
@@ -1137,7 +1203,7 @@ async fn e2b_hydrate_workspace_raises_on_nonzero_extract_exit() {
     }
     let archive = encoder.finish().expect("finish the gzip");
 
-    let server = MockServer::start(session_handler("", 1)).await;
+    let server = support::start_resolving(support::Resolver::E2b, session_handler("", 1)).await;
     let session = client(&server.base_url).create(None).await.expect("create");
 
     let error = session
@@ -1157,7 +1223,7 @@ async fn e2b_hydrate_workspace_raises_on_nonzero_extract_exit() {
 /// uploaded into the sandbox.
 #[tokio::test]
 async fn e2b_hydrate_workspace_refuses_an_invalid_archive() {
-    let server = MockServer::start(session_handler("", 0)).await;
+    let server = support::start_resolving(support::Resolver::E2b, session_handler("", 0)).await;
     let session = client(&server.base_url).create(None).await.expect("create");
 
     let error = session
@@ -1181,7 +1247,10 @@ async fn e2b_hydrate_workspace_refuses_an_invalid_archive() {
 /// A `stop` pauses the sandbox: a paused E2B sandbox keeps its filesystem and resumes by id.
 #[tokio::test]
 async fn e2b_stop_pauses_the_sandbox() {
-    let server = MockServer::start(move |_| MockResponse::json(created_sandbox())).await;
+    let server = support::start_resolving(support::Resolver::E2b, move |_| {
+        MockResponse::json(created_sandbox())
+    })
+    .await;
     let session = client(&server.base_url).create(None).await.expect("create");
 
     session.stop().await.expect("stop");
@@ -1194,7 +1263,7 @@ async fn e2b_stop_pauses_the_sandbox() {
 /// must not leak the sandbox, so shutdown kills it instead.
 #[tokio::test]
 async fn e2b_shutdown_falls_back_to_kill_when_the_pause_fails() {
-    let server = MockServer::start(move |request: &Recorded| {
+    let server = support::start_resolving(support::Resolver::E2b, move |request: &Recorded| {
         if request.path.ends_with("/pause") {
             MockResponse::status(500, json!({ "message": "cannot pause" }))
         } else {
@@ -1224,7 +1293,7 @@ async fn e2b_shutdown_falls_back_to_kill_when_the_pause_fails() {
 /// directly, and a kill that reports "already gone" is not an error.
 #[tokio::test]
 async fn e2b_shutdown_kills_directly_and_tolerates_a_missing_sandbox() {
-    let server = MockServer::start(move |request: &Recorded| {
+    let server = support::start_resolving(support::Resolver::E2b, move |request: &Recorded| {
         if request.method == "DELETE" {
             MockResponse::empty(404)
         } else {
@@ -1244,7 +1313,10 @@ async fn e2b_shutdown_kills_directly_and_tolerates_a_missing_sandbox() {
 /// Shutting down twice releases the sandbox exactly once.
 #[tokio::test]
 async fn e2b_shutdown_releases_the_sandbox_exactly_once() {
-    let server = MockServer::start(move |_| MockResponse::json(created_sandbox())).await;
+    let server = support::start_resolving(support::Resolver::E2b, move |_| {
+        MockResponse::json(created_sandbox())
+    })
+    .await;
     let session = client(&server.base_url).create(None).await.expect("create");
 
     session.shutdown().await.expect("shutdown");

@@ -772,11 +772,8 @@ async fn the_streamed_runner_batches_input_with_lazy_creation() {
     runner_batches_input(true, false).await;
 }
 
-/// Cross-area: `src/run_internal/mod.rs` (`save_session`, ~:1536) appends the input and the
-/// model output in one call, so 41 inputs + 1 reply is `[20, 20, 2]`. Python saves the input
-/// first and the reply afterwards (`[20, 20, 1, 1]`), so a failing model call still leaves the
-/// input stored.
-#[ignore = "cross-area: run_internal persists input and output in a single append"]
+/// Python saves the input first and the reply afterwards (`[20, 20, 1, 1]`), so a failing model
+/// call still leaves the input stored.
 #[tokio::test]
 async fn the_runner_persists_input_before_the_reply() {
     runner_batches_input(false, true).await;

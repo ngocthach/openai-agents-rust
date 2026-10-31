@@ -333,13 +333,9 @@ async fn local_shell_output_survives_run_state_resume() {
     }
 }
 
-// Cross-area divergence, not fixed here (RunState wire reader is another area's file):
-// `src/run_state/wire.rs` refuses an id-only `local_shell_call_output` in every schema with
-// "Run state has an invalid local_shell_call_output item". Python drops the item instead: the
-// current schema then fails the completed-invocation check ("... does not match a restored tool
-// call and output"), and the 1.13 schema resumes without replaying the pair. Un-ignore once the
-// reader drops the item the same way.
-#[ignore = "cross-area: run_state/wire.rs rejects id-only local_shell_call_output (Python drops it)"]
+// An id-only `local_shell_call_output` is dropped by the reader, as Python's strict model does:
+// the current schema then fails the completed-invocation check ("... does not match a restored
+// tool call and output"), and the 1.13 schema resumes without replaying the pair.
 #[tokio::test]
 async fn run_state_rejects_id_only_local_shell_output() {
     for version in SCHEMA_VERSIONS {

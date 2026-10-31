@@ -8,6 +8,9 @@
 //! through the server's socket, which is what a provider sees when a client lets go.
 #![cfg(feature = "sandbox")]
 
+#[path = "py_sandbox_support/mod.rs"]
+mod support;
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -133,6 +136,36 @@ async fn handle(
         .to_string();
 
     if !is_file(&method, &path) {
+        // Every read first runs the path resolver inside the sandbox; answer it in the
+        // provider's own wire format.
+        let content_length = head
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .unwrap_or(0);
+        let mut body = vec![0u8; content_length];
+        if content_length > 0 && stream.read_exact(&mut body).await.is_err() {
+            return;
+        }
+        if String::from_utf8_lossy(&body).contains("resolve-workspace-path") {
+            let kind = if path.ends_with("/process.Process/Start") {
+                Some(support::Resolver::E2b)
+            } else if path.starts_with("/v1/sandbox/") && path.ends_with("/exec") {
+                Some(support::Resolver::Cloudflare)
+            } else if path.contains("/process/session/") && path.ends_with("/exec") {
+                Some(support::Resolver::Daytona)
+            } else {
+                None
+            };
+            if let Some(kind) = kind {
+                let _ = support::write_response(&mut stream, support::resolver_reply(kind)).await;
+                return;
+            }
+        }
         let (status, body) = match control(&method, &path, base) {
             Some(json) => (200, json.to_string()),
             None => (404, "{}".to_string()),
@@ -289,6 +322,10 @@ fn blaxel_control(method: &str, path: &str, base: &str) -> Option<Value> {
         ("POST", "/v0/sandboxes") => Some(json!({
             "metadata": { "name": "agents-test", "url": base }, "status": "DEPLOYED"
         })),
+        // The workspace path resolver the session runs before each read.
+        ("POST", "/process") => {
+            Some(json!({ "exitCode": 0, "stdout": "/workspace/big.log\n", "stderr": "" }))
+        }
         _ => None,
     }
 }

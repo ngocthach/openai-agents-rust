@@ -901,6 +901,7 @@ async fn compaction_replaces_only_the_suffix_the_model_exchange_covers() {
             store: Some(true),
             has_local_tool_outputs: false,
             model_exchange: exchange_digests(&replaceable),
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -952,6 +953,7 @@ async fn compaction_retains_history_it_cannot_match_or_safely_split() {
             store: Some(true),
             has_local_tool_outputs: false,
             model_exchange: exchange_digests(&[InputItem::user("something else")]),
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -966,6 +968,7 @@ async fn compaction_retains_history_it_cannot_match_or_safely_split() {
             store: Some(true),
             has_local_tool_outputs: false,
             model_exchange: exchange_digests(&original[1..]),
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -998,6 +1001,7 @@ async fn compaction_refuses_to_split_a_pending_tool_call() {
             store: Some(true),
             has_local_tool_outputs: false,
             model_exchange: exchange_digests(&history[2..]),
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -1329,6 +1333,7 @@ async fn stores_without_the_snapshot_hook_require_complete_coverage() {
             store: Some(true),
             has_local_tool_outputs: false,
             model_exchange: exchange_digests(&history[2..]),
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -1343,6 +1348,7 @@ async fn stores_without_the_snapshot_hook_require_complete_coverage() {
             store: Some(true),
             has_local_tool_outputs: false,
             model_exchange: exchange_digests(&history),
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -1622,6 +1628,7 @@ async fn whole_history_compaction_reads_past_the_stores_own_limit() {
             store: Some(false),
             has_local_tool_outputs: false,
             model_exchange: exchange_digests(&history),
+            ..Default::default()
         })
         .await
         .unwrap();

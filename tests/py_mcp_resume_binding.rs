@@ -56,7 +56,6 @@ async fn approved_call_runs_on_the_original_recipient() {
 }
 
 #[tokio::test]
-#[ignore = "known cross-area divergence: RunState does not bind an approved MCP call to its server, so the call is re-resolved against whichever server now offers the tool (Python raises 'different recipient'); fix lives in src/run_state*/src/run_internal, not src/mcp"]
 async fn approval_is_rejected_when_the_recipient_changes() {
     // `test_mcp_recipient_survives_absent_tool_during_restore` (changed_recipient=True):
     // the tool moves to the other same-named server before the approved call resumes.
@@ -114,7 +113,6 @@ async fn rejected_call_continues_after_the_recipient_changes() {
 }
 
 #[tokio::test]
-#[ignore = "known cross-area divergence: a handoff named like an MCP tool makes get_all_function_tools fail with 'Duplicate tool names' even without include_server_in_tool_names (Python only reserves handoff names when prefixing) and the 'MCP tool call as a handoff' guard does not exist; fix lives in src/mcp/util.rs and src/run_internal"]
 async fn mcp_approval_cannot_authorize_a_handoff_with_the_same_name() {
     // `test_mcp_approval_cannot_authorize_handoff` (restore=False, streaming=False).
     openai_agents_sdk::set_tracing_disabled(true);

@@ -8,6 +8,9 @@
 
 #![cfg(feature = "sandbox")]
 
+#[path = "py_sandbox_support/mod.rs"]
+mod support;
+
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -150,6 +153,23 @@ impl MockResponse {
     }
 }
 
+/// The reply the in-sandbox path resolver gets, in the wire format of the provider `path` names.
+fn resolver_reply_for(path: &str, body: &[u8]) -> Option<support::MockResponse> {
+    if !String::from_utf8_lossy(body).contains("resolve-workspace-path") {
+        return None;
+    }
+    let kind = if path.ends_with("/process.Process/Start") {
+        support::Resolver::E2b
+    } else if path.starts_with("/v1/sandbox/") && path.ends_with("/exec") {
+        support::Resolver::Cloudflare
+    } else if path.contains("/process/session/") && path.ends_with("/exec") {
+        support::Resolver::Daytona
+    } else {
+        return None;
+    };
+    Some(support::resolver_reply(kind))
+}
+
 type Handler = Arc<dyn Fn(&RecordedRequest) -> MockResponse + Send + Sync>;
 
 struct MockServer {
@@ -175,7 +195,14 @@ impl MockServer {
                         return;
                     };
                     recorded.lock().unwrap().push(request.clone());
-                    let response = handler(&request);
+                    let response = match resolver_reply_for(&request.path, &request.body) {
+                        Some(reply) => MockResponse {
+                            status: reply.status,
+                            content_type: reply.content_type,
+                            chunks: vec![reply.body],
+                        },
+                        None => handler(&request),
+                    };
                     let length: usize = response.chunks.iter().map(Vec::len).sum();
                     let head = format!(
                         "HTTP/1.1 {} OK\r\nContent-Type: {}\r\nContent-Length: {}\r\n\

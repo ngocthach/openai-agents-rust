@@ -684,13 +684,23 @@ async fn the_latest_duplicate_output_is_saved_after_its_call() {
         "new",
     )
     .await;
+    // The caller's input is stored first, as Python's runner does, so its stale output stays
+    // where it was written; the call and the output the tool produced follow, in that order.
     let relevant: Vec<&Value> = saved
         .iter()
         .filter(|i| i["call_id"] == "call_ordered")
         .collect();
     let types: Vec<&str> = relevant.iter().filter_map(|i| i["type"].as_str()).collect();
-    assert_eq!(types, vec!["function_call", "function_call_output"]);
-    assert_eq!(relevant[1]["output"], "new");
+    assert_eq!(
+        types,
+        vec![
+            "function_call_output",
+            "function_call",
+            "function_call_output"
+        ]
+    );
+    assert_eq!(relevant[0]["output"], "old");
+    assert_eq!(relevant[2]["output"], "new");
 }
 
 /// Python: `test_save_result_to_session_keeps_tool_call_before_its_output`.
@@ -708,12 +718,22 @@ async fn a_replayed_call_stays_before_its_output() {
         "result",
     )
     .await;
+    // The caller's input is stored first, so the pair it supplied stays as written and the
+    // model's replayed call and its output follow as their own batch, call first.
     let types: Vec<&str> = saved
         .iter()
         .filter(|i| i["call_id"] == "call_ordered")
         .filter_map(|i| i["type"].as_str())
         .collect();
-    assert_eq!(types, vec!["function_call", "function_call_output"]);
+    assert_eq!(
+        types,
+        vec![
+            "function_call",
+            "function_call_output",
+            "function_call",
+            "function_call_output"
+        ]
+    );
 }
 
 /// Python: `test_save_result_to_session_does_not_increment_counter_when_nothing_saved`,

@@ -349,7 +349,6 @@ struct Gate {
 }
 
 #[tokio::test]
-#[ignore = "cross-area: src/mcp/mod.rs list_tools has no refresh generation, so invalidation during an in-flight refresh is lost (Python keeps the pre-invalidation snapshot in cached_tools and does not publish the stale refresh)"]
 async fn cache_invalidation_during_refresh_is_preserved() {
     let gate = Arc::new(Gate {
         started: tokio::sync::Notify::new(),
@@ -422,7 +421,6 @@ async fn cache_invalidation_during_refresh_is_preserved() {
 }
 
 #[tokio::test]
-#[ignore = "cross-area: src/mcp/mod.rs list_tools publishes whichever refresh finishes last; Python keeps the newer refresh's cache when an older one completes afterwards"]
 async fn older_concurrent_refresh_does_not_overwrite_newer_cache() {
     let gate = Arc::new(Gate {
         started: tokio::sync::Notify::new(),
@@ -471,7 +469,6 @@ async fn older_concurrent_refresh_does_not_overwrite_newer_cache() {
 }
 
 #[tokio::test]
-#[ignore = "cross-area: src/mcp/mod.rs list_tools has no refresh ordering; Python publishes an older refresh when the newer one failed"]
 async fn older_refresh_publishes_when_newer_refresh_fails() {
     let gate = Arc::new(Gate {
         started: tokio::sync::Notify::new(),

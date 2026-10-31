@@ -56,6 +56,15 @@ async fn start(behavior: Shared<Behavior>) -> MockServer {
                 Some(status) => MockResponse::error(status, "cannot delete"),
                 None => MockResponse::empty(204),
             },
+            // The path resolver every read, write and mkdir runs inside the sandbox first.
+            ("POST", "/process")
+                if String::from_utf8_lossy(&request.body)
+                    .contains("/tmp/openai-agents/bin/resolve-workspace-path") =>
+            {
+                MockResponse::json(json!({
+                    "exitCode": 0, "stdout": "/resolved\n", "stderr": "", "status": "completed",
+                }))
+            }
             ("POST", "/process") => match b.exec_status {
                 Some(status) => MockResponse::error(status, "exec failed"),
                 None => MockResponse::json(json!({
@@ -391,9 +400,10 @@ async fn blaxel_shutdown_pause_on_exit_keeps_the_sandbox() {
     server.stop();
 }
 
-/// `test_shutdown_delete_raises`
+/// `test_shutdown_delete_raises` and `test_shutdown_delete_logs_warning`: a failed delete is
+/// logged, not raised.
 #[tokio::test]
-async fn blaxel_shutdown_surfaces_a_delete_failure() {
+async fn blaxel_shutdown_suppresses_a_delete_failure() {
     let server = start(Shared::new(Behavior {
         delete_status: Some(500),
         ..Behavior::default()
@@ -401,7 +411,11 @@ async fn blaxel_shutdown_surfaces_a_delete_failure() {
     .await;
     let session = session(&server).await;
 
-    assert!(session.shutdown().await.is_err());
+    session
+        .shutdown()
+        .await
+        .expect("a failed delete is suppressed");
+    assert_eq!(server.count("DELETE", "/v0/sandboxes/agents-test"), 1);
     server.stop();
 }
 

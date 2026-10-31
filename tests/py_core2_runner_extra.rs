@@ -251,8 +251,8 @@ impl Session for RecordingSession {
 }
 
 /// Python: `test_session_add_items_called_multiple_times_for_multi_turn_completion`: the
-/// session is written once per turn, in order. Python writes the user input in its own first
-/// batch; Rust writes it together with the first turn's items (recorded difference).
+/// session is written once per turn, in order, after the user input has been written as its own
+/// first batch.
 #[tokio::test]
 async fn the_session_is_written_once_per_turn() {
     let model = setup();
@@ -310,7 +310,8 @@ async fn the_session_is_written_once_per_turn() {
     assert_eq!(
         shape,
         vec![
-            s(&["user", "function_call", "function_call_output"]),
+            s(&["user"]),
+            s(&["function_call", "function_call_output"]),
             s(&["function_call", "function_call_output"]),
             s(&["message"]),
         ]

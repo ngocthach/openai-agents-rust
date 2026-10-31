@@ -929,11 +929,7 @@ async fn a_recased_table_pair_is_the_same_pair() {
 async fn distinct_non_ascii_identifiers_are_distinct_pairs() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("non_ascii.db");
-    let first = custom(&path, "ßsessions", "ßmessages", true);
-    // Python accepts non-ASCII identifiers; Rust restricts custom table names to ASCII.
-    let Ok(first) = first else {
-        return;
-    };
+    let first = custom(&path, "ßsessions", "ßmessages", true).unwrap();
     first.add_items(vec![user("first")]).await.unwrap();
     let err = custom(&path, "sssessions", "ssmessages", true)
         .unwrap_err()

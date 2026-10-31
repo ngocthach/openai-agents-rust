@@ -393,7 +393,7 @@ fn commands(server: &MockServer) -> Vec<String> {
 /// the Daytona image's own home rather than the SDK-wide `/workspace` default.
 #[tokio::test]
 async fn daytona_create_uses_the_safe_default_workspace_root() {
-    let server = MockServer::start({
+    let server = support::start_resolving(support::Resolver::Daytona, {
         let base = String::new();
         move |request: &Recorded| {
             let _ = &base;
@@ -417,7 +417,7 @@ async fn daytona_create_uses_the_safe_default_workspace_root() {
 /// environment merged with the manifest's, plus the labels, target and resource request.
 #[tokio::test]
 async fn daytona_create_sends_the_environment_labels_and_resources() {
-    let server = MockServer::start(move |request: &Recorded| {
+    let server = support::start_resolving(support::Resolver::Daytona, move |request: &Recorded| {
         if request.path.starts_with("/sandbox") {
             MockResponse::json(json!({ "id": "sbx-daytona", "state": "started" }))
         } else {
@@ -479,14 +479,15 @@ async fn daytona_create_builds_from_an_image_or_a_named_snapshot() {
         (None, Some("ubuntu:24.04"), None),
         (Some("snap-1"), Some("ubuntu:24.04"), Some("snap-1")),
     ] {
-        let server = MockServer::start(move |request: &Recorded| {
-            if request.path.starts_with("/sandbox") {
-                MockResponse::json(json!({ "id": "sbx-daytona", "state": "started" }))
-            } else {
-                MockResponse::json(json!({}))
-            }
-        })
-        .await;
+        let server =
+            support::start_resolving(support::Resolver::Daytona, move |request: &Recorded| {
+                if request.path.starts_with("/sandbox") {
+                    MockResponse::json(json!({ "id": "sbx-daytona", "state": "started" }))
+                } else {
+                    MockResponse::json(json!({}))
+                }
+            })
+            .await;
         let mut options = DaytonaSandboxClientOptions::new()
             .with_api_key("dtn_test")
             .with_api_url(&server.base_url)
@@ -522,7 +523,7 @@ async fn daytona_create_builds_from_an_image_or_a_named_snapshot() {
 /// A sandbox that never becomes ready fails the create with a start error naming the budget.
 #[tokio::test]
 async fn daytona_create_fails_when_the_sandbox_never_starts() {
-    let server = MockServer::start(move |request: &Recorded| {
+    let server = support::start_resolving(support::Resolver::Daytona, move |request: &Recorded| {
         if request.path.starts_with("/sandbox") {
             MockResponse::json(json!({ "id": "sbx-daytona", "state": "creating" }))
         } else {
@@ -555,14 +556,15 @@ async fn daytona_create_fails_when_the_sandbox_never_starts() {
 #[tokio::test]
 async fn daytona_create_fails_fast_on_an_error_state() {
     for state in ["error", "build_failed"] {
-        let server = MockServer::start(move |request: &Recorded| {
-            if request.path.starts_with("/sandbox") {
-                MockResponse::json(json!({ "id": "sbx-daytona", "state": state }))
-            } else {
-                MockResponse::json(json!({}))
-            }
-        })
-        .await;
+        let server =
+            support::start_resolving(support::Resolver::Daytona, move |request: &Recorded| {
+                if request.path.starts_with("/sandbox") {
+                    MockResponse::json(json!({ "id": "sbx-daytona", "state": state }))
+                } else {
+                    MockResponse::json(json!({}))
+                }
+            })
+            .await;
 
         let error = client(&server.base_url)
             .create(None)
@@ -599,7 +601,7 @@ async fn daytona_rejects_a_missing_api_key() {
 /// root from `/` before anything else runs in it.
 #[tokio::test]
 async fn daytona_start_prepares_the_workspace_root_first() {
-    let server = MockServer::start({
+    let server = support::start_resolving(support::Resolver::Daytona, {
         let base = String::new();
         move |request: &Recorded| {
             let _ = &base;
@@ -643,7 +645,7 @@ async fn daytona_start_prepares_the_workspace_root_first() {
 /// `test_start_wraps_workspace_root_prepare_failure`
 #[tokio::test]
 async fn daytona_start_wraps_a_workspace_root_prepare_failure() {
-    let server = MockServer::start({
+    let server = support::start_resolving(support::Resolver::Daytona, {
         move |request: &Recorded| {
             let path = request.path.as_str();
             if path == "/sandbox" || path == "/sandbox/sbx-daytona" {
@@ -680,7 +682,9 @@ async fn daytona_start_wraps_a_workspace_root_prepare_failure() {
 /// string, so the working directory and the environment are expressed in the command itself.
 #[tokio::test]
 async fn daytona_exec_merges_the_environment_into_the_command() {
-    let server = MockServer::start(handler(String::new(), "out", 0)).await;
+    let server =
+        support::start_resolving(support::Resolver::Daytona, handler(String::new(), "out", 0))
+            .await;
     let session = DaytonaSandboxClient::with_options(
         DaytonaSandboxClientOptions::new()
             .with_api_key("dtn_test")
@@ -716,7 +720,7 @@ async fn daytona_exec_merges_the_environment_into_the_command() {
 /// round trip, which is the reason each command gets its own toolbox session.
 #[tokio::test]
 async fn daytona_exec_preserves_stdout_and_stderr() {
-    let server = MockServer::start(move |request: &Recorded| {
+    let server = support::start_resolving(support::Resolver::Daytona, move |request: &Recorded| {
         let path = request.path.as_str();
         if path == "/sandbox" || path == "/sandbox/sbx-daytona" {
             return MockResponse::json(json!({ "id": "sbx-daytona", "state": "started" }));
@@ -749,7 +753,8 @@ async fn daytona_exec_preserves_stdout_and_stderr() {
 async fn daytona_exec_keeps_the_sudo_wrapper_for_a_user() {
     use openai_agents_sdk::sandbox::types::User;
 
-    let server = MockServer::start(handler(String::new(), "", 0)).await;
+    let server =
+        support::start_resolving(support::Resolver::Daytona, handler(String::new(), "", 0)).await;
     let session = client(&server.base_url).create(None).await.expect("create");
 
     session
@@ -766,7 +771,7 @@ async fn daytona_exec_keeps_the_sudo_wrapper_for_a_user() {
 /// `ExecTimeout` naming the command, and the throwaway toolbox session is still cleaned up.
 #[tokio::test]
 async fn daytona_exec_enforces_a_subsecond_caller_timeout() {
-    let server = MockServer::start(move |request: &Recorded| {
+    let server = support::start_resolving(support::Resolver::Daytona, move |request: &Recorded| {
         let path = request.path.as_str();
         if path == "/sandbox" || path == "/sandbox/sbx-daytona" {
             return MockResponse::json(json!({ "id": "sbx-daytona", "state": "started" }));
@@ -802,7 +807,7 @@ async fn daytona_exec_enforces_a_subsecond_caller_timeout() {
 /// Reads and writes go through the toolbox files API with the resolved absolute path.
 #[tokio::test]
 async fn daytona_reads_and_writes_through_the_toolbox_files_api() {
-    let server = MockServer::start(move |request: &Recorded| {
+    let server = support::start_resolving(support::Resolver::Daytona, move |request: &Recorded| {
         let path = request.path.as_str();
         if path == "/sandbox" || path == "/sandbox/sbx-daytona" {
             return MockResponse::json(json!({ "id": "sbx-daytona", "state": "started" }));
@@ -848,7 +853,7 @@ async fn daytona_reads_and_writes_through_the_toolbox_files_api() {
 /// A missing file is a `WorkspaceReadNotFound`, not a transport error.
 #[tokio::test]
 async fn daytona_read_reports_a_missing_file() {
-    let server = MockServer::start(move |request: &Recorded| {
+    let server = support::start_resolving(support::Resolver::Daytona, move |request: &Recorded| {
         let path = request.path.as_str();
         if path == "/sandbox" || path == "/sandbox/sbx-daytona" {
             return MockResponse::json(json!({ "id": "sbx-daytona", "state": "started" }));
@@ -875,7 +880,8 @@ async fn daytona_read_reports_a_missing_file() {
 /// root is refused before any request is made.
 #[tokio::test]
 async fn daytona_rejects_paths_outside_the_workspace_root() {
-    let server = MockServer::start(handler(String::new(), "", 0)).await;
+    let server =
+        support::start_resolving(support::Resolver::Daytona, handler(String::new(), "", 0)).await;
     let session = client(&server.base_url)
         .create(Some(Manifest::new().with_root("/workspace")))
         .await
@@ -911,22 +917,23 @@ async fn daytona_rejects_paths_outside_the_workspace_root() {
 async fn daytona_running_reads_the_platform_state() {
     for (state, expected) in [("started", true), ("stopped", false)] {
         let gets = support::Counter::new();
-        let server = MockServer::start(move |request: &Recorded| {
-            if request.path == "/sandbox" {
-                return MockResponse::json(json!({ "id": "sbx-daytona", "state": "started" }));
-            }
-            if request.path == "/sandbox/sbx-daytona" {
-                // The first read is the create poll; later reads are the one under test.
-                let state = if gets.next("get") == 0 {
-                    "started"
-                } else {
-                    state
-                };
-                return MockResponse::json(json!({ "id": "sbx-daytona", "state": state }));
-            }
-            MockResponse::json(json!({}))
-        })
-        .await;
+        let server =
+            support::start_resolving(support::Resolver::Daytona, move |request: &Recorded| {
+                if request.path == "/sandbox" {
+                    return MockResponse::json(json!({ "id": "sbx-daytona", "state": "started" }));
+                }
+                if request.path == "/sandbox/sbx-daytona" {
+                    // The first read is the create poll; later reads are the one under test.
+                    let state = if gets.next("get") == 0 {
+                        "started"
+                    } else {
+                        state
+                    };
+                    return MockResponse::json(json!({ "id": "sbx-daytona", "state": state }));
+                }
+                MockResponse::json(json!({}))
+            })
+            .await;
         let session = client(&server.base_url).create(None).await.expect("create");
 
         assert_eq!(session.running().await.expect("running"), expected);
@@ -942,7 +949,7 @@ async fn daytona_running_reads_the_platform_state() {
 /// signed preview URL, whose signature lives in the query.
 #[tokio::test]
 async fn daytona_resolve_exposed_port_uses_a_signed_preview_url() {
-    let server = MockServer::start(move |request: &Recorded| {
+    let server = support::start_resolving(support::Resolver::Daytona, move |request: &Recorded| {
         if request.path.contains("/signed-preview-url") {
             return MockResponse::json(json!({
                 "url": "https://8080-sbx-daytona.proxy.daytona.test/?token=signed",
@@ -982,13 +989,14 @@ async fn daytona_resolve_exposed_port_uses_a_signed_preview_url() {
 #[tokio::test]
 async fn daytona_resolve_exposed_port_rejects_an_invalid_preview_url() {
     for url in ["", "not a url"] {
-        let server = MockServer::start(move |request: &Recorded| {
-            if request.path.contains("/signed-preview-url") {
-                return MockResponse::json(json!({ "url": url }));
-            }
-            MockResponse::json(json!({ "id": "sbx-daytona", "state": "started" }))
-        })
-        .await;
+        let server =
+            support::start_resolving(support::Resolver::Daytona, move |request: &Recorded| {
+                if request.path.contains("/signed-preview-url") {
+                    return MockResponse::json(json!({ "url": url }));
+                }
+                MockResponse::json(json!({ "id": "sbx-daytona", "state": "started" }))
+            })
+            .await;
         let session = DaytonaSandboxClient::with_options(
             DaytonaSandboxClientOptions::new()
                 .with_api_key("dtn_test")
@@ -1029,7 +1037,7 @@ fn resumable_state() -> SandboxSessionState {
 #[tokio::test]
 async fn daytona_resume_restarts_a_stopped_sandbox() {
     let states = support::Counter::new();
-    let server = MockServer::start(move |request: &Recorded| {
+    let server = support::start_resolving(support::Resolver::Daytona, move |request: &Recorded| {
         if request.path == "/sandbox/sbx-daytona" && request.method == "GET" {
             // The first read reports the stopped sandbox; later reads see it started.
             // Reads 0 and 1 are the resume lookup and the stopped-check.
@@ -1064,7 +1072,7 @@ async fn daytona_resume_restarts_a_stopped_sandbox() {
 /// A sandbox that is already running is not restarted.
 #[tokio::test]
 async fn daytona_resume_leaves_a_running_sandbox_alone() {
-    let server = MockServer::start(move |_| {
+    let server = support::start_resolving(support::Resolver::Daytona, move |_| {
         MockResponse::json(json!({ "id": "sbx-daytona", "state": "started" }))
     })
     .await;
@@ -1085,7 +1093,7 @@ async fn daytona_resume_leaves_a_running_sandbox_alone() {
 /// be read is replaced through the ordinary create path.
 #[tokio::test]
 async fn daytona_resume_recreates_a_sandbox_that_cannot_be_read() {
-    let server = MockServer::start(move |request: &Recorded| {
+    let server = support::start_resolving(support::Resolver::Daytona, move |request: &Recorded| {
         if request.method == "GET" && request.path == "/sandbox/sbx-daytona" {
             return MockResponse::empty(404);
         }
@@ -1109,7 +1117,10 @@ async fn daytona_resume_recreates_a_sandbox_that_cannot_be_read() {
 /// A state another backend wrote is refused before any request is made.
 #[tokio::test]
 async fn daytona_resume_rejects_a_foreign_backend_state() {
-    let server = MockServer::start(move |_| MockResponse::json(json!({}))).await;
+    let server = support::start_resolving(support::Resolver::Daytona, move |_| {
+        MockResponse::json(json!({}))
+    })
+    .await;
     let state = SandboxSessionState::new("e2b", "session-1", "/workspace", &Manifest::new())
         .with_provider_id(Some("sbx-1".to_string()));
 
@@ -1126,7 +1137,10 @@ async fn daytona_resume_rejects_a_foreign_backend_state() {
 /// A state without a sandbox id cannot be resumed.
 #[tokio::test]
 async fn daytona_resume_requires_a_recorded_sandbox_id() {
-    let server = MockServer::start(move |_| MockResponse::json(json!({}))).await;
+    let server = support::start_resolving(support::Resolver::Daytona, move |_| {
+        MockResponse::json(json!({}))
+    })
+    .await;
     let state = SandboxSessionState::new(
         "daytona",
         "session-1",
@@ -1150,7 +1164,8 @@ async fn daytona_resume_requires_a_recorded_sandbox_id() {
 /// filesystem and can be started again by id.
 #[tokio::test]
 async fn daytona_stop_stops_the_sandbox_without_deleting_it() {
-    let server = MockServer::start(handler(String::new(), "", 0)).await;
+    let server =
+        support::start_resolving(support::Resolver::Daytona, handler(String::new(), "", 0)).await;
     let session = client(&server.base_url).create(None).await.expect("create");
 
     session.stop().await.expect("stop");
@@ -1163,7 +1178,8 @@ async fn daytona_stop_stops_the_sandbox_without_deleting_it() {
 /// A `shutdown` deletes the sandbox, exactly once however often it is called.
 #[tokio::test]
 async fn daytona_shutdown_deletes_the_sandbox_exactly_once() {
-    let server = MockServer::start(handler(String::new(), "", 0)).await;
+    let server =
+        support::start_resolving(support::Resolver::Daytona, handler(String::new(), "", 0)).await;
     let session = client(&server.base_url).create(None).await.expect("create");
 
     session.shutdown().await.expect("shutdown");
@@ -1176,7 +1192,8 @@ async fn daytona_shutdown_deletes_the_sandbox_exactly_once() {
 /// With `pause_on_exit` the sandbox is stopped rather than deleted, so a later run can resume it.
 #[tokio::test]
 async fn daytona_shutdown_stops_the_sandbox_when_pause_on_exit_is_set() {
-    let server = MockServer::start(handler(String::new(), "", 0)).await;
+    let server =
+        support::start_resolving(support::Resolver::Daytona, handler(String::new(), "", 0)).await;
     let session = DaytonaSandboxClient::with_options(
         DaytonaSandboxClientOptions::new()
             .with_api_key("dtn_test")

@@ -68,7 +68,7 @@ async fn pretty_run_result_streaming() {
          - Current agent: Agent(name=\"test_agent\", ...)\n\
          - Current turn: 1\n\
          - Max turns: 10\n\
-         - Is complete: true\n\
+         - Is complete: True\n\
          - Final output (str):\n\
          \x20   Hi there\n\
          - 1 new item(s)\n\

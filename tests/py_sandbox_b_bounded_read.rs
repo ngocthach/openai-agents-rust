@@ -10,6 +10,9 @@
 //! counterpart.
 #![cfg(feature = "sandbox")]
 
+#[path = "py_sandbox_support/mod.rs"]
+mod support;
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -89,6 +92,45 @@ async fn serve(
                 );
                 let path = target.split('?').next().unwrap_or("").to_string();
                 if !is_file(&method, &path) {
+                    // Every read first runs the path resolver inside the sandbox; answer it in
+                    // the provider's own wire format.
+                    let head_end = buffer[..read]
+                        .windows(4)
+                        .position(|w| w == b"\r\n\r\n")
+                        .map(|at| at + 4)
+                        .unwrap_or(read);
+                    let content_length = head
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                        .unwrap_or(0);
+                    let mut body = buffer[head_end..read].to_vec();
+                    while body.len() < content_length {
+                        let mut more = vec![0u8; content_length - body.len()];
+                        match stream.read(&mut more).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => body.extend_from_slice(&more[..n]),
+                        }
+                    }
+                    if String::from_utf8_lossy(&body).contains("resolve-workspace-path") {
+                        let kind = if path.ends_with("/process.Process/Start") {
+                            Some(support::Resolver::E2b)
+                        } else if path.contains("/process/session/") && path.ends_with("/exec") {
+                            Some(support::Resolver::Daytona)
+                        } else {
+                            None
+                        };
+                        if let Some(kind) = kind {
+                            let _ =
+                                support::write_response(&mut stream, support::resolver_reply(kind))
+                                    .await;
+                            return;
+                        }
+                    }
                     let body = control(&method, &path, &base)
                         .map(|v| v.to_string())
                         .unwrap_or_else(|| json!({"message": "unexpected"}).to_string());
