@@ -76,7 +76,8 @@ use super::ports::{
     exposed_port_unavailable,
 };
 use crate::sandbox::http::{
-    bounded_read_zero, expect_success, http_error, parse_json, read_body_prefix, transport,
+    as_archive_read, bounded_read_zero, expect_success, http_error, parse_json, read_body_prefix,
+    read_status_error, status_is_retryable, transport,
 };
 
 pub mod mounts;
@@ -163,7 +164,7 @@ fn decode_snapshot_ref(raw: &[u8]) -> Option<String> {
 }
 
 /// How a session persists its workspace into a [`Snapshot`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum WorkspacePersistence {
     /// Archive the workspace with `tar`, so the bytes are portable across backends.
     #[default]
@@ -174,7 +175,7 @@ pub enum WorkspacePersistence {
 
 /// One rewrite applied to a request that matched a domain. Mirrors
 /// `agents.extensions.sandbox.vercel._network_policy.NetworkTransformer`.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Default, PartialEq, Eq)]
 pub struct NetworkTransformer {
     /// Headers injected into, or replaced on, the outgoing request.
     pub headers: BTreeMap<String, String>,
@@ -198,7 +199,7 @@ impl NetworkTransformer {
 ///
 /// A domain that carries rules is intercepted rather than proxied through an encrypted
 /// connection, which is what lets the platform rewrite the request.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Default, PartialEq, Eq)]
 pub struct NetworkPolicyRule {
     /// The rewrites applied to a matching request, in order.
     pub transform: Vec<NetworkTransformer>,
@@ -230,7 +231,7 @@ impl NetworkPolicyRule {
 
 /// The network policy applied to a sandbox. Mirrors `agents.extensions.sandbox.vercel`'s
 /// `NetworkPolicy`, kept as the released Agents JSON shape rather than the provider's types.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 pub enum NetworkPolicy {
     /// Allow all egress.
     AllowAll,
@@ -308,7 +309,7 @@ impl NetworkPolicy {
 }
 
 /// Resource limits for a Vercel sandbox.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Default, PartialEq, Eq)]
 pub struct VercelSandboxResources {
     /// Virtual CPUs.
     pub vcpus: Option<u32>,
@@ -328,7 +329,7 @@ impl VercelSandboxResources {
 }
 
 /// Settings used when creating a Vercel-backed session.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, Eq)]
 pub struct VercelSandboxClientOptions {
     /// Bearer token. Falls back to `VERCEL_OIDC_TOKEN`, then `VERCEL_TOKEN`.
     pub token: Option<String>,
@@ -1272,7 +1273,7 @@ impl VercelSandboxSession {
             .json(&json!({ "path": path, "cwd": self.manifest.root() }))
             .send()
             .await
-            .map_err(|e| transport(what, e))?;
+            .map_err(|e| as_archive_read(transport(what, e)))?;
         if response.status() == reqwest::StatusCode::NOT_FOUND {
             return Err(SandboxError::new(
                 ErrorCode::WorkspaceReadNotFound,
@@ -1281,12 +1282,10 @@ impl VercelSandboxSession {
         }
         if !response.status().is_success() {
             let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(http_error(
-                ErrorCode::WorkspaceWriteTypeError,
+            return Err(read_status_error(
                 what,
                 status,
-                &body,
+                Some(status_is_retryable(status)),
             ));
         }
         read_body_prefix(response, limit, what).await

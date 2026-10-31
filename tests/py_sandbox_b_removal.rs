@@ -14,8 +14,11 @@ use openai_agents_sdk::sandbox::{ErrorCode, SandboxError, SandboxResult};
 
 use openai_agents_sdk::sandbox::manifest::Manifest;
 use openai_agents_sdk::sandbox::sandboxes::unix_local::UnixLocalSandboxClient;
+use openai_agents_sdk::sandbox::session::restore_session_snapshot;
 use openai_agents_sdk::sandbox::session::{SandboxClient, SandboxSession};
+use openai_agents_sdk::sandbox::snapshot::Snapshot;
 use openai_agents_sdk::sandbox::snapshot::SnapshotSpec;
+use openai_agents_sdk::sandbox::types::User;
 use openai_agents_sdk::sandbox::workspace_paths::SandboxPathGrant;
 
 fn grant(path: &Path, read_only: bool) -> SandboxPathGrant {
@@ -313,4 +316,158 @@ async fn a_resume_restore_leaves_an_unrelated_read_only_grant_alone() {
     assert_eq!(std::fs::read(&protected).unwrap(), b"protected");
     assert!(resumed.running().await.unwrap());
     client.delete(resumed).await.ok();
+}
+
+/// Python: `test_unix_local_recursive_remove_as_user_preserves_nested_grant`: a recursive removal
+/// as a sandbox user, of a tree that holds a read-only grant, is refused before anything is
+/// unlinked. The refusal names the grant, and the protected file survives.
+#[tokio::test]
+async fn unix_local_recursive_remove_as_user_preserves_a_nested_grant() {
+    let (_temp, root) = root();
+    let workspace = root.join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    let external = root.join("external");
+    let protected = external.join("protected");
+    std::fs::create_dir_all(&protected).unwrap();
+    let sentinel = protected.join("data");
+    std::fs::write(&sentinel, b"protected").unwrap();
+    let session = backend_session(
+        Backend::Local,
+        Manifest::new()
+            .with_root(s(&workspace))
+            .with_extra_path_grant(grant(&external, false))
+            .with_extra_path_grant(grant(&protected, true)),
+    )
+    .await;
+    let user = User::new("example-user");
+
+    let error = session
+        .rm_as(&s(&external), true, Some(&user))
+        .await
+        .expect_err("the nested read-only grant refuses the removal");
+
+    assert_eq!(
+        error.context.get("reason").map(String::as_str),
+        Some("read_only_extra_path_grant")
+    );
+    assert_eq!(std::fs::read(&sentinel).unwrap(), b"protected");
+}
+
+/// A session that starts through the trait's default restore path, as a backend with no
+/// filesystem of its own would: its exec runs on the host, its snapshot is an in-memory archive,
+/// and hydration is recorded rather than unpacked.
+#[derive(Debug)]
+struct ResumeRemote {
+    manifest: Manifest,
+    snapshot: Arc<ArchiveSnapshot>,
+    hydrated: std::sync::Mutex<Vec<Vec<u8>>>,
+}
+
+#[derive(Debug)]
+struct ArchiveSnapshot(Vec<u8>);
+
+#[async_trait::async_trait]
+impl Snapshot for ArchiveSnapshot {
+    fn snapshot_type(&self) -> &str {
+        "archive-fixture"
+    }
+    fn id(&self) -> &str {
+        "resume-remote"
+    }
+    async fn persist(&self, _data: &[u8]) -> SandboxResult<()> {
+        Ok(())
+    }
+    async fn restore(&self) -> SandboxResult<Vec<u8>> {
+        Ok(self.0.clone())
+    }
+    async fn restorable(&self) -> SandboxResult<bool> {
+        Ok(true)
+    }
+}
+
+#[async_trait::async_trait]
+impl SandboxSession for ResumeRemote {
+    fn id(&self) -> &str {
+        "resume-remote"
+    }
+    fn manifest(&self) -> &Manifest {
+        &self.manifest
+    }
+    fn backend_id(&self) -> &str {
+        "resume-remote"
+    }
+    async fn start(&self) -> SandboxResult<()> {
+        restore_session_snapshot(self).await?;
+        Ok(())
+    }
+    async fn stop(&self) -> SandboxResult<()> {
+        Ok(())
+    }
+    async fn shutdown(&self) -> SandboxResult<()> {
+        Ok(())
+    }
+    async fn running(&self) -> SandboxResult<bool> {
+        Ok(true)
+    }
+    async fn exec(&self, request: ExecRequest) -> SandboxResult<ExecResult> {
+        let argv = request.resolved_argv();
+        let output = std::process::Command::new(&argv[0])
+            .args(&argv[1..])
+            .output()
+            .map_err(|e| SandboxError::new(ErrorCode::ExecTransportError, e.to_string()))?;
+        Ok(ExecResult {
+            exit_code: output.status.code().unwrap_or(-1),
+            stdout: output.stdout,
+            stderr: output.stderr,
+        })
+    }
+    async fn read_file(&self, path: &str) -> SandboxResult<Vec<u8>> {
+        std::fs::read(path)
+            .map_err(|e| SandboxError::new(ErrorCode::WorkspaceReadNotFound, e.to_string()))
+    }
+    async fn write_file(&self, _path: &str, _contents: &[u8]) -> SandboxResult<()> {
+        Ok(())
+    }
+    fn snapshot(&self) -> Arc<dyn Snapshot> {
+        self.snapshot.clone()
+    }
+    async fn hydrate_workspace(&self, archive: &[u8]) -> SandboxResult<()> {
+        self.hydrated.lock().unwrap().push(archive.to_vec());
+        Ok(())
+    }
+}
+
+/// Python: `test_default_remote_start_restores_with_unrelated_read_only_grant`: starting a
+/// resumed session prunes the stale workspace, hydrates the archive, and leaves a read-only grant
+/// outside the workspace alone.
+#[tokio::test]
+async fn default_remote_start_restores_with_an_unrelated_read_only_grant() {
+    let (_temp, root) = root();
+    let workspace = root.join("workspace");
+    let stale = workspace.join("generated/stale.txt");
+    std::fs::create_dir_all(stale.parent().unwrap()).unwrap();
+    std::fs::write(&stale, b"old workspace").unwrap();
+    let toolchain = root.join("toolchain");
+    std::fs::create_dir(&toolchain).unwrap();
+    let protected = toolchain.join("config");
+    std::fs::write(&protected, b"protected").unwrap();
+    let session = ResumeRemote {
+        manifest: Manifest::new()
+            .with_root(s(&workspace))
+            .with_extra_path_grant(grant(&toolchain, true)),
+        snapshot: Arc::new(ArchiveSnapshot(b"restored-workspace".to_vec())),
+        hydrated: std::sync::Mutex::new(Vec::new()),
+    };
+
+    session.start().await.unwrap();
+
+    assert!(
+        !stale.parent().unwrap().exists(),
+        "the stale tree is pruned"
+    );
+    assert_eq!(
+        *session.hydrated.lock().unwrap(),
+        vec![b"restored-workspace".to_vec()]
+    );
+    assert_eq!(std::fs::read(&protected).unwrap(), b"protected");
 }

@@ -70,7 +70,8 @@ use super::ports::{
 };
 use crate::sandbox::errors::{ErrorCode, SandboxError, SandboxResult};
 use crate::sandbox::http::{
-    bounded_read_zero, expect_success, http_error, parse_json, read_body_prefix, transport,
+    as_archive_read, bounded_read_zero, expect_success, http_error, parse_json, read_body_prefix,
+    read_status_error, status_is_retryable, transport,
 };
 use crate::sandbox::manifest::Manifest;
 use crate::sandbox::mount_entries::{BuiltinMountPattern, ConfiguredMount};
@@ -116,7 +117,7 @@ const SNAPSHOT_REF_MAGIC: &[u8] = b"E2B_SANDBOX_SNAPSHOT_V1\n";
 /// Which E2B sandbox interface a client creates.
 ///
 /// Both interfaces speak the same HTTP API; the variant selects the default template.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum E2BSandboxType {
     /// The plain `e2b` sandbox.
     #[default]
@@ -144,7 +145,7 @@ impl E2BSandboxType {
 }
 
 /// What E2B does when a sandbox reaches its time-to-live.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum E2BTimeoutAction {
     /// Pause the sandbox, keeping its filesystem and memory.
     #[default]
@@ -154,7 +155,7 @@ pub enum E2BTimeoutAction {
 }
 
 /// How a session persists its workspace into a [`Snapshot`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum WorkspacePersistence {
     /// Archive the workspace with `tar`, so the bytes are portable across backends.
     #[default]
@@ -164,7 +165,7 @@ pub enum WorkspacePersistence {
 }
 
 /// Timeouts applied to E2B operations. Mirrors Python's `E2BSandboxTimeouts`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct E2BSandboxTimeouts {
     /// Sent to envd when a command has no timeout of its own; E2B would otherwise default to 60s.
     pub exec_unbounded: Duration,
@@ -194,7 +195,7 @@ impl Default for E2BSandboxTimeouts {
 }
 
 /// Settings used when creating an E2B-backed session.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, Eq)]
 pub struct E2BSandboxClientOptions {
     /// API key for the platform API. Falls back to `E2B_API_KEY`.
     pub api_key: Option<String>,
@@ -1224,7 +1225,7 @@ impl E2BSandboxSession {
             .query(&[("path", path)])
             .send()
             .await
-            .map_err(|e| transport(what, e))?;
+            .map_err(|e| as_archive_read(transport(what, e)))?;
         if response.status() == reqwest::StatusCode::NOT_FOUND {
             return Err(SandboxError::new(
                 ErrorCode::WorkspaceReadNotFound,
@@ -1233,12 +1234,10 @@ impl E2BSandboxSession {
         }
         if !response.status().is_success() {
             let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(http_error(
-                ErrorCode::WorkspaceWriteTypeError,
+            return Err(read_status_error(
                 what,
                 status,
-                &body,
+                Some(status_is_retryable(status)),
             ));
         }
         read_body_prefix(response, limit, what).await
@@ -1739,19 +1738,21 @@ fn assert_e2b_session(session: &dyn SandboxSession) -> SandboxResult<()> {
 /// [`InContainerMountStrategy`]. The rclone configuration carries the bucket credentials, so the
 /// mount reports [`MountCredentialAuthority::MountScoped`] and the manifest has to acknowledge
 /// the exact mount path before it activates.
-#[derive(Debug, Clone)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct E2BCloudBucketMountStrategy {
     /// The rclone pattern that attaches the bucket.
     pub pattern: RcloneMountPattern,
     /// The secret-bearing rclone configuration and the remote selection options.
     ///
     /// Ignored when [`spec`](Self::spec) is set, which derives the configuration per session.
+    #[serde(skip)]
     pub config: MountPatternConfig,
     /// The storage this strategy attaches, when it was built from a configured mount.
     ///
     /// A configured mount knows how to render its own rclone section, so the configuration is
     /// built on each activation against the session it is attached to instead of being pinned
     /// when the strategy is declared.
+    #[serde(skip)]
     pub spec: Option<Arc<dyn ConfiguredMount>>,
     /// Whether a missing `rclone` (or `fuse3`) may be installed into the sandbox.
     pub install_tools: bool,

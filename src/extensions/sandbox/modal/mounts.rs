@@ -19,7 +19,7 @@ use crate::sandbox::mounts::{Mount, MountStrategy};
 use crate::sandbox::session::SandboxSession;
 
 /// The bucket a Modal sandbox mounts, and how Modal authenticates to it.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, Eq)]
 pub struct ModalCloudBucketMountConfig {
     /// The bucket name.
     pub bucket_name: String,
@@ -258,7 +258,7 @@ impl ModalCloudBucketMountConfig {
 }
 
 /// Declares a bucket Modal attaches when the sandbox is created.
-#[derive(Debug, Clone)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct ModalCloudBucketMountStrategy {
     config: ModalCloudBucketMountConfig,
 }

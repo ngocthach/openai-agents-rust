@@ -36,6 +36,34 @@ pub fn status_is_retryable(status: reqwest::StatusCode) -> bool {
         || (status.is_server_error() && !matches!(status, reqwest::StatusCode::NOT_IMPLEMENTED))
 }
 
+/// Classify a failure of a file read as a workspace read error, keeping its retryability.
+///
+/// Python raises `WorkspaceArchiveReadError` for every failed provider read, with the transport's
+/// own retryability; a read must not surface as an exec or write error.
+pub fn as_archive_read(mut error: SandboxError) -> SandboxError {
+    error.code = ErrorCode::WorkspaceArchiveReadError;
+    error
+}
+
+/// The error for a read answered with a non-success status, without the response body.
+///
+/// Python never reads the body of a failed bounded read: the status alone decides the error, so
+/// a provider's error text cannot reach a log, a trace or the model. `retryable` is the
+/// provider's own classification (`None` when it has none).
+pub fn read_status_error(
+    what: &str,
+    status: reqwest::StatusCode,
+    retryable: Option<bool>,
+) -> SandboxError {
+    let mut error = SandboxError::new(
+        ErrorCode::WorkspaceArchiveReadError,
+        format!("Failed to {what}: HTTP {}", status.as_u16()),
+    )
+    .with_context("http_status", status.as_u16().to_string());
+    error.retryable = retryable;
+    error
+}
+
 /// Map a non-success HTTP response to a sandbox error.
 ///
 /// Providers report failures as `{"message": ...}` or `{"error": {"message": ...}}`; either is

@@ -68,6 +68,7 @@ pub mod memory;
 pub mod mount_entries;
 pub mod mount_patterns;
 pub mod mounts;
+pub mod persisted_registry;
 pub mod pty;
 pub mod remote_mount_policy;
 pub mod retry;

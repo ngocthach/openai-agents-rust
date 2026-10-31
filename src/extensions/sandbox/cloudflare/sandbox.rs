@@ -30,6 +30,7 @@ use futures::StreamExt as _;
 use serde_json::{Value, json};
 
 use crate::sandbox::errors::{ErrorCode, SandboxError, SandboxResult};
+use crate::sandbox::http::read_status_error;
 use crate::sandbox::manifest::{DEFAULT_MANIFEST_ROOT, Manifest};
 use crate::sandbox::pty::{PtyExecRequest, PtyExecUpdate, PtyWriteRequest};
 use crate::sandbox::retry::{
@@ -60,7 +61,7 @@ pub const API_KEY_ENV: &str = "CLOUDFLARE_SANDBOX_API_KEY";
 const MAX_ERROR_BODY_CHARS: usize = 2000;
 
 /// Settings used when creating a Cloudflare-backed session.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, Eq)]
 pub struct CloudflareSandboxClientOptions {
     /// The base URL of the deployed sandbox worker.
     pub worker_url: String,
@@ -72,6 +73,19 @@ pub struct CloudflareSandboxClientOptions {
     pub exec_timeout: Duration,
     /// The timeout applied to every non-exec request.
     pub request_timeout: Duration,
+}
+
+// The API key is a credential, so `Debug` never shows it.
+impl std::fmt::Debug for CloudflareSandboxClientOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CloudflareSandboxClientOptions")
+            .field("worker_url", &self.worker_url)
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .field("exposed_ports", &self.exposed_ports)
+            .field("exec_timeout", &self.exec_timeout)
+            .field("request_timeout", &self.request_timeout)
+            .finish()
+    }
 }
 
 impl CloudflareSandboxClientOptions {
@@ -921,19 +935,13 @@ impl SandboxSession for CloudflareSandboxSession {
             ));
         }
         if !status.is_success() {
-            let body = response.bytes().await.unwrap_or_default();
-            // A 403 is the worker refusing the path, which will never start working.
+            // A 403 is the worker refusing the path, which will never start working. The body
+            // is not read: a bounded read's failure carries the status alone.
             let retryable = status.as_u16() != 403 && is_transient_http_status(status.as_u16());
-            return Err(SandboxError::new(
-                ErrorCode::WorkspaceArchiveReadError,
-                http_error_message(
-                    &format!("GET /file{resolved}"),
-                    status.as_u16(),
-                    format_response_body(&body),
-                ),
-            )
-            .with_context("path", resolved)
-            .with_retryable(retryable));
+            return Err(
+                read_status_error(&format!("read `{resolved}`"), status, Some(retryable))
+                    .with_context("path", resolved),
+            );
         }
         // One byte over the budget is enough to prove it was exceeded, so the rest of an
         // oversized body is never pulled off the socket.

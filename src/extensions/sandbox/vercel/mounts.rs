@@ -386,7 +386,7 @@ async fn unmount_s3(commands: &MountCommands<'_>, mount_path: &str) -> SandboxRe
 /// they reach the sandbox as the mount command's environment, so the mount reports
 /// [`MountCredentialAuthority::MountScoped`] and the manifest has to acknowledge the exact mount
 /// path before it activates.
-#[derive(Clone, Default)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Default)]
 pub struct VercelCloudBucketMountStrategy {
     /// The bucket to mount.
     pub bucket: String,

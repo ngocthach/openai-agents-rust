@@ -312,22 +312,57 @@ pub trait EventSink: Send + Sync + fmt::Debug {
     fn delivers_own_policies(&self) -> bool {
         false
     }
+
+    /// Whether a failed delivery fails the operation the event describes. Mirrors Python's
+    /// `on_error="raise"`. The default is false: a sink that only logs cannot break a run.
+    fn raises_on_error(&self) -> bool {
+        false
+    }
+
+    /// Deliver one event, reporting a failure. Only consulted when
+    /// [`raises_on_error`](Self::raises_on_error) is true.
+    async fn try_emit(&self, event: &SandboxSessionEvent) -> SandboxResult<()> {
+        self.emit(event).await;
+        Ok(())
+    }
 }
+
+/// The closure a [`CallbackSink`] runs for each event.
+type EventCallback = dyn Fn(&SandboxSessionEvent) -> SandboxResult<()> + Send + Sync;
 
 /// Hands each event to a closure. Mirrors Python's `CallbackSink`.
 pub struct CallbackSink {
-    callback: Arc<dyn Fn(&SandboxSessionEvent) + Send + Sync>,
+    callback: Arc<EventCallback>,
+    raises: bool,
     policy: Option<EventPayloadPolicy>,
 }
 
 impl CallbackSink {
-    /// A sink calling `callback` for every event.
+    /// A sink calling `callback` for every event. A failure in `callback` cannot fail the
+    /// operation; use [`raising`](Self::raising) for that.
     pub fn new<F>(callback: F) -> Self
     where
         F: Fn(&SandboxSessionEvent) + Send + Sync + 'static,
     {
         CallbackSink {
+            callback: Arc::new(move |event| {
+                callback(event);
+                Ok(())
+            }),
+            raises: false,
+            policy: None,
+        }
+    }
+
+    /// A sink whose callback may fail. A failure fails the operation that produced the event,
+    /// as Python's `CallbackSink(..., on_error="raise")` does.
+    pub fn raising<F>(callback: F) -> Self
+    where
+        F: Fn(&SandboxSessionEvent) -> SandboxResult<()> + Send + Sync + 'static,
+    {
+        CallbackSink {
             callback: Arc::new(callback),
+            raises: true,
             policy: None,
         }
     }
@@ -348,7 +383,21 @@ impl fmt::Debug for CallbackSink {
 #[async_trait]
 impl EventSink for CallbackSink {
     async fn emit(&self, event: &SandboxSessionEvent) {
-        (self.callback)(event);
+        if let Err(error) = (self.callback)(event) {
+            log::warn!(
+                target: crate::logger::LOG_TARGET,
+                "sandbox event callback failed: {}",
+                error.code
+            );
+        }
+    }
+
+    async fn try_emit(&self, event: &SandboxSessionEvent) -> SandboxResult<()> {
+        (self.callback)(event)
+    }
+
+    fn raises_on_error(&self) -> bool {
+        self.raises
     }
 
     fn payload_policy(&self) -> Option<EventPayloadPolicy> {
@@ -842,6 +891,18 @@ impl Instrumentation {
     /// has one, else the operation's, else the default. A chain applies its members' own
     /// policies as it delivers to each. The raw bytes the event carried never reach a sink.
     pub async fn emit(&self, event: SandboxSessionEvent) {
+        if let Err(error) = self.deliver(event).await {
+            log::warn!(
+                target: crate::logger::LOG_TARGET,
+                "sandbox event delivery failed: {}",
+                error.code
+            );
+        }
+    }
+
+    /// Deliver one event, reporting a failure from a sink that raises. See
+    /// [`EventSink::raises_on_error`].
+    pub async fn deliver(&self, event: SandboxSessionEvent) -> SandboxResult<()> {
         let operation_policy = self.policy_for_op(&event.op);
         if self.sink.delivers_own_policies() {
             // Members that have no policy of their own see what the operation's policy shows;
@@ -849,15 +910,42 @@ impl Instrumentation {
             let mut shown = event.clone().apply_payload_policy(operation_policy);
             shown.stdout_bytes = event.stdout_bytes;
             shown.stderr_bytes = event.stderr_bytes;
-            self.sink.emit(&shown).await;
-            return;
+            return self.send(&shown).await;
         }
         let policy = self.sink.payload_policy().unwrap_or(operation_policy);
-        self.sink.emit(&event.apply_payload_policy(policy)).await;
+        self.send(&event.apply_payload_policy(policy)).await
+    }
+
+    async fn send(&self, event: &SandboxSessionEvent) -> SandboxResult<()> {
+        if !self.sink.raises_on_error() {
+            self.sink.emit(event).await;
+            return Ok(());
+        }
+        self.sink
+            .try_emit(event)
+            .await
+            .map_err(|_| SandboxError::new(ErrorCode::EventSinkFailed, "sandbox event sink failed"))
     }
 
     /// Emit the start event for one operation and return it, for the matching finish.
     pub async fn start(&self, op: SandboxOp, data: Vec<(String, String)>) -> SandboxSessionEvent {
+        let event = self.start_event(op, data);
+        self.emit(event.clone()).await;
+        event
+    }
+
+    /// Like [`start`](Self::start), but a sink that raises fails the operation before it runs.
+    pub async fn try_start(
+        &self,
+        op: SandboxOp,
+        data: Vec<(String, String)>,
+    ) -> SandboxResult<SandboxSessionEvent> {
+        let event = self.start_event(op, data);
+        self.deliver(event.clone()).await?;
+        Ok(event)
+    }
+
+    fn start_event(&self, op: SandboxOp, data: Vec<(String, String)>) -> SandboxSessionEvent {
         let seq = self.seq.fetch_add(1, Ordering::SeqCst);
         let mut event = SandboxSessionEvent::start(
             self.session_id.clone(),
@@ -867,7 +955,6 @@ impl Instrumentation {
             op,
         );
         event.data = data;
-        self.emit(event.clone()).await;
         event
     }
 
@@ -878,6 +965,27 @@ impl Instrumentation {
         duration_ms: u64,
         outcome: Result<(&[u8], &[u8]), &SandboxError>,
     ) {
+        let event = self.finish_event(started, duration_ms, outcome);
+        self.emit(event).await;
+    }
+
+    /// Like [`finish`](Self::finish), but a sink that raises reports its failure.
+    pub async fn try_finish(
+        &self,
+        started: &SandboxSessionEvent,
+        duration_ms: u64,
+        outcome: Result<(&[u8], &[u8]), &SandboxError>,
+    ) -> SandboxResult<()> {
+        let event = self.finish_event(started, duration_ms, outcome);
+        self.deliver(event).await
+    }
+
+    fn finish_event(
+        &self,
+        started: &SandboxSessionEvent,
+        duration_ms: u64,
+        outcome: Result<(&[u8], &[u8]), &SandboxError>,
+    ) -> SandboxSessionEvent {
         let seq = self.seq.fetch_add(1, Ordering::SeqCst);
         let mut event = match outcome {
             Ok((stdout, stderr)) => started
@@ -886,7 +994,7 @@ impl Instrumentation {
             Err(error) => started.finish(false, duration_ms).with_error(error),
         };
         event.seq = seq;
-        self.emit(event).await;
+        event
     }
 
     /// Flush the sink.
@@ -981,28 +1089,38 @@ impl InstrumentedSession {
     where
         F: std::future::Future<Output = SandboxResult<T>>,
     {
-        let started = self.instrumentation.start(op, data.clone()).await;
+        let started = self.instrumentation.try_start(op, data.clone()).await?;
         let clock = std::time::Instant::now();
-        let outcome = crate::sandbox::runtime::sandbox_span_result(
-            span_name(op),
-            span_data(&data),
-            operation,
-        )
-        .await;
+        crate::sandbox::runtime::sandbox_span_result(span_name(op), span_data(&data), async {
+            let outcome = operation.await;
+            self.finish_recorded(&started, clock, &outcome)
+                .await
+                .and(outcome)
+        })
+        .await
+    }
+
+    /// Record the finish of an operation. A sink that raises reports its failure here, and that
+    /// failure replaces the operation's outcome, as in Python.
+    async fn finish_recorded<T>(
+        &self,
+        started: &SandboxSessionEvent,
+        clock: std::time::Instant,
+        outcome: &SandboxResult<T>,
+    ) -> SandboxResult<()> {
         let elapsed = clock.elapsed().as_millis() as u64;
-        match &outcome {
+        match outcome {
             Ok(_) => {
                 self.instrumentation
-                    .finish(&started, elapsed, Ok((&[], &[])))
+                    .try_finish(started, elapsed, Ok((&[], &[])))
                     .await
             }
             Err(error) => {
                 self.instrumentation
-                    .finish(&started, elapsed, Err(error))
+                    .try_finish(started, elapsed, Err(error))
                     .await
             }
         }
-        outcome
     }
 }
 
@@ -1100,15 +1218,15 @@ impl crate::sandbox::session::SandboxSession for InstrumentedSession {
         request: crate::sandbox::session::ExecRequest,
     ) -> SandboxResult<crate::sandbox::types::ExecResult> {
         let argv = request.resolved_argv().join(" ");
-        let argv_for_span = argv.clone();
+        let data = vec![("argv".to_string(), argv)];
         let started = self
             .instrumentation
-            .start(SandboxOp::Exec, vec![("argv".to_string(), argv)])
+            .start(SandboxOp::Exec, data.clone())
             .await;
         let clock = std::time::Instant::now();
         let outcome = crate::sandbox::runtime::sandbox_span_result(
             span_name(SandboxOp::Exec),
-            serde_json::json!({"argv": argv_for_span}),
+            span_data(&data),
             self.inner.exec(request),
         )
         .await;
@@ -1140,7 +1258,6 @@ impl crate::sandbox::session::SandboxSession for InstrumentedSession {
     async fn write_file(&self, path: &str, contents: &[u8]) -> SandboxResult<()> {
         let mut data = vec![("path".to_string(), path.to_string())];
         if self.instrumentation.policy().include_write_len {
-            // The size, never the bytes: the contents are the agent's data.
             data.push(("bytes".to_string(), contents.len().to_string()));
         }
         self.record(
@@ -1151,69 +1268,18 @@ impl crate::sandbox::session::SandboxSession for InstrumentedSession {
         .await
     }
 
-    async fn ls(&self, path: &str) -> SandboxResult<Vec<crate::sandbox::types::FileEntry>> {
-        self.record(
-            SandboxOp::Read,
-            vec![("ls".to_string(), path.to_string())],
-            self.inner.ls(path),
-        )
-        .await
-    }
-
-    async fn mkdir(&self, path: &str, parents: bool) -> SandboxResult<()> {
-        self.record(
-            SandboxOp::Write,
-            vec![("mkdir".to_string(), path.to_string())],
-            self.inner.mkdir(path, parents),
-        )
-        .await
-    }
-
-    async fn rm(&self, path: &str, recursive: bool) -> SandboxResult<()> {
-        self.record(
-            SandboxOp::Write,
-            vec![("rm".to_string(), path.to_string())],
-            self.inner.rm(path, recursive),
-        )
-        .await
-    }
-
-    async fn mv(&self, source: &str, destination: &str) -> SandboxResult<()> {
-        self.record(
-            SandboxOp::Write,
-            vec![
-                ("mv".to_string(), source.to_string()),
-                ("to".to_string(), destination.to_string()),
-            ],
-            self.inner.mv(source, destination),
-        )
-        .await
-    }
-
     async fn pty_exec_start(
         &self,
         request: crate::sandbox::pty::PtyExecRequest,
     ) -> SandboxResult<crate::sandbox::pty::PtyExecUpdate> {
-        let argv = request.resolved_argv().join(" ");
-        self.record(
-            SandboxOp::Exec,
-            vec![("pty_argv".to_string(), argv)],
-            self.inner.pty_exec_start(request),
-        )
-        .await
+        self.inner.pty_exec_start(request).await
     }
 
     async fn pty_write_stdin(
         &self,
         request: crate::sandbox::pty::PtyWriteRequest,
     ) -> SandboxResult<crate::sandbox::pty::PtyExecUpdate> {
-        let session = request.session_id.to_string();
-        self.record(
-            SandboxOp::Exec,
-            vec![("pty_session".to_string(), session)],
-            self.inner.pty_write_stdin(request),
-        )
-        .await
+        self.inner.pty_write_stdin(request).await
     }
 
     async fn pty_terminate_all(&self) -> SandboxResult<()> {
@@ -1246,30 +1312,23 @@ impl crate::sandbox::session::SandboxSession for InstrumentedSession {
         let data = vec![("path".to_string(), path.to_string())];
         let started = self
             .instrumentation
-            .start(SandboxOp::Read, data.clone())
-            .await;
+            .try_start(SandboxOp::Read, data.clone())
+            .await?;
         let clock = std::time::Instant::now();
-        let outcome = crate::sandbox::runtime::sandbox_span_result_expecting(
+        // The finish is recorded inside the span, so a sink failure marks the span even when the
+        // read's own error was expected.
+        crate::sandbox::runtime::sandbox_span_result_expecting(
             span_name(SandboxOp::Read),
             span_data(&data),
             expected,
-            self.inner.read_file_as(path, user),
+            async {
+                let outcome = self.inner.read_file_as(path, user).await;
+                self.finish_recorded(&started, clock, &outcome)
+                    .await
+                    .and(outcome)
+            },
         )
-        .await;
-        let elapsed = clock.elapsed().as_millis() as u64;
-        match &outcome {
-            Ok(_) => {
-                self.instrumentation
-                    .finish(&started, elapsed, Ok((&[], &[])))
-                    .await
-            }
-            Err(error) => {
-                self.instrumentation
-                    .finish(&started, elapsed, Err(error))
-                    .await
-            }
-        }
-        outcome
+        .await
     }
 
     async fn write_file_as(
@@ -1363,6 +1422,167 @@ impl crate::sandbox::session::SandboxSession for InstrumentedSession {
 
     fn set_archive_limits(&self, limits: Option<crate::sandbox::types::SandboxArchiveLimits>) {
         self.inner.set_archive_limits(limits);
+    }
+
+    async fn ls(&self, path: &str) -> SandboxResult<Vec<crate::sandbox::types::FileEntry>> {
+        self.inner.ls(path).await
+    }
+
+    async fn mkdir(&self, path: &str, parents: bool) -> SandboxResult<()> {
+        self.inner.mkdir(path, parents).await
+    }
+
+    async fn rm(&self, path: &str, recursive: bool) -> SandboxResult<()> {
+        self.inner.rm(path, recursive).await
+    }
+
+    async fn mv(&self, source: &str, destination: &str) -> SandboxResult<()> {
+        self.inner.mv(source, destination).await
+    }
+
+    async fn check_mkdir_access(
+        &self,
+        path: &str,
+        parents: bool,
+        user: Option<&crate::sandbox::types::User>,
+    ) -> SandboxResult<()> {
+        self.inner.check_mkdir_access(path, parents, user).await
+    }
+
+    async fn check_read_access(
+        &self,
+        path: &str,
+        user: Option<&crate::sandbox::types::User>,
+    ) -> SandboxResult<String> {
+        self.inner.check_read_access(path, user).await
+    }
+
+    async fn check_rm_access(
+        &self,
+        path: &str,
+        recursive: bool,
+        user: Option<&crate::sandbox::types::User>,
+    ) -> SandboxResult<()> {
+        self.inner.check_rm_access(path, recursive, user).await
+    }
+
+    async fn check_write_access(
+        &self,
+        path: &str,
+        user: Option<&crate::sandbox::types::User>,
+    ) -> SandboxResult<()> {
+        self.inner.check_write_access(path, user).await
+    }
+
+    fn computes_snapshot_fingerprint(&self) -> bool {
+        self.inner.computes_snapshot_fingerprint()
+    }
+
+    fn dependencies(&self) -> Option<&Arc<crate::sandbox::dependencies::Dependencies>> {
+        self.inner.dependencies()
+    }
+
+    fn ensure_mounts_settled(&self) -> SandboxResult<()> {
+        self.inner.ensure_mounts_settled()
+    }
+
+    async fn ensure_runtime_helper_installed(
+        &self,
+        helper: &crate::sandbox::runtime_helpers::RuntimeHelperScript,
+    ) -> SandboxResult<String> {
+        self.inner.ensure_runtime_helper_installed(helper).await
+    }
+
+    async fn extract(
+        &self,
+        path: &str,
+        data: &[u8],
+        compression_scheme: Option<crate::sandbox::archive::CompressionScheme>,
+    ) -> SandboxResult<()> {
+        self.inner.extract(path, data, compression_scheme).await
+    }
+
+    async fn extract_with_limits(
+        &self,
+        path: &str,
+        data: &[u8],
+        compression_scheme: Option<crate::sandbox::archive::CompressionScheme>,
+        limits: Option<crate::sandbox::types::SandboxArchiveLimits>,
+    ) -> SandboxResult<()> {
+        self.inner
+            .extract_with_limits(path, data, compression_scheme, limits)
+            .await
+    }
+
+    fn has_read_only_grant(&self) -> bool {
+        self.inner.has_read_only_grant()
+    }
+
+    fn normalize_path_for_write(&self, path: &str) -> SandboxResult<String> {
+        self.inner.normalize_path_for_write(path)
+    }
+
+    async fn persist_workspace_once(&self) -> SandboxResult<Vec<u8>> {
+        self.inner.persist_workspace_once().await
+    }
+
+    fn persist_workspace_skip_paths(&self) -> Vec<String> {
+        self.inner.persist_workspace_skip_paths()
+    }
+
+    async fn probe_read_path(&self, path: &str) -> SandboxResult<bool> {
+        self.inner.probe_read_path(path).await
+    }
+
+    async fn read_error_from_exec(
+        &self,
+        path: &str,
+        result: &crate::sandbox::types::ExecResult,
+        user: Option<&crate::sandbox::types::User>,
+    ) -> SandboxError {
+        self.inner.read_error_from_exec(path, result, user).await
+    }
+
+    fn record_snapshot_fingerprint(
+        &self,
+        record: Option<crate::sandbox::state::SnapshotFingerprint>,
+    ) {
+        self.inner.record_snapshot_fingerprint(record);
+    }
+
+    fn resume_snapshot_fingerprint(&self) -> Option<crate::sandbox::state::SnapshotFingerprint> {
+        self.inner.resume_snapshot_fingerprint()
+    }
+
+    async fn run_access_check(
+        &self,
+        script: &str,
+        label: &str,
+        args: &[&str],
+        user: Option<&crate::sandbox::types::User>,
+    ) -> SandboxResult<()> {
+        self.inner.run_access_check(script, label, args, user).await
+    }
+
+    fn system_state_preserved_on_start(&self) -> bool {
+        self.inner.system_state_preserved_on_start()
+    }
+
+    async fn validate_remote_path_access(
+        &self,
+        path: &str,
+        for_write: bool,
+        recursive_remove: bool,
+    ) -> SandboxResult<String> {
+        self.inner
+            .validate_remote_path_access(path, for_write, recursive_remove)
+            .await
+    }
+
+    fn workspace_path_policy(
+        &self,
+    ) -> SandboxResult<crate::sandbox::workspace_paths::WorkspacePathPolicy> {
+        self.inner.workspace_path_policy()
     }
 
     // Everything below is delegated for the same reason `read_file_as` is: the trait defaults

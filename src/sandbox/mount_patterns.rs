@@ -428,7 +428,7 @@ fn shell_command(argv: &[String]) -> String {
 // ---------------------------------------------------------------------------------------------
 
 /// Which blobfuse cache component the mount uses.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum BlobfuseCacheType {
     /// Stream blocks through a bounded memory and disk cache.
     #[default]
@@ -461,7 +461,7 @@ impl BlobfuseCacheType {
 /// The generated configuration carries the storage account key, so it is written to a `0600`
 /// file under [`BLOBFUSE_CONFIG_DIR`] and the cache lands under [`BLOBFUSE_CACHE_DIR`]; both are
 /// excluded from every workspace archive.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct FuseMountPattern {
     /// Whether users other than the mounting one may read the mount.
     pub allow_other: bool,
@@ -679,6 +679,10 @@ fn path_component(value: &str) -> String {
 
 #[async_trait]
 impl MountPattern for FuseMountPattern {
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
+    }
+
     fn pattern_type(&self) -> &str {
         "fuse"
     }
@@ -803,7 +807,7 @@ impl MountPattern for FuseMountPattern {
 // ---------------------------------------------------------------------------------------------
 
 /// Defaults a [`MountpointMountPattern`] applies when the mount itself does not set them.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MountpointOptions {
     /// Object prefix exposed at the mount path.
     pub prefix: Option<String>,
@@ -820,7 +824,8 @@ pub struct MountpointOptions {
 /// [`MOUNTPOINT_ENV_DIR`] and sourced by the mount command, so the host's process table never
 /// shows them. An endpoint URL that carries its own authority is passed the same way, through
 /// `${OPENAI_AGENTS_MOUNT_ENDPOINT_URL}`.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct MountpointMountPattern {
     /// Defaults applied when the mount does not set them.
     pub options: MountpointOptions,
@@ -909,6 +914,10 @@ impl MountpointMountPattern {
 
 #[async_trait]
 impl MountPattern for MountpointMountPattern {
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
+    }
+
     fn pattern_type(&self) -> &str {
         "mountpoint"
     }
@@ -1079,7 +1088,7 @@ impl MountPattern for MountpointMountPattern {
 // ---------------------------------------------------------------------------------------------
 
 /// Defaults an [`S3FilesMountPattern`] applies when the mount itself does not set them.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Default, PartialEq, Eq)]
 pub struct S3FilesOptions {
     /// Mount target IP address.
     pub mount_target_ip: Option<String>,
@@ -1097,7 +1106,7 @@ pub struct S3FilesOptions {
 /// The mount helper authenticates from the sandbox's own AWS environment, so this pattern stages
 /// no credential of its own. It also creates nothing: the file system, its mount target and the
 /// network path to it have to exist already.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Default, PartialEq, Eq)]
 pub struct S3FilesMountPattern {
     /// Defaults applied when the mount does not set them.
     pub options: S3FilesOptions,
@@ -1222,6 +1231,10 @@ fn parse_option_list(rendered: Option<&str>) -> SandboxResult<Vec<(String, Optio
 
 #[async_trait]
 impl MountPattern for S3FilesMountPattern {
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
+    }
+
     fn pattern_type(&self) -> &str {
         "s3files"
     }

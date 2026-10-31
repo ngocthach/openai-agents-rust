@@ -181,6 +181,12 @@ pub trait MountPattern: Send + Sync + fmt::Debug {
     /// The pattern type, matching the Python `type` discriminator.
     fn pattern_type(&self) -> &str;
 
+    /// This pattern as [`Any`](std::any::Any), so a persisted payload can be written from a
+    /// `dyn MountPattern`. The default `None` keeps custom patterns working unchanged.
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        None
+    }
+
     /// Whether applying this pattern writes a credential inside the sandbox.
     fn exposes_credentials(&self) -> bool {
         true
@@ -554,7 +560,7 @@ impl Mount {
 /// OS-level confinement.
 ///
 /// </div>
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct BindMountStrategy {
     /// The host directory exposed inside the sandbox.
     pub source: PathBuf,
@@ -576,6 +582,10 @@ impl BindMountStrategy {
 
 #[async_trait]
 impl MountStrategy for BindMountStrategy {
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
+    }
+
     fn strategy_type(&self) -> &str {
         "bind"
     }
@@ -653,11 +663,12 @@ impl MountStrategy for BindMountStrategy {
 // ---------------------------------------------------------------------------------------------
 
 /// Asks the container runtime for a named volume, attached before the session starts.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct DockerVolumeMountStrategy {
     /// The Docker volume driver.
     pub driver: String,
     /// Driver options passed as `volume-opt=<key>=<value>`.
+    #[serde(default)]
     pub driver_options: BTreeMap<String, String>,
 }
 
@@ -679,6 +690,10 @@ impl DockerVolumeMountStrategy {
 
 #[async_trait]
 impl MountStrategy for DockerVolumeMountStrategy {
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
+    }
+
     fn strategy_type(&self) -> &str {
         "docker_volume"
     }
@@ -852,6 +867,10 @@ impl InContainerMountStrategy {
 
 #[async_trait]
 impl MountStrategy for InContainerMountStrategy {
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
+    }
+
     fn strategy_type(&self) -> &str {
         "in_container"
     }
@@ -1124,7 +1143,7 @@ pub const RCLONE_CONFIG_DIR: &str = ".sandbox-rclone-config";
 const RCLONE_CHECK: &str = "command -v rclone >/dev/null 2>&1 || test -x /usr/local/bin/rclone";
 
 /// How `rclone` exposes the remote inside the sandbox.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RcloneMountMode {
     /// Mount the remote with `rclone mount`, which needs FUSE.
     #[default]
@@ -1144,7 +1163,7 @@ pub enum RcloneMountMode {
 /// Installing `rclone` is the provider's job: this pattern only checks that it is present, so a
 /// backend that cannot install it fails with [`ErrorCode::MountMissingTool`] instead of
 /// half-attaching a mount.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct RcloneMountPattern {
     /// How the remote is exposed.
     pub mode: RcloneMountMode,
@@ -1569,6 +1588,10 @@ fn rclone_extra_args_are_safe(extra_args: &[String]) -> bool {
 
 #[async_trait]
 impl MountPattern for RcloneMountPattern {
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
+    }
+
     fn pattern_type(&self) -> &str {
         "rclone"
     }

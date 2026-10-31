@@ -71,7 +71,7 @@ const SNAPSHOT_FILESYSTEM_MAGIC: &[u8] = b"MODAL_SANDBOX_FS_SNAPSHOT_V1\n";
 const SNAPSHOT_DIRECTORY_MAGIC: &[u8] = b"MODAL_SANDBOX_DIR_SNAPSHOT_V1\n";
 
 /// How a Modal workspace is captured into a snapshot.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ModalWorkspacePersistence {
     /// Stream a gzipped tar of the workspace out of the sandbox.
     #[default]
@@ -133,7 +133,7 @@ impl ModalSandboxSelector {
 }
 
 /// Settings used when creating a Modal-backed session.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq)]
 pub struct ModalSandboxClientOptions {
     /// The Modal app the sandbox belongs to.
     pub app_name: String,
@@ -182,6 +182,46 @@ pub struct ModalSandboxClientOptions {
     pub helper_command: Option<Vec<String>>,
     /// The interpreter the bundled helper runs under.
     pub python: Option<String>,
+}
+
+// The helper command may carry a token in its environment arguments, so `Debug` names only the
+// program and how many arguments follow.
+impl std::fmt::Debug for ModalSandboxClientOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let helper = self
+            .helper_command
+            .as_ref()
+            .map(|command| (command.first().cloned(), command.len().saturating_sub(1)));
+        f.debug_struct("ModalSandboxClientOptions")
+            .field("app_name", &self.app_name)
+            .field("image_tag", &self.image_tag)
+            .field("image_id", &self.image_id)
+            .field("sandbox_id", &self.sandbox_id)
+            .field("workspace_persistence", &self.workspace_persistence)
+            .field("exposed_ports", &self.exposed_ports)
+            .field("gpu", &self.gpu)
+            .field("timeout_secs", &self.timeout_secs)
+            .field("idle_timeout_secs", &self.idle_timeout_secs)
+            .field("cpu", &self.cpu)
+            .field("cpu_limit", &self.cpu_limit)
+            .field("memory_mb", &self.memory_mb)
+            .field("memory_limit_mb", &self.memory_limit_mb)
+            .field("use_sleep_cmd", &self.use_sleep_cmd)
+            .field("image_builder_version", &self.image_builder_version)
+            .field("sandbox_create_timeout", &self.sandbox_create_timeout)
+            .field("exec_timeout", &self.exec_timeout)
+            .field(
+                "snapshot_filesystem_timeout",
+                &self.snapshot_filesystem_timeout,
+            )
+            .field(
+                "snapshot_filesystem_restore_timeout",
+                &self.snapshot_filesystem_restore_timeout,
+            )
+            .field("helper_command", &helper)
+            .field("python", &self.python)
+            .finish()
+    }
 }
 
 impl ModalSandboxClientOptions {
@@ -438,28 +478,34 @@ impl ModalHelper {
                 format!("failed to encode the `{op}` request for the Modal helper: {error}"),
             )
         })?;
-        let mut child = tokio::process::Command::new(&self.command[0])
+        let mut command = tokio::process::Command::new(&self.command[0]);
+        command
             .args(&self.command[1..])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|error| {
-                SandboxError::new(
-                    ErrorCode::ExecTransportError,
-                    format!(
-                        "failed to run the Modal helper `{}`: {error}",
-                        self.command.join(" ")
-                    ),
-                )
-            })?;
+            .stderr(Stdio::piped());
+        // On unix a dropped call asks the helper to stop with SIGTERM (see `TerminateOnDrop`), so a
+        // bounded read can close its provider descriptor on the way out. SIGKILL would skip it.
+        #[cfg(not(unix))]
+        command.kill_on_drop(true);
+        let mut child = command.spawn().map_err(|error| {
+            SandboxError::new(
+                ErrorCode::ExecTransportError,
+                format!(
+                    "failed to run the Modal helper `{}`: {error}",
+                    self.command.join(" ")
+                ),
+            )
+        })?;
         if let Some(mut stdin) = child.stdin.take() {
             stdin.write_all(&payload).await.ok();
             stdin.write_all(b"\n").await.ok();
             stdin.shutdown().await.ok();
         }
-        let output = child.wait_with_output().await.map_err(|error| {
+        let terminate = TerminateOnDrop::new(child.id());
+        let output = child.wait_with_output().await;
+        terminate.disarm();
+        let output = output.map_err(|error| {
             SandboxError::new(
                 ErrorCode::ExecTransportError,
                 format!("failed to wait for the Modal helper `{op}` operation: {error}"),
@@ -508,6 +554,40 @@ impl ModalHelper {
             ));
         }
         Ok(response)
+    }
+}
+
+/// Sends SIGTERM to a helper process whose call was dropped before it answered.
+///
+/// A dropped `call` is a cancelled operation. The helper turns SIGTERM into a cancellation of its
+/// in-flight work, so a bounded read's `finally` still closes the provider descriptor.
+struct TerminateOnDrop {
+    pid: Option<u32>,
+}
+
+impl TerminateOnDrop {
+    fn new(pid: Option<u32>) -> Self {
+        TerminateOnDrop { pid }
+    }
+
+    /// The call completed: the helper has answered and nothing needs stopping.
+    fn disarm(mut self) {
+        self.pid = None;
+    }
+}
+
+impl Drop for TerminateOnDrop {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Some(pid) = self.pid.take() {
+            // The system `kill` sends the signal; a pid that already exited is a no-op for it.
+            let _ = std::process::Command::new("/bin/kill")
+                .arg("-TERM")
+                .arg(pid.to_string())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
     }
 }
 

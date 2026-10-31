@@ -71,6 +71,7 @@ pub mod file_mode {
 
 /// POSIX permission triplets for a manifest entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Permissions {
     /// Owner triplet (0-7).
     pub owner: u32,

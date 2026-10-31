@@ -5,14 +5,20 @@
 
 use std::sync::Arc;
 
-use openai_agents_sdk::RunContext;
+use futures::StreamExt;
+use openai_agents_sdk::items::RunItemKind;
+use openai_agents_sdk::run::RunOptions;
+use openai_agents_sdk::run_config::RunConfig;
 use openai_agents_sdk::sandbox::capabilities::pty_tools::{exec_command_tool, write_stdin_tool};
 use openai_agents_sdk::sandbox::capabilities::{Capability, CapabilityBinding, Filesystem};
 use openai_agents_sdk::sandbox::manifest::Manifest;
 use openai_agents_sdk::sandbox::testing::{ScriptedSandboxSession, scripted_sandbox_session};
 use openai_agents_sdk::sandbox::workspace_paths::SandboxWorkspaceScope;
+use openai_agents_sdk::testing::{FakeModel, assistant_message, function_call_with_id};
 use openai_agents_sdk::tool::{FunctionTool, Tool, ToolOutput};
 use openai_agents_sdk::tool_context::ToolContext;
+use openai_agents_sdk::{Agent, RunContext, Runner};
+use serde_json::Value;
 
 fn session() -> Arc<ScriptedSandboxSession> {
     Arc::new(
@@ -47,10 +53,8 @@ fn tool(name: &str, session: &Arc<ScriptedSandboxSession>) -> Arc<FunctionTool<(
     }
 }
 
-/// Python: `test_invalid_model_input_returns_safe_feedback_without_backend_calls`.
-#[tokio::test]
-async fn invalid_model_input_returns_safe_feedback_without_backend_calls() {
-    let cases: Vec<(&str, String, &str)> = vec![
+fn cases() -> Vec<(&'static str, String, &'static str)> {
+    vec![
         (
             "exec_command",
             r#"{"cmd": "pwd", "workdir": "/outside/private-sentinel"}"#.into(),
@@ -86,18 +90,83 @@ async fn invalid_model_input_returns_safe_feedback_without_backend_calls() {
             r#"{"chars": "private-sentinel"}"#.into(),
             "Invalid tool arguments for session_id.",
         ),
-    ];
-    for (name, arguments, expected) in cases {
-        let session = session();
-        let tool = tool(name, &session);
-        let ctx = ToolContext::direct(RunContext::new(()), "agent", name, &arguments);
-        let output = tool.invoke(ctx, arguments.clone()).await.expect("feedback");
-        let ToolOutput::Text(text) = output else {
-            panic!("text feedback for {arguments}");
-        };
-        assert!(text.starts_with(expected), "{arguments}: {text}");
-        assert!(!text.contains("private-sentinel"), "{text}");
-        assert!(session.calls().is_empty(), "{arguments}: no backend call");
+    ]
+}
+
+/// Python: `test_invalid_model_input_returns_safe_feedback_without_backend_calls`, run through
+/// the runner in both modes (`streamed` x 7 cases). The model's tool call is rejected with
+/// feedback, the model gets that feedback as its next input, and the backend is never called.
+#[tokio::test]
+async fn invalid_model_input_returns_safe_feedback_without_backend_calls() {
+    for streamed in [false, true] {
+        for (name, arguments, expected) in cases() {
+            let session = session();
+            let tool = tool(name, &session);
+            let model = Arc::new(FakeModel::new());
+            model.add_turn(vec![function_call_with_id(
+                name,
+                arguments.clone(),
+                "bad-input",
+            )]);
+            model.add_turn(vec![assistant_message("recovered")]);
+            let agent = Agent::<()>::new("test")
+                .with_model_instance(model.clone())
+                .with_tool(Tool::Function(tool));
+            let config = RunConfig::default().with_trace_include_sensitive_data(false);
+            let (final_output, items, last_input) = if streamed {
+                let mut run = Runner::run_streamed_with_options(
+                    agent,
+                    "go",
+                    RunOptions::new(()).run_config(config),
+                );
+                {
+                    let events = run.stream_events();
+                    futures::pin_mut!(events);
+                    while let Some(event) = events.next().await {
+                        event.expect("the stream does not fail");
+                    }
+                }
+                let result = run.into_result().expect("a completed run");
+                (
+                    result.final_output_text(),
+                    result.new_items.clone(),
+                    model.calls()[1].input.last().cloned(),
+                )
+            } else {
+                let result =
+                    Runner::run_with_options(agent, "go", RunOptions::new(()).run_config(config))
+                        .await
+                        .expect("the run completes");
+                (
+                    result.final_output_text(),
+                    result.new_items.clone(),
+                    model.calls()[1].input.last().cloned(),
+                )
+            };
+
+            assert_eq!(
+                final_output.as_deref(),
+                Some("recovered"),
+                "{name} {arguments}"
+            );
+            let outputs: Vec<Value> = items
+                .iter()
+                .filter_map(|item| match &item.kind {
+                    RunItemKind::ToolCallOutput { output, .. } => Some(output.clone()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(outputs.len(), 1, "{name} {arguments}");
+            let text = outputs[0].as_str().expect("text feedback").to_string();
+            assert!(text.starts_with(expected), "{arguments}: {text}");
+            assert!(!text.contains("private-sentinel"), "{text}");
+            assert_eq!(
+                last_input.expect("the model saw the feedback").0["output"],
+                outputs[0],
+                "{name} {arguments}"
+            );
+            assert!(session.calls().is_empty(), "{arguments}: no backend call");
+        }
     }
 }
 

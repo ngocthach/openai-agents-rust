@@ -15,7 +15,7 @@ use crate::sandbox::mounts::{Mount, MountStrategy};
 use crate::sandbox::session::SandboxSession;
 
 /// Which bucket API the worker should speak.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CloudflareBucketProvider {
     /// Cloudflare R2.
     R2,
@@ -37,7 +37,7 @@ impl CloudflareBucketProvider {
 }
 
 /// The bucket a Cloudflare sandbox mounts, and how the worker reaches it.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, Eq)]
 pub struct CloudflareBucketMountConfig {
     /// The bucket name.
     pub bucket_name: String,
@@ -193,7 +193,7 @@ fn normalize_prefix(prefix: &str) -> String {
 }
 
 /// Attaches a bucket to a Cloudflare sandbox through the worker's mount endpoints.
-#[derive(Debug, Clone)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct CloudflareBucketMountStrategy {
     config: CloudflareBucketMountConfig,
 }

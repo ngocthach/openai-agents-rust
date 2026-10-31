@@ -56,7 +56,7 @@ const GCSFUSE_INSTALL_DEBIAN: &str = concat!(
 );
 
 /// Which FUSE tool a bucket mount drives.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BlaxelBucketProvider {
     /// Amazon S3, mounted with `s3fs`.
     S3,
@@ -85,7 +85,7 @@ impl BlaxelBucketProvider {
 }
 
 /// The bucket a Blaxel sandbox mounts, and the credentials the FUSE tool needs.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, Eq)]
 pub struct BlaxelCloudBucketMountConfig {
     /// Which FUSE tool to drive.
     pub provider: BlaxelBucketProvider,
@@ -330,7 +330,7 @@ impl BlaxelCloudBucketMountConfig {
 }
 
 /// Mounts an S3, R2 or GCS bucket inside a Blaxel sandbox with a FUSE tool.
-#[derive(Debug, Clone)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct BlaxelCloudBucketMountStrategy {
     config: BlaxelCloudBucketMountConfig,
 }
@@ -523,7 +523,7 @@ impl MountStrategy for BlaxelCloudBucketMountStrategy {
 }
 
 /// The Blaxel Drive a sandbox mounts.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct BlaxelDriveMountConfig {
     /// The drive name.
     pub drive_name: String,
@@ -716,7 +716,7 @@ impl ConfiguredMount for BlaxelDriveMount {
 }
 
 /// Attaches a Blaxel Drive through the sandbox's drives API.
-#[derive(Debug, Clone)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct BlaxelDriveMountStrategy {
     config: BlaxelDriveMountConfig,
 }

@@ -73,6 +73,10 @@ pub enum ErrorCode {
     SkillsConfigInvalid,
     /// The sandbox configuration is invalid.
     SandboxConfigInvalid,
+    /// A sandbox event sink that raises failed to record an operation, which fails the operation.
+    ///
+    /// Mirrors the `RuntimeError("sandbox event sink failed")` Python raises for `on_error="raise"`.
+    EventSinkFailed,
     /// A port the caller asked to reach cannot be resolved to a host endpoint.
     ///
     /// Mirrors Python's `ExposedPortUnavailableError`. The `reason` context says which case it
@@ -123,6 +127,7 @@ impl ErrorCode {
             ErrorCode::GitCopyError => "git_copy_error",
             ErrorCode::SkillsConfigInvalid => "skills_config_invalid",
             ErrorCode::SandboxConfigInvalid => "sandbox_config_invalid",
+            ErrorCode::EventSinkFailed => "event_sink_failed",
             ErrorCode::ExposedPortUnavailable => "exposed_port_unavailable",
             ErrorCode::SnapshotPersistError => "snapshot_persist_error",
             ErrorCode::SnapshotRestoreError => "snapshot_restore_error",
@@ -164,7 +169,8 @@ impl ErrorCode {
             | ErrorCode::MountConfigInvalid
             | ErrorCode::SkillsConfigInvalid
             | ErrorCode::SandboxConfigInvalid
-            | ErrorCode::SnapshotNotRestorable => Some(false),
+            | ErrorCode::SnapshotNotRestorable
+            | ErrorCode::EventSinkFailed => Some(false),
             // Broad: the same code covers a dropped connection and a permanent refusal.
             ErrorCode::ExecTransportError
             | ErrorCode::ExposedPortUnavailable

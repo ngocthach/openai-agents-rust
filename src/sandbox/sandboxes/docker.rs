@@ -38,7 +38,7 @@ pub const DOCKER_SESSION_ID_KEY: &str = "docker_session_id";
 pub const DEFAULT_PYTHON_SANDBOX_IMAGE: &str = "python:3.14-slim";
 
 /// Settings used when creating a Docker-backed session.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, Eq)]
 pub struct DockerSandboxClientOptions {
     /// The image the container runs.
     pub image: String,
@@ -52,6 +52,20 @@ pub struct DockerSandboxClientOptions {
     pub labels: BTreeMap<String, String>,
     /// Extra arguments inserted before the image in `docker create`.
     pub extra_create_args: Vec<String>,
+}
+
+// Extra create arguments can carry `-e NAME=value` pairs, so `Debug` shows only how many there
+// are.
+impl std::fmt::Debug for DockerSandboxClientOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DockerSandboxClientOptions")
+            .field("image", &self.image)
+            .field("network_disabled", &self.network_disabled)
+            .field("exposed_ports", &self.exposed_ports)
+            .field("labels", &self.labels)
+            .field("extra_create_args", &self.extra_create_args.len())
+            .finish()
+    }
 }
 
 impl Default for DockerSandboxClientOptions {

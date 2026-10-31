@@ -72,7 +72,7 @@ pub const WORKSPACE_ENV: &str = "BL_WORKSPACE";
 pub const REGION_ENV: &str = "BL_REGION";
 
 /// Timeouts for the Blaxel sandbox operations, matching Python's `BlaxelTimeouts`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct BlaxelTimeouts {
     /// The default exec timeout.
     pub exec: Duration,
@@ -102,7 +102,7 @@ impl Default for BlaxelTimeouts {
 }
 
 /// Settings used when creating a Blaxel-backed session.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, Eq)]
 pub struct BlaxelSandboxClientOptions {
     /// The sandbox image, or the Blaxel default when unset.
     pub image: Option<String>,
@@ -138,6 +138,31 @@ pub struct BlaxelSandboxClientOptions {
     pub exposed_port_public: bool,
     /// How long a private preview's access token stays valid, in seconds.
     pub exposed_port_url_ttl_secs: u32,
+}
+
+// The API key is a credential, and the environment values may be too, so `Debug` shows neither.
+impl std::fmt::Debug for BlaxelSandboxClientOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BlaxelSandboxClientOptions")
+            .field("image", &self.image)
+            .field("memory", &self.memory)
+            .field("region", &self.region)
+            .field("ports", &self.ports)
+            .field("env_vars", &self.env_vars.keys().collect::<Vec<_>>())
+            .field("labels", &self.labels)
+            .field("ttl", &self.ttl)
+            .field("name", &self.name)
+            .field("pause_on_exit", &self.pause_on_exit)
+            .field("timeouts", &self.timeouts)
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .field("workspace", &self.workspace)
+            .field("api_base_url", &self.api_base_url)
+            .field("run_base_url", &self.run_base_url)
+            .field("force_sandbox_url", &self.force_sandbox_url)
+            .field("exposed_port_public", &self.exposed_port_public)
+            .field("exposed_port_url_ttl_secs", &self.exposed_port_url_ttl_secs)
+            .finish()
+    }
 }
 
 impl Default for BlaxelSandboxClientOptions {
@@ -1146,16 +1171,27 @@ impl BlaxelSandboxSession {
                 format!("`{resolved}` does not exist in the sandbox workspace"),
             ));
         }
+        if limit.is_some() && !status.is_success() {
+            // Mirrors Python's bounded read: a transient status is retryable, anything else is
+            // left unclassified, and the body is never read.
+            let retryable =
+                crate::sandbox::retry::is_transient_http_status(status.as_u16()).then_some(true);
+            return Err(crate::sandbox::http::read_status_error(
+                &format!("read `{resolved}`"),
+                status,
+                retryable,
+            ));
+        }
         if !status.is_success() {
             let body = response.bytes().await.unwrap_or_default();
+            let detail = blaxel_error_detail(&body)
+                .map(|detail| format!(": {detail}"))
+                .unwrap_or_default();
             return Err(SandboxError::new(
                 ErrorCode::ExecTransportError,
                 format!(
-                    "Failed to read `{resolved}`: HTTP {}{}",
-                    status.as_u16(),
-                    blaxel_error_detail(&body)
-                        .map(|detail| format!(": {detail}"))
-                        .unwrap_or_default()
+                    "Failed to read `{resolved}`: HTTP {}{detail}",
+                    status.as_u16()
                 ),
             ));
         }

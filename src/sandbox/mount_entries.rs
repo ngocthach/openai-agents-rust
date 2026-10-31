@@ -703,7 +703,7 @@ impl MountStrategy for ConfiguredMountStrategy {
 // ---------------------------------------------------------------------------------------------
 
 /// An Amazon S3 bucket, or any bucket reachable over the S3 API. Mirrors Python's `S3Mount`.
-#[derive(Clone, Default)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Default)]
 pub struct S3Mount {
     /// The bucket name.
     pub bucket: String,
@@ -1036,7 +1036,7 @@ fn mountpoint_config(
 ///
 /// With HMAC credentials (`access_id` and `secret_access_key`) the bucket is reached over the
 /// S3-compatible API; otherwise rclone's native Google Cloud Storage backend is used.
-#[derive(Clone, Default)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Default)]
 pub struct GcsMount {
     /// The bucket name.
     pub bucket: String,
@@ -1427,7 +1427,7 @@ impl ConfiguredMount for GcsMount {
 // ---------------------------------------------------------------------------------------------
 
 /// A Cloudflare R2 bucket. Mirrors Python's `R2Mount`.
-#[derive(Clone, Default)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Default)]
 pub struct R2Mount {
     /// The bucket name.
     pub bucket: String,
@@ -1620,7 +1620,7 @@ impl ConfiguredMount for R2Mount {
 // ---------------------------------------------------------------------------------------------
 
 /// An Azure Blob Storage container. Mirrors Python's `AzureBlobMount`.
-#[derive(Clone, Default)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Default)]
 pub struct AzureBlobMount {
     /// The storage account name.
     pub account: String,
@@ -1830,7 +1830,7 @@ impl ConfiguredMount for AzureBlobMount {
 // ---------------------------------------------------------------------------------------------
 
 /// Which kind of Box account a JWT mount authenticates as.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum BoxSubType {
     /// An individual user.
     #[default]
@@ -1853,7 +1853,7 @@ impl BoxSubType {
 ///
 /// A non-interactive mount needs a minted `token` or `access_token`: see Box's JWT setup guide
 /// and rclone's Box documentation.
-#[derive(Clone, Default)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Default)]
 pub struct BoxMount {
     /// The folder path inside Box; `None` mounts the root.
     pub path: Option<String>,
@@ -2150,7 +2150,7 @@ impl ConfiguredMount for BoxMount {
 /// bucket configuration all have to exist, and the sandbox has to run where the mount target is
 /// reachable. At mount time `mount -t s3files` runs inside the sandbox with `file_system_id` as
 /// the device.
-#[derive(Debug, Clone, Default)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Default)]
 pub struct S3FilesMount {
     /// The file system id, used as the mount device.
     pub file_system_id: String,

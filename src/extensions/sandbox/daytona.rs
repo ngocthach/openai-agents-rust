@@ -89,7 +89,8 @@ use super::ports::{
     exposed_port_unavailable,
 };
 use crate::sandbox::http::{
-    bounded_read_zero, expect_success, http_error, parse_json, read_body_prefix, transport,
+    as_archive_read, bounded_read_zero, expect_success, parse_json, read_body_prefix,
+    read_status_error, transport,
 };
 
 /// The backend identifier reported by this client and its sessions.
@@ -126,7 +127,7 @@ const PTY_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const PTY_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(20);
 
 /// Resource limits for a Daytona sandbox. Mirrors Python's `DaytonaSandboxResources`.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Default, PartialEq, Eq)]
 pub struct DaytonaSandboxResources {
     /// CPU cores.
     pub cpu: Option<u32>,
@@ -165,8 +166,20 @@ impl DaytonaSandboxResources {
     }
 }
 
+/// Whether a failed Daytona file read is worth repeating, by HTTP status.
+///
+/// Mirrors Python's `_DAYTONA_HTTP_STATUS_RETRYABLE`: the statuses it names are classified, and
+/// any other status is left unclassified (`None`) rather than guessed at.
+fn daytona_status_retryable(status: u16) -> Option<bool> {
+    match status {
+        400 | 401 | 403 | 404 | 409 => Some(false),
+        429 | 500 | 502 | 503 | 504 => Some(true),
+        _ => None,
+    }
+}
+
 /// Timeouts applied to Daytona operations. Mirrors Python's `DaytonaSandboxTimeouts`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct DaytonaSandboxTimeouts {
     /// Sent to the toolbox when a command has no timeout of its own.
     pub exec_unbounded: Duration,
@@ -199,7 +212,7 @@ impl Default for DaytonaSandboxTimeouts {
 }
 
 /// Settings used when creating a Daytona-backed session.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, Eq)]
 pub struct DaytonaSandboxClientOptions {
     /// API key for the platform API. Falls back to `DAYTONA_API_KEY`.
     pub api_key: Option<String>,
@@ -998,7 +1011,7 @@ impl DaytonaSandboxSession {
             .timeout(self.options.timeouts.file_download)
             .send()
             .await
-            .map_err(|e| transport(what, e))?;
+            .map_err(|e| as_archive_read(transport(what, e)))?;
         if response.status() == reqwest::StatusCode::NOT_FOUND {
             return Err(SandboxError::new(
                 ErrorCode::WorkspaceReadNotFound,
@@ -1007,12 +1020,10 @@ impl DaytonaSandboxSession {
         }
         if !response.status().is_success() {
             let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(http_error(
-                ErrorCode::WorkspaceWriteTypeError,
+            return Err(read_status_error(
                 what,
                 status,
-                &body,
+                daytona_status_retryable(status.as_u16()),
             ));
         }
         read_body_prefix(response, limit, what).await
@@ -2043,19 +2054,21 @@ fn assert_daytona_session(session: &dyn SandboxSession) -> SandboxResult<()> {
 /// then delegates to [`InContainerMountStrategy`]. The rclone configuration carries the bucket
 /// credentials, so the mount reports [`MountCredentialAuthority::MountScoped`] and the manifest
 /// has to acknowledge the exact mount path before it activates.
-#[derive(Debug, Clone)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct DaytonaCloudBucketMountStrategy {
     /// The rclone pattern that attaches the bucket.
     pub pattern: RcloneMountPattern,
     /// The secret-bearing rclone configuration and the remote selection options.
     ///
     /// Ignored when [`spec`](Self::spec) is set, which derives the configuration per session.
+    #[serde(skip)]
     pub config: MountPatternConfig,
     /// The storage this strategy attaches, when it was built from a configured mount.
     ///
     /// A configured mount knows how to render its own rclone section, so the configuration is
     /// built on each activation against the session it is attached to instead of being pinned
     /// when the strategy is declared.
+    #[serde(skip)]
     pub spec: Option<Arc<dyn ConfiguredMount>>,
     /// Whether a missing `rclone` (or `fuse3`) may be installed into the sandbox.
     pub install_tools: bool,

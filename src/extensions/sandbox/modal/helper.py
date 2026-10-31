@@ -47,6 +47,7 @@ import base64
 import json
 import os
 import shlex
+import signal
 import sys
 import threading
 from typing import Any
@@ -231,6 +232,22 @@ def _modal_retryability(error: BaseException) -> bool | None:
     return None
 
 
+def _cancel_on_sigterm() -> None:
+    """Cancel the running operation on SIGTERM, so its cleanup still runs.
+
+    The Rust caller stops a dropped call with SIGTERM rather than SIGKILL, which would skip the
+    `finally` that closes the descriptor.
+    """
+    loop = asyncio.get_running_loop()
+    task = asyncio.current_task()
+    if task is None:
+        return
+    try:
+        loop.add_signal_handler(signal.SIGTERM, task.cancel)
+    except (NotImplementedError, RuntimeError):  # pragma: no cover - not the main thread / Windows
+        pass
+
+
 async def _op_read_bounded(modal: Any, request: dict[str, Any]) -> dict[str, Any]:
     """Read at most `max_bytes` through the sandbox filesystem API and close the descriptor.
 
@@ -239,6 +256,7 @@ async def _op_read_bounded(modal: Any, request: dict[str, Any]) -> dict[str, Any
     only learns the reason and whether a retry may help.
     """
     max_bytes = int(request["max_bytes"])
+    _cancel_on_sigterm()
     try:
         sandbox = await _sandbox(modal, request)
         stream = await sandbox.open.aio(request["path"], "rb")

@@ -14,6 +14,7 @@ use crate::run_config::ModelInputData;
 use crate::sandbox::agent::{PreparedSandboxGraph, SandboxAgent};
 use crate::sandbox::capabilities::CapabilityBinding;
 use crate::sandbox::entries::{Entry, EntryKind};
+use crate::sandbox::errors::ErrorCode;
 use crate::sandbox::manifest::{Manifest, SandboxConcurrencyLimits};
 use crate::sandbox::memory::SandboxMemoryGenerationManager;
 use crate::sandbox::memory::rollouts::{
@@ -343,6 +344,31 @@ impl SandboxSessionGuard {
     }
 }
 
+/// The snapshot spec a new session is created with.
+///
+/// Mirrors Python's `SandboxRuntimeSessionManager._resolve_snapshot_spec`. An explicit spec is
+/// returned as given and the default directory is never resolved, so no directory is created for
+/// it. Without one, `default` supplies the SDK default directory. Only an I/O failure creating
+/// that directory falls back to no snapshots, which is the case Python catches as `OSError`; every
+/// other error propagates.
+pub async fn resolve_snapshot_spec_with<F, Fut>(
+    explicit: Option<&SnapshotSpec>,
+    default: F,
+) -> crate::sandbox::SandboxResult<SnapshotSpec>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = crate::sandbox::SandboxResult<SnapshotSpec>>,
+{
+    if let Some(spec) = explicit {
+        return Ok(spec.clone());
+    }
+    match default().await {
+        Ok(spec) => Ok(spec),
+        Err(error) if error.code == ErrorCode::SnapshotPersistError => Ok(SnapshotSpec::Noop),
+        Err(error) => Err(error),
+    }
+}
+
 /// A [`SandboxAgent`] graph prepared against a live session, ready for [`Runner`].
 pub struct PreparedSandboxRun<C> {
     /// The prepared agent graph.
@@ -633,13 +659,14 @@ impl SandboxRunner {
         config: &SandboxRunConfig,
         client: &dyn SandboxClient,
     ) -> Result<SnapshotSpec> {
-        if let Some(spec) = &config.snapshot {
-            return Ok(spec.clone());
-        }
-        if let Some(spec) = client.configured_snapshot() {
-            return Ok(spec);
-        }
-        Ok(resolve_default_local_snapshot_spec().await?)
+        let explicit = config
+            .snapshot
+            .clone()
+            .or_else(|| client.configured_snapshot());
+        Ok(
+            resolve_snapshot_spec_with(explicit.as_ref(), resolve_default_local_snapshot_spec)
+                .await?,
+        )
     }
 
     /// The manifest a session is created with, with the run config's concurrency limits applied.

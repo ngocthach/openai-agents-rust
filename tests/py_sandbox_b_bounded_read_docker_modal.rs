@@ -111,6 +111,9 @@ class _Stream:
                 log.write(f"read {size}\n")
             if self.mode.startswith("read_fail"):
                 raise _error(self.mode)
+            if self.mode.startswith("hang"):
+                # A read that never completes: only a cancellation ends it.
+                await asyncio.sleep(3600)
             chunk, self.data = self.data[:size], self.data[size:]
             return chunk
         return _Stream._Op(read)
@@ -120,10 +123,10 @@ class _Stream:
         async def close():
             with open(os.environ["STUB_LOG"], "a") as log:
                 log.write("close\n")
-            if self.mode == "close_fail":
+            if self.mode.endswith("close_fail"):
                 raise RuntimeError("synthetic-private-response")
-            if self.mode == "close_timeout":
-                await asyncio.sleep(30)
+            if self.mode.endswith("close_timeout"):
+                raise asyncio.TimeoutError("synthetic-private-response")
         return _Stream._Op(close)
 
 
@@ -174,13 +177,8 @@ impl Stub {
         std::fs::read_to_string(self.directory.path().join("log")).unwrap_or_default()
     }
 
-    async fn read_bounded(
-        &self,
-        mode: &str,
-        size: usize,
-        max_bytes: usize,
-    ) -> SandboxResult<Vec<u8>> {
-        let helper = ModalHelper::new(vec![
+    fn helper(&self, mode: &str, size: usize) -> ModalHelper {
+        ModalHelper::new(vec![
             "/usr/bin/env".to_string(),
             format!("PYTHONPATH={}", self.directory.path().display()),
             format!("STUB_LOG={}", self.directory.path().join("log").display()),
@@ -191,7 +189,16 @@ impl Stub {
                 "{}/src/extensions/sandbox/modal/helper.py",
                 env!("CARGO_MANIFEST_DIR")
             ),
-        ]);
+        ])
+    }
+
+    async fn read_bounded(
+        &self,
+        mode: &str,
+        size: usize,
+        max_bytes: usize,
+    ) -> SandboxResult<Vec<u8>> {
+        let helper = self.helper(mode, size);
         let response: Value = helper
             .call(json!({
                 "op": "read_bounded", "sandbox_id": "sb-1",
@@ -263,4 +270,43 @@ async fn modal_bounded_read_uses_large_bounded_requests() {
             .collect();
         assert_eq!(requests, expected, "limit {limit}");
     }
+}
+
+/// Python: `test_modal_bounded_read_cancellation_closes_descriptor`. A dropped read is a
+/// cancelled operation: the helper gets SIGTERM, its `finally` closes the descriptor, and the
+/// close error (none, a failure, or a timeout) does not change that.
+#[tokio::test]
+async fn modal_cancelled_read_closes_the_descriptor() {
+    for mode in ["hang", "hang_close_fail", "hang_close_timeout"] {
+        let Some(stub) = Stub::new() else { return };
+        let stub = Arc::new(stub);
+        let helper = stub.helper(mode, 3);
+        let task = tokio::spawn(async move {
+            helper
+                .call(json!({
+                    "op": "read_bounded", "sandbox_id": "sb-1",
+                    "path": "/workspace/out.jsonl", "max_bytes": 3,
+                }))
+                .await
+        });
+        // The read has started once the helper logs it.
+        let started = wait_until(|| stub.log().contains("read 3")).await;
+        assert!(started, "{mode}: the helper started the read");
+
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled(), "{mode}");
+
+        let closed = wait_until(|| stub.log().contains("close")).await;
+        assert!(closed, "{mode}: the cancelled helper closed the descriptor");
+    }
+}
+
+async fn wait_until(mut condition: impl FnMut() -> bool) -> bool {
+    for _ in 0..500 {
+        if condition() {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    false
 }

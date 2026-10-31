@@ -36,6 +36,21 @@ use crate::sandbox::types::{ExecResult, SandboxArchiveLimits};
 /// Prefix of the temporary workspace directories created for Unix-local sessions.
 const WORKSPACE_PREFIX: &str = "openai-agents-sandbox-";
 
+/// Options for a host-shell sandbox, mirroring Python's `UnixLocalSandboxClientOptions`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct UnixLocalSandboxClientOptions {
+    /// Host ports the sandbox exposes, as [`UnixLocalSandboxClient::with_exposed_ports`].
+    #[serde(default)]
+    pub exposed_ports: Vec<u16>,
+}
+
+impl UnixLocalSandboxClientOptions {
+    /// The client these options describe.
+    pub fn client(&self) -> UnixLocalSandboxClient {
+        UnixLocalSandboxClient::new().with_exposed_ports(self.exposed_ports.clone())
+    }
+}
+
 /// Creates [`UnixLocalSandboxSession`]s backed by a temporary host directory.
 ///
 /// <div class="warning">

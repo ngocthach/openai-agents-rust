@@ -24,12 +24,18 @@ pub trait EnvValue: Send + Sync + fmt::Debug {
     /// The value type, matching the Python `type` discriminator.
     fn env_value_type(&self) -> &str;
 
+    /// This value as [`Any`](std::any::Any), so a persisted payload can be written from a
+    /// `dyn EnvValue`. The default `None` keeps custom sources working unchanged.
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        None
+    }
+
     /// Produce the value. Called once per session start.
     async fn resolve(&self) -> SandboxResult<String>;
 }
 
 /// A literal environment value. Mirrors Python's `StrEnvValue`.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct StrEnvValue {
     value: String,
 }
@@ -54,6 +60,10 @@ impl fmt::Debug for StrEnvValue {
 
 #[async_trait]
 impl EnvValue for StrEnvValue {
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
+    }
+
     fn env_value_type(&self) -> &str {
         "str"
     }
