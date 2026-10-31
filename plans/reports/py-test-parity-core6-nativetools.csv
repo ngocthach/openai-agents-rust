@@ -1,0 +1,4 @@
+path,total,ported,covered,python_only,not_ported,rust_files
+tests/test_native_tool_failure_history.py,72,38,0,34,0,"tests/py_core6_nativetools_failure_history.rs;tests/py_core2_toolerrors_batch.rs"
+tests/test_tool_batch_failure_history.py,64,25,0,39,0,"tests/py_core6_nativetools_guardrail_race.rs;tests/py_core2_toolerrors_batch.rs;tests/py_core6_streamedleft_batch.rs"
+tests/test_run_impl_resume_paths.py,198,142,10,24,22,"tests/py_core6_nativetools_approvals.rs;tests/py_core6_resume_name_fallback.rs"

@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.9.0 (2026-11-01)
+
+Burns down the measured parity gap. The Python suite's 12,641 test cases are now all classified
+(`plans/reports/py-test-parity-ledger.md`): 7,981 ported, 604 covered by existing Rust tests, 3,987
+Python-only with a recorded reason, 69 not ported, 0 unaccounted. New tests live in `tests/py_core6_*.rs`;
+per-area notes are in `plans/reports/py-test-parity-core6-*.md`. No live model call was made: wire formats
+are checked against mock servers only.
+
+Fixes the ported tests exposed:
+
+- Sandbox providers (Blaxel, Cloudflare, E2B, Daytona, Modal, Vercel): workspace symlink escapes are
+  refused, credentials no longer end up in a Modal snapshot, and archive and mount credential handling
+  matches Python. The local PTY reports an exit code and a live process id from one read.
+- Runner: native tools run concurrently with the function-tool batch and race the guardrails; the input
+  guardrail is polled before the model call so a guardrail that trips first wins; resumed runs, name
+  fallbacks, compaction and session appends match Python; a failed streamed run's `to_state()` returns the
+  checkpoint.
+- MCP: pagination, retry, session setup, approval caching and resume binding match Python; invalidating the
+  tool cache keeps the stale list visible but never serves it.
+- Model retry backoff defaults are 0.25 s initial, 2 s max, factor 2, jitter on.
+
+Breaking changes: `RunConfig::tool_post_invoke_wait` (new), `RunState::foreign_owner_call_ids` (new),
+`ProcessedResponseSnapshot::mcp_tool_bindings` has a new type, `SessionRunCompletion::omit_reasoning_item_ids`
+(new), `RequireApproval::DynamicWithContext` (new), `Session::ignores_item_ids_for_matching` (new),
+sandbox backends implement `read_bounded_unchecked` instead of `read_bounded`, Cloudflare resume refuses
+credentialed state, E2B native snapshots with skip paths return a tar, and shutdown suppresses a failed
+delete.
+
+Known differences and gaps: 7 MCP cases (four expired-during-compaction rollbacks, three
+mutation-generation interleavings) and a few others (69 in all) are not ported; a tar nested-path case is
+skipped on macOS (needs GNU tar); tar `--no-wildcards` differs; the live-session `concurrency_limits`
+differ. `test_complex_async_tracing` failed once in about 60 loaded runs and has not reproduced.
+
 ## 0.8.0 (2026-10-31)
 
 Closes the gaps a completeness check found in the 0.6.0/0.7.0 parity work: about 450 cases of top-level

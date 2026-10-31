@@ -1,0 +1,21 @@
+path,total,ported,covered,python_only,not_ported,rust_files
+tests/mcp/test_client_session_retries.py,40,15,3,22,0,tests/py_mcp_http_transport.rs;tests/py_core6_mcpmisc_mcp_retry_setup.rs
+tests/mcp/test_mcp_approval.py,13,9,1,3,0,tests/py_mcp_caching_approval.rs;tests/py_mcp_runner_tracing.rs;tests/py_core6_mcpmisc_mcp_util.rs
+tests/mcp/test_mcp_resume_binding.py,61,61,0,0,0,tests/py_core6_mcpmisc_resume_binding.rs;tests/py_mcp_resume_binding.rs
+tests/mcp/test_mcp_server_manager.py,88,36,2,50,0,tests/py_mcp_manager.rs;tests/py_core6_mcpmisc_manager.rs
+tests/mcp/test_mcp_util.py,135,108,11,16,0,tests/py_mcp_util.rs;tests/py_mcp_util_logging.rs;tests/py_mcp_util_schemas.rs;tests/py_core6_mcpmisc_mcp_util.rs;tests/py_core6_mcpmisc_mcp_static_meta.rs
+tests/mcp/test_message_handler.py,4,0,1,3,0,tests/mcp_tests.rs
+tests/mcp/test_runner_calls_mcp.py,24,24,0,0,0,tests/py_mcp_runner_tracing.rs;tests/py_core6_mcpmisc_mcp_util.rs
+tests/mcp/test_server_errors.py,121,22,0,99,0,tests/py_mcp_http_transport.rs;tests/py_mcp_pagination.rs;tests/py_mcp_server_errors.rs
+tests/memory/test_compaction_model_visibility.py,81,81,0,0,0,tests/py_core6_mcpmisc_compaction_visibility.rs;tests/py_memory_compaction_visibility.rs
+tests/memory/test_compaction_suffix.py,46,22,0,24,0,tests/py_core6_mcpmisc_compaction_suffix.rs;tests/py_memory_remaining_a.rs
+tests/memory/test_openai_conversations_session.py,74,33,24,17,0,tests/py_memory_conversations.rs;tests/py_memory_conversations_remaining.rs;tests/py_memory_remaining_c.rs;tests/py_core6_mcpmisc_conversations_resume.rs
+tests/memory/test_openai_responses_compaction_session.py,94,36,35,16,7,tests/py_memory_compaction.rs;tests/py_memory_responses_compaction_a.rs;tests/py_memory_responses_compaction_b.rs;tests/py_core6_mcpmisc_compaction_session.rs
+tests/memory/test_session_context_wrapper.py,15,0,0,15,0,
+tests/memory/test_session_helpers.py,6,3,0,3,0,tests/py_memory_limits_helpers.rs
+tests/memory/test_session_limit.py,15,15,0,0,0,tests/py_core6_mcpmisc_session_limit.rs;tests/py_memory_limits_helpers.rs
+tests/memory/test_sqlalchemy_compaction.py,30,12,0,18,0,tests/py_memory_sqlx_compaction.rs;tests/py_memory_remaining_b.rs;tests/py_core6_mcpmisc_sqlx_compaction.rs
+tests/docs/test_translate_docs.py,9,0,0,9,0,
+tests/fastapi/test_streaming_context.py,1,0,0,1,0,
+tests/sandbox/test_tar_workspace.py,6,6,0,0,0,tests/py_core6_mcpmisc_tar_workspace.rs
+tests/test_run_impl_resume_paths.py (3 cases handed over by the resume agent),3,3,0,0,0,tests/py_core6_mcpmisc_compaction.rs
