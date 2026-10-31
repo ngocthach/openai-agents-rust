@@ -1,5 +1,39 @@
 # Changelog
 
+## Unreleased (0.6.0)
+
+`RunState` parity with Python's `test_run_state.py` (see `plans/reports/py-test-parity-core2-runstate.md`).
+
+Added:
+
+- `RunState` reads and writes the `sandbox` resume payload of a Python snapshot as opaque JSON, with
+  mount credentials, credential-file sources and unsafe endpoints removed on every read and write.
+- Nested-handoff ownership (`nested_history_owned_items`) and the generated/session index map are
+  serialized and validated with Python's digest, so a resumed run does not replay carried items twice.
+- `RunState::try_approve` / `try_reject` (refuse a call that has no canonical invocation identity),
+  `to_json_with_tracing_api_key`, `reasoning_item_id_policy`, `tool_input`,
+  `ToolApprovalItem::tool_namespace` / `qualified_name`, and `RunItem::tool_lookup_key` /
+  `allow_bare_name_alias`.
+- Resuming a parked approval turn under output guardrails is refused ("current response boundary
+  cannot be proven") when the serialized ownership of the parked response is corrupt or comes from a
+  legacy writer; hosted MCP items obey the `allowed_callers` of their server.
+
+Breaking changes (pre-1.0):
+
+- `RunState`, `ProcessedResponseSnapshot` and `RunItem` gained public fields; build them with
+  `..Default::default()` / `RunItem::new`.
+- Schema, ledger and parse errors use Python's exact messages and never echo the payload.
+- `RunState::approve` / `reject` keep their infallible signatures. Python's `approve` / `reject` raise
+  for an item that cannot carry the decision; the Rust forms record nothing and return. The fallible
+  path with Python's errors is `RunState::try_approve` / `try_reject`.
+
+Deliberate differences from Python:
+
+- A snapshot item without an agent, without a type, or that cannot be read is an error, where Python
+  skips it with a log line. A skipped item is history the resumed run would never see.
+- Python's object-identity ownership rules (deep copies, aliasing of equal items) have no Rust
+  equivalent; items are owned values and the generated and session histories are one list.
+
 ## 0.5.0 (2026-10-30)
 
 Closes the gaps found by an independent audit of the public Python surface (1845 names, options and

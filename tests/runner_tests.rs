@@ -112,6 +112,17 @@ async fn structured_output_is_validated() {
     model.add_turn(vec![assistant_message("not json")]);
     let err = Runner::run(&agent, "x").await.unwrap_err();
     assert!(matches!(err, AgentsError::ModelBehaviorError { .. }));
+    // By default (like Python's `DONT_LOG_MODEL_DATA`) an invalid-JSON error is redacted and
+    // carries no run data, so the model's payload never reaches the error.
+    assert!(err.run_data().is_none());
+    assert!(!err.to_string().contains("not json"));
+
+    // With model-data logging enabled the same error names the payload and carries the run.
+    openai_agents_sdk::debug::set_dont_log_model_data(false);
+    model.add_turn(vec![assistant_message("not json")]);
+    let err = Runner::run(&agent, "x").await.unwrap_err();
+    openai_agents_sdk::debug::reset_dont_log_model_data();
+    assert!(matches!(err, AgentsError::ModelBehaviorError { .. }));
     assert!(err.run_data().is_some());
 }
 
@@ -1021,7 +1032,11 @@ async fn tool_name_collisions_follow_policy() {
     let err = Runner::run_with_options(&agent, "x", RunOptions::new(()).run_config(config))
         .await
         .unwrap_err();
-    assert!(err.to_string().contains("collision"));
+    assert!(
+        err.to_string()
+            .contains("Ambiguous tool routing configuration"),
+        "{err}"
+    );
 }
 
 #[test]

@@ -306,9 +306,11 @@ fn run_streamed_default<C: Send + Sync + 'static>(
 ) -> RunResultStreaming<C> {
     let (tx, rx) = mpsc::unbounded_channel();
     let cancel = Arc::new(AtomicBool::new(false));
+    let control = Arc::new(crate::result::StreamControl::default());
     let sink = EventSink {
         tx: tx.clone(),
         cancel_after_turn: cancel.clone(),
+        control: control.clone(),
     };
     let scope = ScopeSnapshot::capture();
     let start_agent = agent.clone();
@@ -319,7 +321,7 @@ fn run_streamed_default<C: Send + Sync + 'static>(
             .await;
         let _ = tx.send(StreamMsg::Done(Box::new(result)));
     });
-    let mut streaming = RunResultStreaming::new(rx, start_agent, cancel, handle);
+    let mut streaming = RunResultStreaming::new(rx, start_agent, cancel, control, handle);
     streaming.set_max_turns(max_turns);
     streaming
 }

@@ -159,6 +159,16 @@ impl OpenAIClient {
         self
     }
 
+    /// The organization sent with every request, if any.
+    pub fn organization(&self) -> Option<&str> {
+        self.organization.as_deref()
+    }
+
+    /// The project sent with every request, if any.
+    pub fn project(&self) -> Option<&str> {
+        self.project.as_deref()
+    }
+
     /// Add a default header sent on every request.
     pub fn with_header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
         self.default_headers.insert(name.into(), value.into());

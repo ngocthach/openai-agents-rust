@@ -520,6 +520,24 @@ impl ToolApprovalItem {
     pub fn arguments(&self) -> &str {
         &self.raw_item.arguments
     }
+    /// The namespace of the called tool, when the call carries one. Mirrors
+    /// `ToolApprovalItem.tool_namespace`.
+    pub fn tool_namespace(&self) -> Option<&str> {
+        self.raw_item
+            .extra
+            .get("namespace")
+            .and_then(Value::as_str)
+            .filter(|ns| !ns.is_empty())
+    }
+    /// `namespace.name`, or the bare name when there is no namespace or the namespace is the
+    /// synthetic one a deferred top-level tool gets (equal to the tool name). Mirrors
+    /// `ToolApprovalItem.qualified_name`.
+    pub fn qualified_name(&self) -> String {
+        match self.tool_namespace() {
+            Some(ns) if ns != self.tool_name => format!("{ns}.{}", self.tool_name),
+            _ => self.tool_name.clone(),
+        }
+    }
 }
 
 /// The kind of a [`RunItem`].
@@ -596,6 +614,16 @@ pub struct RunItem {
     /// `ToolCallItem.tool_origin`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_origin: Option<crate::tool::ToolOrigin>,
+    /// The function-tool lookup key the item resolves under, in the snapshot's wire form
+    /// (`{"kind": "bare" | "namespaced" | "deferred_top_level", ...}`). Mirrors
+    /// `ToolApprovalItem.tool_lookup_key`; kept so a restored approval still names the tool it
+    /// was raised for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_lookup_key: Option<Value>,
+    /// Whether an approval for a namespaced tool also covers the bare tool name. Mirrors
+    /// `ToolApprovalItem._allow_bare_name_alias`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allow_bare_name_alias: bool,
     /// Run-local lineage key that survives copies, so the loop can tell which items a handoff
     /// input filter kept. Never serialized and never part of equality. Mirrors
     /// `_NESTED_HISTORY_RUN_ITEM_OCCURRENCE_KEY`.
@@ -628,6 +656,8 @@ impl RunItem {
             description: None,
             title: None,
             tool_origin: None,
+            tool_lookup_key: None,
+            allow_bare_name_alias: false,
             occurrence: OccurrenceKey::default(),
         }
     }

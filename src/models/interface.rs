@@ -205,4 +205,10 @@ pub trait ModelProvider: Send + Sync + fmt::Debug {
     ///
     /// Mirrors `ModelProvider.aclose()`; the default does nothing.
     async fn close(&self) {}
+
+    /// Whether the runner created this provider for one run and closes it when the run ends.
+    #[doc(hidden)]
+    fn is_run_owned(&self) -> bool {
+        false
+    }
 }

@@ -105,7 +105,24 @@ async fn consume_stream<C: Send + Sync + 'static>(
             apply_aggregated_usage(&mut parsed, r);
             final_response = Some(parsed);
         }
+        // A failed terminal event ends the run with the event still delivered as a raw
+        // response. Port of the terminal-event branch of `run_single_turn_streamed`.
+        let failure = match ty {
+            "response.incomplete" | "response.failed" => Some(
+                crate::models::response_terminal::response_terminal_failure_error(
+                    ty,
+                    ev.get("response"),
+                ),
+            ),
+            "error" | "response.error" => {
+                Some(crate::models::response_terminal::response_error_event_failure_error(ty, &ev))
+            }
+            _ => None,
+        };
         sink.send(StreamEvent::RawResponse(ev));
+        if let Some(error) = failure {
+            return Err(error);
+        }
     }
     final_response.ok_or_else(|| {
         AgentsError::model_behavior("Model stream ended without a response.completed event")

@@ -307,7 +307,7 @@ impl<C> Default for RunConfig<C> {
     fn default() -> Self {
         RunConfig {
             model: None,
-            model_provider: Arc::new(MultiProvider::default()),
+            model_provider: Arc::new(MultiProvider::default().into_run_owned()),
             model_settings: None,
             handoff_input_filter: None,
             nest_handoff_history: false,

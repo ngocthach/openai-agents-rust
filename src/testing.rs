@@ -949,10 +949,16 @@ fn completed_response_value(response: &ModelResponse) -> Value {
     usage["input_tokens"] = json!(response.usage.input_tokens);
     usage["output_tokens"] = json!(response.usage.output_tokens);
     usage["total_tokens"] = json!(response.usage.total_tokens);
-    json!({
+    let mut completed = json!({
         "id": response.response_id,
         "status": "completed",
         "output": response.output.iter().map(OutputItem::to_value).collect::<Vec<_>>(),
         "usage": usage,
-    })
+    });
+    // A streamed response carries its transport request id on the terminal event, as a real
+    // Responses stream does (Python's `response._request_id`).
+    if let Some(request_id) = &response.request_id {
+        completed[crate::models::openai_responses::STREAM_REQUEST_ID_KEY] = json!(request_id);
+    }
+    completed
 }

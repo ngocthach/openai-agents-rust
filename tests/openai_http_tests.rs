@@ -142,9 +142,11 @@ async fn responses_api_round_trip() {
     let body = &reqs[0].1;
     assert_eq!(body["model"], "gpt-5.6-luna");
     assert_eq!(body["instructions"], "Use tools");
-    assert_eq!(
-        body["reasoning"]["effort"], "none",
-        "GPT-5 defaults applied"
+    // A model instance selects no implicit model defaults, as in Python's
+    // `_model_settings_for_resolved_name`.
+    assert!(
+        body["reasoning"]["effort"].is_null(),
+        "no implicit GPT-5 defaults for a model instance"
     );
     let params = &body["tools"][0]["parameters"];
     assert_eq!(params["additionalProperties"], false);

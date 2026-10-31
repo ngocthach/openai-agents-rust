@@ -170,6 +170,8 @@ fn lookup_key_value(name: &str, namespace: Option<&str>) -> Option<Value> {
         return None;
     }
     Some(match namespace.filter(|n| !n.is_empty()) {
+        // A namespace equal to the name is the reserved deferred top-level wire shape.
+        Some(ns) if ns == name => json!(["deferred_top_level", name]),
         Some(ns) => json!(["namespaced", ns, name]),
         None => json!(["bare", name]),
     })
@@ -178,6 +180,7 @@ fn lookup_key_value(name: &str, namespace: Option<&str>) -> Option<Value> {
 /// The authorization scope of an invocation. Port of `tool_invocation_approval_scope`.
 fn approval_scope(
     raw: &Map<String, Value>,
+    tool_name: Option<&str>,
     invocation_role: Option<&str>,
 ) -> Option<(String, String)> {
     let invocation_type = raw.get("type").and_then(Value::as_str)?;
@@ -208,9 +211,11 @@ fn approval_scope(
             payload.insert("server_label".into(), Value::String(label.to_string()));
         }
         _ => {
-            if let Some(name) = raw
-                .get("name")
-                .and_then(Value::as_str)
+            // A native call is scoped by the tool it resolved to, so the same payload routed
+            // to a replacement tool is a different invocation.
+            if let Some(name) = tool_name
+                .filter(|n| !n.is_empty())
+                .or_else(|| raw.get("name").and_then(Value::as_str))
                 .filter(|n| !n.is_empty())
             {
                 payload.insert("name".into(), Value::String(name.to_string()));
@@ -224,6 +229,17 @@ fn approval_scope(
 /// the fields its type needs). Port of `tool_invocation_identity_and_scope`.
 pub(crate) fn tool_invocation_identity(
     raw_item: &Value,
+    invocation_role: Option<&str>,
+) -> Option<ToolInvocationIdentity> {
+    tool_invocation_identity_named(raw_item, None, invocation_role)
+}
+
+/// [`tool_invocation_identity`] for a call that resolved to the tool named `tool_name`. Port of
+/// the `tool_name` argument of `tool_invocation_identity_and_scope`, which native calls
+/// (shell, apply_patch, computer, local shell, custom) pass.
+pub(crate) fn tool_invocation_identity_named(
+    raw_item: &Value,
+    tool_name: Option<&str>,
     invocation_role: Option<&str>,
 ) -> Option<ToolInvocationIdentity> {
     let raw = unwrap_hosted_mcp_approval(raw_item)?;
@@ -241,7 +257,7 @@ pub(crate) fn tool_invocation_identity(
         .and_then(Value::as_str)
         .filter(|c| !c.is_empty())?
         .to_string();
-    let (scope_type, scope) = approval_scope(&raw, invocation_role)?;
+    let (scope_type, scope) = approval_scope(&raw, tool_name, invocation_role)?;
     if scope_type != invocation_type {
         return None;
     }
@@ -292,6 +308,63 @@ pub(crate) fn tool_invocation_identity(
         call_id,
         approval_scope: scope,
         fingerprint: digest(&Value::Object(semantic)),
+    })
+}
+
+/// Whether a recognized tool invocation (other than a hosted MCP approval request, which is
+/// answered rather than executed) has no non-empty string call id. Port of the
+/// `call_identity[1] is None` check in `_dedupe_processed_response_invocations`.
+pub(crate) fn lacks_call_id(raw_item: &Value) -> bool {
+    let Some(map) = raw_item.as_object() else {
+        return false;
+    };
+    let Some(invocation_type) = map.get("type").and_then(Value::as_str) else {
+        return false;
+    };
+    if invocation_type == "mcp_approval_request"
+        || !TOOL_INVOCATION_TYPES.contains(&invocation_type)
+    {
+        return false;
+    }
+    map.get("call_id")
+        .and_then(Value::as_str)
+        .is_none_or(str::is_empty)
+}
+
+/// The non-empty call id of a recognized tool invocation, whether or not its payload is
+/// complete. Port of `tool_invocation_call_id`.
+pub(crate) fn invocation_call_id(raw_item: &Value) -> Option<String> {
+    let raw = unwrap_hosted_mcp_approval(raw_item)?;
+    let invocation_type = raw.get("type").and_then(Value::as_str)?;
+    if !TOOL_INVOCATION_TYPES.contains(&invocation_type) {
+        return None;
+    }
+    let key = if invocation_type == "mcp_approval_request" {
+        "id"
+    } else {
+        "call_id"
+    };
+    raw.get(key)
+        .and_then(Value::as_str)
+        .filter(|c| !c.is_empty())
+        .map(str::to_string)
+}
+
+/// The canonical `(invocation_type, call_id, approval_scope, fingerprint)` of a tool call, for
+/// cross-SDK conformance tests. Not part of the public API.
+#[doc(hidden)]
+pub fn tool_invocation_identity_for_tests(
+    raw_item: &Value,
+    tool_name: Option<&str>,
+    invocation_role: Option<&str>,
+) -> Option<(String, String, String, String)> {
+    tool_invocation_identity_named(raw_item, tool_name, invocation_role).map(|i| {
+        (
+            i.invocation_type,
+            i.call_id,
+            i.approval_scope,
+            i.fingerprint,
+        )
     })
 }
 

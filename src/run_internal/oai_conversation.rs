@@ -25,6 +25,9 @@ fn strip_internal_metadata(mut item: Value) -> Value {
         m.remove("created_by");
         m.remove("_session_description");
         m.remove("_session_title");
+        // The keys the Python SDK writes (`TOOL_CALL_SESSION_*_KEY`).
+        m.remove("_agents_tool_description");
+        m.remove("_agents_tool_title");
     }
     item
 }
@@ -249,8 +252,10 @@ impl ServerConversationTracker {
         {
             return false;
         }
-        if self.primed_from_state
-            && let Some(fp) = &fp
+        // A generated item delivered by an earlier turn of this run (or of the run a state
+        // was taken from) is already on the server. Python skips it by object identity
+        // (`sent_items`); the content fingerprint plays that role here.
+        if let Some(fp) = &fp
             && self.state.sent_item_fingerprints.contains(fp)
         {
             return false;
@@ -297,9 +302,7 @@ mod tests {
         let item = InputItem(json!({"type": "message", "role": "user", "content": "hi"}));
         assert!(tracker.needs_send(&item));
         tracker.mark_input_as_sent(std::slice::from_ref(&item));
-        // Fingerprint dedupe only engages for state-primed runs; identity covers live runs.
-        assert!(tracker.needs_send(&item));
-        tracker.primed_from_state = true;
+        // A delivered item is not sent again, in a live run as after a resume.
         assert!(!tracker.needs_send(&item));
     }
 

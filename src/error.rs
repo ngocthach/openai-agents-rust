@@ -10,6 +10,12 @@ use crate::usage::Usage;
 /// Convenience alias used throughout the crate.
 pub type Result<T> = std::result::Result<T, AgentsError>;
 
+/// The message of an output validation error raised without its payload.
+pub const REDACTED_INVALID_JSON_MESSAGE: &str = "Invalid JSON when parsing model output";
+
+/// The message of an error that replaced a failure whose details are redacted.
+pub const DATA_REDACTED_ERROR_MESSAGE: &str = "Error details are redacted.";
+
 /// Snapshot of the run captured when the runner raises an error.
 #[derive(Debug, Clone, Default)]
 pub struct RunErrorDetails {
@@ -186,6 +192,55 @@ impl AgentsError {
         match self {
             AgentsError::Sandbox { code, .. } => Some(code),
             _ => None,
+        }
+    }
+
+    /// The error for output that fails to parse or validate. Port of `util._json.validate_json`.
+    ///
+    /// The payload (and the parser detail, which echoes it) only reaches the message when the
+    /// model data policy, and for tool data also the tool data policy, allow it. Otherwise the
+    /// error is the fixed, data-redacted [`REDACTED_INVALID_JSON_MESSAGE`].
+    pub(crate) fn invalid_json(
+        json_str: &str,
+        target: &str,
+        detail: &dyn std::fmt::Display,
+        contains_tool_data: bool,
+    ) -> Self {
+        if crate::logger::may_log_model_data(contains_tool_data) {
+            AgentsError::model_behavior(format!(
+                "Invalid JSON when parsing {json_str} for {target}; {detail}"
+            ))
+        } else {
+            AgentsError::model_behavior(REDACTED_INVALID_JSON_MESSAGE)
+        }
+    }
+
+    /// The payload-free error that replaces a failure following a data-redacted error.
+    /// Port of `_prepare_data_redacted_error`.
+    pub(crate) fn data_redacted() -> Self {
+        AgentsError::user(DATA_REDACTED_ERROR_MESSAGE)
+    }
+
+    /// Whether the error was raised without its data because the logging policy redacts it
+    /// (Python's `_is_error_data_redacted`). Such an error carries no run data, and a later
+    /// failure (a session write, an error handler) is replaced by [`Self::data_redacted`]
+    /// instead of surfacing its own payload.
+    pub(crate) fn is_data_redacted(&self) -> bool {
+        match self {
+            AgentsError::ModelBehaviorError { message, .. } => {
+                message == REDACTED_INVALID_JSON_MESSAGE || message == DATA_REDACTED_ERROR_MESSAGE
+            }
+            AgentsError::UserError { message, .. } => message == DATA_REDACTED_ERROR_MESSAGE,
+            _ => false,
+        }
+    }
+
+    /// Replace `later`, a failure raised while handling `self`, when `self` is data-redacted.
+    pub(crate) fn redact_follow_up(&self, later: AgentsError) -> AgentsError {
+        if self.is_data_redacted() {
+            AgentsError::data_redacted()
+        } else {
+            later
         }
     }
 

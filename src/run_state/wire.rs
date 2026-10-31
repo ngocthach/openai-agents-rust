@@ -5,7 +5,7 @@
 //! resumed in the other. Fields that only exist on the Rust side travel under the `rust` key,
 //! which Python ignores.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{Map, Value, json};
 
@@ -22,11 +22,451 @@ use crate::tool_guardrails::{
 };
 use crate::usage::Usage;
 
-/// Schema versions this crate can read. Mirrors Python's `SUPPORTED_SCHEMA_VERSIONS`.
-pub(super) const SUPPORTED_SCHEMA_VERSIONS: [&str; 22] = [
+/// Schema versions this crate can read, oldest first. Mirrors Python's
+/// `SUPPORTED_SCHEMA_VERSIONS`.
+pub const SUPPORTED_SCHEMA_VERSIONS: [&str; 22] = [
     "1.0", "1.1", "1.2", "1.3", "1.4", "1.5", "1.6", "1.7", "1.8", "1.9", "1.10", "1.11", "1.12",
     "1.13", "1.14", "1.15", "1.16", "1.17", "1.18", "1.19", "1.20", "1.21",
 ];
+
+/// The first schema that may carry Programmatic Tool Calling items.
+const PROGRAMMATIC_TOOL_CALLING_MIN_SCHEMA_VERSION: (u32, u32) = (1, 13);
+/// The first schema that may carry agent-owned `function_tool_approvals`.
+const AGENT_OWNED_APPROVALS_MIN_SCHEMA_VERSION: (u32, u32) = (1, 18);
+/// The first schema that may carry `tool_output_guardrail_result_start`.
+const TOOL_OUTPUT_GUARDRAIL_BOUNDARY_MIN_SCHEMA_VERSION: (u32, u32) = (1, 20);
+
+/// Tool-call item types a ledger entry may describe. Mirrors `_TOOL_INVOCATION_TYPES`.
+const TOOL_INVOCATION_TYPES: [&str; 7] = [
+    "apply_patch_call",
+    "computer_call",
+    "custom_tool_call",
+    "function_call",
+    "local_shell_call",
+    "mcp_approval_request",
+    "shell_call",
+];
+
+/// Parse a snapshot string. Mirrors `RunState.from_string`: the parser's own message is
+/// replaced, so a malformed payload never echoes its content into the error.
+pub(super) fn parse_json(s: &str) -> Result<Value> {
+    serde_json::from_str(s).map_err(|_| AgentsError::user("Failed to parse run state JSON"))
+}
+
+/// Python's truthiness, for the `if not schema_version` check.
+fn is_falsy(value: &Value) -> bool {
+    match value {
+        Value::Null => true,
+        Value::Bool(b) => !b,
+        Value::Number(n) => n.as_f64() == Some(0.0),
+        Value::String(s) => s.is_empty(),
+        Value::Array(a) => a.is_empty(),
+        Value::Object(m) => m.is_empty(),
+    }
+}
+
+/// Check the payload shape and its schema version. Port of
+/// `_validate_run_state_schema_version`; the messages are Python's, and none of them echo the
+/// offending value.
+pub(super) fn validate_schema_version(value: &Value) -> Result<String> {
+    let Value::Object(map) = value else {
+        return Err(AgentsError::user("Run state JSON must be an object"));
+    };
+    let version = match map.get("$schemaVersion") {
+        None => return Err(AgentsError::user("Run state is missing schema version")),
+        Some(v) if is_falsy(v) => {
+            return Err(AgentsError::user("Run state is missing schema version"));
+        }
+        Some(Value::String(s)) => s.clone(),
+        Some(_) => {
+            return Err(AgentsError::user(
+                "Run state schema version has an invalid type",
+            ));
+        }
+    };
+    if !SUPPORTED_SCHEMA_VERSIONS.contains(&version.as_str()) {
+        // Python joins `sorted(SUPPORTED_SCHEMA_VERSIONS)`, a string sort.
+        let mut supported = SUPPORTED_SCHEMA_VERSIONS.to_vec();
+        supported.sort_unstable();
+        return Err(AgentsError::user(format!(
+            "Run state schema version is not supported. Supported versions are: {}. New \
+             snapshots are written as version {CURRENT_SCHEMA_VERSION}.",
+            supported.join(", ")
+        )));
+    }
+    Ok(version)
+}
+
+/// Raw items from every durable location of the envelope. Port of `_run_state_raw_items`.
+fn run_state_raw_items(value: &Value) -> Vec<&Value> {
+    let mut raw = Vec::new();
+    for key in ["original_input", "pending_input"] {
+        if let Some(Value::Array(items)) = value.get(key) {
+            raw.extend(items.iter());
+        }
+    }
+    for key in ["model_responses", "last_model_response"] {
+        let responses: Vec<&Value> = match value.get(key) {
+            Some(Value::Array(items)) => items.iter().collect(),
+            Some(v @ Value::Object(_)) => vec![v],
+            _ => Vec::new(),
+        };
+        for response in responses {
+            if let Some(Value::Array(output)) = response.get("output") {
+                raw.extend(output.iter());
+            }
+        }
+    }
+    fn item_raws(items: Option<&Value>) -> Vec<&Value> {
+        match items {
+            Some(Value::Array(items)) => items.iter().filter_map(|i| i.get("raw_item")).collect(),
+            _ => Vec::new(),
+        }
+    }
+    for key in ["generated_items", "session_items"] {
+        raw.extend(item_raws(value.get(key)));
+    }
+    if let Some(processed @ Value::Object(_)) = value.get("last_processed_response") {
+        for key in ["new_items", "interruptions"] {
+            raw.extend(item_raws(processed.get(key)));
+        }
+        for key in [
+            "functions",
+            "computer_actions",
+            "custom_tool_actions",
+            "local_shell_actions",
+            "shell_actions",
+            "apply_patch_actions",
+            "handoffs",
+        ] {
+            if let Some(Value::Array(actions)) = processed.get(key) {
+                raw.extend(actions.iter().filter_map(|a| a.get("tool_call")));
+            }
+        }
+    }
+    raw.extend(item_raws(
+        value
+            .get("current_step")
+            .and_then(|s| s.get("data"))
+            .and_then(|d| d.get("interruptions")),
+    ));
+    raw
+}
+
+/// Port of `_raw_item_uses_programmatic_tool_calling`.
+fn raw_item_uses_programmatic_tool_calling(raw: &Value) -> bool {
+    let Value::Object(map) = raw else {
+        return false;
+    };
+    if matches!(
+        map.get("type").and_then(Value::as_str),
+        Some("program" | "program_output")
+    ) {
+        return true;
+    }
+    map.get("caller").is_some_and(|caller| {
+        caller.get("type").and_then(Value::as_str) == Some("program")
+            && caller.get("caller_id").is_some_and(Value::is_string)
+    })
+}
+
+/// Envelope checks that depend on the schema version, run before anything is rebuilt. Ports
+/// the version gates of `_build_run_state_from_json` and `_deserialize_run_state`.
+pub(super) fn validate_envelope(value: &Value, version: &str) -> Result<()> {
+    let at_least = |(major, minor): (u32, u32)| schema_version_at_least(version, major, minor);
+    if !at_least(PROGRAMMATIC_TOOL_CALLING_MIN_SCHEMA_VERSION)
+        && run_state_raw_items(value)
+            .into_iter()
+            .any(raw_item_uses_programmatic_tool_calling)
+    {
+        let (major, minor) = PROGRAMMATIC_TOOL_CALLING_MIN_SCHEMA_VERSION;
+        return Err(AgentsError::user(format!(
+            "Run state contains Programmatic Tool Calling data but uses schema version \
+             {version}. Programmatic Tool Calling requires schema version {major}.{minor} or \
+             later."
+        )));
+    }
+    let context = value.get("context");
+    if let Some(approvals) = context.and_then(|c| c.get("function_tool_approvals")) {
+        if !is_falsy(approvals) && !at_least(AGENT_OWNED_APPROVALS_MIN_SCHEMA_VERSION) {
+            return Err(AgentsError::user(
+                "Agent-owned function approvals require RunState schema 1.18.",
+            ));
+        }
+        if !approvals.is_null() && !approvals.is_array() {
+            return Err(AgentsError::user(
+                "RunState function_tool_approvals must be a list.",
+            ));
+        }
+        for entry in approvals.as_array().into_iter().flatten() {
+            if !entry.get("tool_key").is_some_and(Value::is_string)
+                || !entry.get("decision").is_some_and(Value::is_object)
+            {
+                return Err(AgentsError::user(
+                    "Invalid agent-owned function approval record.",
+                ));
+            }
+        }
+    }
+    if let Some(processed @ Value::Object(_)) = value.get("last_processed_response")
+        && let Some(start) = processed
+            .get("tool_output_guardrail_result_start")
+            .filter(|v| !v.is_null())
+    {
+        if !at_least(TOOL_OUTPUT_GUARDRAIL_BOUNDARY_MIN_SCHEMA_VERSION) {
+            return Err(AgentsError::user(
+                "Run state tool output guardrail result boundary requires schema 1.20.",
+            ));
+        }
+        // `type(start) is int`: a bool, float or string is not a count.
+        let serialized = value
+            .get("tool_output_guardrail_results")
+            .and_then(Value::as_array)
+            .map(|rows| rows.as_slice())
+            .unwrap_or_default();
+        let kept = serialized
+            .iter()
+            .filter(|row| tool_guardrail_row_matches(row, "tool_output"))
+            .count();
+        let valid = start
+            .as_u64()
+            .is_some_and(|start| start as usize <= kept && kept == serialized.len());
+        if !valid {
+            // Dropping a serialized entry would shift every later result's boundary.
+            return Err(AgentsError::user(
+                "Invalid tool output guardrail result boundary",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Whether a serialized tool guardrail result belongs to the `expected` list. Port of the type
+/// check in `_parse_tool_guardrail_entry`: an entry naming another guardrail kind is dropped.
+fn tool_guardrail_row_matches(row: &Value, expected: &str) -> bool {
+    match row
+        .get("guardrail")
+        .and_then(|g| g.get("type"))
+        .filter(|t| !is_falsy(t))
+    {
+        Some(t) => t.as_str() == Some(expected),
+        None => true,
+    }
+}
+
+/// Rebuild the ledger entries of the pending approvals of a snapshot written before the
+/// ledger existed. Port of `RunContextWrapper._restore_pending_approval_binding`: a legacy
+/// decision then authorizes only the exact invocation it was given for, so a snapshot whose
+/// stored call was edited is refused on resume instead of running the edited payload.
+pub(super) fn reconstruct_legacy_pending_bindings(state: &mut RunState) {
+    use crate::run_internal::tool_invocation::tool_invocation_identity;
+
+    for item in &state.interruptions {
+        let mut raw = item.raw_item.to_value();
+        // Hosted MCP requests keep their identity in `id`, which the typed call stores as
+        // `call_id`.
+        if raw.get("type").and_then(Value::as_str) == Some("mcp_approval_request")
+            && let Value::Object(map) = &mut raw
+        {
+            map.entry("id")
+                .or_insert_with(|| Value::String(item.raw_item.call_id.clone()));
+        }
+        // An empty `arguments` is how the typed call stores a missing one.
+        let unbindable = raw.get("type").and_then(Value::as_str) == Some("mcp_approval_request")
+            && item.raw_item.arguments.is_empty();
+        match tool_invocation_identity(&raw, None).filter(|_| !unbindable) {
+            Some(id) => {
+                state
+                    .tool_invocations
+                    .entry(id.call_id)
+                    .or_insert(ToolInvocationRecord {
+                        invocation_type: id.invocation_type,
+                        approval_scope: id.approval_scope,
+                        fingerprint: id.fingerprint,
+                        executed: false,
+                        completed: false,
+                    });
+            }
+            // A pending call that cannot be bound to one invocation carries no restored
+            // decision: it goes back to the user. Port of the `identity is None` branch of
+            // `_restore_pending_approval_binding`.
+            None => {
+                state
+                    .restored_unbound_approval_call_ids
+                    .insert(item.raw_item.call_id.clone());
+            }
+        }
+    }
+    // Completed calls a legacy snapshot holds in its history are bound to what they ran as,
+    // so a replay under the same call id is recognized. Native calls are left to the live
+    // check, which knows the tool they resolve to.
+    let raws = restored_call_raw_items(state);
+    let completed: BTreeSet<String> = raws
+        .iter()
+        .filter_map(|(raw, _)| crate::run_internal::tool_invocation::tool_output_identity(raw))
+        .map(|(_, call_id)| call_id)
+        .collect();
+    for (raw, role) in &raws {
+        let Some(id) = tool_invocation_identity(raw, *role) else {
+            continue;
+        };
+        if !matches!(
+            id.invocation_type.as_str(),
+            "function_call" | "custom_tool_call" | "mcp_approval_request"
+        ) || !completed.contains(&id.call_id)
+        {
+            continue;
+        }
+        state
+            .tool_invocations
+            .entry(id.call_id)
+            .or_insert(ToolInvocationRecord {
+                invocation_type: id.invocation_type,
+                approval_scope: id.approval_scope,
+                fingerprint: id.fingerprint,
+                executed: true,
+                completed: true,
+            });
+    }
+}
+
+/// Raw tool-call items a restored state holds, with the role their identity is scoped under.
+/// The durable locations Python's `_reconcile_tool_invocations` walks: generated items, the
+/// parked response's items, the model responses and the original input.
+fn restored_call_raw_items(state: &RunState) -> Vec<(Value, Option<&'static str>)> {
+    let mut raws: Vec<(Value, Option<&'static str>)> = Vec::new();
+    let mut push_items = |items: &[RunItem]| {
+        for item in items {
+            let role = matches!(item.kind, crate::items::RunItemKind::HandoffCall { .. })
+                .then_some(crate::run_internal::tool_invocation::HANDOFF_ROLE);
+            raws.push((item.to_input_item().0, role));
+        }
+    };
+    push_items(&state.generated_items);
+    if let Some(processed) = &state.last_processed_response {
+        push_items(&processed.new_items);
+    }
+    raws.extend(state.original_input.iter().map(|i| (i.0.clone(), None)));
+    raws
+}
+
+/// [`restored_call_raw_items`] plus the raw model-response outputs. The runner fingerprints
+/// the call it executed, which may be the sanitized form of the provider's raw item, so the
+/// responses only show which call ids occurred; they are not compared against the ledger.
+fn restored_call_raw_items_with_responses(state: &RunState) -> Vec<(Value, Option<&'static str>)> {
+    let mut raws = restored_call_raw_items(state);
+    for response in &state.model_responses {
+        raws.extend(response.output.iter().map(|o| (o.to_value(), None)));
+    }
+    raws
+}
+
+/// The call id of a raw tool-call item (`id` for a hosted MCP approval request), or `None`
+/// when the item is not a tool call.
+fn raw_call_id(raw: &Value) -> Option<&str> {
+    let raw_type = raw.get("type").and_then(Value::as_str).unwrap_or_default();
+    if !TOOL_INVOCATION_TYPES.contains(&raw_type) && raw_type != "hosted_tool_call" {
+        return None;
+    }
+    let id_key = if raw_type == "mcp_approval_request" {
+        "id"
+    } else {
+        "call_id"
+    };
+    raw.get(id_key)
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+}
+
+/// Call ids of every tool call a restored state holds in its history.
+pub(super) fn history_tool_call_ids(state: &RunState) -> Vec<String> {
+    // Hosted MCP requests are left out: the runner records their ledger entries when the
+    // approval is raised, not with the request item, so a missing entry says nothing about them.
+    restored_call_raw_items_with_responses(state)
+        .iter()
+        .filter(|(raw, _)| {
+            !matches!(
+                raw.get("type").and_then(Value::as_str),
+                Some("mcp_approval_request" | "hosted_tool_call")
+            )
+        })
+        .filter_map(|(raw, _)| raw_call_id(raw).map(str::to_string))
+        .collect()
+}
+
+/// A completed ledger entry claims the call ran and its output was committed. Port of the
+/// completed-record check at the end of `_reconcile_tool_invocations`: every restored
+/// occurrence of the call id must carry the recorded invocation, and a matching output must
+/// have been restored too, otherwise the snapshot is refused.
+pub(super) fn validate_completed_tool_invocations(state: &RunState, wire: &Value) -> Result<()> {
+    use crate::run_internal::tool_invocation::{tool_invocation_identity, tool_output_identity};
+
+    let completed: Vec<(&String, &ToolInvocationRecord)> = state
+        .tool_invocations
+        .iter()
+        .filter(|(_, record)| record.completed)
+        .collect();
+    if completed.is_empty() {
+        return Ok(());
+    }
+    let mut raws = restored_call_raw_items(state);
+    // Python also reads the session history, so a call or output present there but removed
+    // from the generated items does not make a completed entry unprovable.
+    if let Some(items) = wire.get("session_items").and_then(Value::as_array) {
+        for item in items {
+            if let Some(raw) = item.get("raw_item") {
+                let role = (item.get("type").and_then(Value::as_str) == Some("handoff_call_item"))
+                    .then_some(crate::run_internal::tool_invocation::HANDOFF_ROLE);
+                raws.push((raw.clone(), role));
+            }
+        }
+    }
+    let refused = || {
+        AgentsError::user(
+            "RunState completed tool invocation does not match a restored tool call and output.",
+        )
+    };
+    for (call_id, record) in completed {
+        let mut seen_call = false;
+        let mut seen_output = false;
+        for (raw, role) in &raws {
+            if let Some((output_type, output_call_id)) = tool_output_identity(raw)
+                && output_call_id == *call_id
+                && output_type == record.invocation_type
+            {
+                seen_output = true;
+                continue;
+            }
+            if raw_call_id(raw) != Some(call_id.as_str()) {
+                continue;
+            }
+            seen_call = true;
+            // A native call's fingerprint covers the name of the tool it resolved to, which
+            // the restored item does not carry; its payload is re-checked against the agent's
+            // tools when the run resumes.
+            let native = matches!(
+                record.invocation_type.as_str(),
+                "apply_patch_call" | "computer_call" | "local_shell_call" | "shell_call"
+            );
+            let matches = |role: Option<&str>| {
+                tool_invocation_identity(raw, role).is_some_and(|id| {
+                    id.invocation_type == record.invocation_type
+                        && (native || id.fingerprint == record.fingerprint)
+                })
+            };
+            // A raw response or input item may be a handoff call; Python records both
+            // readings (`allow_handoff_alternative`).
+            let handoff = crate::run_internal::tool_invocation::HANDOFF_ROLE;
+            if !(matches(*role) || (role.is_none() && matches(Some(handoff)))) {
+                return Err(refused());
+            }
+        }
+        if !seen_call || !seen_output {
+            return Err(refused());
+        }
+    }
+    Ok(())
+}
 
 /// Split a `major.minor` schema version into its numbers.
 ///
@@ -198,11 +638,222 @@ fn split_approval_key(key: &str) -> (String, String) {
     }
 }
 
+/// Hosted MCP decisions with their typed identities, in Python's `hosted_mcp_approvals` shape.
+fn hosted_approvals_to_wire(approvals: &ApprovalsState) -> Vec<Value> {
+    use crate::run_context::HostedApprovalIdentity as H;
+    approvals
+        .0
+        .iter()
+        .filter_map(|(key, record)| {
+            let identity = match crate::run_context::parse_hosted_key(key)? {
+                H::ServerTool {
+                    server_label,
+                    tool_name,
+                } => json!({"type": "server_tool", "server_label": server_label, "tool_name": tool_name}),
+                H::Request { request_id } => json!({"type": "request", "request_id": request_id}),
+                H::Query {
+                    tool_name,
+                    request_id,
+                } => json!({"type": "query", "tool_name": tool_name, "request_id": request_id}),
+            };
+            Some(json!({"identity": identity, "decision": approval_decision_to_wire(record)}))
+        })
+        .collect()
+}
+
+/// Whether the serialized current response of a parked turn can be proven to be the exact
+/// terminal run of generated items. Port of `_restore_current_response_item_identities` plus
+/// the `proven` rule of `_current_response_boundary`: `true` when there is nothing to prove.
+///
+/// The response is proven when its ownership range matches the serialized items one for one,
+/// its interruptions are the approval items after it, and every item of it that is public
+/// history sits in the session history as the terminal suffix, through a valid
+/// `generated_session_item_indexes` map. Anything else is unproven, except on turn one, where
+/// no earlier items exist to confuse it with.
+fn current_response_boundary_proven(value: &Value, version: &str) -> bool {
+    let processed = value
+        .get("last_processed_response")
+        .filter(|p| p.is_object())
+        .and_then(|p| p.get("new_items"))
+        .and_then(Value::as_array)
+        .filter(|items| !items.is_empty());
+    let interruptions = value
+        .get("current_step")
+        .and_then(|s| s.get("data"))
+        .and_then(|d| d.get("interruptions"))
+        .and_then(Value::as_array)
+        .filter(|items| !items.is_empty());
+    let (Some(processed), Some(interruptions)) = (processed, interruptions) else {
+        return true;
+    };
+    let generated = value
+        .get("generated_items")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    if relinks(value, version, generated, processed, interruptions) {
+        return true;
+    }
+    // Serialization rebuilds identities; turn one has no accepted prefix to mistake it for.
+    value.get("current_turn").and_then(Value::as_u64) == Some(1)
+        && generated.len() >= processed.len()
+        && generated
+            .iter()
+            .zip(processed)
+            .all(|(g, p)| g.get("type") == p.get("type"))
+}
+
+fn relinks(
+    value: &Value,
+    version: &str,
+    generated: &[Value],
+    processed: &[Value],
+    interruptions: &[Value],
+) -> bool {
+    if !schema_version_at_least(version, 1, 17) {
+        return false;
+    }
+    let Some(ownership) = value.get("current_response_generated_item_ownership") else {
+        return false;
+    };
+    let index = |v: Option<&Value>| v.and_then(Value::as_u64).map(|v| v as usize);
+    let (Some(start), Some(end)) = (index(ownership.get("start")), index(ownership.get("end")))
+    else {
+        return false;
+    };
+    let processed_end = start + processed.len();
+    if end != generated.len() || processed_end > end {
+        return false;
+    }
+    let Some(owned_interruptions) = ownership.get("interruptions").and_then(Value::as_array) else {
+        return false;
+    };
+    let indexes: Vec<usize> = owned_interruptions
+        .iter()
+        .filter_map(|v| index(Some(v)))
+        .collect();
+    if indexes.len() != owned_interruptions.len()
+        || indexes.len() != interruptions.len()
+        || indexes.iter().any(|i| *i < processed_end || *i >= end)
+    {
+        return false;
+    }
+    let distinct: std::collections::BTreeSet<_> = indexes.iter().collect();
+    if distinct.len() != indexes.len() {
+        return false;
+    }
+    let source_indexes = (start..processed_end).chain(indexes.iter().copied());
+    let expected = processed.iter().chain(interruptions);
+    if source_indexes
+        .zip(expected)
+        .any(|(i, expected)| &generated[i] != expected)
+    {
+        return false;
+    }
+    // Every current-response item that is public history must be the terminal suffix of the
+    // session history, reached through a valid index map. A tool output committed to execution
+    // history but not yet public may be absent from it.
+    let session = value
+        .get("session_items")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let mapping = value
+        .get("generated_session_item_indexes")
+        .and_then(Value::as_array)
+        .filter(|m| m.len() == generated.len());
+    let mapped = |generated_index: usize| -> Option<usize> {
+        let mapping = mapping?;
+        // The map is honoured only if it is valid as a whole.
+        let mut seen = std::collections::BTreeSet::new();
+        for entry in mapping {
+            if entry.is_null() {
+                continue;
+            }
+            let i = index(Some(entry))?;
+            if i >= session.len() || !seen.insert(i) {
+                return None;
+            }
+        }
+        let i = index(Some(&mapping[generated_index]))?;
+        (generated[generated_index] == session[i]).then_some(i)
+    };
+    let processed_count = processed.len();
+    let mut public = Vec::new();
+    for (offset, generated_index) in (start..end).enumerate() {
+        match mapped(generated_index) {
+            Some(session_index) => public.push(session_index),
+            None => {
+                let is_output = generated[generated_index]
+                    .get("type")
+                    .and_then(Value::as_str)
+                    == Some("tool_call_output_item");
+                if offset < processed_count || !is_output {
+                    return false;
+                }
+            }
+        }
+    }
+    let Some(session_start) = session.len().checked_sub(public.len()) else {
+        return false;
+    };
+    public
+        .iter()
+        .enumerate()
+        .all(|(k, session_index)| *session_index == session_start + k)
+}
+
+/// Read Python's `hosted_mcp_approvals`. Port of `_rebuild_hosted_mcp_approvals`: an entry
+/// whose identity is incomplete or of an unknown type is skipped.
+fn hosted_approvals_from_wire(context: &Value, state: &mut ApprovalsState) {
+    let Some(Value::Array(entries)) = context.get("hosted_mcp_approvals") else {
+        return;
+    };
+    let field = |identity: &Value, name: &str| {
+        identity
+            .get(name)
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    for entry in entries {
+        let (Some(identity), Some(decision)) = (entry.get("identity"), entry.get("decision"))
+        else {
+            continue;
+        };
+        if !identity.is_object() || !decision.is_object() {
+            continue;
+        }
+        let key = match identity.get("type").and_then(Value::as_str) {
+            Some("server_tool") => match (
+                field(identity, "server_label"),
+                field(identity, "tool_name"),
+            ) {
+                (Some(label), Some(tool)) => {
+                    crate::run_context::hosted_server_tool_key(&label, &tool)
+                }
+                _ => continue,
+            },
+            Some("request") => match field(identity, "request_id") {
+                Some(id) => crate::run_context::hosted_request_key(&id),
+                None => continue,
+            },
+            Some("query") => match (field(identity, "tool_name"), field(identity, "request_id")) {
+                (Some(tool), Some(id)) => crate::run_context::hosted_query_key(&tool, &id),
+                _ => continue,
+            },
+            _ => continue,
+        };
+        state.0.insert(key, approval_decision_from_wire(decision));
+    }
+}
+
 fn approvals_to_wire(approvals: &ApprovalsState) -> Value {
     Value::Array(
         approvals
             .0
             .iter()
+            .filter(|(key, _)| crate::run_context::parse_hosted_key(key).is_none())
             .map(|(key, record)| {
                 let (agent, tool_key) = split_approval_key(key);
                 json!({
@@ -215,7 +866,7 @@ fn approvals_to_wire(approvals: &ApprovalsState) -> Value {
     )
 }
 
-fn approvals_from_wire(context: &Value) -> ApprovalsState {
+fn approvals_from_wire(context: &Value, version: &str) -> ApprovalsState {
     let mut state = ApprovalsState::default();
     if let Some(Value::Array(entries)) = context.get("function_tool_approvals") {
         for entry in entries {
@@ -241,6 +892,11 @@ fn approvals_from_wire(context: &Value) -> ApprovalsState {
                 .or_insert_with(|| approval_decision_from_wire(decision));
         }
     }
+    // Typed hosted MCP records exist from schema 1.14; an older snapshot's are ignored, as in
+    // Python, so a legacy writer's decisions never authorize a server they were not scoped to.
+    if schema_version_at_least(version, 1, 14) {
+        hosted_approvals_from_wire(context, &mut state);
+    }
     state
 }
 
@@ -253,12 +909,21 @@ fn run_item_to_wire(item: &RunItem) -> Value {
         tool_name,
     } = &item.kind
     {
-        return interruption_to_wire(&ToolApprovalItem {
+        let mut wire = interruption_to_wire(&ToolApprovalItem {
             agent: item.agent.clone(),
             raw_item: raw_item.clone(),
             tool_name: tool_name.clone(),
             tool_origin: item.tool_origin.clone(),
         });
+        if let Value::Object(map) = &mut wire {
+            if let Some(key) = &item.tool_lookup_key {
+                map.insert("tool_lookup_key".into(), key.clone());
+            }
+            if item.allow_bare_name_alias {
+                map.insert("allow_bare_name_alias".into(), Value::Bool(true));
+            }
+        }
+        return wire;
     }
     let mut value = serde_json::to_value(item).unwrap_or_else(|_| json!({}));
     if let Value::Object(m) = &mut value {
@@ -311,7 +976,12 @@ fn function_call_from_raw(raw: &Value) -> Option<crate::items::FunctionCall> {
         }
     }
     Some(crate::items::FunctionCall {
-        id: None,
+        // A call has an item id beside its call id; a hosted request's id is its call id.
+        id: obj
+            .get("call_id")
+            .and_then(|_| obj.get("id"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
         call_id: obj
             .get("call_id")
             .or_else(|| obj.get("id"))
@@ -323,10 +993,18 @@ fn function_call_from_raw(raw: &Value) -> Option<crate::items::FunctionCall> {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string(),
+        // A hosted MCP request without arguments stays without them: it cannot be bound to
+        // one invocation, which `reconstruct_legacy_pending_bindings` must see.
         arguments: obj
             .get("arguments")
             .and_then(Value::as_str)
-            .unwrap_or("{}")
+            .unwrap_or(
+                if obj.get("type").and_then(Value::as_str) == Some("mcp_approval_request") {
+                    ""
+                } else {
+                    "{}"
+                },
+            )
             .to_string(),
         status: obj
             .get("status")
@@ -351,7 +1029,20 @@ fn run_item_from_wire(value: &Value) -> Result<RunItem> {
             }
             _ => {}
         }
-        let agent = agent_name_of(m.get("agent"));
+        // A handoff output written without `agent` belongs to its source agent (then its
+        // target), as `_deserialize_items` resolves it.
+        let agent = ["agent", "source_agent", "target_agent"]
+            .iter()
+            .map(|key| agent_name_of(m.get(*key)))
+            .find(|name| !name.is_empty())
+            .ok_or_else(|| {
+                // Python skips such an item; keeping a snapshot that silently lost history is
+                // worse than refusing it.
+                AgentsError::user(format!(
+                    "Run state has an item of type {} without an agent",
+                    m.get("type").and_then(Value::as_str).unwrap_or("<missing>")
+                ))
+            })?;
         m.insert("agent".into(), Value::String(agent));
         for key in ["source_agent", "target_agent"] {
             if let Some(entry) = m.get(key).cloned()
@@ -366,16 +1057,71 @@ fn run_item_from_wire(value: &Value) -> Result<RunItem> {
             Some("handoff_call_item") | Some("tool_approval_item")
         ) && let Some(raw) = m.get("raw_item").cloned()
         {
-            m.insert("raw_item".into(), strip_function_call_type(raw));
+            let mut raw = strip_function_call_type(raw);
+            // Python falls back to the bare dict for a payload that is not a function call;
+            // the typed call takes empty defaults so the item is kept rather than dropped.
+            if let Value::Object(call) = &mut raw {
+                for (key, default) in [("call_id", ""), ("name", ""), ("arguments", "{}")] {
+                    call.entry(key)
+                        .or_insert_with(|| Value::String(default.into()));
+                }
+            }
+            m.insert("raw_item".into(), raw);
+        }
+        // Python validates the shell output item strictly (it has a typed model there): both
+        // the call id and the output must be strings, and the call id may not be empty. The
+        // refusal never echoes the offending value.
+        if m.get("type").and_then(Value::as_str) == Some("tool_call_output_item")
+            && let Some(raw) = m.get("raw_item")
+            && raw.get("type").and_then(Value::as_str) == Some("local_shell_call_output")
+        {
+            let call_id_ok = raw
+                .get("call_id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| !id.is_empty());
+            let output_ok = raw.get("output").is_some_and(Value::is_string);
+            if !call_id_ok || !output_ok {
+                return Err(AgentsError::user(
+                    "Run state has an invalid local_shell_call_output item",
+                ));
+            }
+        }
+        // Fields Python's reader derives when a payload leaves them out.
+        match m.get("type").and_then(Value::as_str) {
+            Some("tool_call_output_item") if !m.contains_key("output") => {
+                let output = m
+                    .get("raw_item")
+                    .and_then(|r| r.get("output"))
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                m.insert("output".into(), output);
+            }
+            Some("tool_approval_item") if !m.get("tool_name").is_some_and(Value::is_string) => {
+                let name = m
+                    .get("raw_item")
+                    .and_then(|r| r.get("name"))
+                    .cloned()
+                    .unwrap_or_else(|| Value::String(String::new()));
+                m.insert("tool_name".into(), name);
+            }
+            Some("handoff_output_item") => {
+                for key in ["source_agent", "target_agent"] {
+                    m.entry(key).or_insert_with(|| Value::String(String::new()));
+                }
+            }
+            _ => {}
         }
         // Python-only bookkeeping that has no Rust field.
-        for key in [
-            "input_id",
-            "tool_lookup_key",
-            "allow_bare_name_alias",
-            "tool_namespace",
-        ] {
+        for key in ["input_id", "tool_namespace"] {
             m.remove(key);
+        }
+        // Read tolerantly like Python: a lookup key must be a mapping and the alias flag is
+        // honoured only as a literal `true`.
+        if !m.get("tool_lookup_key").is_some_and(Value::is_object) {
+            m.remove("tool_lookup_key");
+        }
+        if m.get("allow_bare_name_alias") != Some(&Value::Bool(true)) {
+            m.remove("allow_bare_name_alias");
         }
         // Origin metadata is read tolerantly: a malformed or unknown origin is dropped, so a
         // snapshot written by a newer SDK still loads.
@@ -474,9 +1220,17 @@ fn tool_run_to_wire(run: &ToolRunSnapshot, include_params_schema: bool) -> Value
     if let Some(ns) = run.namespace.as_ref().filter(|n| !n.is_empty()) {
         tool.insert("namespace".into(), Value::String(ns.clone()));
     }
+    // A deferred top-level tool is called under a synthetic namespace equal to its own name;
+    // Python keys it as `deferred_top_level` rather than as a namespaced tool.
+    let deferred_top_level = run.namespace.as_deref().is_none_or(str::is_empty)
+        && run.tool_call.get("namespace").and_then(Value::as_str) == Some(run.tool_name.as_str());
     tool.insert(
         "lookupKey".into(),
-        lookup_key_to_wire(&run.tool_name, run.namespace.as_deref()),
+        if deferred_top_level {
+            json!({"kind": "deferred_top_level", "name": run.tool_name})
+        } else {
+            lookup_key_to_wire(&run.tool_name, run.namespace.as_deref())
+        },
     );
     if let Some(d) = &run.description {
         tool.insert("description".into(), Value::String(d.clone()));
@@ -569,9 +1323,47 @@ fn handoffs_from_wire(value: Option<&Value>) -> Vec<ToolRunSnapshot> {
         .collect()
 }
 
+/// Lookup key and alias flag of each approval item in the history, by call id, so the
+/// interruptions written beside it carry the same payload (Python compares them).
+type ApprovalMetadata = BTreeMap<String, (Option<Value>, bool)>;
+
+fn approval_metadata(state: &RunState) -> ApprovalMetadata {
+    state
+        .generated_items
+        .iter()
+        .filter_map(|item| match &item.kind {
+            crate::items::RunItemKind::ToolApproval { raw_item, .. }
+                if item.tool_lookup_key.is_some() || item.allow_bare_name_alias =>
+            {
+                Some((
+                    raw_item.call_id.clone(),
+                    (item.tool_lookup_key.clone(), item.allow_bare_name_alias),
+                ))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn interruption_with_metadata(item: &ToolApprovalItem, metadata: &ApprovalMetadata) -> Value {
+    let mut wire = interruption_to_wire(item);
+    if let (Some((key, alias)), Value::Object(map)) = (metadata.get(item.call_id()), &mut wire) {
+        if let Some(key) = key {
+            map.insert("tool_lookup_key".into(), key.clone());
+        }
+        if *alias {
+            map.insert("allow_bare_name_alias".into(), Value::Bool(true));
+        }
+    }
+    wire
+}
+
 /// Serialize the interrupted turn's processed response. Mirrors
 /// `RunState._serialize_processed_response`.
-fn processed_response_to_wire(processed: &ProcessedResponseSnapshot) -> Value {
+fn processed_response_to_wire(
+    processed: &ProcessedResponseSnapshot,
+    metadata: &ApprovalMetadata,
+) -> Value {
     let mut out = Map::new();
     out.insert(
         "new_items".into(),
@@ -600,7 +1392,7 @@ fn processed_response_to_wire(processed: &ProcessedResponseSnapshot) -> Value {
             processed
                 .interruptions
                 .iter()
-                .map(interruption_to_wire)
+                .map(|item| interruption_with_metadata(item, metadata))
                 .collect(),
         ),
     );
@@ -608,6 +1400,9 @@ fn processed_response_to_wire(processed: &ProcessedResponseSnapshot) -> Value {
         "mcp_tool_bindings".into(),
         json!(processed.mcp_tool_bindings),
     );
+    if let Some(start) = processed.tool_output_guardrail_result_start {
+        out.insert("tool_output_guardrail_result_start".into(), json!(start));
+    }
     Value::Object(out)
 }
 
@@ -686,6 +1481,11 @@ fn processed_response_from_wire(value: &Value) -> Result<ProcessedResponseSnapsh
                     .collect()
             })
             .unwrap_or_default(),
+        // `validate_envelope` already refused anything but a count in range.
+        tool_output_guardrail_result_start: value
+            .get("tool_output_guardrail_result_start")
+            .and_then(Value::as_u64)
+            .map(|v| v as usize),
     })
 }
 
@@ -812,16 +1612,21 @@ fn guardrail_name(value: &Value) -> String {
 /// Read the tool-invocation ledger. Port of `_rebuild_tool_invocations`: a malformed entry
 /// is an error, not a silent drop, because the ledger is what binds an approval decision to
 /// the call it was given for.
-fn tool_invocations_from_wire(context: &Value) -> Result<BTreeMap<String, ToolInvocationRecord>> {
+fn tool_invocations_from_wire(
+    context: &Value,
+    version: &str,
+) -> Result<BTreeMap<String, ToolInvocationRecord>> {
+    // Snapshots before the binding schema carry no ledger Python trusts; it starts empty.
+    let (major, minor) = super::STRICT_APPROVAL_BINDING_MIN_SCHEMA_VERSION;
+    if !schema_version_at_least(version, major, minor) {
+        return Ok(BTreeMap::new());
+    }
     let Some(raw) = context.get("tool_invocations") else {
         return Ok(BTreeMap::new());
     };
-    if raw.is_null() {
-        return Ok(BTreeMap::new());
-    }
     let map = raw
         .as_object()
-        .ok_or_else(|| AgentsError::user("Run state tool_invocations must be a mapping."))?;
+        .ok_or_else(|| AgentsError::user("RunState tool_invocations must be a mapping."))?;
     let is_digest = |v: Option<&Value>| {
         v.and_then(Value::as_str).is_some_and(|d| {
             d.len() == 64
@@ -833,12 +1638,12 @@ fn tool_invocations_from_wire(context: &Value) -> Result<BTreeMap<String, ToolIn
     for (call_id, entry) in map {
         if call_id.is_empty() {
             return Err(AgentsError::user(
-                "Run state tool_invocations contains an invalid call ID.",
+                "RunState tool_invocations contains an invalid call ID.",
             ));
         }
         let entry = entry
             .as_object()
-            .ok_or_else(|| AgentsError::user("Run state tool invocation must be a mapping."))?;
+            .ok_or_else(|| AgentsError::user("RunState tool invocation must be a mapping."))?;
         let invocation_type = entry
             .get("type")
             .and_then(Value::as_str)
@@ -847,7 +1652,7 @@ fn tool_invocations_from_wire(context: &Value) -> Result<BTreeMap<String, ToolIn
         let completed = entry.get("completed").and_then(Value::as_bool);
         match (executed, completed) {
             (Some(executed), Some(completed))
-                if !invocation_type.is_empty()
+                if TOOL_INVOCATION_TYPES.contains(&invocation_type)
                     && is_digest(entry.get("approval_scope"))
                     && is_digest(entry.get("fingerprint"))
                     // A completed call must also be an executed one.
@@ -872,7 +1677,7 @@ fn tool_invocations_from_wire(context: &Value) -> Result<BTreeMap<String, ToolIn
             }
             _ => {
                 return Err(AgentsError::user(
-                    "Run state tool invocation contains invalid lifecycle data.",
+                    "RunState tool invocation contains invalid lifecycle data.",
                 ));
             }
         }
@@ -882,8 +1687,12 @@ fn tool_invocations_from_wire(context: &Value) -> Result<BTreeMap<String, ToolIn
 
 /// The `trace` payload: the full `TraceState` when the run carried one, otherwise the bare
 /// `{object, id}` reference built from `trace_id`. Mirrors `_serialize_trace_data`.
-fn trace_payload(state: &RunState) -> Value {
-    if let Some(payload) = state.trace_state.as_ref().and_then(|t| t.to_json(false)) {
+fn trace_payload(state: &RunState, include_tracing_api_key: bool) -> Value {
+    if let Some(payload) = state
+        .trace_state
+        .as_ref()
+        .and_then(|t| t.to_json(include_tracing_api_key))
+    {
         return payload;
     }
     state
@@ -894,7 +1703,7 @@ fn trace_payload(state: &RunState) -> Value {
 }
 
 /// Serialize a run state to Python's schema 1.21 envelope.
-pub(super) fn to_wire(state: &RunState) -> Result<Value> {
+pub(super) fn to_wire(state: &RunState, include_tracing_api_key: bool) -> Result<Value> {
     let generated_items: Vec<Value> = state.generated_items.iter().map(run_item_to_wire).collect();
     let model_responses: Vec<Value> = state
         .model_responses
@@ -933,7 +1742,13 @@ pub(super) fn to_wire(state: &RunState) -> Result<Value> {
             }),
         },
     });
+    let mut context = context;
+    let hosted = hosted_approvals_to_wire(&state.approvals);
+    if !hosted.is_empty() {
+        context["hosted_mcp_approvals"] = Value::Array(hosted);
+    }
 
+    let metadata = approval_metadata(state);
     let current_step = if state.pending_tool_processing || !state.interruptions.is_empty() {
         json!({
             "type": "next_step_interruption",
@@ -941,7 +1756,7 @@ pub(super) fn to_wire(state: &RunState) -> Result<Value> {
                 "interruptions": state
                     .interruptions
                     .iter()
-                    .map(interruption_to_wire)
+                    .map(|item| interruption_with_metadata(item, &metadata))
                     .collect::<Vec<_>>(),
             },
         })
@@ -955,8 +1770,14 @@ pub(super) fn to_wire(state: &RunState) -> Result<Value> {
         .last_processed_response
         .as_ref()
         .filter(|_| !state.interruptions.is_empty());
-    let ownership = last_processed.and_then(|p| ownership_to_wire(state, p));
+    let ownership = last_processed
+        .filter(|_| !state.current_response_boundary_unproven)
+        .and_then(|p| ownership_to_wire(state, p));
 
+    let mut context = context;
+    if let (Some(tool_input), Value::Object(map)) = (&state.tool_input, &mut context) {
+        map.insert("tool_input".into(), tool_input.clone());
+    }
     let mut envelope = json!({
         "$schemaVersion": CURRENT_SCHEMA_VERSION,
         "current_turn": state.current_turn,
@@ -964,8 +1785,8 @@ pub(super) fn to_wire(state: &RunState) -> Result<Value> {
             &state.current_agent_name,
             state.current_agent_identity.as_deref(),
         ),
-        "original_input": state.original_input,
-        "pending_input": state.pending_input,
+        "original_input": serialize_input(&state.original_input),
+        "pending_input": serialize_input(&state.pending_input),
         "model_responses": model_responses,
         "context": context,
         "tool_use_tracker": state.tool_use_tracker,
@@ -1011,22 +1832,35 @@ pub(super) fn to_wire(state: &RunState) -> Result<Value> {
         "previous_response_id": state.previous_response_id,
         "auto_previous_response_id": state.auto_previous_response_id,
         "generated_prompt_cache_key": state.generated_prompt_cache_key,
-        "reasoning_item_id_policy": Value::Null,
-        "nested_history_owned_session_item_refs": Value::Array(Vec::new()),
+        "reasoning_item_id_policy": match state.reasoning_item_id_policy {
+            Some(crate::run_config::ReasoningItemIdPolicy::Omit) => json!("omit"),
+            Some(crate::run_config::ReasoningItemIdPolicy::Preserve) => json!("preserve"),
+            None => Value::Null,
+        },
+        "nested_history_owned_session_item_refs": super::nested_history::ownership_to_wire(state),
+        // A state whose parked response could not be proven keeps that on the wire: its
+        // generated items are written as unaliased to the session history, as Python does for
+        // items it cannot match, so a second round trip does not make them look proven.
         "generated_session_item_indexes": (0..generated_items.len())
-            .map(Value::from)
+            .map(|i| {
+                if state.current_response_boundary_unproven {
+                    Value::Null
+                } else {
+                    Value::from(i)
+                }
+            })
             .collect::<Vec<_>>(),
         "generated_items": generated_items.clone(),
         "session_items": generated_items,
         "current_step": current_step,
         "last_model_response": model_responses.last().cloned().unwrap_or(Value::Null),
         "last_processed_response": last_processed
-            .map(processed_response_to_wire)
+            .map(|p| processed_response_to_wire(p, &metadata))
             .unwrap_or(Value::Null),
         "current_turn_persisted_item_count": state
             .session_saved_items
             .saturating_sub(state.turn_start_index),
-        "trace": trace_payload(state),
+        "trace": trace_payload(state, include_tracing_api_key),
         // Rust-only run state. Python ignores unknown top-level keys.
         "rust": {
             "server_sent_items": state.server_sent_items,
@@ -1036,10 +1870,19 @@ pub(super) fn to_wire(state: &RunState) -> Result<Value> {
             "nested_agent_tool_states": state.nested_agent_tool_states,
             "pending_tool_processing": state.pending_tool_processing,
             "turn_start_index": state.turn_start_index,
+            "model_input_start": state.model_input_start,
             "final_output": state.final_output,
             "server_conversation": state.server_conversation,
         },
     });
+    if let Some(sandbox) = &state.sandbox
+        && let Value::Object(map) = &mut envelope
+    {
+        map.insert(
+            "sandbox".into(),
+            super::sandbox_payload::sanitize_sandbox_payload(sandbox.clone())?,
+        );
+    }
     if state.terminal_unrecoverable
         && let Value::Object(map) = &mut envelope
     {
@@ -1085,8 +1928,34 @@ pub(super) fn context_meta_warning(context_meta: Option<&Value>) -> &'static str
     "RunState context requires explicit restoration; provide a context override to restore it."
 }
 
+/// Input items in the shape the Responses API expects. Port of `RunState._serialize_input`:
+/// an assistant message gets `output_text` content parts and a `completed` status.
+fn serialize_input(items: &[InputItem]) -> Value {
+    Value::Array(
+        items
+            .iter()
+            .map(|item| {
+                let mut value = item.0.clone();
+                if value.get("role").and_then(Value::as_str) == Some("assistant")
+                    && let Value::Object(map) = &mut value
+                {
+                    if let Some(Value::String(text)) = map.get("content").cloned() {
+                        map.insert(
+                            "content".into(),
+                            json!([{"type": "output_text", "text": text}]),
+                        );
+                    }
+                    map.entry("status")
+                        .or_insert_with(|| Value::String("completed".into()));
+                }
+                value
+            })
+            .collect(),
+    )
+}
+
 /// Rebuild a run state from Python's envelope.
-pub(super) fn from_wire(value: &Value) -> Result<RunState> {
+pub(super) fn from_wire(value: &Value, version: &str) -> Result<RunState> {
     let context = value.get("context").cloned().unwrap_or(Value::Null);
     let rust = value.get("rust").cloned().unwrap_or(Value::Null);
 
@@ -1149,7 +2018,9 @@ pub(super) fn from_wire(value: &Value) -> Result<RunState> {
             .get(key)
             .and_then(Value::as_array)
             .map(|rows| {
+                let expected = key.trim_end_matches("_guardrail_results");
                 rows.iter()
+                    .filter(|r| tool_guardrail_row_matches(r, expected))
                     .map(|r| {
                         (
                             guardrail_name(r),
@@ -1192,7 +2063,7 @@ pub(super) fn from_wire(value: &Value) -> Result<RunState> {
             generated_items.len().saturating_sub(turn_items)
         });
 
-    Ok(RunState {
+    let mut state = RunState {
         schema_version: value
             .get("$schemaVersion")
             .and_then(Value::as_str)
@@ -1224,7 +2095,7 @@ pub(super) fn from_wire(value: &Value) -> Result<RunState> {
             .get("usage")
             .map(usage_from_wire)
             .unwrap_or_default(),
-        approvals: approvals_from_wire(&context),
+        approvals: approvals_from_wire(&context, version),
         nested_agent_tool_states: rust
             .get("nested_agent_tool_states")
             .cloned()
@@ -1279,7 +2150,7 @@ pub(super) fn from_wire(value: &Value) -> Result<RunState> {
             .get("pending_session_write")
             .filter(|v| v.is_object())
             .cloned(),
-        tool_invocations: tool_invocations_from_wire(&context)?,
+        tool_invocations: tool_invocations_from_wire(&context, version)?,
         trace_state: crate::tracing::TraceState::from_json(value.get("trace")).filter(|t| {
             t.workflow_name.is_some()
                 || t.group_id.is_some()
@@ -1293,15 +2164,26 @@ pub(super) fn from_wire(value: &Value) -> Result<RunState> {
             context.get("context_meta"),
         ),
         turn_start_index: rust_usize("turn_start_index", default_turn_start),
-        tool_use_tracker: value
-            .get("tool_use_tracker")
-            .cloned()
-            .and_then(|v| serde_json::from_value(v).ok())
-            .unwrap_or_default(),
+        model_input_start: rust_usize("model_input_start", 0),
+        tool_use_tracker: tool_use_tracker_from_wire(value.get("tool_use_tracker")),
+        sandbox: match value.get("sandbox") {
+            None => None,
+            Some(sandbox) => Some(super::sandbox_payload::sanitize_sandbox_payload(
+                sandbox.clone(),
+            )?),
+        },
         generated_prompt_cache_key: value
             .get("generated_prompt_cache_key")
             .and_then(Value::as_str)
             .map(str::to_string),
+        reasoning_item_id_policy: match value
+            .get("reasoning_item_id_policy")
+            .and_then(Value::as_str)
+        {
+            Some("omit") => Some(crate::run_config::ReasoningItemIdPolicy::Omit),
+            Some("preserve") => Some(crate::run_config::ReasoningItemIdPolicy::Preserve),
+            _ => None,
+        },
         server_conversation: rust
             .get("server_conversation")
             .cloned()
@@ -1316,7 +2198,13 @@ pub(super) fn from_wire(value: &Value) -> Result<RunState> {
         // Derived by `RunState::from_json` once the schema version is known; the wire format
         // never carries it.
         restored_unbound_approval_call_ids: Default::default(),
-    })
+        nested_history_owned_items: Vec::new(),
+        tool_input: context.get("tool_input").cloned().filter(|v| !v.is_null()),
+        current_response_boundary_unproven: !current_response_boundary_proven(value, version),
+    };
+    super::nested_history::check_generated_session_indexes(value);
+    state.nested_history_owned_items = super::nested_history::ownership_from_wire(value, &state)?;
+    Ok(state)
 }
 
 fn input_items(value: Option<&Value>) -> Vec<InputItem> {
@@ -1340,6 +2228,27 @@ pub(super) fn from_legacy_rust(value: Value) -> Result<RunState> {
             "Run state is not a readable 1.0 Rust snapshot: {e}"
         ))
     })
+}
+
+/// Read the tool-use tracker, dropping entries that are not strings instead of the whole
+/// snapshot. Mirrors `set_tool_use_tracker_snapshot`'s filtering.
+fn tool_use_tracker_from_wire(value: Option<&Value>) -> ToolUseTrackerSnapshot {
+    let Some(Value::Object(map)) = value else {
+        return ToolUseTrackerSnapshot::new();
+    };
+    map.iter()
+        .filter_map(|(agent, tools)| {
+            let tools = tools.as_array()?;
+            Some((
+                agent.clone(),
+                tools
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect(),
+            ))
+        })
+        .collect()
 }
 
 /// A tool-use snapshot keyed by agent name. Mirrors `serialize_tool_use_tracker`.

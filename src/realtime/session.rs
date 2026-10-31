@@ -1253,8 +1253,7 @@ impl<C: Send + Sync + 'static> SessionInner<C> {
             let mut decision = decision_for(&self.context);
             if decision.is_none() {
                 let needs_approval = tool
-                    .needs_approval
-                    .evaluate(&self.context, &call.arguments, &call.call_id)
+                    .evaluate_needs_approval(&self.context, &call.arguments, &call.call_id)
                     .await;
                 // A decision may have landed while the rule was running.
                 decision = decision_for(&self.context);

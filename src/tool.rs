@@ -512,6 +512,64 @@ pub fn merge_custom_data(values: &[Option<Value>]) -> Result<Option<Value>> {
     }
 }
 
+/// The error for tool arguments that do not parse or validate. Port of
+/// `_parse_function_tool_json_input` and the argument-validation branch of `function_tool`.
+///
+/// The payload is tool data and a serde error echoes the offending value, so neither reaches
+/// the message unless the tool data logging policy allows it.
+pub(crate) fn invalid_tool_input_error(
+    tool_name: &str,
+    payload: &str,
+    error: &serde_json::Error,
+) -> AgentsError {
+    let base = format!("Invalid JSON input for tool {tool_name}");
+    if crate::debug::dont_log_tool_data() {
+        log::debug!(target: crate::logger::LOG_TARGET, "{base}");
+        return AgentsError::model_behavior(base);
+    }
+    // A decode error reports the raw payload; a validation error reports what failed.
+    let detail = if serde_json::from_str::<Value>(payload).is_err() {
+        payload.to_string()
+    } else {
+        error.to_string()
+    };
+    let message = format!("{base}: {detail}");
+    log::debug!(target: crate::logger::LOG_TARGET, "{message}");
+    AgentsError::model_behavior(message)
+}
+
+/// One shared [`default_tool_error_function`] handle per context type, so a configuration
+/// that defaults to it (such as `MCPConfig::default`) can later be recognized by identity.
+pub(crate) fn shared_default_tool_error_function<C: 'static>() -> ToolErrorFn<C> {
+    use std::any::{Any, TypeId};
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<HashMap<TypeId, Box<dyn Any + Send + Sync>>>> = OnceLock::new();
+    let mut cache = CACHE
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    cache
+        .entry(TypeId::of::<C>())
+        .or_insert_with(|| {
+            let f: ToolErrorFn<C> = Arc::new(default_tool_error_function::<C>);
+            Box::new(f)
+        })
+        .downcast_ref::<ToolErrorFn<C>>()
+        .expect("cached by its own type id")
+        .clone()
+}
+
+/// Whether `f` is the shared [`default_tool_error_function`] handle.
+#[cfg(feature = "mcp")]
+pub(crate) fn is_shared_default_tool_error_function<C: 'static>(f: &ToolErrorFn<C>) -> bool {
+    Arc::ptr_eq(f, &shared_default_tool_error_function::<C>())
+}
+
+fn type_id_of_val<T: 'static>(_: &T) -> std::any::TypeId {
+    std::any::TypeId::of::<T>()
+}
+
 /// The default message sent to the model when a tool fails. It does not expose the error.
 pub fn default_tool_error_function<C>(_ctx: &RunContext<C>, _error: &AgentsError) -> String {
     "An error occurred while running the tool. Please try again.".to_string()
@@ -526,6 +584,11 @@ type InvokeFn<C> =
 /// Checks a tool's return value against the output type declared with
 /// [`FunctionTool::with_output_type`], returning the validation error message.
 type OutputValidatorFn = Arc<dyn Fn(&Value) -> std::result::Result<(), String> + Send + Sync>;
+
+/// Whether parsed arguments are exactly the invocation a typed tool would run: they parse into
+/// its argument type and name every declared parameter and nothing else, so no default is
+/// filled in and no key is dropped. Mirrors the `unchanged` check of `prepare_arguments`.
+type ApprovalArgsCheckFn = Arc<dyn Fn(&Value) -> bool + Send + Sync>;
 
 /// A tool that wraps a Rust async function.
 pub struct FunctionTool<C> {
@@ -556,6 +619,9 @@ pub struct FunctionTool<C> {
     /// Whether `failure_error_function` is still the SDK default. When it is, the run's
     /// `tool_error_formatter` gets a `tool_exception` chance to rewrite the message.
     pub(crate) uses_default_failure_error_function: bool,
+    /// Whether the failure policy is [`default_tool_error_function`], set implicitly or
+    /// explicitly. That policy keeps the error detail out of traces.
+    pub(crate) default_failure_error_function: bool,
     /// Timeout message formatter.
     pub timeout_error_function: Option<ToolErrorFn<C>>,
     /// Programmatic callers allowed to invoke this tool (Responses API only).
@@ -568,6 +634,8 @@ pub struct FunctionTool<C> {
     /// Runtime check of the tool's return value against a declared output type. Set by
     /// [`FunctionTool::with_output_type`]; mirrors `FunctionTool._output_type_adapter`.
     output_validator: Option<OutputValidatorFn>,
+    /// See [`ApprovalArgsCheckFn`]; set by [`FunctionTool::new`].
+    approval_args_check: Option<ApprovalArgsCheckFn>,
     /// Human-readable title of the MCP tool this one was derived from, when it declared one.
     /// Mirrors `FunctionTool._mcp_title`.
     pub mcp_title: Option<String>,
@@ -599,11 +667,13 @@ impl<C> Clone for FunctionTool<C> {
             defer_loading: self.defer_loading,
             failure_error_function: self.failure_error_function.clone(),
             uses_default_failure_error_function: self.uses_default_failure_error_function,
+            default_failure_error_function: self.default_failure_error_function,
             timeout_error_function: self.timeout_error_function.clone(),
             allowed_callers: self.allowed_callers.clone(),
             custom_data_extractor: self.custom_data_extractor.clone(),
             output_json_schema: self.output_json_schema.clone(),
             output_validator: self.output_validator.clone(),
+            approval_args_check: self.approval_args_check.clone(),
             mcp_title: self.mcp_title.clone(),
             is_codex_tool: self.is_codex_tool,
             invoke: self.invoke.clone(),
@@ -661,20 +731,8 @@ impl<C: Send + Sync + 'static> FunctionTool<C> {
         let invoke: InvokeFn<C> = Arc::new(move |ctx, args_json| {
             let f = f.clone();
             Box::pin(async move {
-                // The payload is tool data, and a serde error echoes the offending value, so
-                // neither reaches the message unless the logging policy allows model and tool
-                // data. Mirrors `validate_json`'s `should_redact` branch, which drops the
-                // payload *and* the parser detail.
                 let invalid_json = |payload: &str, e: serde_json::Error, tool_name: &str| {
-                    if crate::logger::may_log_model_data(true) {
-                        AgentsError::model_behavior(format!(
-                            "Invalid JSON when parsing {payload} for tool {tool_name}: {e}"
-                        ))
-                    } else {
-                        AgentsError::model_behavior(format!(
-                            "Invalid JSON when parsing input for tool {tool_name}"
-                        ))
-                    }
+                    invalid_tool_input_error(tool_name, payload, &e)
                 };
                 let args: Args = if args_json.trim().is_empty() {
                     serde_json::from_str("{}").map_err(|e| invalid_json("{}", e, &ctx.tool_name))?
@@ -686,7 +744,24 @@ impl<C: Send + Sync + 'static> FunctionTool<C> {
                 Ok(out.into_tool_output())
             })
         });
-        Self::build(name.into(), description.into(), schema, invoke)
+        let declared: Option<std::collections::BTreeSet<String>> = schema
+            .get("properties")
+            .and_then(Value::as_object)
+            .map(|props| props.keys().cloned().collect());
+        let approval_args_check: ApprovalArgsCheckFn = Arc::new(move |args: &Value| {
+            let Value::Object(map) = args else {
+                return false;
+            };
+            if let Some(declared) = &declared
+                && (map.len() != declared.len() || !map.keys().all(|k| declared.contains(k)))
+            {
+                return false;
+            }
+            serde_json::from_value::<Args>(args.clone()).is_ok()
+        });
+        let mut tool = Self::build(name.into(), description.into(), schema, invoke);
+        tool.approval_args_check = Some(approval_args_check);
+        tool
     }
 
     /// Create a tool without parameters.
@@ -752,6 +827,7 @@ impl<C: Send + Sync + 'static> FunctionTool<C> {
             defer_loading: false,
             failure_error_function: Some(Arc::new(default_tool_error_function::<C>)),
             uses_default_failure_error_function: true,
+            default_failure_error_function: true,
             timeout_error_function: None,
             invoke,
             is_agent_tool: false,
@@ -761,6 +837,7 @@ impl<C: Send + Sync + 'static> FunctionTool<C> {
             custom_data_extractor: None,
             output_json_schema: None,
             output_validator: None,
+            approval_args_check: None,
             mcp_title: None,
             is_codex_tool: false,
             namespace: None,
@@ -813,6 +890,29 @@ impl<C: Send + Sync + 'static> FunctionTool<C> {
         self
     }
 
+    /// Evaluate the approval rule for one call.
+    ///
+    /// A dynamic rule sees only the invocation that can execute: when the arguments of a typed
+    /// tool would not run unchanged (they fail to parse into its argument type, omit a parameter
+    /// a default would fill, or carry an undeclared key), the rule is not consulted and the call
+    /// requires approval. Mirrors `evaluate_function_tool_approval`.
+    pub async fn evaluate_needs_approval(
+        &self,
+        ctx: &RunContext<C>,
+        arguments: &str,
+        call_id: &str,
+    ) -> bool {
+        if let (NeedsApproval::Dynamic(_), Some(check)) =
+            (&self.needs_approval, &self.approval_args_check)
+        {
+            let parsed: Option<Value> = serde_json::from_str(arguments).ok();
+            if !parsed.as_ref().is_some_and(|args| check(args)) {
+                return true;
+            }
+        }
+        self.needs_approval.evaluate(ctx, arguments, call_id).await
+    }
+
     /// Set the per-call timeout.
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = Some(timeout);
@@ -839,6 +939,10 @@ impl<C: Send + Sync + 'static> FunctionTool<C> {
     where
         F: Fn(&RunContext<C>, &AgentsError) -> String + Send + Sync + 'static,
     {
+        // An explicit `default_tool_error_function` keeps the default policy's trace redaction
+        // (Python compares the handler's identity with `default_tool_error_function`).
+        self.default_failure_error_function =
+            std::any::TypeId::of::<F>() == type_id_of_val(&default_tool_error_function::<C>);
         self.failure_error_function = Some(Arc::new(f));
         self.uses_default_failure_error_function = false;
         self
@@ -848,6 +952,7 @@ impl<C: Send + Sync + 'static> FunctionTool<C> {
     pub fn without_failure_error_function(mut self) -> Self {
         self.failure_error_function = None;
         self.uses_default_failure_error_function = false;
+        self.default_failure_error_function = false;
         self
     }
 
@@ -1000,13 +1105,11 @@ impl<C> FunctionTool<C> {
                     "Function tool {tool_name} returned an output that does not match its \
                      declared output type"
                 );
-                Err(AgentsError::user(
-                    if crate::logger::may_log_model_data(true) {
-                        format!("{base}: {detail}")
-                    } else {
-                        base
-                    },
-                ))
+                Err(AgentsError::user(if !crate::debug::dont_log_tool_data() {
+                    format!("{base}: {detail}")
+                } else {
+                    base
+                }))
             }
         }
     }

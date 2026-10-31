@@ -81,92 +81,460 @@ fn lookup_names(tool_name: &str) -> impl Iterator<Item = &str> {
     std::iter::once(tool_name).chain(bare)
 }
 
-impl ApprovalsState {
-    /// Approve a call; `always` approves future calls to the same tool by the same agent.
-    pub fn approve(&mut self, item: &ToolApprovalItem, always: bool) {
-        let rec = self
-            .0
-            .entry(approval_key(
-                &item.agent,
-                &approval_tool_key(&item.tool_name, &item.raw_item),
-            ))
-            .or_default();
-        if always {
+/// Reserved marker that starts the tool half of a hosted MCP approval key. No tool name can
+/// contain it, so hosted records never collide with function or native tool records.
+const HOSTED_MARKER: char = '\u{2}';
+/// Separator between the fields of a hosted MCP approval key.
+const HOSTED_SEP: char = '\u{1f}';
+
+/// Key of a sticky hosted MCP decision, scoped by server label and tool name. Hosted MCP
+/// decisions belong to no agent. Mirrors Python's `("hosted_mcp", server_label, tool_name)`.
+pub(crate) fn hosted_server_tool_key(server_label: &str, tool_name: &str) -> String {
+    format!("\u{1}{HOSTED_MARKER}hosted_mcp{HOSTED_SEP}{server_label}{HOSTED_SEP}{tool_name}")
+}
+
+/// Key of an exact-call hosted MCP decision whose request carries no full identity. Mirrors
+/// Python's `("hosted_mcp_call", request_id)`.
+pub(crate) fn hosted_request_key(request_id: &str) -> String {
+    format!("\u{1}{HOSTED_MARKER}hosted_mcp_call{HOSTED_SEP}{request_id}")
+}
+
+/// Key of the lookup-only mirror that lets a name-based query see one exact hosted MCP
+/// decision. It never authorizes anything. Mirrors Python's `("hosted_mcp_query", tool, id)`.
+pub(crate) fn hosted_query_key(tool_name: &str, request_id: &str) -> String {
+    format!("\u{1}{HOSTED_MARKER}hosted_mcp_query{HOSTED_SEP}{tool_name}{HOSTED_SEP}{request_id}")
+}
+
+/// A typed hosted MCP approval identity, decoded from a reserved key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum HostedApprovalIdentity {
+    ServerTool {
+        server_label: String,
+        tool_name: String,
+    },
+    Request {
+        request_id: String,
+    },
+    Query {
+        tool_name: String,
+        request_id: String,
+    },
+}
+
+/// Decode a reserved hosted MCP key; `None` for function and native tool keys.
+pub(crate) fn parse_hosted_key(key: &str) -> Option<HostedApprovalIdentity> {
+    let rest = key.strip_prefix('\u{1}')?.strip_prefix(HOSTED_MARKER)?;
+    let parts: Vec<&str> = rest.split(HOSTED_SEP).collect();
+    match parts.as_slice() {
+        ["hosted_mcp", label, tool] => Some(HostedApprovalIdentity::ServerTool {
+            server_label: (*label).to_string(),
+            tool_name: (*tool).to_string(),
+        }),
+        ["hosted_mcp_call", id] => Some(HostedApprovalIdentity::Request {
+            request_id: (*id).to_string(),
+        }),
+        ["hosted_mcp_query", tool, id] => Some(HostedApprovalIdentity::Query {
+            tool_name: (*tool).to_string(),
+            request_id: (*id).to_string(),
+        }),
+        _ => None,
+    }
+}
+
+/// The identity fields of a hosted MCP approval request. Port of
+/// `HostedMCPApprovalRequestIdentity`: every field is `None` unless it is a non-empty string.
+struct HostedRequest<'a> {
+    request_id: Option<&'a str>,
+    server_label: Option<&'a str>,
+    tool_name: Option<&'a str>,
+}
+
+impl HostedRequest<'_> {
+    fn identity(&self) -> Option<(&str, &str)> {
+        self.server_label.zip(self.tool_name)
+    }
+}
+
+fn non_empty(s: &str) -> Option<&str> {
+    (!s.is_empty()).then_some(s)
+}
+
+/// The hosted MCP request an approval item stands for, if it is one. The tool name falls back
+/// to the item's own `tool_name` the way Python reads persisted legacy items.
+fn hosted_request(item: &ToolApprovalItem) -> Option<HostedRequest<'_>> {
+    let raw = &item.raw_item;
+    if raw.extra.get("type").and_then(Value::as_str) != Some("mcp_approval_request") {
+        return None;
+    }
+    Some(HostedRequest {
+        request_id: non_empty(&raw.call_id),
+        server_label: raw
+            .extra
+            .get("server_label")
+            .and_then(Value::as_str)
+            .and_then(non_empty),
+        tool_name: non_empty(&raw.name),
+    })
+}
+
+/// The bare tool name a legacy (pre-scoping) hosted MCP record was stored under.
+fn hosted_legacy_name<'a>(item: &'a ToolApprovalItem, request: &HostedRequest<'a>) -> &'a str {
+    request.tool_name.unwrap_or(&item.tool_name)
+}
+
+/// Record one decision on a record. Port of the per-record branch of
+/// `RunContextWrapper._apply_approval_decision`: a sticky decision replaces the opposite
+/// decision wholesale, a per-call decision moves only its call id.
+fn apply_decision(
+    rec: &mut ApprovalRecord,
+    call_id: &str,
+    sticky: bool,
+    approve: bool,
+    message: Option<String>,
+) {
+    if sticky {
+        if approve {
             rec.approved_always = true;
             rec.rejected_always = false;
+            rec.rejected_call_ids.clear();
+            rec.rejection_messages.clear();
+            rec.sticky_rejection_message = None;
+        } else {
+            rec.approved_always = false;
+            rec.approved_call_ids.clear();
+            rec.rejected_always = true;
+            match &message {
+                Some(m) => {
+                    rec.rejection_messages
+                        .insert(call_id.to_string(), m.clone());
+                }
+                None => {
+                    rec.rejection_messages.remove(call_id);
+                }
+            }
+            rec.sticky_rejection_message = message;
         }
-        rec.approved_call_ids.insert(item.call_id().to_string());
-        rec.rejected_call_ids.remove(item.call_id());
+        return;
+    }
+    if approve {
+        rec.rejected_call_ids.remove(call_id);
+        if !rec.approved_always {
+            rec.approved_call_ids.insert(call_id.to_string());
+        }
+        rec.rejection_messages.remove(call_id);
+    } else {
+        rec.approved_call_ids.remove(call_id);
+        if !rec.rejected_always {
+            rec.rejected_call_ids.insert(call_id.to_string());
+        }
+        match message {
+            Some(m) => {
+                rec.rejection_messages.insert(call_id.to_string(), m);
+            }
+            None => {
+                rec.rejection_messages.remove(call_id);
+            }
+        }
+    }
+}
+
+/// Only an exact-call decision. Port of `_get_per_call_approval_status_for_record`.
+fn per_call_status(rec: &ApprovalRecord, call_id: &str) -> Option<bool> {
+    if rec.approved_call_ids.contains(call_id) {
+        Some(true)
+    } else if rec.rejected_call_ids.contains(call_id) {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// The model-visible message of a decided record. Port of `_get_rejection_message_for_key`.
+fn record_rejection_message(rec: &ApprovalRecord, call_id: &str) -> Option<String> {
+    if rec.approved_call_ids.contains(call_id) {
+        return None;
+    }
+    if rec.rejected_always {
+        return rec
+            .rejection_messages
+            .get(call_id)
+            .or(rec.sticky_rejection_message.as_ref())
+            .cloned();
+    }
+    if rec.rejected_call_ids.contains(call_id) {
+        return rec.rejection_messages.get(call_id).cloned();
+    }
+    None
+}
+
+impl ApprovalsState {
+    /// Approve a call; `always` approves future calls to the same tool by the same agent.
+    ///
+    /// An item that cannot carry the decision (a hosted MCP request without a request id, or a
+    /// sticky decision without a server label and tool name) records nothing; use
+    /// [`try_approve`](Self::try_approve) to get the reason.
+    pub fn approve(&mut self, item: &ToolApprovalItem, always: bool) {
+        let _ = self.try_approve(item, always);
     }
 
     /// Reject a call; `always` rejects future calls to the same tool by the same agent.
+    /// Records nothing for an item that cannot carry the decision; see
+    /// [`try_reject`](Self::try_reject).
     pub fn reject(&mut self, item: &ToolApprovalItem, always: bool, message: Option<String>) {
-        let rec = self
-            .0
-            .entry(approval_key(
-                &item.agent,
-                &approval_tool_key(&item.tool_name, &item.raw_item),
-            ))
-            .or_default();
-        if always {
-            rec.rejected_always = true;
-            rec.approved_always = false;
-            if message.is_some() {
-                rec.sticky_rejection_message = message.clone();
-            }
-        }
-        rec.rejected_call_ids.insert(item.call_id().to_string());
-        rec.approved_call_ids.remove(item.call_id());
-        if let Some(m) = message {
-            rec.rejection_messages.insert(item.call_id().to_string(), m);
-        }
+        let _ = self.try_reject(item, always, message);
     }
 
-    fn record_status(rec: &ApprovalRecord, call_id: &str) -> Option<bool> {
-        if rec.rejected_call_ids.contains(call_id) {
-            return Some(false);
+    /// [`approve`](Self::approve), failing the way Python's `approve_tool` raises.
+    pub fn try_approve(&mut self, item: &ToolApprovalItem, always: bool) -> crate::Result<()> {
+        self.decide(item, always, true, None)
+    }
+
+    /// [`reject`](Self::reject), failing the way Python's `reject_tool` raises.
+    pub fn try_reject(
+        &mut self,
+        item: &ToolApprovalItem,
+        always: bool,
+        message: Option<String>,
+    ) -> crate::Result<()> {
+        self.decide(item, always, false, message)
+    }
+
+    fn decide(
+        &mut self,
+        item: &ToolApprovalItem,
+        always: bool,
+        approve: bool,
+        message: Option<String>,
+    ) -> crate::Result<()> {
+        let Some(request) = hosted_request(item) else {
+            let rec = self
+                .0
+                .entry(approval_key(
+                    &item.agent,
+                    &approval_tool_key(&item.tool_name, &item.raw_item),
+                ))
+                .or_default();
+            apply_decision(rec, item.call_id(), always, approve, message);
+            return Ok(());
+        };
+        // Validate everything before touching the ledger, so a refused decision leaves it as
+        // it was. Port of the hosted branch of `_apply_approval_decision`.
+        let request_id = request.request_id.ok_or_else(|| {
+            crate::AgentsError::user(
+                "Hosted MCP approval decisions require a non-empty request id.",
+            )
+        })?;
+        let identity = request.identity();
+        if always && identity.is_none() {
+            return Err(crate::AgentsError::user(
+                "Persistent hosted MCP approval decisions require a non-empty server_label \
+                 and tool name.",
+            ));
         }
-        if rec.approved_call_ids.contains(call_id) {
+        let Some((label, tool)) = identity else {
+            return Err(crate::AgentsError::model_behavior(
+                "Approval decisions require a canonical invocation identity.",
+            ));
+        };
+        let rec = self
+            .0
+            .entry(hosted_server_tool_key(label, tool))
+            .or_default();
+        apply_decision(rec, request_id, always, approve, message.clone());
+        // Exact name-based lookup without adding an authorization source.
+        let query = self
+            .0
+            .entry(hosted_query_key(tool, request_id))
+            .or_default();
+        apply_decision(query, request_id, false, approve, message);
+        Ok(())
+    }
+
+    /// Python's `_get_approval_status_for_record`: an exact call decision wins over the sticky
+    /// one, and approval wins when both sticky decisions are set.
+    fn record_status(rec: &ApprovalRecord, call_id: &str) -> Option<bool> {
+        if let Some(status) = per_call_status(rec, call_id) {
+            return Some(status);
+        }
+        if rec.approved_always {
             return Some(true);
         }
         if rec.rejected_always {
             return Some(false);
         }
-        if rec.approved_always {
-            return Some(true);
-        }
         None
+    }
+
+    /// The first record, in lookup order, that decides `call_id`.
+    fn deciding_record(
+        &self,
+        agent: &str,
+        tool_name: &str,
+        call_id: &str,
+    ) -> Option<&ApprovalRecord> {
+        let decided = |owner: &str| {
+            lookup_names(tool_name).find_map(|name| {
+                self.0
+                    .get(&approval_key(owner, name))
+                    .filter(|rec| Self::record_status(rec, call_id).is_some())
+            })
+        };
+        decided(agent).or_else(|| decided(""))
+    }
+
+    /// The decision for a function tool call. Port of the function branch of
+    /// `_approval_records_for_tool`: an ownerless (pre-1.18) record contributes only its exact
+    /// call decisions, never a sticky grant, so an old permanent decision never picks an owner.
+    pub(crate) fn function_tool_status(
+        &self,
+        agent: &str,
+        tool_name: &str,
+        call_id: &str,
+    ) -> ApprovalStatus {
+        let owned = lookup_names(tool_name).find_map(|name| {
+            self.0
+                .get(&approval_key(agent, name))
+                .filter(|rec| Self::record_status(rec, call_id).is_some())
+        });
+        if let Some(rec) = owned {
+            return ApprovalStatus {
+                approved: Self::record_status(rec, call_id),
+                rejection_message: record_rejection_message(rec, call_id),
+            };
+        }
+        let legacy = lookup_names(tool_name).find_map(|name| {
+            self.0
+                .get(&approval_key("", name))
+                .filter(|rec| per_call_status(rec, call_id).is_some())
+        });
+        let Some(rec) = legacy else {
+            return ApprovalStatus::default();
+        };
+        let approved = per_call_status(rec, call_id);
+        ApprovalStatus {
+            approved,
+            rejection_message: (approved == Some(false))
+                .then(|| rec.rejection_messages.get(call_id).cloned())
+                .flatten(),
+        }
     }
 
     /// `Some(true)` approved, `Some(false)` rejected, `None` undecided.
     ///
     /// Decisions recorded without an owning agent (Python's agent-agnostic `approvals`
     /// bucket, and snapshots written before it bound function tools to their agent) apply to
-    /// every agent and are consulted when the agent-specific record is undecided.
+    /// every agent and are consulted when the agent-specific record is undecided. The runner's
+    /// function-tool path does not use this fallback for sticky grants; see
+    /// `function_tool_status`.
     pub fn status(&self, agent: &str, tool_name: &str, call_id: &str) -> Option<bool> {
-        let decided = |owner: &str| {
-            lookup_names(tool_name).find_map(|name| {
-                self.0
-                    .get(&approval_key(owner, name))
-                    .and_then(|rec| Self::record_status(rec, call_id))
-            })
-        };
-        decided(agent).or_else(|| decided(""))
+        self.deciding_record(agent, tool_name, call_id)
+            .and_then(|rec| Self::record_status(rec, call_id))
     }
 
-    /// Custom rejection message for a call.
+    /// Custom rejection message for a call: the message of the record that decides it.
     pub fn rejection_message(&self, agent: &str, tool_name: &str, call_id: &str) -> Option<String> {
-        let message = |owner: &str| {
-            lookup_names(tool_name).find_map(|name| {
-                self.0.get(&approval_key(owner, name)).and_then(|rec| {
-                    rec.rejection_messages
-                        .get(call_id)
-                        .cloned()
-                        .or_else(|| rec.sticky_rejection_message.clone())
-                })
+        self.deciding_record(agent, tool_name, call_id)
+            .and_then(|rec| record_rejection_message(rec, call_id))
+    }
+
+    /// The exact hosted MCP decision a name-only query sees for `call_id`, if one was made.
+    /// The outer `Option` says whether the mirror decides the call at all.
+    fn hosted_query(&self, tool_name: &str, call_id: &str) -> Option<(bool, Option<String>)> {
+        let rec = self.0.get(&hosted_query_key(tool_name, call_id))?;
+        let status = per_call_status(rec, call_id)?;
+        Some((status, record_rejection_message(rec, call_id)))
+    }
+
+    /// The decision for a hosted MCP request with a full identity. Port of
+    /// `_resolve_hosted_mcp_approval_decision`: the `(server_label, tool)` record decides first;
+    /// otherwise only an exact-call decision under a legacy name counts, so a legacy sticky
+    /// grant never authorizes a server it was not scoped to.
+    pub(crate) fn hosted_decision(
+        &self,
+        agent: &str,
+        server_label: &str,
+        tool_name: &str,
+        request_id: &str,
+    ) -> ApprovalStatus {
+        let decided = |rec: &ApprovalRecord, exact_only: bool| {
+            let status = if exact_only {
+                per_call_status(rec, request_id)
+            } else {
+                Self::record_status(rec, request_id)
+            };
+            status.map(|approved| ApprovalStatus {
+                approved: Some(approved),
+                rejection_message: record_rejection_message(rec, request_id),
             })
         };
-        message(agent).or_else(|| message(""))
+        if let Some(found) = self
+            .0
+            .get(&hosted_server_tool_key(server_label, tool_name))
+            .and_then(|rec| decided(rec, false))
+        {
+            return found;
+        }
+        // Snapshots this crate wrote before hosted identities were typed keyed the decision
+        // by the owning agent and `label:tool`.
+        let scoped = format!("{server_label}:{tool_name}");
+        if let Some(found) = [agent, ""]
+            .iter()
+            .find_map(|owner| self.0.get(&approval_key(owner, &scoped)))
+            .and_then(|rec| decided(rec, false))
+        {
+            return found;
+        }
+        self.hosted_legacy_exact(agent, tool_name, request_id)
+    }
+
+    /// An exact-call decision recorded under the request id or the bare tool name.
+    fn hosted_legacy_exact(
+        &self,
+        agent: &str,
+        tool_name: &str,
+        request_id: &str,
+    ) -> ApprovalStatus {
+        let exact = |rec: &ApprovalRecord| {
+            per_call_status(rec, request_id).map(|approved| ApprovalStatus {
+                approved: Some(approved),
+                rejection_message: record_rejection_message(rec, request_id),
+            })
+        };
+        self.0
+            .get(&hosted_request_key(request_id))
+            .and_then(exact)
+            .or_else(|| {
+                [agent, ""]
+                    .iter()
+                    .find_map(|owner| self.0.get(&approval_key(owner, tool_name)).and_then(exact))
+            })
+            .unwrap_or_default()
+    }
+
+    /// The decision that governs `call_id` when it runs as the call `item` stands for. Port of
+    /// `RunContextWrapper.get_approval_status(..., existing_pending=item)` together with
+    /// `get_rejection_message`.
+    ///
+    /// A hosted MCP request without a server label and tool name cannot be bound to a
+    /// canonical invocation, so it is always undecided; only its legacy exact rejection
+    /// message stays readable.
+    pub fn status_for_item(&self, item: &ToolApprovalItem, call_id: &str) -> ApprovalStatus {
+        let Some(request) = hosted_request(item) else {
+            let key = approval_tool_key(&item.tool_name, &item.raw_item);
+            return ApprovalStatus {
+                approved: self.status(&item.agent, &key, call_id),
+                rejection_message: self.rejection_message(&item.agent, &key, call_id),
+            };
+        };
+        match request.identity() {
+            Some((label, tool)) => self.hosted_decision(&item.agent, label, tool, call_id),
+            None => ApprovalStatus {
+                approved: None,
+                rejection_message: self
+                    .hosted_legacy_exact(&item.agent, hosted_legacy_name(item, &request), call_id)
+                    .rejection_message,
+            },
+        }
     }
 
     /// Merge decisions from another state.
@@ -211,6 +579,52 @@ struct Inner {
     nested_states: BTreeMap<String, Value>,
     /// Interruptions raised by nested agent tool runs, keyed by tool call id.
     nested_interruptions: BTreeMap<String, Vec<ToolApprovalItem>>,
+    /// The invocations decisions were recorded for, keyed by call id. Mirrors
+    /// `RunContextWrapper._tool_invocations`: a decision binds the exact call it was made for.
+    invocations: BTreeMap<String, crate::run_state::ToolInvocationRecord>,
+}
+
+/// The invocation a function-tool decision binds: the call id, the tool it routes to and its
+/// arguments. Port of the `_tool_invocation_status` registration in `_apply_approval_decision`.
+/// Other tool kinds are bound by the run that raises them.
+pub(crate) fn approval_binding(
+    item: &ToolApprovalItem,
+) -> Option<(String, crate::run_state::ToolInvocationRecord)> {
+    let mut raw = item.raw_item.to_value();
+    let map = raw.as_object_mut()?;
+    let ty = map
+        .entry("type")
+        .or_insert_with(|| Value::String("function_call".into()))
+        .as_str()?
+        .to_string();
+    // A native or custom call travels as a `FunctionCall` whose `name`/`arguments` the SDK
+    // filled in; its own payload is the rest. Native calls are scoped by their tool's name.
+    let tool_name = match ty.as_str() {
+        "function_call" => None,
+        "custom_tool_call" => {
+            map.remove("arguments");
+            None
+        }
+        "shell_call" | "apply_patch_call" | "computer_call" | "local_shell_call" => {
+            map.remove("arguments");
+            map.remove("name");
+            Some(item.tool_name.as_str())
+        }
+        _ => return None,
+    };
+    let id = crate::run_internal::tool_invocation::tool_invocation_identity_named(
+        &raw, tool_name, None,
+    )?;
+    Some((
+        id.call_id,
+        crate::run_state::ToolInvocationRecord {
+            invocation_type: id.invocation_type,
+            approval_scope: id.approval_scope,
+            fingerprint: id.fingerprint,
+            executed: false,
+            completed: false,
+        },
+    ))
 }
 
 /// Wrapper around the app context with shared usage and approval state.
@@ -220,6 +634,10 @@ pub struct RunContext<C> {
     context: Arc<C>,
     inner: Arc<Mutex<Inner>>,
     tool_input: Option<Arc<Value>>,
+    /// Call ids whose tool started running but whose output was never committed. Shared by
+    /// clones (every run that reuses this context), fresh for a nested agent-tool context.
+    /// Mirrors the `executed`/`completed` flags of `RunContextWrapper._tool_invocations`.
+    uncommitted: Arc<Mutex<BTreeSet<String>>>,
 }
 
 impl<C> Clone for RunContext<C> {
@@ -228,6 +646,7 @@ impl<C> Clone for RunContext<C> {
             context: self.context.clone(),
             inner: self.inner.clone(),
             tool_input: self.tool_input.clone(),
+            uncommitted: self.uncommitted.clone(),
         }
     }
 }
@@ -247,6 +666,7 @@ impl<C> RunContext<C> {
             context: Arc::new(context),
             inner: Arc::new(Mutex::new(Inner::default())),
             tool_input: None,
+            uncommitted: Arc::default(),
         }
     }
 
@@ -256,6 +676,7 @@ impl<C> RunContext<C> {
             context,
             inner: Arc::new(Mutex::new(Inner::default())),
             tool_input: None,
+            uncommitted: Arc::default(),
         }
     }
 
@@ -303,13 +724,55 @@ impl<C> RunContext<C> {
             context: self.context.clone(),
             inner: self.inner.clone(),
             tool_input: Some(Arc::new(tool_input)),
+            uncommitted: self.uncommitted.clone(),
         }
+    }
+
+    /// A clone that shares everything but the invocation lifecycle, for a nested run.
+    pub(crate) fn with_fresh_invocations(&self) -> Self {
+        RunContext {
+            uncommitted: Arc::default(),
+            ..self.clone()
+        }
+    }
+
+    /// Record that the tool behind `call_id` is about to run its body.
+    pub(crate) fn mark_invocation_executed(&self, call_id: &str) {
+        self.uncommitted
+            .lock()
+            .expect("run context poisoned")
+            .insert(call_id.to_string());
+    }
+
+    /// Record that the output of `call_id` was committed to the run.
+    pub(crate) fn mark_invocation_completed(&self, call_id: &str) {
+        self.uncommitted
+            .lock()
+            .expect("run context poisoned")
+            .remove(call_id);
+    }
+
+    /// Record that the output of a decided call was committed, so a context reused for a later
+    /// run does not run it again.
+    pub(crate) fn mark_bound_invocation_completed(&self, call_id: &str) {
+        if let Some(record) = self.lock().invocations.get_mut(call_id) {
+            record.executed = true;
+            record.completed = true;
+        }
+    }
+
+    /// Whether `call_id` already ran in a run that failed before committing its output.
+    pub(crate) fn invocation_executed_uncommitted(&self, call_id: &str) -> bool {
+        self.uncommitted
+            .lock()
+            .expect("run context poisoned")
+            .contains(call_id)
     }
 
     /// Approve a pending tool call. With `always_approve`, future calls to the same tool by the
     /// same agent are approved automatically.
     pub fn approve_tool(&self, item: &ToolApprovalItem, always_approve: bool) {
-        self.lock().approvals.approve(item, always_approve);
+        let _ = self.try_approve_tool(item, always_approve);
     }
 
     /// Reject a pending tool call, optionally with a custom model-visible message.
@@ -319,22 +782,137 @@ impl<C> RunContext<C> {
         always_reject: bool,
         rejection_message: Option<String>,
     ) {
-        self.lock()
+        let _ = self.try_reject_tool(item, always_reject, rejection_message);
+    }
+
+    /// [`approve_tool`](Self::approve_tool), returning why a decision could not be recorded:
+    /// a hosted MCP request needs a request id, a sticky hosted decision needs a server label
+    /// and tool name, and a per-call one needs a complete invocation identity. Nothing is
+    /// recorded on error. Mirrors the exceptions `RunContextWrapper.approve_tool` raises.
+    pub fn try_approve_tool(
+        &self,
+        item: &ToolApprovalItem,
+        always_approve: bool,
+    ) -> crate::Result<()> {
+        let mut inner = self.lock();
+        inner.approvals.try_approve(item, always_approve)?;
+        Self::bind(&mut inner, item);
+        Ok(())
+    }
+
+    fn bind(inner: &mut Inner, item: &ToolApprovalItem) {
+        if let Some((call_id, record)) = approval_binding(item) {
+            inner.invocations.entry(call_id).or_insert(record);
+        }
+    }
+
+    /// The invocations this context's decisions are bound to, keyed by call id. Carry them
+    /// with [`export_approvals`](Self::export_approvals) when moving a context elsewhere, as
+    /// Python's context converters carry `_tool_invocations`: a later run then refuses a call
+    /// that reuses a decided call id for different arguments, and does not repeat a call that
+    /// already completed.
+    pub fn export_tool_invocations(
+        &self,
+    ) -> BTreeMap<String, crate::run_state::ToolInvocationRecord> {
+        self.lock().invocations.clone()
+    }
+
+    /// The invocation a decision about `call_id` was bound to, if any.
+    pub(crate) fn bound_invocation(
+        &self,
+        call_id: &str,
+    ) -> Option<crate::run_state::ToolInvocationRecord> {
+        self.lock().invocations.get(call_id).cloned()
+    }
+
+    /// Restore invocations exported with [`export_tool_invocations`](Self::export_tool_invocations).
+    /// Entries already known keep their current state.
+    pub fn import_tool_invocations(
+        &self,
+        invocations: &BTreeMap<String, crate::run_state::ToolInvocationRecord>,
+    ) {
+        let mut inner = self.lock();
+        for (call_id, record) in invocations {
+            inner
+                .invocations
+                .entry(call_id.clone())
+                .or_insert_with(|| record.clone());
+        }
+    }
+
+    /// [`reject_tool`](Self::reject_tool), returning why a decision could not be recorded.
+    pub fn try_reject_tool(
+        &self,
+        item: &ToolApprovalItem,
+        always_reject: bool,
+        rejection_message: Option<String>,
+    ) -> crate::Result<()> {
+        let mut inner = self.lock();
+        inner
             .approvals
-            .reject(item, always_reject, rejection_message);
+            .try_reject(item, always_reject, rejection_message)?;
+        Self::bind(&mut inner, item);
+        Ok(())
     }
 
     /// Approval status for a tool call: `Some(true)` approved, `Some(false)` rejected, `None`
     /// undecided.
+    ///
+    /// An exact hosted MCP decision about a tool of this name and this call id answers first,
+    /// as Python's name-only query does; it is lookup-only and never extends to other calls.
     pub fn is_tool_approved(&self, agent: &str, tool_name: &str, call_id: &str) -> Option<bool> {
-        self.lock().approvals.status(agent, tool_name, call_id)
+        let inner = self.lock();
+        if let Some((approved, _)) = inner.approvals.hosted_query(tool_name, call_id) {
+            return Some(approved);
+        }
+        inner.approvals.status(agent, tool_name, call_id)
+    }
+
+    /// The decision for a function tool call, without an old snapshot's ownerless sticky
+    /// grants; see `ApprovalsState::function_tool_status`.
+    pub(crate) fn function_tool_status(
+        &self,
+        agent: &str,
+        tool_name: &str,
+        call_id: &str,
+    ) -> ApprovalStatus {
+        self.lock()
+            .approvals
+            .function_tool_status(agent, tool_name, call_id)
     }
 
     /// Custom rejection message for a rejected call, if one was provided.
     pub fn rejection_message(&self, agent: &str, tool_name: &str, call_id: &str) -> Option<String> {
+        let inner = self.lock();
+        if let Some((_, message)) = inner.approvals.hosted_query(tool_name, call_id) {
+            return message;
+        }
+        inner.approvals.rejection_message(agent, tool_name, call_id)
+    }
+
+    /// The decision governing `call_id` when it runs as the call `item` stands for: the same
+    /// tool, agent and (for hosted MCP) server. Mirrors
+    /// `RunContextWrapper.get_approval_status(tool_name, call_id, existing_pending=item)`
+    /// plus `get_rejection_message` with the same arguments.
+    pub fn approval_status_for_item(
+        &self,
+        item: &ToolApprovalItem,
+        call_id: &str,
+    ) -> ApprovalStatus {
+        self.lock().approvals.status_for_item(item, call_id)
+    }
+
+    /// The decision for a hosted MCP request, scoped by its server label and tool name.
+    pub(crate) fn hosted_mcp_decision(
+        &self,
+        agent: &str,
+        server_label: &str,
+        tool_name: &str,
+        request_id: &str,
+    ) -> ApprovalStatus {
         self.lock()
             .approvals
-            .rejection_message(agent, tool_name, call_id)
+            .hosted_decision(agent, server_label, tool_name, request_id)
     }
 
     /// The input list of the turn currently being executed, as the model sees it. Empty
@@ -356,10 +934,9 @@ impl<C> RunContext<C> {
         tool_name: &str,
         call_id: &str,
     ) -> ApprovalStatus {
-        let inner = self.lock();
         ApprovalStatus {
-            approved: inner.approvals.status(agent, tool_name, call_id),
-            rejection_message: inner.approvals.rejection_message(agent, tool_name, call_id),
+            approved: self.is_tool_approved(agent, tool_name, call_id),
+            rejection_message: self.rejection_message(agent, tool_name, call_id),
         }
     }
 

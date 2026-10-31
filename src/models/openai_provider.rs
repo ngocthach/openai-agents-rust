@@ -18,6 +18,10 @@ type WebsocketModelCache =
 #[derive(Debug, Clone, Default)]
 pub struct OpenAIProvider {
     client: Option<OpenAIClient>,
+    api_key: Option<String>,
+    base_url: Option<String>,
+    organization: Option<String>,
+    project: Option<String>,
     use_responses: Option<bool>,
     agent_harness_id: Option<String>,
     strict_feature_validation: bool,
@@ -41,6 +45,35 @@ impl OpenAIProvider {
     /// Use a specific client.
     pub fn with_client(mut self, client: OpenAIClient) -> Self {
         self.client = Some(client);
+        self
+    }
+
+    /// Use this API key for a client the provider builds itself, instead of the default
+    /// client. An explicit value, even an empty one, wins over the global key and the
+    /// environment. Not combinable with [`with_client`](Self::with_client).
+    pub fn with_api_key(mut self, api_key: impl Into<String>) -> Self {
+        self.api_key = Some(api_key.into());
+        self
+    }
+
+    /// Use this base URL for a client the provider builds itself, instead of the default
+    /// client and `OPENAI_BASE_URL`. Not combinable with [`with_client`](Self::with_client).
+    pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
+        self.base_url = Some(base_url.into());
+        self
+    }
+
+    /// Use this organization for a client the provider builds itself.
+    /// Not combinable with [`with_client`](Self::with_client).
+    pub fn with_organization(mut self, organization: impl Into<String>) -> Self {
+        self.organization = Some(organization.into());
+        self
+    }
+
+    /// Use this project for a client the provider builds itself.
+    /// Not combinable with [`with_client`](Self::with_client).
+    pub fn with_project(mut self, project: impl Into<String>) -> Self {
+        self.project = Some(project.into());
         self
     }
 
@@ -117,11 +150,72 @@ impl OpenAIProvider {
         }
     }
 
+    /// Whether a client option was set on the provider itself.
+    fn has_explicit_client_options(&self) -> bool {
+        #[cfg(feature = "websocket")]
+        let websocket = self.websocket_base_url.is_some();
+        #[cfg(not(feature = "websocket"))]
+        let websocket = false;
+        self.api_key.is_some()
+            || self.base_url.is_some()
+            || self.organization.is_some()
+            || self.project.is_some()
+            || websocket
+    }
+
+    /// Reject client options next to an explicit client, which would silently ignore them.
+    fn validate_client_options(&self) -> Result<()> {
+        if self.client.is_some() && self.has_explicit_client_options() {
+            return Err(crate::error::AgentsError::user(
+                "Don't provide api_key, base_url, websocket_base_url, organization, or project \
+                 if you provide openai_client",
+            ));
+        }
+        Ok(())
+    }
+
+    /// The client this provider's models use: the explicit client, else the default client
+    /// unless a client option was set on the provider, else a client built from the provider's
+    /// options with the global key and the environment filling the gaps. Mirrors `_get_client`.
+    pub fn openai_client(&self) -> OpenAIClient {
+        if let Some(client) = &self.client {
+            return client.clone();
+        }
+        if !self.has_explicit_client_options()
+            && let Some(client) = default_openai_client()
+        {
+            return client;
+        }
+        let mut client = OpenAIClient::from_env();
+        if let Some(key) = &self.api_key {
+            client = client.with_api_key(key.clone());
+        }
+        if let Some(url) = &self.base_url {
+            client = client.with_base_url(url.clone());
+        }
+        if let Some(organization) = &self.organization {
+            client = client.with_organization(organization.clone());
+        }
+        if let Some(project) = &self.project {
+            client = client.with_project(project.clone());
+        }
+        #[cfg(feature = "websocket")]
+        if let Some(url) = self.websocket_base_url() {
+            client = client.with_websocket_base_url(url);
+        }
+        client
+    }
+
     fn client(&self) -> OpenAIClient {
-        self.client
-            .clone()
-            .or_else(default_openai_client)
-            .unwrap_or_else(OpenAIClient::from_env)
+        self.openai_client()
+    }
+
+    /// The low-level WebSocket options handed to this provider's models.
+    #[cfg(feature = "websocket")]
+    pub fn websocket_options(
+        &self,
+    ) -> &super::openai_responses_ws::OpenAIResponsesWebSocketOptions {
+        &self.websocket_options
     }
 
     /// The Responses WebSocket base URL this provider hands to its models: the one set with
@@ -160,6 +254,7 @@ impl ModelProvider for OpenAIProvider {
     }
 
     fn get_model(&self, model_name: Option<&str>) -> Result<Arc<dyn Model>> {
+        self.validate_client_options()?;
         let explicit = model_name.is_some();
         let name = model_name
             .map(str::to_string)

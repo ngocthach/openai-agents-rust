@@ -2,7 +2,7 @@
 
 use std::fmt;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use futures::Stream;
 use serde::de::DeserializeOwned;
@@ -120,6 +120,10 @@ pub struct RunResult<C> {
     pub(crate) model_input_items: Vec<RunItem>,
     /// Whether model history diverged from the public history during this run.
     pub(crate) replay_from_model_input_items: bool,
+    /// Indexes into `new_items` of items a nested handoff already carried into `input`
+    /// verbatim; the full-history view leaves them out so they are not replayed twice. Port of
+    /// `NestedHistoryOwnedItemRef`.
+    pub(crate) nested_history_owned_items: Vec<usize>,
     pub(crate) state: Box<RunState>,
 }
 
@@ -160,18 +164,39 @@ impl<C> RunResult<C> {
     /// Input items for the next turn, choosing which history view to replay.
     /// Mirrors `RunResultBase.to_input_list(mode=...)`.
     pub fn to_input_list_with(&self, mode: ToInputListMode) -> Vec<InputItem> {
-        let source = match mode {
+        let owned: &[usize] = &self.nested_history_owned_items;
+        let source: Vec<&RunItem> = match mode {
             ToInputListMode::Normalized if self.replay_from_model_input_items => {
-                &self.model_input_items
+                self.model_input_items.iter().collect()
             }
-            _ => &self.new_items,
+            ToInputListMode::Normalized => self.new_items.iter().collect(),
+            ToInputListMode::PreserveAll => self
+                .new_items
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| !owned.contains(index))
+                .map(|(_, item)| item)
+                .collect(),
         };
+        // Replay follows the run's reasoning-id policy, as the model input did. Port of
+        // `run_items_to_input_items(..., reasoning_item_id_policy)`.
+        let omit_reasoning_ids = self.state.reasoning_item_id_policy
+            == Some(crate::run_config::ReasoningItemIdPolicy::Omit);
         let mut out = self.input.clone();
         out.extend(
             source
-                .iter()
+                .into_iter()
                 .filter(|i| !matches!(i.kind, RunItemKind::ToolApproval { .. }))
-                .map(RunItem::to_input_item),
+                .map(RunItem::to_input_item)
+                .map(|mut item| {
+                    if omit_reasoning_ids
+                        && item.item_type() == Some("reasoning")
+                        && let serde_json::Value::Object(map) = &mut item.0
+                    {
+                        map.remove("id");
+                    }
+                    item
+                }),
         );
         out
     }
@@ -241,6 +266,116 @@ pub enum CancelMode {
     AfterTurn,
 }
 
+/// State a streamed run shares with its [`RunResultStreaming`]: how far the consumer got
+/// through the events, and the immediate-cancel signal.
+#[derive(Debug, Default)]
+pub(crate) struct StreamControl {
+    sent: AtomicU64,
+    acknowledged: AtomicU64,
+    consumers: AtomicUsize,
+    progress: tokio::sync::Notify,
+    cancelled: AtomicBool,
+    cancel: tokio::sync::Notify,
+}
+
+impl StreamControl {
+    /// Count an event handed to the consumer channel.
+    pub(crate) fn record_sent(&self) {
+        self.sent.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn acknowledge(&self) {
+        self.acknowledged.fetch_add(1, Ordering::SeqCst);
+        self.progress.notify_waiters();
+    }
+
+    fn register_consumer(&self) {
+        self.consumers.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn unregister_consumer(&self) {
+        self.consumers.fetch_sub(1, Ordering::SeqCst);
+        self.progress.notify_waiters();
+    }
+
+    /// Wait until an active consumer has handled every event sent so far. Returns at once when
+    /// nobody is consuming the stream, so an unconsumed run never blocks. Port of
+    /// `RunResultStreaming._wait_for_turn_event_consumption`.
+    pub(crate) async fn wait_for_consumption(&self) {
+        loop {
+            let progress = self.progress.notified();
+            let mut progress = std::pin::pin!(progress);
+            progress.as_mut().enable();
+            if self.consumers.load(Ordering::SeqCst) == 0
+                || self.acknowledged.load(Ordering::SeqCst) >= self.sent.load(Ordering::SeqCst)
+            {
+                return;
+            }
+            progress.await;
+        }
+    }
+
+    fn cancel_now(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+        self.cancel.notify_one();
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+
+    /// Resolve once the run was cancelled immediately.
+    pub(crate) async fn cancelled(&self) {
+        if self.is_cancelled() {
+            return;
+        }
+        self.cancel.notified().await;
+    }
+}
+
+/// Keeps a stream consumer registered while its event stream is alive, and remembers the
+/// event it yielded last until the consumer asks for the next one.
+struct ConsumerGuard {
+    control: Arc<StreamControl>,
+    pending: bool,
+}
+
+impl ConsumerGuard {
+    fn acknowledge(&mut self) {
+        if std::mem::take(&mut self.pending) {
+            self.control.acknowledge();
+        }
+    }
+}
+
+impl Drop for ConsumerGuard {
+    fn drop(&mut self) {
+        // A consumer that goes away has finished with the event it was handling.
+        self.acknowledge();
+        self.control.unregister_consumer();
+    }
+}
+
+/// Cancels a streamed run without borrowing its [`RunResultStreaming`], so a consumer can
+/// cancel from inside its `stream_events` loop as Python's `result.cancel()` does.
+#[derive(Debug, Clone)]
+pub struct StreamCancelHandle {
+    control: Arc<StreamControl>,
+    cancel_after_turn: Arc<AtomicBool>,
+}
+
+impl StreamCancelHandle {
+    /// Cancel the run. [`CancelMode::Immediate`] stops it at its next await point (its cleanup
+    /// still runs) and the stream yields no further events; [`CancelMode::AfterTurn`] lets the
+    /// current turn finish and stops before the next one starts.
+    pub fn cancel(&self, mode: CancelMode) {
+        match mode {
+            CancelMode::AfterTurn => self.cancel_after_turn.store(true, Ordering::SeqCst),
+            CancelMode::Immediate => self.control.cancel_now(),
+        }
+    }
+}
+
 /// How a streamed run ended, handed to an
 /// [`on_complete`](RunResultStreaming::with_on_complete) hook.
 ///
@@ -284,8 +419,11 @@ pub struct RunResultStreaming<C> {
     result: Option<RunResult<C>>,
     current_agent: Arc<Agent<C>>,
     cancel_after_turn: Arc<AtomicBool>,
+    control: Arc<StreamControl>,
     handle: Option<JoinHandle<()>>,
     complete: bool,
+    /// An immediate cancel was requested and the run has not reported back yet.
+    awaiting_cancelled_run: bool,
     on_complete: Option<StreamCompletionHook>,
     max_turns: Option<usize>,
     run_loop_error: Option<String>,
@@ -312,6 +450,7 @@ impl<C: Send + Sync + 'static> RunResultStreaming<C> {
         rx: mpsc::UnboundedReceiver<StreamMsg<C>>,
         current_agent: Arc<Agent<C>>,
         cancel_after_turn: Arc<AtomicBool>,
+        control: Arc<StreamControl>,
         handle: JoinHandle<()>,
     ) -> Self {
         RunResultStreaming {
@@ -319,8 +458,10 @@ impl<C: Send + Sync + 'static> RunResultStreaming<C> {
             result: None,
             current_agent,
             cancel_after_turn,
+            control,
             handle: Some(handle),
             complete: false,
+            awaiting_cancelled_run: false,
             on_complete: None,
             max_turns: None,
             run_loop_error: None,
@@ -353,7 +494,7 @@ impl<C: Send + Sync + 'static> RunResultStreaming<C> {
     /// drained only runs the hook, and the hook runs at most once.
     pub async fn finish(&mut self) -> Result<()> {
         let mut error = None;
-        if !self.complete {
+        if !self.complete || self.awaiting_cancelled_run || self.control.is_cancelled() {
             let mut stream = std::pin::pin!(self.stream_events());
             while let Some(event) = futures::StreamExt::next(&mut stream).await {
                 if let Err(e) = event {
@@ -394,9 +535,28 @@ impl<C: Send + Sync + 'static> RunResultStreaming<C> {
     ///
     /// When the run ends, any hook installed with
     /// [`with_on_complete`](Self::with_on_complete) runs before the stream terminates.
+    ///
+    /// While the stream is alive the run waits, between turns, until the consumer has handled
+    /// every event of the finished turn (asked for the next one), so an after-turn cancel issued
+    /// while handling an event stops the run before its next turn. Dropping the stream releases
+    /// the run.
     pub fn stream_events(&mut self) -> impl Stream<Item = Result<StreamEvent<C>>> + Send + '_ {
-        futures::stream::unfold(self, |this| async move {
+        self.control.register_consumer();
+        let guard = ConsumerGuard {
+            control: self.control.clone(),
+            pending: false,
+        };
+        futures::stream::unfold((self, guard), |(this, mut guard)| async move {
+            // The consumer asked for the next event, so it has handled the previous one.
+            guard.acknowledge();
+            if this.control.is_cancelled() && !this.complete {
+                this.complete = true;
+                this.awaiting_cancelled_run = true;
+            }
             if this.complete {
+                if std::mem::take(&mut this.awaiting_cancelled_run) {
+                    this.settle_cancelled_run().await;
+                }
                 this.run_completion_hook().await;
                 return None;
             }
@@ -405,11 +565,25 @@ impl<C: Send + Sync + 'static> RunResultStreaming<C> {
                     if let StreamEvent::AgentUpdated { new_agent } = &ev {
                         this.current_agent = new_agent.clone();
                     }
-                    Some((Ok(ev), this))
+                    if this.control.is_cancelled() {
+                        // Cancelled while waiting: no event is delivered after a cancel.
+                        this.complete = true;
+                        this.settle_cancelled_run().await;
+                        this.run_completion_hook().await;
+                        return None;
+                    }
+                    guard.pending = true;
+                    Some((Ok(ev), (this, guard)))
                 }
                 Some(StreamMsg::Done(res)) => {
                     this.complete = true;
                     match *res {
+                        // The run stopped because it was cancelled: that is not an error.
+                        Err(_) if this.control.is_cancelled() => {
+                            this.handle.take();
+                            this.run_completion_hook().await;
+                            None
+                        }
                         Ok(r) => {
                             this.current_agent = r.last_agent.clone();
                             this.result = Some(r);
@@ -423,7 +597,7 @@ impl<C: Send + Sync + 'static> RunResultStreaming<C> {
                             // with `ev?` returns immediately. The hook is a no-op if the
                             // consumer does poll again.
                             this.run_completion_hook().await;
-                            Some((Err(e), this))
+                            Some((Err(e), (this, guard)))
                         }
                     }
                 }
@@ -436,22 +610,46 @@ impl<C: Send + Sync + 'static> RunResultStreaming<C> {
         })
     }
 
-    /// Cancel the run.
-    pub fn cancel(&mut self, mode: CancelMode) {
-        match mode {
-            CancelMode::AfterTurn => self.cancel_after_turn.store(true, Ordering::SeqCst),
-            CancelMode::Immediate => {
-                if let Some(h) = self.handle.take() {
-                    h.abort();
+    /// Wait for a cancelled run to finish its cleanup, discarding its remaining events. A run
+    /// that completed before it saw the cancel still reports its result.
+    async fn settle_cancelled_run(&mut self) {
+        while let Some(msg) = self.rx.recv().await {
+            if let StreamMsg::Done(res) = msg {
+                if let Ok(r) = *res {
+                    self.current_agent = r.last_agent.clone();
+                    self.result = Some(r);
                 }
-                self.complete = true;
+                break;
             }
+        }
+        self.handle.take();
+    }
+
+    /// Cancel the run. See [`StreamCancelHandle::cancel`].
+    ///
+    /// After an immediate cancel, draining [`stream_events`](Self::stream_events) (or calling
+    /// [`finish`](Self::finish)) yields nothing more and returns once the run has released its
+    /// resources.
+    pub fn cancel(&mut self, mode: CancelMode) {
+        self.cancel_handle().cancel(mode);
+        if mode == CancelMode::Immediate && !self.complete {
+            self.complete = true;
+            self.awaiting_cancelled_run = true;
         }
     }
 
-    /// Whether the run has finished.
+    /// A handle that cancels this run without borrowing it, for use inside a
+    /// [`stream_events`](Self::stream_events) loop.
+    pub fn cancel_handle(&self) -> StreamCancelHandle {
+        StreamCancelHandle {
+            control: self.control.clone(),
+            cancel_after_turn: self.cancel_after_turn.clone(),
+        }
+    }
+
+    /// Whether the run has finished (or was cancelled immediately).
     pub fn is_complete(&self) -> bool {
-        self.complete
+        self.complete || self.control.is_cancelled()
     }
 
     /// The agent currently running (updates as handoffs happen).

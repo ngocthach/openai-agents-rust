@@ -205,7 +205,7 @@ impl<C: Send + Sync + 'static> Default for MCPConfig<C> {
         MCPConfig {
             convert_schemas_to_strict: false,
             include_server_in_tool_names: false,
-            failure_error_function: Some(Arc::new(crate::tool::default_tool_error_function::<C>)),
+            failure_error_function: Some(crate::tool::shared_default_tool_error_function::<C>()),
         }
     }
 }
@@ -262,6 +262,10 @@ pub struct Agent<C> {
     pub model_settings: ModelSettings,
     /// Whether `model_settings` were set explicitly (otherwise model defaults apply).
     pub(crate) model_settings_explicit: bool,
+    /// The default-model settings captured when the agent was created, used when neither the
+    /// agent nor the run selects a model and the provider's model reports no defaults.
+    /// Mirrors the settings `Agent.__post_init__` stores for an omitted `model_settings`.
+    pub(crate) implicit_model_settings: ModelSettings,
     /// Tools.
     pub tools: Vec<Tool<C>>,
     /// MCP servers providing tools.
@@ -294,6 +298,7 @@ impl<C> Clone for Agent<C> {
             model: self.model.clone(),
             model_settings: self.model_settings.clone(),
             model_settings_explicit: self.model_settings_explicit,
+            implicit_model_settings: self.implicit_model_settings.clone(),
             tools: self.tools.clone(),
             #[cfg(feature = "mcp")]
             mcp_servers: self.mcp_servers.clone(),
@@ -344,6 +349,9 @@ impl<C: Send + Sync + 'static> Agent<C> {
             model: None,
             model_settings: ModelSettings::default(),
             model_settings_explicit: false,
+            implicit_model_settings: crate::models::default_models::get_default_model_settings(
+                None,
+            ),
             tools: Vec::new(),
             #[cfg(feature = "mcp")]
             mcp_servers: Vec::new(),
@@ -567,7 +575,14 @@ impl<C: Send + Sync + 'static> Agent<C> {
         let mut out = Vec::new();
         #[cfg(feature = "mcp")]
         {
-            let reserved = self.mcp_reserved_tool_names(ctx).await;
+            // Reserved names only matter when server-prefixed names are derived, and evaluating
+            // them runs the handoffs' `is_enabled` checks, so skip it otherwise like Python.
+            let reserved =
+                if self.mcp_config.include_server_in_tool_names && !self.mcp_servers.is_empty() {
+                    self.mcp_reserved_tool_names(ctx).await
+                } else {
+                    HashSet::new()
+                };
             let mcp_tools = crate::mcp::util::get_all_function_tools_for_agent(
                 &self.mcp_servers,
                 &self.mcp_config,
@@ -988,6 +1003,7 @@ impl<C: Send + Sync + 'static> Agent<C> {
         });
         let needs_approval = options.needs_approval.clone();
         let is_enabled = options.is_enabled.clone();
+        let failure_error_function = options.failure_error_function.clone();
         let opts = Arc::new(options);
         let schema_for_builder = schema.clone();
         let mut tool =
@@ -997,18 +1013,8 @@ impl<C: Send + Sync + 'static> Agent<C> {
                 let schema = schema_for_builder.clone();
                 async move {
                     let payload = if args.trim().is_empty() { "{}" } else { &args };
-                    // Neither the payload nor the parser detail (which echoes the offending
-                    // value) reaches the message unless the logging policy allows tool data.
                     let parsed: Value = serde_json::from_str(payload).map_err(|e| {
-                        if crate::logger::may_log_model_data(true) {
-                            crate::error::AgentsError::model_behavior(format!(
-                                "Invalid JSON when parsing {payload} for an agent tool: {e}"
-                            ))
-                        } else {
-                            crate::error::AgentsError::model_behavior(
-                                "Invalid JSON when parsing agent tool input",
-                            )
-                        }
+                        crate::tool::invalid_tool_input_error(&tool_ctx.tool_name, payload, &e)
                     })?;
                     let input_text = if structured {
                         let schema_ref = if opts.include_input_schema {
@@ -1121,6 +1127,14 @@ impl<C: Send + Sync + 'static> Agent<C> {
         tool.needs_approval = needs_approval;
         tool.is_enabled = is_enabled;
         tool.is_agent_tool = true;
+        // `as_tool` resolves its failure policy itself (Python passes it, or the default,
+        // explicitly), so the run's `tool_error_formatter` does not rewrite agent tool
+        // failures, and a custom policy also covers the output extractor.
+        tool.uses_default_failure_error_function = false;
+        if let Some(f) = failure_error_function {
+            tool.failure_error_function = Some(f);
+            tool.default_failure_error_function = false;
+        }
         tool.tool_origin = Some(crate::tool::ToolOrigin::agent_as_tool(
             self.name.clone(),
             tool.name.clone(),

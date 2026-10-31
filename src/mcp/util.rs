@@ -428,7 +428,7 @@ pub async fn to_function_tool<C: Send + Sync + 'static>(
         exposed_name,
         convert_to_strict,
         agent_name,
-        Some(Arc::new(crate::tool::default_tool_error_function::<C>)),
+        Some(crate::tool::shared_default_tool_error_function::<C>()),
     )
     .await
 }
@@ -487,7 +487,13 @@ pub async fn to_function_tool_with_failure<C: Send + Sync + 'static>(
         _ => failure_error_function,
     };
     f = match failure {
-        Some(handler) => f.with_failure_error_function(move |ctx, e| handler(ctx, e)),
+        Some(handler) => {
+            // The default policy keeps the error detail out of traces.
+            let is_default = crate::tool::is_shared_default_tool_error_function(&handler);
+            let mut f = f.with_failure_error_function(move |ctx, e| handler(ctx, e));
+            f.default_failure_error_function = is_default;
+            f
+        }
         None => f.without_failure_error_function(),
     };
     if let Some(p) = policy {

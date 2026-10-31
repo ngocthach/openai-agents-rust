@@ -234,6 +234,25 @@ pub(crate) fn normalize_handoff_items(
         .collect()
 }
 
+/// Indexes into `items` of the items [`build_ordered_history`] forwards verbatim (outside the
+/// summary). Port of the provenance half of `_build_ordered_default_history`.
+pub(crate) fn forwarded_item_indexes(items: &[RunItem], pre_count: usize) -> Vec<usize> {
+    items
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| !matches!(item.kind, RunItemKind::ToolApproval { .. }))
+        .filter(|(index, item)| {
+            let plain = item.to_input_item();
+            if *index < pre_count {
+                should_forward_pre_item(&plain.0)
+            } else {
+                should_forward_new_item(&plain.0)
+            }
+        })
+        .map(|(index, _)| index)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

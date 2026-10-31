@@ -40,6 +40,17 @@ pub(crate) enum LocalCall<C> {
 }
 
 impl<C> LocalCall<C> {
+    /// The call item as recorded and executed (sanitized, or normalized for a fallback).
+    pub(crate) fn raw(&self) -> &Value {
+        match self {
+            LocalCall::Computer(v, _)
+            | LocalCall::Shell(v, _)
+            | LocalCall::LocalShell(v, _)
+            | LocalCall::ApplyPatch(v, _)
+            | LocalCall::Custom(v, _) => v,
+        }
+    }
+
     pub(crate) fn tool_name(&self) -> String {
         match self {
             LocalCall::Computer(_, t) => t.name().to_string(),
@@ -60,6 +71,13 @@ pub(crate) enum LocalOutcome {
         custom_data: Option<Value>,
     },
     Interruption(ToolApprovalItem),
+    /// The tool ran, but a step after its side effect failed. The output is committed before
+    /// the error propagates, so a retry does not repeat the side effect.
+    OutputThenError {
+        raw_item: Value,
+        output: Value,
+        error: AgentsError,
+    },
 }
 
 pub(crate) fn call_id_of(raw: &Value) -> String {
@@ -118,7 +136,7 @@ async fn approval_gate<C: Send + Sync + 'static>(
     call: FunctionCall,
     needs_approval: impl std::future::Future<Output = bool>,
     on_approval: Option<&OnApprovalFn<C>>,
-) -> Gate {
+) -> Result<Gate> {
     let agent = &env.agent.name;
     let call_id = call.call_id.clone();
     // Sticky decisions are scoped by how the tool was invoked, so a native `apply_patch_call`
@@ -132,9 +150,38 @@ async fn approval_gate<C: Send + Sync + 'static>(
         &call_id,
     );
     if status.is_none() {
-        if !needs_approval.await {
-            return Gate::Proceed;
+        let needs = needs_approval.await;
+        // A decision recorded while the rule ran wins over the rule, but only one recorded
+        // for this very call: a decision about changed content under the same call id is a
+        // reused call id. Port of the binding check in `_tool_invocation_status`.
+        let current = crate::run_context::approval_binding(&ToolApprovalItem {
+            agent: agent.clone(),
+            raw_item: call.clone(),
+            tool_name: tool_name.to_string(),
+            tool_origin: None,
+        });
+        if let (Some((_, current)), Some(bound)) = (current, env.ctx.bound_invocation(&call_id))
+            && (bound.invocation_type != current.invocation_type
+                || bound.approval_scope != current.approval_scope
+                || bound.fingerprint != current.fingerprint)
+        {
+            return Err(AgentsError::model_behavior(
+                "Model reused a tool call ID for a different invocation. \
+                 Use a unique call ID for each tool invocation.",
+            ));
         }
+        status = super::tools::bound_approval_status(
+            env.ctx,
+            env.unbound_approvals,
+            agent,
+            &tool_key,
+            &call_id,
+        );
+        if status.is_none() && !needs {
+            return Ok(Gate::Proceed);
+        }
+    }
+    if status.is_none() {
         let item = ToolApprovalItem {
             agent: agent.clone(),
             raw_item: call,
@@ -161,7 +208,7 @@ async fn approval_gate<C: Send + Sync + 'static>(
             .then(|| env.ctx.is_tool_approved(agent, &tool_key, &call_id))
             .flatten();
         if status.is_none() {
-            return Gate::Pending(Box::new(item));
+            return Ok(Gate::Pending(Box::new(item)));
         }
     }
     match status {
@@ -181,9 +228,9 @@ async fn approval_gate<C: Send + Sync + 'static>(
                         None,
                     )
                 });
-            Gate::Rejected(message)
+            Ok(Gate::Rejected(message))
         }
-        _ => Gate::Proceed,
+        _ => Ok(Gate::Proceed),
     }
 }
 
@@ -217,6 +264,8 @@ async fn start_hooks<C: Send + Sync + 'static>(
     ctx: &ToolContext<C>,
     tool: &Tool<C>,
 ) {
+    // From here on user code runs: a retry must not run it again.
+    env.ctx.mark_invocation_executed(&ctx.tool_call_id);
     if let Some(h) = env.hooks {
         h.on_tool_start(ctx, env.agent, tool).await;
     }
@@ -446,15 +495,22 @@ async fn run_computer<C: Send + Sync + 'static>(
                 output: &image_url,
                 raw_item: &raw_item,
             };
-            normalize_custom_data(extractor(&ctx).await)?
+            normalize_custom_data(extractor(&ctx).await)
         }
-        None => None,
+        None => Ok(None),
     };
-    Ok(LocalOutcome::Output {
-        raw_item,
-        output: Value::String(image_url),
-        custom_data,
-    })
+    match custom_data {
+        Ok(custom_data) => Ok(LocalOutcome::Output {
+            raw_item,
+            output: Value::String(image_url),
+            custom_data,
+        }),
+        Err(error) => Ok(LocalOutcome::OutputThenError {
+            raw_item,
+            output: Value::String(image_url),
+            error,
+        }),
+    }
 }
 
 fn shell_rejection(call: &Value, call_id: &str, message: String) -> LocalOutcome {
@@ -489,7 +545,7 @@ async fn run_shell<C: Send + Sync + 'static>(
             .evaluate(env.ctx, data.action.clone(), &call_id),
         tool.on_approval.as_ref(),
     )
-    .await;
+    .await?;
     match gate {
         Gate::Pending(item) => return Ok(LocalOutcome::Interruption(*item)),
         Gate::Rejected(message) => return Ok(shell_rejection(&raw, &call_id, message)),
@@ -654,6 +710,9 @@ async fn run_apply_patch<C: Send + Sync + 'static>(
     let operations = parse_apply_patch_operations(&raw)?;
     let ops_json = serde_json::to_string(&operations)?;
     let fc = approval_call(&raw, &tool.name, ops_json.clone());
+    // Once a decision lands for the call, the remaining operations are not checked: the
+    // decision governs the whole call.
+    let tool_key = crate::run_context::approval_tool_key(&tool.name, &fc);
     let needs = async {
         for op in &operations {
             if tool
@@ -662,6 +721,17 @@ async fn run_apply_patch<C: Send + Sync + 'static>(
                 .await
             {
                 return true;
+            }
+            if super::tools::bound_approval_status(
+                env.ctx,
+                env.unbound_approvals,
+                &env.agent.name,
+                &tool_key,
+                &call_id,
+            )
+            .is_some()
+            {
+                return false;
             }
         }
         false
@@ -674,7 +744,7 @@ async fn run_apply_patch<C: Send + Sync + 'static>(
         needs,
         tool.on_approval.as_ref(),
     )
-    .await;
+    .await?;
     match gate {
         Gate::Pending(item) => return Ok(LocalOutcome::Interruption(*item)),
         Gate::Rejected(message) => {
@@ -763,15 +833,23 @@ async fn run_apply_patch<C: Send + Sync + 'static>(
                 status,
                 raw_item: &raw_item,
             };
-            normalize_custom_data(extractor(&ctx).await)?
+            normalize_custom_data(extractor(&ctx).await)
         }
-        None => None,
+        None => Ok(None),
     };
-    Ok(LocalOutcome::Output {
-        raw_item,
-        output: Value::String(output_text),
-        custom_data,
-    })
+    // The patch is applied: a failed custom data extraction keeps its output committed.
+    match custom_data {
+        Ok(custom_data) => Ok(LocalOutcome::Output {
+            raw_item,
+            output: Value::String(output_text),
+            custom_data,
+        }),
+        Err(error) => Ok(LocalOutcome::OutputThenError {
+            raw_item,
+            output: Value::String(output_text),
+            error,
+        }),
+    }
 }
 
 async fn run_custom<C: Send + Sync + 'static>(
@@ -812,7 +890,7 @@ async fn run_custom<C: Send + Sync + 'static>(
             .evaluate(env.ctx, input.clone(), &call_id),
         tool.on_approval.as_ref(),
     )
-    .await;
+    .await?;
     match gate {
         Gate::Pending(item) => return Ok(LocalOutcome::Interruption(*item)),
         Gate::Rejected(message) => return Ok(output_item(message)),
@@ -864,7 +942,23 @@ async fn run_custom<C: Send + Sync + 'static>(
             output: &text,
             raw_item,
         };
-        *custom_data = normalize_custom_data(extractor(&ctx).await)?;
+        match normalize_custom_data(extractor(&ctx).await) {
+            Ok(data) => *custom_data = data,
+            Err(error) => {
+                // The tool ran: a failed custom data extraction keeps its output committed.
+                let LocalOutcome::Output {
+                    raw_item, output, ..
+                } = outcome
+                else {
+                    unreachable!("matched above")
+                };
+                return Ok(LocalOutcome::OutputThenError {
+                    raw_item,
+                    output,
+                    error,
+                });
+            }
+        }
     }
     Ok(outcome)
 }

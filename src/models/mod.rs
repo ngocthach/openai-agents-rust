@@ -104,6 +104,12 @@ pub fn set_default_openai_client(client: OpenAIClient, use_for_tracing: bool) {
     *DEFAULT_USE_FOR_TRACING.write().expect("poisoned") = use_for_tracing;
 }
 
+/// Forget the default client set with [`set_default_openai_client`].
+#[doc(hidden)]
+pub fn clear_default_openai_client() {
+    *DEFAULT_CLIENT.write().expect("poisoned") = None;
+}
+
 /// Choose the API shape (`Responses` or `ChatCompletions`) for the default provider.
 pub fn set_default_openai_api(api: OpenAIApi) {
     *DEFAULT_API.write().expect("poisoned") = api;

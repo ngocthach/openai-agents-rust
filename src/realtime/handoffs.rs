@@ -179,15 +179,15 @@ impl<C: Send + Sync + 'static> RealtimeHandoff<C> {
             let agent = agent.clone();
             let tool_name = tool_name.clone();
             Box::pin(async move {
-                let parsed: T = serde_json::from_str(if args.trim().is_empty() {
+                // Handoff arguments are model and tool data. Port of `validate_json(...,
+                // contains_tool_data=True)`.
+                let payload = if args.trim().is_empty() {
                     "{}"
                 } else {
                     args.as_str()
-                })
-                .map_err(|e| {
-                    AgentsError::model_behavior(format!(
-                        "Invalid JSON input for handoff {tool_name}: {e}"
-                    ))
+                };
+                let parsed: T = serde_json::from_str(payload).map_err(|e| {
+                    AgentsError::invalid_json(payload, &format!("handoff {tool_name}"), &e, true)
                 })?;
                 f(ctx, parsed).await?;
                 Ok(agent)

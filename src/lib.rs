@@ -111,6 +111,8 @@ pub use run_config::{
 pub use run_context::{ApprovalStatus, RunContext};
 pub use run_error_handlers::{RunErrorHandlerInput, RunErrorHandlerResult, RunErrorHandlers};
 pub use run_internal::resolve_run_grouping_id;
+#[doc(hidden)]
+pub use run_internal::tool_invocation::tool_invocation_identity_for_tests;
 pub use run_state::RunState;
 pub use stream_events::{RunItemStreamEventName, StreamEvent};
 pub use tool::{

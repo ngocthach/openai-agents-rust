@@ -84,6 +84,7 @@ pub struct MultiProvider {
     fallback_providers: Arc<Mutex<HashMap<String, Arc<dyn ModelProvider>>>>,
     openai_prefix_mode: PrefixMode,
     unknown_prefix_mode: PrefixMode,
+    run_owned: bool,
 }
 
 impl Default for MultiProvider {
@@ -94,6 +95,7 @@ impl Default for MultiProvider {
             fallback_providers: Arc::new(Mutex::new(HashMap::new())),
             openai_prefix_mode: PrefixMode::Alias,
             unknown_prefix_mode: PrefixMode::Alias,
+            run_owned: false,
         }
     }
 }
@@ -101,6 +103,14 @@ impl Default for MultiProvider {
 impl MultiProvider {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Mark the provider as created by the runner for a single run, which closes it when the
+    /// run ends. `RunConfig::default` uses this for the provider it creates.
+    #[doc(hidden)]
+    pub fn into_run_owned(mut self) -> Self {
+        self.run_owned = true;
+        self
     }
 
     /// Use a configured OpenAI provider.
@@ -157,6 +167,10 @@ impl MultiProvider {
 
 #[async_trait::async_trait]
 impl ModelProvider for MultiProvider {
+    fn is_run_owned(&self) -> bool {
+        self.run_owned
+    }
+
     /// Close the OpenAI provider, every registered provider and every fallback provider.
     async fn close(&self) {
         self.openai.close().await;

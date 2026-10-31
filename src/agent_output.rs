@@ -65,12 +65,10 @@ impl AgentOutputSchema {
             .next()
             .unwrap_or("Output")
             .to_string();
-        let validator: Validator = Arc::new(|s: &str| {
-            let parsed: T = serde_json::from_str(s).map_err(|e| {
-                AgentsError::model_behavior(format!(
-                    "Invalid JSON when parsing {s} for output type: {e}"
-                ))
-            })?;
+        let target = format!("output type {type_name}");
+        let validator: Validator = Arc::new(move |s: &str| {
+            let parsed: T = serde_json::from_str(s)
+                .map_err(|e| AgentsError::invalid_json(s, &target, &e, false))?;
             // Re-serialize so the caller gets a JSON value; T: Deserialize only, so use the
             // original string parsed as a generic value.
             drop(parsed);
@@ -83,9 +81,8 @@ impl AgentOutputSchema {
     /// valid JSON.
     pub fn from_json_schema(name: impl Into<String>, schema: Value, strict: bool) -> Result<Self> {
         let validator: Validator = Arc::new(|s: &str| {
-            serde_json::from_str::<Value>(s).map_err(|e| {
-                AgentsError::model_behavior(format!("Invalid JSON when parsing {s}: {e}"))
-            })
+            serde_json::from_str::<Value>(s)
+                .map_err(|e| AgentsError::invalid_json(s, "output type", &e, false))
         });
         Self::build(name.into(), schema, strict, validator)
     }
@@ -159,17 +156,18 @@ impl AgentOutputSchemaBase for AgentOutputSchema {
 
     fn validate_json(&self, json_str: &str) -> Result<Value> {
         if self.is_wrapped {
-            let parsed: Value = serde_json::from_str(json_str).map_err(|e| {
-                AgentsError::model_behavior(format!("Invalid JSON when parsing {json_str}: {e}"))
-            })?;
+            let parsed: Value = serde_json::from_str(json_str)
+                .map_err(|e| AgentsError::invalid_json(json_str, &self.type_name, &e, false))?;
+            // The payload only reaches the message when the model data policy allows it.
+            let payload = crate::logger::model_data_payload(json_str, false);
             let Value::Object(mut m) = parsed else {
                 return Err(AgentsError::model_behavior(format!(
-                    "Expected a dict, got {json_str}"
+                    "Expected a dict, got {payload}"
                 )));
             };
             let Some(inner) = m.remove(WRAPPER_DICT_KEY) else {
                 return Err(AgentsError::model_behavior(format!(
-                    "Could not find key {WRAPPER_DICT_KEY} in JSON: {json_str}"
+                    "Could not find key {WRAPPER_DICT_KEY} in JSON: {payload}"
                 )));
             };
             (self.validator)(&inner.to_string())

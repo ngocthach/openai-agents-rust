@@ -161,6 +161,42 @@ fn completed_call_ids(items: &[InputItem]) -> HashMap<&'static str, HashSet<Stri
     map
 }
 
+/// Hosted item types a program can own; they keep their program active. Mirrors
+/// `_PROGRAM_OWNED_HOSTED_ITEM_TYPES`.
+const PROGRAM_OWNED_HOSTED_ITEM_TYPES: [&str; 9] = [
+    "hosted_tool_call",
+    "file_search_call",
+    "web_search_call",
+    "code_interpreter_call",
+    "image_generation_call",
+    "mcp_list_tools",
+    "mcp_call",
+    "mcp_approval_request",
+    "mcp_approval_response",
+];
+
+/// Whether a program-owned item keeps its parent program active. With a pruning scope only an
+/// item outside it is known to be retained; otherwise only hosted items, tool outputs and
+/// pending hosted shell calls count (a bare call without its output does not). Port of
+/// `_is_retained_program_owned_item`.
+fn is_retained_program_owned_item(
+    item: &Value,
+    index: usize,
+    pruning_indexes: Option<&HashSet<usize>>,
+) -> bool {
+    if let Some(set) = pruning_indexes {
+        return !set.contains(&index);
+    }
+    let ty = item.get("type").and_then(Value::as_str).unwrap_or_default();
+    let pending_hosted_shell = ty == "shell_call"
+        && item
+            .get("status")
+            .is_none_or(|s| s.is_null() || s == "in_progress");
+    pending_hosted_shell
+        || PROGRAM_OWNED_HOSTED_ITEM_TYPES.contains(&ty)
+        || TOOL_CALL_TO_OUTPUT_TYPE.iter().any(|(_, out)| *out == ty)
+}
+
 /// Remove tool and program call items that have no matching output, so a resumption or retry
 /// does not replay stale calls, together with the reasoning items tied to them.
 /// Port of `drop_orphan_function_calls`.
@@ -201,13 +237,32 @@ pub(crate) fn drop_orphan_function_calls_in(
             .enumerate()
             .any(|(candidate_index, candidate)| {
                 program_caller_id(&candidate.0) == Some(call_id)
-                // With a pruning scope, only an item outside it is known to be retained.
-                && pruning_indexes.is_none_or(|set| !set.contains(&candidate_index))
+                    && is_retained_program_owned_item(
+                        &candidate.0,
+                        candidate_index,
+                        pruning_indexes,
+                    )
             });
         if has_owned {
             active_program_call_ids.insert(call_id.to_string());
         } else {
             orphan_program_call_ids.insert(call_id.to_string());
+        }
+    }
+
+    // Anonymous `tool_search_call`s paired with a later anonymous output, latest call first.
+    // Port of `_matched_anonymous_tool_search_call_indexes`.
+    let mut matched_anonymous_searches: HashSet<usize> = HashSet::new();
+    let mut pending_anonymous_outputs = 0usize;
+    for (index, item) in items.iter().enumerate().rev() {
+        let anonymous = !item.0.get("call_id").is_some_and(Value::is_string);
+        match item.0.get("type").and_then(Value::as_str) {
+            Some("tool_search_output") if anonymous => pending_anonymous_outputs += 1,
+            Some("tool_search_call") if anonymous && pending_anonymous_outputs > 0 => {
+                matched_anonymous_searches.insert(index);
+                pending_anonymous_outputs -= 1;
+            }
+            _ => {}
         }
     }
 
@@ -232,10 +287,23 @@ pub(crate) fn drop_orphan_function_calls_in(
         if ty == "program" && call_id.is_some_and(|id| active_program_call_ids.contains(id)) {
             continue;
         }
+        // A program-owned hosted shell call may stay pending without an output.
+        if ty == "shell_call"
+            && program_caller_id(&item.0).is_some()
+            && item
+                .0
+                .get("status")
+                .is_none_or(|s| s.is_null() || s == "in_progress")
+        {
+            continue;
+        }
         match call_id {
             Some(cid) if completed.get(out_type).is_some_and(|ids| ids.contains(cid)) => continue,
-            // An anonymous `tool_search_call` is matched positionally, not by id.
-            None if ty == "tool_search_call" => continue,
+            // An anonymous `tool_search_call` is matched positionally, not by id: it survives
+            // only when a later anonymous output pairs with it.
+            None if ty == "tool_search_call" && matched_anonymous_searches.contains(&index) => {
+                continue;
+            }
             _ => {}
         }
         dropped.insert(index);
@@ -358,6 +426,109 @@ fn output_call_id(item: &RunItem) -> Option<String> {
     }
 }
 
+/// Provider-executed call types that finished server side once their status is `completed`.
+const PROVIDER_COMPLETED_CALL_TYPES: [&str; 5] = [
+    "file_search_call",
+    "web_search_call",
+    "code_interpreter_call",
+    "image_generation_call",
+    "mcp_call",
+];
+
+/// The part of a failed tool turn that stays in history: accepted call/output pairs in model
+/// order with the reasoning right before them, completed provider-side items, then the
+/// committed outputs. Calls that never got an output, the turn's messages and stranded
+/// reasoning are dropped, so a retry neither replays nor repeats them.
+/// Port of `_completed_tool_step_items`.
+pub(crate) fn completed_tool_step_items(
+    prior: &[RunItem],
+    model: &[RunItem],
+    outputs: &[RunItem],
+) -> Vec<RunItem> {
+    // The raw item keeps fields (such as `status`) the replayed input item may drop.
+    let raw = |item: &RunItem| match &item.kind {
+        RunItemKind::ToolCall { raw_item } | RunItemKind::ToolCallOutput { raw_item, .. } => {
+            raw_item.clone()
+        }
+        _ => item.to_input_item().0,
+    };
+    let str_of = |v: &Value, key: &str| v.get(key).and_then(Value::as_str).map(str::to_string);
+    let is_output_type = |ty: &str| TOOL_CALL_TO_OUTPUT_TYPE.iter().any(|(_, out)| *out == ty);
+    // Outputs the model returned itself count as accepted once they completed.
+    let mut accepted_call_ids: HashSet<String> = HashSet::new();
+    for item in model.iter().chain(outputs) {
+        let v = raw(item);
+        let ty = str_of(&v, "type").unwrap_or_default();
+        let from_model = !outputs.iter().any(|o| std::ptr::eq(o, item));
+        if is_output_type(&ty)
+            && (!from_model || str_of(&v, "status").as_deref() == Some("completed"))
+            && let Some(call_id) = str_of(&v, "call_id")
+        {
+            accepted_call_ids.insert(call_id);
+        }
+    }
+    let mut candidates: Vec<RunItem> = Vec::new();
+    let mut reasoning: Vec<RunItem> = Vec::new();
+    for item in model {
+        let v = raw(item);
+        let ty = str_of(&v, "type").unwrap_or_default();
+        if ty == "reasoning" {
+            reasoning.push(item.clone());
+            continue;
+        }
+        let completed = str_of(&v, "status").as_deref() == Some("completed");
+        let call_id = str_of(&v, "call_id");
+        let keep = if ty == "mcp_approval_request" {
+            // A hosted approval request is a settled decision point; its response is kept below.
+            true
+        } else if ty == "tool_search_call" || ty == "tool_search_output" {
+            str_of(&v, "execution").as_deref() == Some("server") && completed
+        } else if is_output_type(&ty) {
+            completed
+        } else if output_type_for(&ty).is_some()
+            || PROVIDER_COMPLETED_CALL_TYPES.contains(&ty.as_str())
+        {
+            call_id.is_some_and(|id| accepted_call_ids.contains(&id))
+                || (PROVIDER_COMPLETED_CALL_TYPES.contains(&ty.as_str()) && completed)
+                || ty == "program"
+        } else {
+            false
+        };
+        if keep {
+            candidates.append(&mut reasoning);
+            candidates.push(item.clone());
+        }
+        // Reasoning belongs to the next model item, even when that item is omitted.
+        reasoning.clear();
+    }
+    candidates.extend(outputs.iter().cloned());
+
+    // Prune what would still be an orphan next to the prior history; the index marker maps the
+    // surviving payloads back to their run items.
+    const MARKER: &str = "__completed_tool_step_index";
+    let mut inputs: Vec<InputItem> = prior.iter().map(RunItem::to_input_item).collect();
+    let offset = inputs.len();
+    for (index, item) in candidates.iter().enumerate() {
+        let mut v = raw(item);
+        if let Value::Object(m) = &mut v {
+            m.insert(MARKER.into(), Value::from(index));
+        }
+        inputs.push(InputItem(v));
+    }
+    let scope: HashSet<usize> = (offset..inputs.len()).collect();
+    let kept: HashSet<usize> = drop_orphan_function_calls_in(inputs, None, Some(&scope))
+        .iter()
+        .filter_map(|i| i.0.get(MARKER).and_then(Value::as_u64))
+        .map(|i| i as usize)
+        .collect();
+    candidates
+        .into_iter()
+        .enumerate()
+        .filter(|(index, _)| kept.contains(index))
+        .map(|(_, item)| item)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -405,11 +576,9 @@ mod tests {
                 "caller": {"type": "program", "caller_id": "p1"},
             })),
         ];
-        // The program has an owned item, so neither is dropped as an orphan program, but the
-        // unanswered function call still goes.
-        let kept = drop_orphan_function_calls(items);
-        assert_eq!(kept.len(), 1);
-        assert_eq!(kept[0].0["type"], "program");
+        // A bare call without its output does not keep its program active, so the whole
+        // orphan chain goes (Python `test_replay_pruning_drops_orphan_program_call_chain`).
+        assert!(drop_orphan_function_calls(items).is_empty());
     }
 
     #[test]
