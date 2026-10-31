@@ -27,15 +27,14 @@ use crate::tracing::transcription_span;
 use crate::util::gen_hex32;
 use crate::voice::input::{AudioInput, StreamedAudioInput, pcm16_to_bytes};
 use crate::voice::model::{STTModel, STTModelSettings, StreamedTranscriptionSession};
-use crate::voice::models::request_headers;
 use crate::voice::result::get_trace_error;
 
-/// How long to wait for a session event before assuming the session is done.
-const EVENT_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(1000);
-/// How long to wait for the `session.created` event.
-const SESSION_CREATION_TIMEOUT: Duration = Duration::from_secs(10);
-/// How long to wait for the `session.updated` event.
-const SESSION_UPDATE_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long to wait for a session event before assuming the session is done, in seconds.
+pub const EVENT_INACTIVITY_TIMEOUT: f64 = 1000.0;
+/// How long to wait for the `session.created` event, in seconds.
+pub const SESSION_CREATION_TIMEOUT: f64 = 10.0;
+/// How long to wait for the `session.updated` event, in seconds.
+pub const SESSION_UPDATE_TIMEOUT: f64 = 10.0;
 
 /// Keepalive and frame-size settings for the realtime transcription websocket.
 ///
@@ -52,6 +51,12 @@ pub struct VoiceWebSocketOptions {
     pub ping_timeout: Option<f64>,
     /// Maximum size of an incoming message, in bytes. `None` means no limit.
     pub max_size: Option<usize>,
+    /// Seconds to wait for the `session.created` event.
+    pub session_creation_timeout: f64,
+    /// Seconds to wait for the `session.updated` event.
+    pub session_update_timeout: f64,
+    /// Seconds without any session event after which the session is assumed done.
+    pub event_inactivity_timeout: f64,
 }
 
 impl Default for VoiceWebSocketOptions {
@@ -60,6 +65,9 @@ impl Default for VoiceWebSocketOptions {
             ping_interval: Some(20.0),
             ping_timeout: Some(20.0),
             max_size: Some(1 << 20),
+            session_creation_timeout: SESSION_CREATION_TIMEOUT,
+            session_update_timeout: SESSION_UPDATE_TIMEOUT,
+            event_inactivity_timeout: EVENT_INACTIVITY_TIMEOUT,
         }
     }
 }
@@ -80,6 +88,24 @@ impl VoiceWebSocketOptions {
     /// Maximum size of an incoming message, in bytes (`None` means no limit).
     pub fn with_max_size(mut self, bytes: Option<usize>) -> Self {
         self.max_size = bytes;
+        self
+    }
+
+    /// Seconds to wait for the `session.created` event.
+    pub fn with_session_creation_timeout(mut self, seconds: f64) -> Self {
+        self.session_creation_timeout = seconds;
+        self
+    }
+
+    /// Seconds to wait for the `session.updated` event.
+    pub fn with_session_update_timeout(mut self, seconds: f64) -> Self {
+        self.session_update_timeout = seconds;
+        self
+    }
+
+    /// Seconds without any session event after which the session is assumed done.
+    pub fn with_event_inactivity_timeout(mut self, seconds: f64) -> Self {
+        self.event_inactivity_timeout = seconds;
         self
     }
 
@@ -385,10 +411,16 @@ impl OpenAISTTTranscriptionSession {
             .unwrap_or_else(default_turn_detection);
         let transcription_config = transcription_config(model, settings);
 
-        let mut request = websocket_url(client)
+        let url = websocket_url(client);
+        let mut request = url
+            .as_str()
             .into_client_request()
             .map_err(|e| AgentsError::user(format!("Invalid transcription websocket URL: {e}")))?;
-        request.headers_mut().extend(request_headers(client)?);
+        // The client's `RequestAuth` hook runs here, so a rotating API key is refreshed
+        // before every handshake.
+        request
+            .headers_mut()
+            .extend(client.websocket_headers(&url).await?);
         crate::util::ensure_crypto_provider();
         let (ws, _) = tokio_tungstenite::connect_async_with_config(
             request,
@@ -402,7 +434,7 @@ impl OpenAISTTTranscriptionSession {
         wait_for_event(
             &mut stream,
             &["session.created", "transcription_session.created"],
-            SESSION_CREATION_TIMEOUT,
+            seconds(options.session_creation_timeout),
             "Timeout waiting for transcription_session.created event",
         )
         .await?;
@@ -429,7 +461,7 @@ impl OpenAISTTTranscriptionSession {
         wait_for_event(
             &mut stream,
             &["session.updated", "transcription_session.updated"],
-            SESSION_UPDATE_TIMEOUT,
+            seconds(options.session_update_timeout),
             "Timeout waiting for transcription_session.updated event",
         )
         .await?;
@@ -453,6 +485,8 @@ impl OpenAISTTTranscriptionSession {
             include_sensitive_data: trace_include_sensitive_data,
             include_sensitive_audio_data: trace_include_sensitive_audio_data,
         });
+        // Open the first turn's span now, so a session closed right after setup still records it.
+        tracing.start_turn();
         let (turns_tx, turns) = mpsc::unbounded_channel();
         let closing = Arc::new(AtomicBool::new(false));
         let final_commit_id = Arc::new(Mutex::new(None));
@@ -558,26 +592,46 @@ fn transcription_config(model: &str, settings: &STTModelSettings) -> Value {
 }
 
 /// The realtime transcription websocket URL for this client.
+///
+/// Port of Python's `_prepare_websocket_url`: the client's websocket base URL (or its HTTP
+/// base URL with the scheme swapped), the query already on that URL, and the client's
+/// `default_query`, with `intent=transcription` forced last.
 fn websocket_url(client: &OpenAIClient) -> String {
-    let base = client.base_url().trim_end_matches('/');
-    let base = match base.split_once("://") {
+    let configured = client.websocket_base_url();
+    let configured = match configured.split_once("://") {
         Some(("https", rest)) => format!("wss://{rest}"),
         Some(("http", rest)) => format!("ws://{rest}"),
-        _ => base.to_string(),
+        _ => configured,
     };
-    // Python merges the client's `default_query` into the handshake URL and then forces
-    // `intent=transcription`, so a default `intent` cannot hijack the session type.
-    let mut params: Vec<(String, String)> = client
+    let (base, base_query) = configured
+        .split_once('?')
+        .unwrap_or((configured.as_str(), ""));
+    let base = base.trim_end_matches('/');
+
+    // Values already on the URL stay as given; the client's default query overrides them.
+    let mut params: Vec<(String, String)> = base_query
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+        .map(|pair| {
+            let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
+            (name.to_string(), value.to_string())
+        })
+        .filter(|(name, _)| name != "intent")
+        .collect();
+    let mut defaults: Vec<(&String, &String)> = client
         .default_query()
         .iter()
         .filter(|(name, _)| name.as_str() != "intent")
-        .map(|(name, value)| (name.clone(), value.clone()))
         .collect();
-    params.sort_unstable();
+    defaults.sort_unstable();
+    for (name, value) in defaults {
+        params.retain(|(existing, _)| existing != name);
+        params.push((name.clone(), url_encode(value)));
+    }
     params.push(("intent".to_string(), "transcription".to_string()));
     let query = params
         .iter()
-        .map(|(name, value)| format!("{}={}", url_encode(name), url_encode(value)))
+        .map(|(name, value)| format!("{}={}", url_encode(name), value))
         .collect::<Vec<_>>()
         .join("&");
     format!("{base}/realtime?{query}")
@@ -629,7 +683,7 @@ async fn wait_for_event(
         };
         let message =
             message.map_err(|e| websocket_error(format!("STT websocket read failed: {e}")))?;
-        let Some(event) = parse_event(&message) else {
+        let Some(event) = parse_event(&message)? else {
             continue;
         };
         let event_type = event
@@ -649,12 +703,17 @@ async fn wait_for_event(
 }
 
 /// A websocket message decoded as a session event, if it carries one.
-fn parse_event(message: &Message) -> Option<Value> {
-    match message {
-        Message::Text(text) => serde_json::from_str(text.as_str()).ok(),
-        Message::Binary(bytes) => serde_json::from_slice(bytes).ok(),
-        _ => None,
-    }
+///
+/// A frame that is not valid JSON is an error, as in Python's `json.loads` in the listener.
+fn parse_event(message: &Message) -> Result<Option<Value>> {
+    let parsed = match message {
+        Message::Text(text) => serde_json::from_str(text.as_str()),
+        Message::Binary(bytes) => serde_json::from_slice(bytes),
+        _ => return Ok(None),
+    };
+    parsed
+        .map(Some)
+        .map_err(|e| websocket_error(format!("Error parsing events: {e}")))
 }
 
 /// Forward queued audio to the websocket, committing the buffer at the end of the stream.
@@ -664,7 +723,6 @@ async fn stream_audio(
     tracing: Arc<SessionTracing>,
     final_commit_id: Arc<Mutex<Option<String>>>,
 ) {
-    tracing.start_turn();
     while let Some(item) = audio.recv().await {
         let Some(buffer) = item else {
             let commit_id = gen_hex32();
@@ -712,7 +770,7 @@ async fn next_event(
     sink: &WsSink,
     options: &VoiceWebSocketOptions,
 ) -> NextEvent {
-    let deadline = tokio::time::Instant::now() + EVENT_INACTIVITY_TIMEOUT;
+    let deadline = tokio::time::Instant::now() + seconds(options.event_inactivity_timeout);
     let mut awaiting_pong = false;
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -756,6 +814,7 @@ async fn next_event(
             Ok(Some(Err(error))) => {
                 return NextEvent::Failed(format!("STT websocket read failed: {error}"));
             }
+            Ok(Some(Ok(Message::Close(_)))) => return NextEvent::Closed,
             Ok(Some(Ok(Message::Pong(_)))) => awaiting_pong = false,
             Ok(Some(Ok(message))) => return NextEvent::Message(message),
         }
@@ -807,8 +866,13 @@ async fn handle_events(
         if matches!(message, Message::Close(_)) {
             break;
         }
-        let Some(event) = parse_event(&message) else {
-            continue;
+        let event = match parse_event(&message) {
+            Ok(Some(event)) => event,
+            Ok(None) => continue,
+            Err(error) => {
+                let _ = turns.send(Err(error));
+                break;
+            }
         };
         let event_type = event
             .get("type")

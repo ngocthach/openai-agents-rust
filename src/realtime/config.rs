@@ -55,6 +55,20 @@ pub struct RealtimeFunctionToolSpec {
     pub description: String,
     /// JSON schema of the tool parameters.
     pub parameters: Value,
+    /// The `tool_namespace()` namespace this tool was declared in, if any.
+    ///
+    /// The Realtime API has no namespaces, so a transport rejects a spec that carries one, as
+    /// Python's `ensure_function_tool_supports_responses_only_features` does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
+    /// Whether the tool asked for deferred loading through hosted tool search, which only the
+    /// Responses API supports.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub defer_loading: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl RealtimeFunctionToolSpec {
@@ -64,7 +78,49 @@ impl RealtimeFunctionToolSpec {
             name: name.into(),
             description: description.into(),
             parameters,
+            namespace: None,
+            defer_loading: false,
         }
+    }
+
+    /// Record the namespace the tool was declared in.
+    pub fn with_namespace(mut self, namespace: impl Into<String>) -> Self {
+        self.namespace = Some(namespace.into());
+        self
+    }
+
+    /// Record that the tool asked for deferred loading.
+    pub fn with_defer_loading(mut self, defer_loading: bool) -> Self {
+        self.defer_loading = defer_loading;
+        self
+    }
+
+    /// The Responses-only features this tool uses, which a Realtime transport cannot honor.
+    pub fn responses_only_features(&self) -> Vec<&'static str> {
+        let mut features = Vec::new();
+        if self.namespace.is_some() {
+            features.push("tool_namespace()");
+        }
+        if self.defer_loading {
+            features.push("defer_loading=True");
+        }
+        features
+    }
+
+    /// Fail when the tool uses a feature only the Responses API supports.
+    pub fn ensure_realtime_supported(&self) -> crate::error::Result<()> {
+        let features = self.responses_only_features();
+        if features.is_empty() {
+            return Ok(());
+        }
+        let name = match &self.namespace {
+            Some(namespace) => format!("{namespace}.{}", self.name),
+            None => self.name.clone(),
+        };
+        Err(crate::error::AgentsError::user(format!(
+            "The following function-tool features are only supported with OpenAI Responses models: {}. Tool `{name}` cannot be used with Realtime models.",
+            features.join(", ")
+        )))
     }
 
     /// Serialize to the realtime `session.tools` wire format.

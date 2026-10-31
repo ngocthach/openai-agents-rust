@@ -205,6 +205,8 @@ struct WsState {
     create_in_flight: Option<String>,
     /// A response was requested while one was running or in flight.
     pending_response_create: bool,
+    /// The body of a caller-supplied `response.create`, sent in place of a bare one.
+    create_payload: Option<Value>,
     create_counter: u64,
     automatic_response_cancellation: bool,
 }
@@ -214,7 +216,10 @@ impl WsState {
     ///
     /// The realtime API rejects a second `response.create` while a response is active, and
     /// parallel tool outputs would otherwise both see an idle connection after `response.done`.
-    fn request_response_create(&mut self) -> Option<String> {
+    fn request_response_create(&mut self, payload: Option<Value>) -> Option<String> {
+        if payload.is_some() {
+            self.create_payload = payload;
+        }
         if self.ongoing_response || self.create_in_flight.is_some() {
             self.pending_response_create = true;
             return None;
@@ -224,7 +229,14 @@ impl WsState {
 
     fn begin_response_create(&mut self) -> String {
         self.create_counter += 1;
-        let event_id = format!("agents_rs_response_create_{}", self.create_counter);
+        // A caller-chosen id wins, so an error that names it still matches this create.
+        let event_id = self
+            .create_payload
+            .as_ref()
+            .and_then(|payload| payload.get("event_id"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("agents_rs_response_create_{}", self.create_counter));
         self.create_in_flight = Some(event_id.clone());
         event_id
     }
@@ -307,7 +319,15 @@ impl WsState {
     }
 
     /// Clear the active response and return the `event_id` of a deferred create to send now.
-    fn on_response_done(&mut self) -> Option<String> {
+    ///
+    /// A `response.done` for an older response says nothing about the one now generating, so it
+    /// must not free the slot: a create sent then would collide with the active response.
+    fn on_response_done(&mut self, response_id: Option<&str>) -> Option<String> {
+        if let (Some(done), Some(ongoing)) = (response_id, self.ongoing_response_id.as_deref())
+            && done != ongoing
+        {
+            return None;
+        }
         self.ongoing_response = false;
         self.ongoing_response_id = None;
         self.cancel_requested = false;
@@ -326,6 +346,13 @@ impl WsState {
             return Some(self.begin_response_create());
         }
         None
+    }
+
+    /// Drop the in-flight create when its send did not complete, so later requests are not
+    /// deferred behind a response that was never requested.
+    fn release_create(&mut self) {
+        self.create_in_flight = None;
+        self.create_payload = None;
     }
 
     /// Whether a server error is the rejection of the create this client has in flight.
@@ -356,6 +383,50 @@ impl WsState {
     }
 }
 
+/// Which pending request a [`SlotGuard`] frees.
+#[derive(Clone, Copy)]
+enum SlotKind {
+    Create,
+    Cancel,
+}
+
+/// Frees a `response.create` or `response.cancel` slot unless the send is confirmed.
+///
+/// A send can end three ways: accepted, failed, or abandoned because the caller's future was
+/// dropped. The latter two must leave the slot free so a retry is not swallowed.
+struct SlotGuard<'a> {
+    inner: &'a WsInner,
+    kind: SlotKind,
+    armed: bool,
+}
+
+impl<'a> SlotGuard<'a> {
+    fn new(inner: &'a WsInner, kind: SlotKind) -> Self {
+        SlotGuard {
+            inner,
+            kind,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for SlotGuard<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let mut state = self.inner.state.lock().expect("realtime model poisoned");
+        match self.kind {
+            SlotKind::Create => state.release_create(),
+            SlotKind::Cancel => state.release_cancel(),
+        }
+    }
+}
+
 struct WsInner {
     sink: tokio::sync::Mutex<Option<WsSink>>,
     /// When the last pong arrived, for the keepalive deadline.
@@ -366,6 +437,8 @@ struct WsInner {
     state: Mutex<WsState>,
     reader: Mutex<Option<JoinHandle<()>>>,
     close_requested: AtomicBool,
+    /// A connection attempt is in progress.
+    connecting: AtomicBool,
 }
 
 /// A realtime transport speaking the GA realtime protocol over a WebSocket.
@@ -409,6 +482,7 @@ impl OpenAIRealtimeWebSocketModel {
                 }),
                 reader: Mutex::new(None),
                 close_requested: AtomicBool::new(false),
+                connecting: AtomicBool::new(false),
             }),
         }
     }
@@ -433,19 +507,27 @@ impl OpenAIRealtimeWebSocketModel {
     }
 }
 
-#[async_trait]
-impl RealtimeModel for OpenAIRealtimeWebSocketModel {
-    async fn connect(&self, config: RealtimeModelConfig) -> Result<RealtimeModelEvents> {
+/// Releases the connect slot when a connection attempt ends, however it ends.
+struct ConnectSlot<'a>(&'a AtomicBool);
+
+impl Drop for ConnectSlot<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
+impl OpenAIRealtimeWebSocketModel {
+    async fn connect_inner(&self, config: RealtimeModelConfig) -> Result<RealtimeModelEvents> {
         if self.inner.sink.lock().await.is_some() {
             return Err(AgentsError::user(
-                "The realtime model is already connected.",
+                "Already connected: the realtime model is already connected.",
             ));
         }
 
         let settings = config.initial_model_settings.clone().unwrap_or_default();
         if config.call_id.is_some() && settings.model_name.is_some() {
             return Err(AgentsError::user(
-                "Cannot specify both `call_id` and a model name when attaching to an existing \
+                "Cannot specify both `call_id` and `model_name` when attaching to an existing \
                  realtime call.",
             ));
         }
@@ -473,6 +555,8 @@ impl RealtimeModel for OpenAIRealtimeWebSocketModel {
             state.current_item_id = None;
             state.pending_response_create = false;
             state.create_in_flight = None;
+            state.create_payload = None;
+            state.interrupted_audio_response_ids.clear();
         }
 
         let url = connect_url(
@@ -546,11 +630,13 @@ impl RealtimeModel for OpenAIRealtimeWebSocketModel {
                                 "Failed to parse a realtime server message as JSON",
                                 &error,
                             );
-                            reader_inner.emit(RealtimeModelEvent::Exception {
-                                message: error.to_string(),
-                                context: Some(
-                                    "Failed to parse WebSocket message as JSON".to_string(),
-                                ),
+                            // A bad frame is reported, not fatal: the session carries on, as
+                            // Python's `error` event does.
+                            reader_inner.emit(RealtimeModelEvent::Error {
+                                error: json!({
+                                    "message": error.to_string(),
+                                    "context": "Failed to parse WebSocket message as JSON",
+                                }),
                             });
                         }
                     },
@@ -559,6 +645,19 @@ impl RealtimeModel for OpenAIRealtimeWebSocketModel {
                             .last_pong
                             .lock()
                             .expect("realtime model poisoned") = Instant::now();
+                    }
+                    Ok(Message::Close(Some(frame)))
+                        if !matches!(u16::from(frame.code), 1000 | 1001) =>
+                    {
+                        // Only a normal or going-away close is a clean end of the session.
+                        reader_inner.emit(RealtimeModelEvent::Exception {
+                            message: format!(
+                                "WebSocket closed with code {}: {}",
+                                u16::from(frame.code),
+                                frame.reason
+                            ),
+                            context: Some("WebSocket connection closed unexpectedly".to_string()),
+                        });
                     }
                     Ok(_) => {}
                     Err(error) => {
@@ -593,13 +692,41 @@ impl RealtimeModel for OpenAIRealtimeWebSocketModel {
                 .expect("realtime model poisoned") = Some(keepalive);
         }
 
-        self.inner.send_session_update(&settings).await?;
+        if let Err(error) = self.inner.send_session_update(&settings).await {
+            // A connection that never accepted its session must not keep the model "connected".
+            let _ = self.close().await;
+            return Err(error);
+        }
         Ok(rx)
+    }
+}
+
+#[async_trait]
+impl RealtimeModel for OpenAIRealtimeWebSocketModel {
+    async fn connect(&self, config: RealtimeModelConfig) -> Result<RealtimeModelEvents> {
+        // Claim the model before the first suspension point, so two concurrent attempts cannot
+        // both pass the "already connected" check and open a socket each.
+        if self.inner.connecting.swap(true, Ordering::SeqCst) {
+            return Err(AgentsError::user(
+                "Already connected: the realtime model is already connecting.",
+            ));
+        }
+        let _slot = ConnectSlot(&self.inner.connecting);
+        self.connect_inner(config).await
     }
 
     async fn send_event(&self, event: RealtimeModelSendEvent) -> Result<()> {
         match event {
-            RealtimeModelSendEvent::RawMessage { message } => self.inner.send_raw(message).await,
+            RealtimeModelSendEvent::RawMessage { message } => {
+                // A caller-supplied `response.create` takes part in the same sequencing as the
+                // ones the transport sends itself, or a follow-up input would start a second
+                // response while this one is still being created.
+                if message.get("type").and_then(Value::as_str) == Some("response.create") {
+                    self.inner.request_response_create(Some(message)).await
+                } else {
+                    self.inner.send_raw(message).await
+                }
+            }
             RealtimeModelSendEvent::UserInput { user_input } => {
                 self.inner
                     .send_raw(json!({
@@ -607,7 +734,7 @@ impl RealtimeModel for OpenAIRealtimeWebSocketModel {
                         "item": user_input.to_conversation_item(),
                     }))
                     .await?;
-                self.inner.request_response_create().await
+                self.inner.request_response_create(None).await
             }
             RealtimeModelSendEvent::Audio { audio, commit } => {
                 self.inner
@@ -650,7 +777,7 @@ impl RealtimeModel for OpenAIRealtimeWebSocketModel {
                         extra: Map::new(),
                     }));
                 if start_response {
-                    self.inner.request_response_create().await?;
+                    self.inner.request_response_create(None).await?;
                 }
                 Ok(())
             }
@@ -688,7 +815,7 @@ impl RealtimeModel for OpenAIRealtimeWebSocketModel {
         if !self.inner.send_raw_if(message, condition.as_ref()).await? {
             return Ok(false);
         }
-        self.inner.request_response_create().await?;
+        self.inner.request_response_create(None).await?;
         Ok(true)
     }
 
@@ -740,6 +867,7 @@ impl RealtimeModel for OpenAIRealtimeWebSocketModel {
         state.current_item_id = None;
         state.pending_response_create = false;
         state.create_in_flight = None;
+        state.create_payload = None;
         Ok(())
     }
 }
@@ -844,6 +972,7 @@ impl OpenAIRealtimeSIPModel {
             resolved.settings.merge(overrides);
         }
 
+        ensure_tools_supported(&resolved.settings)?;
         // A fresh transport, so the payload reflects only the settings, never a live connection.
         Ok(OpenAIRealtimeWebSocketModel::new().session_payload_for_settings(&resolved.settings))
     }
@@ -965,6 +1094,7 @@ impl WsInner {
     }
 
     async fn send_session_update(&self, settings: &RealtimeSessionModelSettings) -> Result<()> {
+        ensure_tools_supported(settings)?;
         let session = self.session_payload(settings);
         self.send_raw(json!({"type": "session.update", "session": session}))
             .await
@@ -1153,12 +1283,12 @@ impl WsInner {
     }
 
     /// Ask the model for a new response, deferring while one is already running.
-    async fn request_response_create(&self) -> Result<()> {
+    async fn request_response_create(&self, payload: Option<Value>) -> Result<()> {
         let event_id = {
             self.state
                 .lock()
                 .expect("realtime model poisoned")
-                .request_response_create()
+                .request_response_create(payload)
         };
         match event_id {
             Some(event_id) => self.send_response_create(event_id).await,
@@ -1183,16 +1313,20 @@ impl WsInner {
     }
 
     async fn send_response_create(&self, event_id: String) -> Result<()> {
-        let result = self
-            .send_raw(json!({"type": "response.create", "event_id": event_id}))
-            .await;
-        if result.is_err() {
-            // The create never reached the server, so it must not block later requests.
-            let _ = self
-                .state
-                .lock()
-                .expect("realtime model poisoned")
-                .on_response_create_failed();
+        let payload = self
+            .state
+            .lock()
+            .expect("realtime model poisoned")
+            .create_payload
+            .take();
+        let mut message = payload.unwrap_or_else(|| json!({"type": "response.create"}));
+        message["event_id"] = Value::String(event_id);
+        // Dropping this future mid-send (a cancelled caller) must free the slot as well as an
+        // error does; the guard is disarmed only once the send has been accepted.
+        let mut slot = SlotGuard::new(self, SlotKind::Create);
+        let result = self.send_raw(message).await;
+        if result.is_ok() {
+            slot.disarm();
         }
         result
     }
@@ -1397,12 +1531,10 @@ impl WsInner {
         if let Some(response_id) = response_id {
             message["response_id"] = Value::String(response_id.to_string());
         }
+        let mut slot = SlotGuard::new(self, SlotKind::Cancel);
         let result = self.send_raw(message).await;
-        if result.is_err() {
-            self.state
-                .lock()
-                .expect("realtime model poisoned")
-                .release_cancel();
+        if result.is_ok() {
+            slot.disarm();
         }
         result
     }
@@ -1426,6 +1558,20 @@ impl WsInner {
 
         match event_type {
             "response.output_audio.delta" => {
+                // The server always names the item, the response and the audio. An event
+                // without them cannot be tracked, so it is a protocol error rather than silence.
+                if ["item_id", "response_id", "delta"]
+                    .iter()
+                    .any(|key| event.get(key).and_then(Value::as_str).is_none())
+                {
+                    self.emit(RealtimeModelEvent::Error {
+                        error: json!({
+                            "message": "Invalid response.output_audio.delta event",
+                            "context": "Failed to validate server event",
+                        }),
+                    });
+                    return;
+                }
                 let item_id = string_field(&event, "item_id");
                 let content_index = usize_field(&event, "content_index");
                 let response_id = string_field(&event, "response_id");
@@ -1504,7 +1650,7 @@ impl WsInner {
                     if let Some(response_id) = &response_id {
                         state.interrupted_audio_response_ids.remove(response_id);
                     }
-                    state.on_response_done()
+                    state.on_response_done(response_id.as_deref())
                 };
                 if let Some(reported) = event.pointer("/response/usage")
                     && let Some(converted) = convert_usage(reported)
@@ -1568,7 +1714,12 @@ impl WsInner {
                     .flatten();
                 if let Some(item) = event.get("item")
                     && item.get("type").and_then(Value::as_str) == Some("message")
-                    && let Some(message) = parse_message_item(item, previous_item_id, None)
+                    // An item the server reports without a status is still being built, which is
+                    // what Python's `item.status or "in_progress"` encodes. Leaving it unset
+                    // would make a fresh item indistinguishable from one whose status the
+                    // transport could not read.
+                    && let Some(message) =
+                        parse_message_item(item, previous_item_id, Some("in_progress"))
                 {
                     self.emit(RealtimeModelEvent::item_updated(message));
                 }
@@ -1773,6 +1924,15 @@ impl WsInner {
 }
 
 /// The URL to connect to: an explicit override, then an existing call, then a new session.
+/// Reject tools that use a feature only the Responses API supports, as Python's
+/// `_tools_to_session_tools` does before it builds the session payload.
+fn ensure_tools_supported(settings: &RealtimeSessionModelSettings) -> Result<()> {
+    for spec in settings.tools.as_deref().unwrap_or_default() {
+        spec.ensure_realtime_supported()?;
+    }
+    Ok(())
+}
+
 fn connect_url(url: Option<&str>, call_id: Option<&str>, model: &str) -> String {
     match (url, call_id) {
         (Some(url), _) => url.to_string(),
@@ -2164,10 +2324,10 @@ mod sequencing_tests {
     fn a_second_create_defers_until_the_first_response_starts() {
         let mut state = state();
         let first = state
-            .request_response_create()
+            .request_response_create(None)
             .expect("first create is sent");
         // Parallel tool outputs both see an idle connection until `response.created` lands.
-        assert_eq!(state.request_response_create(), None);
+        assert_eq!(state.request_response_create(None), None);
         assert!(state.pending_response_create);
 
         state.on_response_created(Some("resp_1"));
@@ -2175,18 +2335,18 @@ mod sequencing_tests {
         assert!(state.ongoing_response);
 
         let second = state
-            .on_response_done()
+            .on_response_done(None)
             .expect("deferred create is flushed");
         assert_ne!(first, second);
         assert!(!state.pending_response_create);
-        assert_eq!(state.on_response_done(), None);
+        assert_eq!(state.on_response_done(None), None);
     }
 
     #[test]
     fn an_unrelated_error_keeps_a_deferred_create() {
         let mut state = state();
-        let event_id = state.request_response_create().unwrap();
-        assert_eq!(state.request_response_create(), None);
+        let event_id = state.request_response_create(None).unwrap();
+        assert_eq!(state.request_response_create(None), None);
 
         // A barge-in truncate failure must not drop the deferred response.
         let unrelated = json!({"event_id": "agents_rs_truncate", "message": "bad truncate"});
@@ -2202,7 +2362,7 @@ mod sequencing_tests {
     #[test]
     fn errors_without_an_event_id_match_on_code_or_message() {
         let mut state = state();
-        state.request_response_create().unwrap();
+        state.request_response_create(None).unwrap();
         assert!(state.error_rejects_pending_create(&json!({"code": "bad_response_create"})));
         assert!(state.error_rejects_pending_create(
             &json!({"message": "Cannot send response.create right now"})
@@ -2234,7 +2394,7 @@ mod sequencing_tests {
         assert!(state.begin_cancel(None));
 
         // The next response may be cancelled again.
-        state.on_response_done();
+        state.on_response_done(None);
         assert!(!state.begin_cancel(None));
         state.on_response_created(Some("resp_2"));
         assert!(state.begin_cancel(None));
@@ -2324,5 +2484,87 @@ mod sequencing_tests {
         assert_eq!(tracked.item_id.as_deref(), Some("item_9"));
         assert_eq!(tracked.content_index, Some(2));
         assert_eq!(tracked.elapsed_ms, Some(42.0));
+    }
+
+    /// Hold the socket lock so a send cannot complete, run `operation` until it times out (the
+    /// caller giving up mid-send), then release the lock.
+    async fn abandon_mid_send<F: std::future::Future>(inner: &WsInner, operation: F) {
+        let held = inner.sink.lock().await;
+        let outcome = tokio::time::timeout(Duration::from_millis(50), operation).await;
+        assert!(
+            outcome.is_err(),
+            "the send must still be waiting for the socket"
+        );
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn an_abandoned_cancel_frees_the_slot_for_a_retry() {
+        let model = OpenAIRealtimeWebSocketModel::new();
+        let inner = &model.inner;
+        inner
+            .state
+            .lock()
+            .unwrap()
+            .on_response_created(Some("response_1"));
+
+        abandon_mid_send(inner, inner.cancel_response(Some("response_1"))).await;
+
+        // The cancel never went out, so the next attempt must not be swallowed.
+        assert!(inner.state.lock().unwrap().begin_cancel(Some("response_1")));
+    }
+
+    #[tokio::test]
+    async fn a_failed_cancel_send_can_be_retried() {
+        let model = OpenAIRealtimeWebSocketModel::new();
+        let inner = &model.inner;
+        inner
+            .state
+            .lock()
+            .unwrap()
+            .on_response_created(Some("response_1"));
+
+        // Nothing is connected, so the send fails.
+        assert!(inner.cancel_response(Some("response_1")).await.is_err());
+        assert!(inner.state.lock().unwrap().begin_cancel(Some("response_1")));
+    }
+
+    #[tokio::test]
+    async fn an_abandoned_response_create_releases_the_in_flight_slot() {
+        let model = OpenAIRealtimeWebSocketModel::new();
+        let inner = &model.inner;
+
+        abandon_mid_send(inner, inner.request_response_create(None)).await;
+
+        let mut state = inner.state.lock().unwrap();
+        assert!(state.create_in_flight.is_none());
+        // The next request starts a response instead of deferring behind one that never started.
+        assert!(state.request_response_create(None).is_some());
+    }
+
+    #[tokio::test]
+    async fn a_failed_response_create_send_releases_the_in_flight_slot() {
+        let model = OpenAIRealtimeWebSocketModel::new();
+        let inner = &model.inner;
+
+        assert!(inner.request_response_create(None).await.is_err());
+
+        let mut state = inner.state.lock().unwrap();
+        assert!(state.create_in_flight.is_none());
+        assert!(state.request_response_create(None).is_some());
+    }
+
+    #[test]
+    fn a_response_done_for_another_response_leaves_the_active_one_alone() {
+        let mut state = state();
+        state.on_response_created(Some("response_2"));
+        assert_eq!(state.request_response_create(None), None);
+
+        assert_eq!(state.on_response_done(Some("response_1")), None);
+        assert!(state.ongoing_response);
+        assert!(state.pending_response_create);
+
+        assert!(state.on_response_done(Some("response_2")).is_some());
+        assert!(!state.ongoing_response);
     }
 }

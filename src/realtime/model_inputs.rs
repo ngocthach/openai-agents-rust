@@ -69,12 +69,12 @@ impl RealtimeInterrupt {
     pub fn validate(&self) -> Result<()> {
         if self.playback_only && (self.cancel_response_only || self.force_response_cancel) {
             return Err(AgentsError::user(
-                "A playback-only realtime interrupt cannot also cancel a response.",
+                "playback_only cannot be combined with explicit cancellation modes",
             ));
         }
         if self.cancel_response_only && self.response_id.is_none() {
             return Err(AgentsError::user(
-                "A cancel-response-only realtime interrupt requires a response id.",
+                "cancel_response_only requires response_id",
             ));
         }
         Ok(())

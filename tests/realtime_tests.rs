@@ -1847,6 +1847,7 @@ async fn mcp_tools_reach_the_realtime_session() {
             }
             async fn list_tools(&self) -> openai_agents_sdk::Result<Vec<MCPTool>> {
                 Ok(vec![MCPTool {
+                    meta: None,
                     name: "search_docs".to_string(),
                     title: None,
                     description: Some("Search the docs".to_string()),
@@ -2621,7 +2622,7 @@ async fn a_tool_guardrail_tripwire_ends_the_session() {
 
     wait_for(&session, |event| {
         matches!(event, RealtimeSessionEvent::Error { error, .. }
-            if error["message"] == "Tool input guardrail halt triggered tripwire")
+            if error["message"] == "Tool call task failed")
     })
     .await;
 

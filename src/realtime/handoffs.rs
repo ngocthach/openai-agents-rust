@@ -239,6 +239,8 @@ impl<C> RealtimeHandoff<C> {
             name: self.tool_name.clone(),
             description: self.tool_description.clone(),
             parameters: self.input_json_schema.clone(),
+            namespace: None,
+            defer_loading: false,
         }
     }
 }

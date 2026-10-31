@@ -173,6 +173,10 @@ struct SessionInner<C> {
     state: Mutex<SessionState<C>>,
     sender: Mutex<Option<mpsc::UnboundedSender<RealtimeSessionEvent<C>>>>,
     closed: AtomicBool,
+    /// Whether the transport finished closing; a failed close can be retried.
+    model_closed: AtomicBool,
+    /// Serializes `close` so concurrent callers do not close the transport twice.
+    close_lock: tokio::sync::Mutex<()>,
     pump: Mutex<Option<JoinHandle<()>>>,
     guardrail_tasks: Mutex<Vec<JoinHandle<()>>>,
     /// Tool calls running on their own task, with `async_tool_calls` on.
@@ -303,6 +307,8 @@ impl<C: Send + Sync + 'static> RealtimeSession<C> {
             }),
             sender: Mutex::new(None),
             closed: AtomicBool::new(false),
+            model_closed: AtomicBool::new(false),
+            close_lock: tokio::sync::Mutex::new(()),
             pump: Mutex::new(None),
             guardrail_tasks: Mutex::new(Vec::new()),
             tool_tasks: Mutex::new(Vec::new()),
@@ -481,9 +487,25 @@ impl<C: Send + Sync + 'static> RealtimeSession<C> {
 
     /// Close the session and its transport.
     pub async fn close(&self) -> Result<()> {
+        let _closing = self.inner.close_lock.lock().await;
         if self.inner.closed.swap(true, Ordering::SeqCst) {
-            return Ok(());
+            // A repeat call only has work left when the transport failed to close before.
+            if self.inner.model_closed.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            let result = self.inner.model.close().await;
+            if result.is_ok() {
+                self.inner.model_closed.store(true, Ordering::SeqCst);
+            }
+            return result;
         }
+        // A task that closes the session from inside must not abort itself mid-cleanup.
+        let current = tokio::task::try_id();
+        let abort = |task: &JoinHandle<()>| {
+            if Some(task.id()) != current {
+                task.abort();
+            }
+        };
         if let Some(pump) = self
             .inner
             .pump
@@ -491,7 +513,7 @@ impl<C: Send + Sync + 'static> RealtimeSession<C> {
             .expect("realtime session poisoned")
             .take()
         {
-            pump.abort();
+            abort(&pump);
         }
         for task in self
             .inner
@@ -500,7 +522,7 @@ impl<C: Send + Sync + 'static> RealtimeSession<C> {
             .expect("realtime session poisoned")
             .drain(..)
         {
-            task.abort();
+            abort(&task);
         }
         for task in self
             .inner
@@ -509,7 +531,7 @@ impl<C: Send + Sync + 'static> RealtimeSession<C> {
             .expect("realtime session poisoned")
             .drain(..)
         {
-            task.abort();
+            abort(&task);
         }
         *self.inner.sender.lock().expect("realtime session poisoned") = None;
         {
@@ -529,7 +551,11 @@ impl<C: Send + Sync + 'static> RealtimeSession<C> {
             state.active_response_id = None;
             state.active_response_agent = None;
         }
-        self.inner.model.close().await
+        let result = self.inner.model.close().await;
+        if result.is_ok() {
+            self.inner.model_closed.store(true, Ordering::SeqCst);
+        }
+        result
     }
 }
 
@@ -616,11 +642,16 @@ pub(crate) async fn build_model_settings_from_agent<C: Send + Sync + 'static>(
     let mut specs: Vec<RealtimeFunctionToolSpec> = tools
         .iter()
         .map(|tool| {
-            RealtimeFunctionToolSpec::new(
+            let mut spec = RealtimeFunctionToolSpec::new(
                 tool.name.clone(),
                 tool.description.clone(),
                 tool.params_json_schema.clone(),
             )
+            .with_defer_loading(tool.defer_loading);
+            if let Some(namespace) = tool.namespace() {
+                spec = spec.with_namespace(namespace);
+            }
+            spec
         })
         .collect();
     specs.extend(handoffs.iter().map(RealtimeHandoff::to_spec));
@@ -689,6 +720,17 @@ impl<C: Send + Sync + 'static> SessionInner<C> {
     /// every event already queued before `recv` returns `None`.
     fn end_with_error(&self, error: AgentsError) {
         let message = error.to_string();
+        self.end_with_error_message(error, message);
+    }
+
+    /// A tool task failed: keep the error for the caller, but publish only Python's fixed
+    /// message so tool arguments and results never leak through the event stream.
+    fn end_with_tool_task_error(&self, error: AgentsError) {
+        crate::realtime::debug::log_tool_action_error("Realtime tool call task failed", &error);
+        self.end_with_error_message(error, "Tool call task failed".to_string());
+    }
+
+    fn end_with_error_message(&self, error: AgentsError, message: String) {
         {
             let mut stored = self.stored_error.lock().expect("realtime session poisoned");
             if stored.is_some() {
@@ -997,8 +1039,12 @@ impl<C: Send + Sync + 'static> SessionInner<C> {
                     });
                 }
             }
+            RealtimeModelEvent::EndOfStream => {
+                // The raw event is already queued; dropping the sender lets a caller drain the
+                // queue and then see the stream end, as Python's end-of-stream sentinel does.
+                *self.sender.lock().expect("realtime session poisoned") = None;
+            }
             RealtimeModelEvent::ConnectionStatus { .. }
-            | RealtimeModelEvent::EndOfStream
             | RealtimeModelEvent::Other { .. }
             | RealtimeModelEvent::RawServerEvent { .. } => {}
         }
@@ -1013,6 +1059,11 @@ impl<C: Send + Sync + 'static> SessionInner<C> {
         &self,
         call: &RealtimeModelToolCallEvent,
     ) -> Result<Option<AdmittedCall<C>>> {
+        if call.call_id.is_empty() {
+            return Err(AgentsError::model_behavior(
+                "Realtime tool calls require a non-empty string call ID.",
+            ));
+        }
         let (agent, tools, handoffs) = {
             let state = self.state.lock().expect("realtime session poisoned");
             (
@@ -1083,7 +1134,7 @@ impl<C: Send + Sync + 'static> SessionInner<C> {
 
         if !self.run_config.async_tool_calls {
             if let Err(error) = self.run_admitted_tool_call(call, admitted).await {
-                self.end_with_error(error);
+                self.end_with_tool_task_error(error);
             }
             return Ok(());
         }
@@ -1091,7 +1142,7 @@ impl<C: Send + Sync + 'static> SessionInner<C> {
         let inner = self.clone();
         let task = tokio::spawn(async move {
             if let Err(error) = inner.run_admitted_tool_call(call, admitted).await {
-                inner.end_with_error(error);
+                inner.end_with_tool_task_error(error);
             }
         });
         let mut tasks = self.tool_tasks.lock().expect("realtime session poisoned");
@@ -1170,88 +1221,110 @@ impl<C: Send + Sync + 'static> SessionInner<C> {
         tools: Vec<Arc<FunctionTool<C>>>,
         handoffs: Vec<RealtimeHandoff<C>>,
     ) -> Result<()> {
-        if let Some(tool) = tools.iter().find(|tool| tool.name == call.name).cloned() {
-            let approval_item = approval_item(&agent.name, &tool.name, &call);
-            let needs_approval = tool
-                .needs_approval
-                .evaluate(&self.context, &call.arguments, &call.call_id)
-                .await;
-            if needs_approval {
-                match self
-                    .context
-                    .is_tool_approved(&agent.name, &tool.name, &call.call_id)
+        // Enablement can change after the tools were resolved, so a call is routed only to a
+        // tool or handoff that is still enabled when it is dispatched.
+        let mut enabled_tool = None;
+        for tool in tools.iter().filter(|tool| tool.name == call.name) {
+            if tool.is_enabled.evaluate(&self.context, &agent.name).await {
+                enabled_tool = Some(tool.clone());
+                break;
+            }
+        }
+        let mut enabled_handoff = None;
+        if enabled_tool.is_none() {
+            for handoff in handoffs.iter().filter(|h| h.tool_name == call.name) {
+                if handoff
+                    .is_enabled
+                    .evaluate(&self.context, &agent.name)
+                    .await
                 {
-                    None => {
-                        if self
-                            .run_config
-                            .tool_execution
-                            .pre_approval_tool_input_guardrails
-                            && !tool.tool_input_guardrails.is_empty()
-                        {
-                            // Catch a blocked call before bothering a human with it. The same
-                            // guardrails run again before the tool executes.
-                            let function_call = function_call_item(&call);
-                            let tool_context = ToolContext::from_call(
-                                self.context.clone(),
-                                &agent.name,
-                                &function_call,
-                            );
-                            match self
-                                .run_tool_input_guardrails(&tool, &tool_context, &agent.name)
-                                .await?
-                            {
-                                ToolInputVerdict::Allow => {}
-                                ToolInputVerdict::Reject(message) => {
-                                    return self
-                                        .complete_tool_call(
-                                            &agent,
-                                            &tool,
-                                            &call,
-                                            ToolOutput::Text(message),
-                                        )
-                                        .await;
-                                }
-                                ToolInputVerdict::Raise(error) => return Err(*error),
-                            }
-                        }
-                        {
-                            let mut state = self.state.lock().expect("realtime session poisoned");
-                            state.pending_tool_calls.insert(
-                                call.call_id.clone(),
-                                PendingToolCall {
-                                    call: call.clone(),
-                                    agent: agent.clone(),
-                                    tool: tool.clone(),
-                                    approval_item,
-                                    identity: InvocationIdentity {
-                                        name: call.name.clone(),
-                                        role: InvocationRole::Function,
-                                        arguments: call.arguments.clone(),
-                                    },
-                                },
-                            );
-                        }
-                        self.emit(RealtimeSessionEvent::ToolApprovalRequired {
-                            agent,
-                            tool,
-                            call_id: call.call_id.clone(),
-                            arguments: call.arguments.clone(),
-                            info: self.info(),
-                        });
-                        return Ok(());
-                    }
-                    Some(false) => return self.send_tool_rejection(&agent, &tool, &call).await,
-                    Some(true) => {}
+                    enabled_handoff = Some(handoff.clone());
+                    break;
                 }
             }
-            return self.execute_tool(agent, tool, call).await;
         }
 
-        if let Some(handoff) = handoffs
-            .iter()
-            .find(|handoff| handoff.tool_name == call.name)
-            .cloned()
-        {
+        if let Some(tool) = enabled_tool {
+            let approval_item = approval_item(&agent.name, &tool.name, &call);
+            let decision_for =
+                |ctx: &RunContext<C>| ctx.is_tool_approved(&agent.name, &tool.name, &call.call_id);
+            // A standing decision wins over the approval rule, so the rule is not consulted
+            // once the reviewer has decided for this tool.
+            let mut decision = decision_for(&self.context);
+            if decision.is_none() {
+                let needs_approval = tool
+                    .needs_approval
+                    .evaluate(&self.context, &call.arguments, &call.call_id)
+                    .await;
+                // A decision may have landed while the rule was running.
+                decision = decision_for(&self.context);
+                if decision.is_none() && !needs_approval {
+                    decision = Some(true);
+                }
+            }
+            match decision {
+                Some(false) => return self.send_tool_rejection(&agent, &tool, &call).await,
+                Some(true) => return self.execute_tool(agent, tool, call).await,
+                None => {}
+            }
+
+            if self
+                .run_config
+                .tool_execution
+                .pre_approval_tool_input_guardrails
+                && !tool.tool_input_guardrails.is_empty()
+            {
+                // Catch a blocked call before bothering a human with it. The same guardrails
+                // run again before the tool executes.
+                let function_call = function_call_item(&call);
+                let tool_context =
+                    ToolContext::from_call(self.context.clone(), &agent.name, &function_call);
+                let verdict = self
+                    .run_tool_input_guardrails(&tool, &tool_context, &agent.name)
+                    .await?;
+                if let ToolInputVerdict::Raise(error) = verdict {
+                    return Err(*error);
+                }
+                // A standing decision recorded while the guardrails ran takes precedence.
+                match decision_for(&self.context) {
+                    Some(false) => return self.send_tool_rejection(&agent, &tool, &call).await,
+                    Some(true) => return self.execute_tool(agent, tool, call).await,
+                    None => {}
+                }
+                if let ToolInputVerdict::Reject(message) = verdict {
+                    return self
+                        .complete_tool_call(&agent, &tool, &call, ToolOutput::Text(message))
+                        .await;
+                }
+            }
+            {
+                let mut state = self.state.lock().expect("realtime session poisoned");
+                state.pending_tool_calls.insert(
+                    call.call_id.clone(),
+                    PendingToolCall {
+                        call: call.clone(),
+                        agent: agent.clone(),
+                        tool: tool.clone(),
+                        approval_item,
+                        identity: InvocationIdentity {
+                            name: call.name.clone(),
+                            role: InvocationRole::Function,
+                            arguments: call.arguments.clone(),
+                        },
+                    },
+                );
+            }
+            self.emit(RealtimeSessionEvent::ToolApprovalRequired {
+                agent,
+                tool,
+                call_id: call.call_id.clone(),
+                arguments: call.arguments.clone(),
+                info: self.info(),
+            });
+            return Ok(());
+        }
+
+        if let Some(handoff) = enabled_handoff {
             return self.execute_handoff(agent, handoff, call).await;
         }
 
@@ -1712,7 +1785,14 @@ impl<C: Send + Sync + 'static> SessionInner<C> {
         is_audio_output: bool,
     ) {
         let mut guardrails: Vec<OutputGuardrail<C>> = agent.output_guardrails.clone();
-        guardrails.extend(self.run_config.output_guardrails.iter().cloned());
+        // A guardrail listed on both the agent and the run config runs once. Python dedupes by
+        // object identity; guardrails here are cloneable handles with no exposed identity, so the
+        // name is the key.
+        for guardrail in &self.run_config.output_guardrails {
+            if !guardrails.iter().any(|known| known.name == guardrail.name) {
+                guardrails.push(guardrail.clone());
+            }
+        }
         if guardrails.is_empty() {
             return;
         }
@@ -1898,6 +1978,7 @@ fn approval_item(
         agent: agent_name.to_string(),
         raw_item: function_call_item(call),
         tool_name: tool_name.to_string(),
+        tool_origin: None,
     }
 }
 

@@ -307,7 +307,8 @@ impl RealtimeSendMatcher {
     /// A short description for assertion messages.
     fn describe(&self) -> String {
         match self {
-            RealtimeSendMatcher::Event(event) => format!("the exact event {event:?}"),
+            // The event itself is left out: scripted exchanges can carry user data.
+            RealtimeSendMatcher::Event(_) => "the scripted event".to_string(),
             RealtimeSendMatcher::Kind(kind) => format!("an event of kind {kind:?}"),
             RealtimeSendMatcher::Predicate(_) => "an event matching a predicate".to_string(),
         }
@@ -363,7 +364,7 @@ impl RealtimeStep {
     fn validate(&self) -> Result<()> {
         if self.error.is_some() && !self.emit.is_empty() {
             return Err(AgentsError::user(
-                "A RealtimeStep cannot both emit events and fail.",
+                "A RealtimeStep cannot define both emit events and an error.",
             ));
         }
         Ok(())
@@ -406,7 +407,7 @@ impl fmt::Display for RealtimeScriptError {
             ),
             RealtimeScriptError::UnconsumedSteps { remaining } => write!(
                 f,
-                "{remaining} scripted realtime step(s) were not consumed."
+                "{remaining} scripted Realtime step(s) were not consumed."
             ),
         }
     }
@@ -585,6 +586,16 @@ impl ScriptedRealtimeModel {
         self.lock().connect_calls.clone()
     }
 
+    /// Whether the model is currently connected.
+    pub fn is_connected(&self) -> bool {
+        self.lock().connected
+    }
+
+    /// Whether the model has been closed.
+    pub fn is_closed(&self) -> bool {
+        self.lock().closed
+    }
+
     /// How many times [`RealtimeModel::close`] was called.
     pub fn close_calls(&self) -> usize {
         self.lock().close_calls
@@ -639,8 +650,11 @@ impl RealtimeModel for ScriptedRealtimeModel {
         let receiver = {
             let mut state = self.lock();
             if state.connected {
+                return Err(AgentsError::user("Already connected"));
+            }
+            if self.connect_error.is_some() && !self.connect_events.is_empty() {
                 return Err(AgentsError::user(
-                    "The scripted realtime model is connected.",
+                    "A ScriptedRealtimeModel cannot define both connect events and a connect error.",
                 ));
             }
             state

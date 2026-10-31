@@ -48,9 +48,9 @@
 //!   type (`coerce_*`), and `_DictLike` lets events and items be indexed like dicts. Rust uses
 //!   typed structs with builder methods; events and items implement `Serialize`/`Deserialize` and
 //!   expose `to_value()`.
-//! - **Duplicate-tool fail-fast.** Python marks the tool with `_is_codex_tool` and `Agent`
-//!   rejects two Codex tools sharing a name. `FunctionTool` has no marker slot, so the check is
-//!   not performed; give each tool a unique name.
+//! - **Duplicate-tool fail-fast.** Like Python's `_is_codex_tool`, [`codex_tool`] marks the tool
+//!   it builds and [`Agent`](crate::Agent) rejects two tools sharing a Codex tool's name; give
+//!   each Codex tool on one agent a unique name.
 
 pub mod client;
 pub mod events;

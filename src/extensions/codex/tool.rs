@@ -563,6 +563,16 @@ fn invalid_input(message: impl fmt::Display) -> AgentsError {
     AgentsError::model_behavior(format!("Invalid JSON input for codex tool: {message}"))
 }
 
+/// A parse or deserialization failure. Serde's message can echo the offending argument value,
+/// so it is dropped while tool data is kept out of logs (Python's `DONT_LOG_TOOL_DATA`).
+fn invalid_json(error: serde_json::Error) -> AgentsError {
+    if crate::debug::dont_log_tool_data() {
+        AgentsError::model_behavior("Invalid JSON input for codex tool")
+    } else {
+        invalid_input(error)
+    }
+}
+
 /// Validate the arguments against a caller-supplied parameters schema.
 ///
 /// Python validates against the caller's own Pydantic model; this honours the parts of a JSON
@@ -616,12 +626,12 @@ fn parse_tool_input(
     } else {
         arguments
     };
-    let value: Value = serde_json::from_str(text).map_err(invalid_input)?;
+    let value: Value = serde_json::from_str(text).map_err(invalid_json)?;
     match custom_schema {
         Some(schema) => validate_against_schema(&value, schema)?,
         None => reject_unknown_fields(&value)?,
     }
-    let raw: RawToolCallArgs = serde_json::from_value(value).map_err(invalid_input)?;
+    let raw: RawToolCallArgs = serde_json::from_value(value).map_err(invalid_json)?;
 
     if raw.inputs.is_empty() {
         return Err(invalid_input(
@@ -668,10 +678,17 @@ fn parse_tool_input(
         }
     }
 
-    let thread_id = raw
-        .thread_id
-        .map(|id| id.trim().to_string())
-        .filter(|id| !id.is_empty());
+    // Python's `CodexToolParameters.validate_thread_id` rejects a blank thread id instead of
+    // silently starting a new thread; an absent or null field stays `None`.
+    let thread_id = match raw.thread_id {
+        Some(id) if id.trim().is_empty() => {
+            return Err(invalid_input(
+                "When provided, \"thread_id\" must be a non-empty string.",
+            ));
+        }
+        Some(id) => Some(id.trim().to_string()),
+        None => None,
+    };
     Ok((inputs, thread_id))
 }
 
@@ -1127,13 +1144,25 @@ mod tests {
     }
 
     #[test]
-    fn empty_thread_id_falls_back_to_none() {
-        let (_, thread_id) = parse_tool_input(
+    fn a_blank_thread_id_is_rejected_and_a_null_one_is_none() {
+        let error = parse_tool_input(
             r#"{"inputs":[{"type":"text","text":"hi"}],"thread_id":"  "}"#,
             None,
         )
-        .unwrap();
-        assert_eq!(thread_id, None);
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Invalid JSON input for codex tool: When provided, \"thread_id\" must be a \
+             non-empty string."
+        );
+
+        for arguments in [
+            r#"{"inputs":[{"type":"text","text":"hi"}],"thread_id":null}"#,
+            r#"{"inputs":[{"type":"text","text":"hi"}]}"#,
+        ] {
+            let (_, thread_id) = parse_tool_input(arguments, None).unwrap();
+            assert_eq!(thread_id, None);
+        }
     }
 
     #[test]
