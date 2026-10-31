@@ -1,8 +1,24 @@
 # Changelog
 
-## Unreleased (0.6.0)
+## 0.6.0 (2026-10-31)
 
-Shell, apply_patch, computer, and partial programmatic and collision-policy parity with Python's `test_shell_tool.py`,
+Parity release driven by the Python SDK's own test suite. The Python tests under
+`openai-agents-python/tests/` were triaged case by case; each behavioural case was ported to a Rust
+test (about 4,900 new tests across `tests/py_*.rs`), and every divergence a ported test exposed was
+fixed in the SDK. Each case is classified as ported, covered by an existing Rust test, or
+Python-only (pytest fixtures, asyncio task internals, pydantic and `inspect` introspection, CI and
+example scripts), with the reason recorded in `plans/reports/py-test-parity-*.md`.
+
+Not covered by a Rust port: the Python-only cases above, a handful of cases that need Python object
+identity or live vendor SDK objects, and the websocket official-endpoint case that needs a connector
+seam. Deliberate differences from Python are listed under each area below and in
+`docs/project-roadmap.md`. Retry backoff defaults now match Python (0.25 s initial delay, 2.0 s cap).
+
+Areas: runner, `RunState` interoperability, approvals and call-id reuse, handoffs and nested history,
+guardrails and hooks, tracing, models and providers, MCP and sessions, realtime, voice, Codex,
+sandbox core and the cloud sandbox providers.
+
+Shell, apply_patch, computer, programmatic tool-calling and collision-policy parity with Python's `test_shell_tool.py`,
 `test_shell_call_serialization.py`, `test_apply_patch_tool.py`, `test_local_shell_tool.py`,
 `test_computer_tool_lifecycle.py`, `test_strict_schema_oneof.py`, `test_scripted_sandbox.py`,
 `test_tool_name_collision_policy.py` and `test_programmatic_tool_calling.py` (see

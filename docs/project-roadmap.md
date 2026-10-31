@@ -28,6 +28,13 @@ Last updated: 2026-10-29.
 - MCP legacy HTTP+SSE transport
 - Extensions: tool output trimmer, Codex tool, hosted multi-agent (experimental)
 
+## 0.6.0 (released)
+
+- Python test-suite parity: the Python SDK's tests were triaged and ported as Rust tests, and the
+  divergences they exposed were fixed (runner, `RunState`, approvals, handoffs, guardrails, tracing,
+  models, MCP and sessions, realtime, voice, Codex, sandbox and cloud providers)
+- Per-case classification (ported, covered, Python-only) lives in `plans/reports/py-test-parity-*.md`
+
 ## 0.5.0 (released)
 
 - Independent-audit fixes: handoff failure recovery, in-process archive validation and limits, `extract()`,

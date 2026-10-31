@@ -694,8 +694,8 @@ fn archive_establishes(
 /// `...`, independent of the source backend's root name. FIFOs and device nodes, which a staged
 /// `cp -R` legitimately carries and strict hydration refuses, are dropped. When
 /// `relativize_symlinks_under` names the workspace root, a *simple* absolute symlink target under it
-/// is rebased onto the link's own directory (see [`simple_rebase_components`] and
-/// [`archive_establishes`]); every other target stays absolute for strict hydration to refuse.
+/// is rebased onto the link's own directory (see `simple_rebase_components` and
+/// `archive_establishes`); every other target stays absolute for strict hydration to refuse.
 ///
 /// The result is validated with the default [`TarValidationOptions`] before it is returned, as
 /// Python does, so a member that escapes (`..`, an absolute path, a hardlink) fails here.
