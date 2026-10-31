@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.9.1 (2026-11-01)
+
+Corrects the 0.9.0 parity count and ports the last cases. The 0.9.0 entry said 69 cases were not ported;
+that came from a ledger merge in which a stale per-area row overwrote a newer one. The true figure was 7,
+all in `test_openai_responses_compaction_session.py`, and they are now ported
+(`tests/py_core6_final7_compaction.rs`). Measured state: 12,641 Python test cases, 8,036 ported, 604 covered,
+4,001 Python-only with a recorded reason, 0 not ported, 0 unaccounted. The library code is unchanged from
+0.9.0.
+
+Differences that remain (behaviour, not unported cases): an expired-during-compaction history makes Rust skip
+the replacement with a warning where Python raises; a tar nested-path case is skipped on macOS (needs GNU
+tar); tar `--no-wildcards` differs; live-session `concurrency_limits` differ.
+
 ## 0.9.0 (2026-11-01)
 
 Burns down the measured parity gap. The Python suite's 12,641 test cases are now all classified
@@ -28,8 +41,7 @@ sandbox backends implement `read_bounded_unchecked` instead of `read_bounded`, C
 credentialed state, E2B native snapshots with skip paths return a tar, and shutdown suppresses a failed
 delete.
 
-Known differences and gaps: 7 MCP cases (four expired-during-compaction rollbacks, three
-mutation-generation interleavings) and a few others (69 in all) are not ported; a tar nested-path case is
+Known differences and gaps (the "69 not ported" figure first published here was wrong; see 0.9.1): a tar nested-path case is
 skipped on macOS (needs GNU tar); tar `--no-wildcards` differs; the live-session `concurrency_limits`
 differ. `test_complex_async_tracing` failed once in about 60 loaded runs and has not reproduced.
 

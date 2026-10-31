@@ -28,10 +28,14 @@ Last updated: 2026-10-29.
 - MCP legacy HTTP+SSE transport
 - Extensions: tool output trimmer, Codex tool, hosted multi-agent (experimental)
 
+## 0.9.1 (released)
+
+- Last 7 Python compaction cases ported; parity ledger corrected: 0 not ported, 0 unaccounted
+
 ## 0.9.0 (released)
 
-- Whole-suite parity measured and burned down: all 12,641 Python test cases classified (7,981 ported, 604
-  covered, 3,987 Python-only, 69 not ported); sandbox, runner, MCP and resume divergences fixed
+- Whole-suite parity measured and burned down: all 12,641 Python test cases classified (8,036 ported, 604
+  covered, 4,001 Python-only, 0 not ported); sandbox, runner, MCP and resume divergences fixed
 
 ## 0.8.0 (released)
 
