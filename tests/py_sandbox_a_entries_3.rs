@@ -1398,8 +1398,9 @@ async fn rclone_generated_config_is_written_owner_only() {
         ])
     );
     assert_eq!(commands[1], argv(&["mkdir", "-p", "--", config_dir]));
-    // Python spells the mode `0600`; the file mode is the same.
-    assert_eq!(commands[2], argv(&["chmod", "600", "--", config_path]));
+    // The mode is spelled as in Python (`chmod 0600 <path>`, no `--`: BSD `chmod` on macOS
+    // would read `--` as a file name).
+    assert_eq!(commands[2], argv(&["chmod", "0600", config_path]));
     assert_eq!(
         commands[3][..2],
         ["sh", "-lc"],

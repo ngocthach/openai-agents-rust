@@ -36,16 +36,34 @@ struct FsSession {
     /// A backend that offers no bounded fetch, like a custom backend with only `read`.
     legacy: bool,
     running: Mutex<bool>,
+    /// A manifest reported in place of the workspace's own, for entries the fake never mounts.
+    overlay: Option<Manifest>,
 }
 
 impl FsSession {
     async fn new(legacy: bool) -> (UnixLocalSandboxClient, Arc<FsSession>) {
+        FsSession::build(legacy, |_| None).await
+    }
+
+    /// A session whose manifest also holds the entries `extra` adds, under the workspace root.
+    async fn with_entries(
+        extra: impl FnOnce(Manifest) -> Manifest,
+    ) -> (UnixLocalSandboxClient, Arc<FsSession>) {
+        FsSession::build(false, |root| Some(extra(Manifest::new().with_root(root)))).await
+    }
+
+    async fn build(
+        legacy: bool,
+        overlay: impl FnOnce(&str) -> Option<Manifest>,
+    ) -> (UnixLocalSandboxClient, Arc<FsSession>) {
         let client = UnixLocalSandboxClient::new();
         let inner = client.create(None).await.unwrap();
         inner.start().await.unwrap();
+        let overlay = overlay(inner.workspace_root());
         (
             client,
             Arc::new(FsSession {
+                overlay,
                 inner,
                 bounded_requests: Mutex::new(Vec::new()),
                 whole_reads: Mutex::new(0),
@@ -81,7 +99,9 @@ impl SandboxSession for FsSession {
         self.inner.id()
     }
     fn manifest(&self) -> &Manifest {
-        self.inner.manifest()
+        self.overlay
+            .as_ref()
+            .unwrap_or_else(|| self.inner.manifest())
     }
     fn backend_id(&self) -> &str {
         "fs-session"
@@ -115,7 +135,7 @@ impl SandboxSession for FsSession {
         }
         self.inner.write_file(path, contents).await
     }
-    async fn read_bounded(&self, path: &str, max_bytes: usize) -> SandboxResult<Vec<u8>> {
+    async fn read_bounded_unchecked(&self, path: &str, max_bytes: usize) -> SandboxResult<Vec<u8>> {
         if self.legacy {
             // The trait default: read it whole, then cut.
             let mut contents = self.read_file(path).await?;
@@ -717,4 +737,145 @@ async fn two_sinks_over_one_outbox_append() {
     assert_eq!(delivered.len(), 2);
     assert!(delivered.iter().all(|line| line["seq"] == 1));
     client.delete(session.inner.clone()).await.unwrap();
+}
+
+/// Python: `test_bounded_read_preserves_retryability_without_provider_diagnostics` (3 rows). A
+/// failed bounded read reaches the caller, and the finish event, with only the path and a
+/// reason; the provider's context, response and cause are dropped, and retryability survives.
+#[tokio::test]
+async fn bounded_read_preserves_retryability_without_provider_diagnostics() {
+    use openai_agents_sdk::sandbox::events::{CallbackSink, EventPhase};
+
+    let rows: [(Option<bool>, &str, &str); 3] = [
+        (Some(true), "provider_failure", "bounded_read_failed"),
+        (
+            Some(false),
+            "bounded_read_wire_limit",
+            "bounded_read_wire_limit",
+        ),
+        (None, "provider_failure", "bounded_read_failed"),
+    ];
+    for (retryable, reason, expected_reason) in rows {
+        let (client, inner) = FsSession::new(false).await;
+        let mut failure = SandboxError::new(
+            ErrorCode::WorkspaceArchiveReadError,
+            "synthetic-private-payload",
+        )
+        .with_context("reason", reason)
+        .with_context("response", "synthetic-private-payload")
+        .with_context("path", "out.jsonl");
+        failure.retryable = retryable;
+        inner.fail_reads(failure);
+        let events: Arc<Mutex<Vec<SandboxSessionEvent>>> = Arc::default();
+        let seen = events.clone();
+        let session = InstrumentedSession::new(
+            inner.clone(),
+            Arc::new(CallbackSink::new(move |event| {
+                seen.lock().unwrap().push(event.clone())
+            })),
+        );
+
+        let error = session.read_bounded("out.jsonl", 100).await.unwrap_err();
+
+        assert_eq!(error.code, ErrorCode::WorkspaceArchiveReadError);
+        assert_eq!(error.retryable, retryable, "{reason}");
+        let expected: std::collections::BTreeMap<String, String> = [
+            ("path".to_string(), "out.jsonl".to_string()),
+            ("reason".to_string(), expected_reason.to_string()),
+        ]
+        .into();
+        assert_eq!(error.context, expected);
+        assert!(!error.message.contains("synthetic-private-payload"));
+        {
+            let events = events.lock().unwrap();
+            let finish = events
+                .iter()
+                .find(|event| event.op == "read" && event.phase == EventPhase::Finish)
+                .expect("a read finish event");
+            assert_eq!(finish.error_retryable, retryable);
+            assert!(
+                !serde_json::to_string(finish)
+                    .unwrap()
+                    .contains("synthetic-private-payload")
+            );
+        }
+        client.delete(inner.inner.clone()).await.ok();
+    }
+}
+
+/// Python: `test_bounded_read_preserves_classified_transport_retryability`: a classified
+/// transport failure keeps its retryability and leaks nothing, called on the session itself.
+#[tokio::test]
+async fn bounded_read_preserves_classified_transport_retryability() {
+    let (client, inner) = FsSession::new(false).await;
+    inner.fail_reads(
+        SandboxError::new(ErrorCode::ExecTransportError, "synthetic-private-payload")
+            .with_retryable(true),
+    );
+
+    let error = inner.read_bounded("out.jsonl", 100).await.unwrap_err();
+
+    assert_eq!(error.code, ErrorCode::WorkspaceArchiveReadError);
+    assert_eq!(error.retryable, Some(true));
+    assert!(!error.message.contains("synthetic-private-payload"));
+    assert!(
+        !format!("{error:?}").contains("synthetic-private-payload"),
+        "{error:?}"
+    );
+    client.delete(inner.inner.clone()).await.ok();
+}
+
+/// Python: `test_workspace_jsonl_sink_preserves_mounted_write_and_rebind` (2 rows). An outbox under
+/// a mount, or under a mount at the workspace root, is written through, binding the sink leaves the
+/// session's persist exclusions alone (a mount is already excluded), and a sink bound afterwards
+/// appends to the same file instead of replacing it.
+#[tokio::test]
+async fn a_mounted_outbox_is_written_and_rebound_without_changing_exclusions() {
+    use openai_agents_sdk::sandbox::entries::Entry;
+    use openai_agents_sdk::sandbox::mount_entries::{ConfiguredMountStrategy, S3Mount};
+
+    for root_mount in [false, true] {
+        let (client, session) = FsSession::with_entries(|manifest| {
+            let mount_path = if root_mount {
+                manifest.root().to_string()
+            } else {
+                "logs".to_string()
+            };
+            manifest.with_entry(
+                "storage",
+                Entry::mount(
+                    ConfiguredMountStrategy::rclone(S3Mount::new("test-bucket"))
+                        .mount()
+                        .with_mount_path(mount_path),
+                ),
+            )
+        })
+        .await;
+        let exclusions = |session: &FsSession| {
+            session
+                .inner
+                .persist_skip_registry()
+                .map(|registry| registry.lock().unwrap().clone())
+                .unwrap_or_default()
+        };
+        let original = exclusions(&session);
+
+        let first = sink(&session, "logs/out.jsonl");
+        assert_eq!(exclusions(&session), original, "root_mount={root_mount}");
+        first
+            .try_emit(&event(&session, SandboxOp::Write))
+            .await
+            .unwrap();
+        let second = sink(&session, "logs/out.jsonl");
+        assert_eq!(exclusions(&session), original, "root_mount={root_mount}");
+        second
+            .try_emit(&event(&session, SandboxOp::Write))
+            .await
+            .unwrap();
+
+        let delivered = lines(&session.root_file("logs/out.jsonl"));
+        assert_eq!(delivered.len(), 2, "root_mount={root_mount}");
+        assert!(delivered.iter().all(|line| line["seq"] == 1));
+        client.delete(session.inner.clone()).await.unwrap();
+    }
 }

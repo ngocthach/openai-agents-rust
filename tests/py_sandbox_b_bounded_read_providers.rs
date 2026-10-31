@@ -649,6 +649,44 @@ async fn e2b_bounded_stream_failure_preserves_retryability() {
     }
 }
 
+/// Python: `test_e2b_bounded_stream_failure_preserves_retryability[TimeoutException]`. A body that
+/// stalls after the first byte times out, and the failure is retryable and carries no payload.
+/// The test hands the client a short idle limit; the default is the SDK's 60 seconds.
+#[tokio::test]
+async fn e2b_bounded_body_timeout_is_retryable() {
+    let mock = start(
+        Provider::E2b,
+        Reply::Stall {
+            status: 200,
+            prefix: b"x".to_vec(),
+        },
+    )
+    .await;
+    let session = E2BSandboxClient::with_options(
+        E2BSandboxClientOptions::new()
+            .with_api_key("e2b_test")
+            .with_base_url(&mock.base)
+            .with_sandbox_type(E2BSandboxType::CodeInterpreter)
+            .with_timeout_secs(120),
+    )
+    .with_http_client(
+        reqwest::Client::builder()
+            .read_timeout(Duration::from_millis(300))
+            .build()
+            .unwrap(),
+    )
+    .create(None)
+    .await
+    .expect("create");
+
+    let error = read(session.as_ref(), 5).await.unwrap_err();
+
+    assert_eq!(error.code, ErrorCode::WorkspaceArchiveReadError);
+    assert_eq!(error.retryable, Some(true));
+    assert_no_payload(&error);
+    assert!(wait_for(&mock.flags.hung_up).await, "the stream was closed");
+}
+
 // ----------------------------------------------------------------------------------------------
 // Daytona timeouts
 // ----------------------------------------------------------------------------------------------

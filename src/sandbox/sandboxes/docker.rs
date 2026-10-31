@@ -1489,7 +1489,7 @@ impl SandboxSession for DockerSandboxSession {
         Ok(())
     }
 
-    async fn read_bounded(&self, path: &str, max_bytes: usize) -> SandboxResult<Vec<u8>> {
+    async fn read_bounded_unchecked(&self, path: &str, max_bytes: usize) -> SandboxResult<Vec<u8>> {
         if max_bytes == 0 {
             return Err(SandboxError::new(
                 ErrorCode::SandboxConfigInvalid,

@@ -1716,12 +1716,9 @@ impl MountPattern for RcloneMountPattern {
                 )
             })?;
         let chmod = session
-            .exec(ExecRequest::argv([
-                "chmod",
-                "600",
-                "--",
-                config_path.as_str(),
-            ]))
+            // No `--`: BSD `chmod` (macOS) reads it as a file name after the mode. The path is
+            // absolute, so it cannot be mistaken for an option; Python runs it the same way.
+            .exec(ExecRequest::argv(["chmod", "0600", config_path.as_str()]))
             .await?;
         if !chmod.ok() {
             let _ = session.rm(&config_path, false).await;

@@ -1531,7 +1531,7 @@ impl SandboxSession for VercelSandboxSession {
         self.download_at(&resolved, None).await
     }
 
-    async fn read_bounded(&self, path: &str, max_bytes: usize) -> SandboxResult<Vec<u8>> {
+    async fn read_bounded_unchecked(&self, path: &str, max_bytes: usize) -> SandboxResult<Vec<u8>> {
         if max_bytes == 0 {
             return Err(bounded_read_zero());
         }

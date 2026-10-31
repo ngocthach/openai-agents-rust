@@ -905,7 +905,7 @@ impl SandboxSession for CloudflareSandboxSession {
     /// buffers. The wire budget is `8 * max_bytes + 65536`, and a body that exceeds it is
     /// refused with `reason = "bounded_read_wire_limit"` — the convention the core
     /// [`read_bounded`](SandboxSession::read_bounded) doc names — rather than decoded.
-    async fn read_bounded(&self, path: &str, max_bytes: usize) -> SandboxResult<Vec<u8>> {
+    async fn read_bounded_unchecked(&self, path: &str, max_bytes: usize) -> SandboxResult<Vec<u8>> {
         if max_bytes == 0 {
             return Err(SandboxError::new(
                 ErrorCode::SandboxConfigInvalid,

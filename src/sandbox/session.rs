@@ -1104,10 +1104,13 @@ pub trait SandboxSession: Send + Sync + fmt::Debug {
     /// to look at its first kilobyte is how a sandbox turns a disk into memory pressure on the
     /// host.
     ///
-    /// The default reads through [`read_file`](Self::read_file) and truncates, which bounds what
-    /// the *caller* holds but not what the backend fetched. A backend whose transport can bound
-    /// the fetch should override this, and report a transport that refuses the request with
-    /// `context["reason"] = "bounded_read_wire_limit"` so the caller can tell the two apart.
+    /// Failures are payload-free. A missing file is `WorkspaceReadNotFound`; every other failure
+    /// becomes a `WorkspaceArchiveReadError` whose context holds only the path and a reason
+    /// (`bounded_read_failed`, or `bounded_read_wire_limit` for a transport that refused an
+    /// over-long encoded response), and whose retryability is the provider's own. What the
+    /// provider said, including any response text, is dropped at this boundary.
+    ///
+    /// Backends override [`read_bounded_unchecked`](Self::read_bounded_unchecked), not this.
     async fn read_bounded(&self, path: &str, max_bytes: usize) -> SandboxResult<Vec<u8>> {
         if max_bytes == 0 {
             return Err(SandboxError::new(
@@ -1115,6 +1118,41 @@ pub trait SandboxSession: Send + Sync + fmt::Debug {
                 "read_bounded max_bytes must be positive",
             ));
         }
+        match self.read_bounded_unchecked(path, max_bytes).await {
+            Ok(bytes) => Ok(bytes),
+            Err(error) if error.code == ErrorCode::WorkspaceReadNotFound => Err(SandboxError::new(
+                ErrorCode::WorkspaceReadNotFound,
+                format!("Workspace path `{path}` was not found"),
+            )
+            .with_context("path", path.to_string())),
+            Err(error) => {
+                let reason = if error.context.get("reason").map(String::as_str)
+                    == Some("bounded_read_wire_limit")
+                {
+                    "bounded_read_wire_limit"
+                } else {
+                    "bounded_read_failed"
+                };
+                let mut sanitized = SandboxError::new(
+                    ErrorCode::WorkspaceArchiveReadError,
+                    format!("Failed to read workspace path `{path}`"),
+                )
+                .with_context("path", path.to_string())
+                .with_context("reason", reason);
+                sanitized.retryable = error.retryable;
+                Err(sanitized)
+            }
+        }
+    }
+
+    /// The backend hook behind [`read_bounded`](Self::read_bounded).
+    ///
+    /// The default reads through [`read_file`](Self::read_file) and truncates, which bounds what
+    /// the *caller* holds but not what the backend fetched. A backend whose transport can bound
+    /// the fetch should override this, and report a transport that refuses the request with
+    /// `context["reason"] = "bounded_read_wire_limit"` so the caller can tell the two apart.
+    /// `max_bytes` is already known to be positive.
+    async fn read_bounded_unchecked(&self, path: &str, max_bytes: usize) -> SandboxResult<Vec<u8>> {
         let mut contents = self.read_file(path).await?;
         contents.truncate(max_bytes);
         Ok(contents)

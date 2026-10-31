@@ -1620,6 +1620,10 @@ impl crate::sandbox::session::SandboxSession for InstrumentedSession {
         .await
     }
 
+    async fn read_bounded_unchecked(&self, path: &str, max_bytes: usize) -> SandboxResult<Vec<u8>> {
+        self.inner.read_bounded_unchecked(path, max_bytes).await
+    }
+
     async fn write_new_file(
         &self,
         path: &str,

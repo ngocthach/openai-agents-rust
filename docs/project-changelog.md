@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.7.0 (2026-10-31)
+
+Completes the sandbox and runner-tracing parity work that 0.6.0 left open. All 806 cases of the Python
+sandbox suite are now accounted for (651 ported, 36 covered, 119 Python-only, none unported), and all
+102 runner-tracing cases are (99 ported, 3 Python-only). Per-file counts are in
+`plans/reports/py-test-parity-sandbox-b.md` and `plans/reports/py-test-parity-core4-tracerunner.md`.
+
+Breaking changes (pre-1.0):
+
+- `SandboxSessionGuard::suspend` now releases the sandbox as Python's pause does: it captures the
+  snapshot, reads the state, then stops, shuts down and deletes the session. A paused run no longer
+  keeps its workspace or backend alive, and the resumed run restores from the snapshot.
+- `SandboxSession::read_bounded` now sanitizes failures (only the path, a reason and the provider's
+  retryability survive). Backends implement the new `read_bounded_unchecked`; a custom session that
+  overrode `read_bounded` should rename the override.
+- The default E2B client has a 60 s connect and idle-read timeout, matching the Python SDK, so a
+  stalled download is a retryable timeout instead of a hang.
+
+Fixed:
+
+- The rclone config step runs `chmod 0600 <path>` as Python does (the previous spelling failed on macOS).
+- The websocket model records the response id by the HTTP client's endpoint, as Python does, instead of
+  by the websocket scheme.
+
 ## 0.6.0 (2026-10-31)
 
 Parity release driven by the Python SDK's own test suite. The Python tests under
@@ -13,6 +37,9 @@ Not covered by a Rust port: the Python-only cases above, a handful of cases that
 identity or live vendor SDK objects, and the websocket official-endpoint case that needs a connector
 seam. Deliberate differences from Python are listed under each area below and in
 `docs/project-roadmap.md`. Retry backoff defaults now match Python (0.25 s initial delay, 2.0 s cap).
+
+Credentials in sandbox client options are redacted from `Debug` output, logs, errors and persisted
+state, and every persisted manifest entry and mount payload variant round-trips.
 
 Areas: runner, `RunState` interoperability, approvals and call-id reuse, handoffs and nested history,
 guardrails and hooks, tracing, models and providers, MCP and sessions, realtime, voice, Codex,

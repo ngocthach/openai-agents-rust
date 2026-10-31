@@ -262,6 +262,9 @@ pub struct OpenAIResponsesWSModel {
     websocket_base_url: Option<String>,
     options: OpenAIResponsesWebSocketOptions,
     connection: Arc<Mutex<Option<Connection>>>,
+    /// Test-only: where to dial and which roots to trust, in place of the URL's host and the
+    /// webpki roots. `None` in the SDK.
+    test_transport: Option<(std::net::SocketAddr, Arc<rustls::ClientConfig>)>,
     /// Bumped by [`OpenAIResponsesWSModel::close_connection`]. A request subscribes when it
     /// starts, so a change mid-flight means the caller closed the model: the request fails as an
     /// abort instead of as a transport error, and it never waits for `close_connection`.
@@ -326,8 +329,23 @@ impl OpenAIResponsesWSModel {
             websocket_base_url: None,
             options: OpenAIResponsesWebSocketOptions::default(),
             connection: Arc::new(Mutex::new(None)),
+            test_transport: None,
             close_generation: Arc::new(watch::channel(0).0),
         }
+    }
+
+    /// Dial `addr` instead of the URL's host and trust `tls` instead of the webpki roots. The URL,
+    /// its host (used for TLS server name checks and the official-endpoint rule) and every
+    /// header stay as they are. The SDK never sets this; tests use it to reach a local wss server
+    /// with a throwaway certificate.
+    #[doc(hidden)]
+    pub fn with_test_transport(
+        mut self,
+        addr: std::net::SocketAddr,
+        tls: Arc<rustls::ClientConfig>,
+    ) -> Self {
+        self.test_transport = Some((addr, tls));
+        self
     }
 
     pub(crate) fn with_explicit(mut self, explicit: bool) -> Self {
@@ -422,13 +440,29 @@ impl OpenAIResponsesWSModel {
             req.headers_mut().insert(k.clone(), v.clone());
         }
         crate::util::ensure_crypto_provider();
-        match tokio_tungstenite::connect_async_with_config(
-            req,
-            Some(self.options.websocket_config()),
-            false,
-        )
-        .await
-        {
+        let connected = match &self.test_transport {
+            Some((addr, tls)) => match TcpStream::connect(addr).await {
+                Ok(tcp) => {
+                    tokio_tungstenite::client_async_tls_with_config(
+                        req,
+                        tcp,
+                        Some(self.options.websocket_config()),
+                        Some(tokio_tungstenite::Connector::Rustls(tls.clone())),
+                    )
+                    .await
+                }
+                Err(e) => Err(tokio_tungstenite::tungstenite::Error::Io(e)),
+            },
+            None => {
+                tokio_tungstenite::connect_async_with_config(
+                    req,
+                    Some(self.options.websocket_config()),
+                    false,
+                )
+                .await
+            }
+        };
+        match connected {
             Ok((socket, _)) => Ok(socket),
             Err(e) if is_transient_handshake_error(&e) => Err(ConnectFailure::Disconnected),
             Err(e) => Err(ConnectFailure::Rejected(AgentsError::other(format!(
@@ -876,7 +910,7 @@ impl Model for OpenAIResponsesWSModel {
         }
         .await;
         let include_data = request.tracing.include_data();
-        let trusted_response_id = self.supports_default_prompt_cache_key();
+        let trusted_response_id = self.client.is_openai_api();
         match &result {
             Ok(resp) => finish_response_span(
                 &span,
@@ -898,7 +932,7 @@ impl Model for OpenAIResponsesWSModel {
         let span = response_span(request.tracing.is_disabled());
         span.start();
         let include_data = request.tracing.include_data();
-        let trusted_response_id = self.supports_default_prompt_cache_key();
+        let trusted_response_id = self.client.is_openai_api();
         let stream = match self.open_stream(&request).await {
             Ok(s) => s,
             Err(e) => {

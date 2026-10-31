@@ -486,6 +486,12 @@ impl ConfiguredMountStrategy {
         )
     }
 
+    /// The mount type of the storage this strategy attaches: `s3_mount`, `gcs_mount`,
+    /// `r2_mount` or `azure_blob_mount`.
+    pub fn mount_type(&self) -> &'static str {
+        self.spec.mount_type()
+    }
+
     /// The in-container pattern, when this strategy uses one.
     pub fn pattern(&self) -> Option<&BuiltinMountPattern> {
         match &self.backend {

@@ -555,10 +555,14 @@ async fn a_streamed_run_that_pauses_suspends_the_sandbox() {
         .sandbox_state()
         .expect("a paused run suspends the sandbox");
     assert_eq!(state.rollout_id.as_deref(), Some("stream-rollout"));
-    // The workspace is kept so the run can be resumed.
+    // As in Python, a pause releases the workspace after capturing it into the snapshot the
+    // state names; the resumed run restores it from there.
     let workspace = std::path::PathBuf::from(state.workspace_root.clone());
-    assert!(workspace.exists());
-    std::fs::remove_dir_all(&workspace).ok();
+    assert!(!workspace.exists());
+    assert_eq!(
+        serde_json::to_value(&state).unwrap()["snapshot"]["type"],
+        "local"
+    );
 }
 
 // -------------------------------------------------------------------------------------------
@@ -1035,11 +1039,11 @@ async fn resumes_a_suspended_sandbox_from_persisted_state() {
     );
     drop(outcome);
     assert!(
-        workspace.exists(),
-        "a suspended session keeps its workspace"
+        !workspace.exists(),
+        "a paused run releases its workspace after capturing it"
     );
 
-    // Resume: approve the pending call and continue against the same workspace.
+    // Resume: approve the pending call and continue from the captured workspace.
     let sandbox_state = SandboxSessionState::from_json_str(&sandbox_state_json).unwrap();
     let mut run_state = RunState::from_json_str(&run_state_json).unwrap();
     let pending = run_state.get_interruptions()[0].clone();

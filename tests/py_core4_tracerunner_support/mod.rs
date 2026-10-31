@@ -710,6 +710,8 @@ pub fn dummy_usage() -> Value {
 pub struct TlsModelEndpoint {
     pub addr: std::net::SocketAddr,
     pub bodies: Arc<Mutex<Vec<Value>>>,
+    /// The throwaway server certificate (DER), for clients that trust it as a root.
+    pub cert_der: Vec<u8>,
     _certs: tempfile::TempDir,
 }
 
@@ -738,25 +740,7 @@ fn throwaway_certificate() -> (tempfile::TempDir, std::path::PathBuf, std::path:
 
 /// Start a [`TlsModelEndpoint`] that answers in order, like [`start_model_endpoint`].
 pub fn start_tls_model_endpoint(replies: Vec<ModelReply>) -> TlsModelEndpoint {
-    use rustls::pki_types::CertificateDer;
-    use rustls::pki_types::PrivateKeyDer;
-    use rustls::pki_types::pem::PemObject;
-
-    let (certs_dir, cert_path, key_path) = throwaway_certificate();
-    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(&cert_path)
-        .expect("cert file")
-        .collect::<std::result::Result<_, _>>()
-        .expect("cert pem");
-    let key = PrivateKeyDer::from_pem_file(&key_path).expect("key pem");
-    let config = rustls::ServerConfig::builder_with_provider(Arc::new(
-        rustls::crypto::aws_lc_rs::default_provider(),
-    ))
-    .with_safe_default_protocol_versions()
-    .expect("protocol versions")
-    .with_no_client_auth()
-    .with_single_cert(certs, key)
-    .expect("server certificate");
-    let config = Arc::new(config);
+    let (certs_dir, config, cert_der) = tls_server_material();
 
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().expect("addr");
@@ -819,6 +803,7 @@ pub fn start_tls_model_endpoint(replies: Vec<ModelReply>) -> TlsModelEndpoint {
     TlsModelEndpoint {
         addr,
         bodies,
+        cert_der,
         _certs: certs_dir,
     }
 }
@@ -856,3 +841,98 @@ pub fn openssl_available() -> bool {
 /// The message a TLS test prints when it skips for want of `openssl`.
 pub const OPENSSL_SKIP_MESSAGE: &str =
     "skipped: openssl is not on PATH; this test needs it to generate a throwaway TLS certificate";
+
+/// A server TLS configuration for `api.openai.com` with a throwaway certificate, the temporary
+/// directory that holds it, and the certificate's DER bytes.
+fn tls_server_material() -> (tempfile::TempDir, Arc<rustls::ServerConfig>, Vec<u8>) {
+    use rustls::pki_types::pem::PemObject;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+
+    let (certs_dir, cert_path, key_path) = throwaway_certificate();
+    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(&cert_path)
+        .expect("cert file")
+        .collect::<std::result::Result<_, _>>()
+        .expect("cert pem");
+    let cert_der = certs[0].as_ref().to_vec();
+    let key = PrivateKeyDer::from_pem_file(&key_path).expect("key pem");
+    let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .expect("protocol versions")
+    .with_no_client_auth()
+    .with_single_cert(certs, key)
+    .expect("server certificate");
+    (certs_dir, Arc::new(config), cert_der)
+}
+
+/// A client TLS configuration that trusts only `endpoint`'s throwaway certificate.
+pub fn trusting_client_config(endpoint: &TlsModelEndpoint) -> Arc<rustls::ClientConfig> {
+    let mut roots = rustls::RootCertStore::empty();
+    roots
+        .add(rustls::pki_types::CertificateDer::from(
+            endpoint.cert_der.clone(),
+        ))
+        .expect("trust the throwaway certificate");
+    let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .expect("protocol versions")
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    Arc::new(config)
+}
+
+/// A secure WebSocket server with a throwaway certificate. Each connection records the first text
+/// frame it receives into `bodies`, then sends `events` as text frames and waits for the client.
+#[cfg(feature = "websocket")]
+pub fn start_tls_ws_endpoint(events: Vec<Value>) -> TlsModelEndpoint {
+    use tokio_tungstenite::tungstenite::{Message, accept};
+
+    let (certs_dir, config, cert_der) = tls_server_material();
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let bodies = Arc::new(Mutex::new(Vec::new()));
+    let recorded = bodies.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(sock) = stream else { return };
+            let Ok(conn) = rustls::ServerConnection::new(config.clone()) else {
+                return;
+            };
+            let events = events.clone();
+            let recorded = recorded.clone();
+            std::thread::spawn(move || {
+                let tls = rustls::StreamOwned::new(conn, sock);
+                let Ok(mut ws) = accept(tls) else { return };
+                loop {
+                    match ws.read() {
+                        Ok(Message::Text(text)) => {
+                            let frame = serde_json::from_str(&text).unwrap_or(Value::Null);
+                            recorded
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .push(frame);
+                            break;
+                        }
+                        Ok(_) => continue,
+                        Err(_) => return,
+                    }
+                }
+                for event in &events {
+                    if ws.send(Message::text(event.to_string())).is_err() {
+                        return;
+                    }
+                }
+                while ws.read().is_ok() {}
+            });
+        }
+    });
+    TlsModelEndpoint {
+        addr,
+        bodies,
+        cert_der,
+        _certs: certs_dir,
+    }
+}

@@ -28,6 +28,11 @@ Last updated: 2026-10-29.
 - MCP legacy HTTP+SSE transport
 - Extensions: tool output trimmer, Codex tool, hosted multi-agent (experimental)
 
+## 0.7.0 (released)
+
+- Sandbox and runner-tracing parity completed: pause releases the sandbox like Python's, bounded reads
+  sanitize failures, the E2B client has Python's timeouts
+
 ## 0.6.0 (released)
 
 - Python test-suite parity: the Python SDK's tests were triaged and ported as Rust tests, and the

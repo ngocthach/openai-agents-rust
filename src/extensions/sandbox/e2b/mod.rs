@@ -507,6 +507,19 @@ impl Default for E2BSandboxClient {
     }
 }
 
+/// The HTTP client a client builds for itself.
+///
+/// The E2B SDK gives every request a 60 second timeout, so a response that stalls surfaces as a
+/// retryable `TimeoutException` instead of holding the caller forever. The same bound applies
+/// here as an idle limit between reads, which leaves a large download that keeps flowing alone.
+fn default_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(60))
+        .read_timeout(Duration::from_secs(60))
+        .build()
+        .unwrap_or_default()
+}
+
 impl E2BSandboxClient {
     /// A client reading its credentials from the environment.
     pub fn new() -> Self {
@@ -517,7 +530,7 @@ impl E2BSandboxClient {
     pub fn with_options(options: E2BSandboxClientOptions) -> Self {
         E2BSandboxClient {
             options,
-            http: reqwest::Client::new(),
+            http: default_http_client(),
             snapshot: None,
         }
     }
@@ -1440,7 +1453,7 @@ impl SandboxSession for E2BSandboxSession {
         self.download_at(&resolved, None).await
     }
 
-    async fn read_bounded(&self, path: &str, max_bytes: usize) -> SandboxResult<Vec<u8>> {
+    async fn read_bounded_unchecked(&self, path: &str, max_bytes: usize) -> SandboxResult<Vec<u8>> {
         if max_bytes == 0 {
             return Err(bounded_read_zero());
         }

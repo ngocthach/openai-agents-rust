@@ -441,3 +441,58 @@ async fn stream_disabled_tracing_doesnt_create_span() {
     );
     assert!(rec.ordered_spans().is_empty());
 }
+
+#[cfg(feature = "websocket")]
+#[tokio::test]
+async fn stream_non_data_tracing_preserves_id_for_https_official_websocket() {
+    use openai_agents_sdk::models::openai_responses_ws::OpenAIResponsesWSModel;
+
+    if !support::openssl_available() {
+        eprintln!("{}", support::OPENSSL_SKIP_MESSAGE);
+        return;
+    }
+    let _lock = lock_async().await;
+    let rec = SpanRecorder::new();
+    let _pipeline = Pipeline::install(vec![rec.clone() as Arc<dyn TracingProcessor>]);
+    let provider_response_id = "resp-official-ws";
+    // The model dials a local secure WebSocket server for the official host and trusts its
+    // throwaway certificate; the URL and the client's base URL stay the official ones.
+    let endpoint = support::start_tls_ws_endpoint(vec![completed_event(provider_response_id)]);
+    let model = OpenAIResponsesWSModel::new("test-model", OpenAIClient::new("sk-test"))
+        .with_websocket_base_url("https://api.openai.com/v1")
+        .with_test_transport(endpoint.addr, support::trusting_client_config(&endpoint));
+    assert!(!model.supports_default_prompt_cache_key());
+
+    let events: Vec<Value> = trace("test")
+        .run(async {
+            let stream = model
+                .stream_response(request(ModelTracing::EnabledWithoutData))
+                .await
+                .unwrap();
+            stream.map(|e| e.unwrap()).collect().await
+        })
+        .await;
+
+    assert_eq!(events.last().unwrap()["type"], "response.completed");
+    assert_eq!(
+        events.last().unwrap()["response"]["id"],
+        provider_response_id
+    );
+    let spans = rec.ordered_spans();
+    let [span] = spans.as_slice() else {
+        panic!("one span, got {}", spans.len())
+    };
+    let SpanData::Response {
+        response_id,
+        usage,
+        response,
+        input,
+    } = span.data()
+    else {
+        panic!("response span expected")
+    };
+    assert_eq!(response_id.as_deref(), Some(provider_response_id));
+    assert!(response.is_none());
+    assert!(input.is_none());
+    assert!(usage.is_some());
+}

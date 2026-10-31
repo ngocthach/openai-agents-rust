@@ -3478,7 +3478,10 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
                         replay_unsafe_request,
                     ),
                 ));
+                // Poll the guardrail first, as Python starts its task before the model call: a
+                // guardrail that trips without awaiting wins, and the model call never starts.
                 tokio::select! {
+                    biased;
                     g = &mut guard => {
                         if g.0.iter().any(|r| r.output.tripwire_triggered) || g.1.is_err() {
                             // Dropping the model future cancels the in-flight call.

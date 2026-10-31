@@ -274,7 +274,8 @@ async fn masked<F: std::future::Future>(disabled: bool, fut: F) -> F::Output {
 /// Owns the teardown of a sandbox session for the duration of a run.
 ///
 /// A session created from a [`SandboxRunConfig::client`] is released by
-/// [`close`](Self::close) or kept alive by [`suspend`](Self::suspend); a session supplied
+/// [`close`](Self::close) or [`suspend`](Self::suspend) (which also releases it, after capturing
+/// the state a later run resumes from); a session supplied
 /// through [`SandboxRunConfig::session`] is left untouched, because the caller owns it.
 #[derive(Debug, Clone)]
 pub struct SandboxSessionGuard {
@@ -302,6 +303,30 @@ impl SandboxSessionGuard {
     /// `stop()` does, so what the run produced outlives the workspace. The session is released
     /// even when the capture fails, and the failure is reported afterwards.
     pub async fn close(self) -> Result<()> {
+        self.release(true).await.map(|_| ())
+    }
+
+    /// Release the session and return the state needed to resume it later.
+    ///
+    /// Mirrors Python, where a paused run is cleaned up exactly like a finished one: interactive
+    /// processes are terminated, the workspace is captured into the session's snapshot, and the
+    /// session is stopped, shut down and deleted. Nothing is left on the host or at the backend;
+    /// the returned state names the snapshot a later run restores the workspace from. A session
+    /// the caller supplied is only captured, never released, because the caller owns it.
+    pub async fn suspend(self) -> Result<SandboxSessionState> {
+        let session = self.session.clone();
+        let persisted = persist_session_snapshot(session.as_ref()).await;
+        // The state is read after the capture, so it names the snapshot just taken, and before
+        // the release, because deleting the session invalidates what it reports.
+        let state = session.session_state();
+        // Capturing happened above; the release must not capture a second time.
+        let released = self.release(false).await;
+        persisted?;
+        released?;
+        Ok(state)
+    }
+
+    async fn release(self, persist: bool) -> Result<()> {
         let owned = self.client.is_some();
         let tracing_disabled = self.tracing_disabled;
         let teardown = async move {
@@ -309,7 +334,13 @@ impl SandboxSessionGuard {
             match self.client {
                 None => Ok(()),
                 Some(client) => {
-                    let persisted = persist_session_snapshot(self.session.as_ref()).await;
+                    // A session with a snapshot configured is captured before it is released,
+                    // and released even when the capture fails; the failure is reported after.
+                    let persisted = if persist {
+                        persist_session_snapshot(self.session.as_ref()).await
+                    } else {
+                        Ok(())
+                    };
                     client.delete(self.session).await?;
                     Ok(persisted?)
                 }
@@ -331,16 +362,6 @@ impl SandboxSessionGuard {
             ),
         )
         .await
-    }
-
-    /// Keep the session alive for a later run and return the state needed to reattach to it.
-    ///
-    /// Interactive processes are terminated and the workspace is captured into the session's
-    /// snapshot, but neither the workspace nor the backend resource is released.
-    pub async fn suspend(self) -> Result<SandboxSessionState> {
-        let _ = self.session.pty_terminate_all().await;
-        persist_session_snapshot(self.session.as_ref()).await?;
-        Ok(self.session.session_state())
     }
 }
 

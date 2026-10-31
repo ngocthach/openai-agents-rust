@@ -1448,7 +1448,7 @@ impl SandboxSession for BlaxelSandboxSession {
         self.read_internal(&resolved, None).await
     }
 
-    async fn read_bounded(&self, path: &str, max_bytes: usize) -> SandboxResult<Vec<u8>> {
+    async fn read_bounded_unchecked(&self, path: &str, max_bytes: usize) -> SandboxResult<Vec<u8>> {
         if max_bytes == 0 {
             return Err(crate::sandbox::http::bounded_read_zero());
         }

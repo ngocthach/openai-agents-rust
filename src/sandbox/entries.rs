@@ -234,6 +234,20 @@ impl Entry {
         )
     }
 
+    /// The entry's Python `type` discriminator, with a mount reported as its own mount type
+    /// (`s3_mount`, `gcs_mount`, `r2_mount`, `azure_blob_mount`) rather than the generic
+    /// `mount` that [`type_name`](Self::type_name) uses for digests.
+    pub fn type_discriminator(&self) -> &'static str {
+        if let EntryKind::Mount { mount } = &self.kind
+            && let Some(strategy) = mount.strategy.as_any().and_then(|any| {
+                any.downcast_ref::<crate::sandbox::mount_entries::ConfiguredMountStrategy>()
+            })
+        {
+            return strategy.mount_type();
+        }
+        self.type_name()
+    }
+
     /// The entry type name, matching the Python `type` discriminator.
     pub fn type_name(&self) -> &'static str {
         match self.kind {
