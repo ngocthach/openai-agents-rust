@@ -696,6 +696,10 @@ async fn collect(
             break;
         }
     }
+    // Read the exit code once: a process that exits between the loop and the report must be
+    // reported as closed with its code, never as both still running and exited.
+    let exit_code = process.exit_code();
+    let closed = closed || exit_code.is_some();
     if !closed {
         // An unfinished process may have been cut mid-character; carry those bytes over.
         output.extend(process.take_output(true));
@@ -709,7 +713,7 @@ async fn collect(
     PtyExecUpdate {
         process_id: (!closed).then_some(process.id),
         output: text.into_bytes(),
-        exit_code: process.exit_code(),
+        exit_code,
         original_token_count,
     }
 }

@@ -13,7 +13,8 @@ use crate::items::InputItem;
 use crate::models::OpenAIClient;
 
 /// The Conversations items-create endpoint accepts at most this many items per request.
-const MAX_ITEMS_PER_REQUEST: usize = 20;
+/// The most items one Conversations items-create request carries.
+pub(crate) const MAX_ITEMS_PER_REQUEST: usize = 20;
 
 /// Stores history server-side in an OpenAI conversation (`conv_...`).
 ///

@@ -331,6 +331,13 @@ impl MountStrategy for ModalCloudBucketMountStrategy {
         false
     }
 
+    /// Inline credentials and a named Modal secret are both authority the bucket was attached
+    /// with: persisted state must not let a sandbox that holds them be reattached on its own, and
+    /// provider errors are not allowed to echo them.
+    fn carries_credentials(&self, _mount: &Mount) -> bool {
+        !self.config.credentials.is_empty() || self.config.secret_name.is_some()
+    }
+
     async fn activate(
         &self,
         mount: &Mount,
@@ -414,6 +421,16 @@ impl ModalCloudBucketMountConfig {
         }
 
         if let Some(gcs) = any.downcast_ref::<GcsMount>() {
+            // Modal speaks only the HMAC interface. A mount using native auth would otherwise
+            // be attached unsigned; a named Modal secret goes through
+            // `ModalCloudBucketMountConfig::gcs` instead.
+            if !gcs.uses_s3_compatible_api() {
+                return Err(SandboxError::new(
+                    ErrorCode::MountConfigInvalid,
+                    "gcs modal cloud bucket mounts require access_id and secret_access_key",
+                )
+                .with_context("type", mount.mount_type().to_string()));
+            }
             let mut config = ModalCloudBucketMountConfig::gcs(gcs.bucket.clone());
             if let Some(endpoint_url) = &gcs.endpoint_url {
                 config.bucket_endpoint_url = Some(endpoint_url.clone());

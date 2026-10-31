@@ -1395,6 +1395,11 @@ impl crate::sandbox::session::SandboxSession for InstrumentedSession {
     }
 
     async fn persist_workspace(&self) -> SandboxResult<Vec<u8>> {
+        // Before any archive work, as Python's session wrapper does: an unsafe mount is refused
+        // without a byte of the workspace being captured.
+        self.inner
+            .manifest()
+            .validate_mount_credential_boundaries()?;
         self.record(
             SandboxOp::PersistWorkspace,
             Vec::new(),
@@ -1404,6 +1409,9 @@ impl crate::sandbox::session::SandboxSession for InstrumentedSession {
     }
 
     async fn hydrate_workspace(&self, archive: &[u8]) -> SandboxResult<()> {
+        self.inner
+            .manifest()
+            .validate_mount_credential_boundaries()?;
         self.record(
             SandboxOp::HydrateWorkspace,
             vec![("bytes".to_string(), archive.len().to_string())],
@@ -1516,6 +1524,10 @@ impl crate::sandbox::session::SandboxSession for InstrumentedSession {
 
     fn has_read_only_grant(&self) -> bool {
         self.inner.has_read_only_grant()
+    }
+
+    fn resolves_paths_remotely(&self) -> bool {
+        self.inner.resolves_paths_remotely()
     }
 
     fn normalize_path_for_write(&self, path: &str) -> SandboxResult<String> {

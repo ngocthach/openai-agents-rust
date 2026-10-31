@@ -226,33 +226,70 @@ fn normalize_output_items(output: &[Value]) -> Result<Vec<InputItem>> {
 /// Walks both backwards, consuming exchange digests as it goes: items the exchange contains but
 /// storage does not are skipped, while a stored item that is missing or out of order ends the
 /// match. `session_items.len()` means nothing matched.
+#[cfg(test)]
 fn match_model_exchange_suffix(
     session_items: &[InputItem],
     model_exchange: &[String],
     ignore_ids_for_matching: bool,
 ) -> usize {
-    let mut remaining = model_exchange.len();
-    let mut matched = 0usize;
-    for item in session_items.iter().rev() {
-        let digest = if ignore_ids_for_matching {
+    match_model_exchange(
+        session_items,
+        model_exchange,
+        ignore_ids_for_matching,
+        false,
+    )
+    .0
+}
+
+/// [`match_model_exchange_suffix`] that can also match a stored reasoning item without its id,
+/// which is how the run sent it when it omitted reasoning ids. Returns where the matched suffix
+/// starts and the matched items in the form the model saw them (the stored copy, or that copy
+/// without its reasoning id when only the latter matched).
+fn match_model_exchange(
+    session_items: &[InputItem],
+    model_exchange: &[String],
+    ignore_ids_for_matching: bool,
+    omit_reasoning_item_ids: bool,
+) -> (usize, Vec<InputItem>) {
+    let digest_of = |item: &InputItem| {
+        if ignore_ids_for_matching {
             compaction_item_digest(&crate::run_internal::strip_item_id(item.clone()))
         } else {
             compaction_item_digest(item)
-        };
-        let mut found = false;
+        }
+    };
+    let mut remaining = model_exchange.len();
+    let mut matched: Vec<InputItem> = Vec::new();
+    for item in session_items.iter().rev() {
+        let digest = digest_of(item);
+        let without_reasoning_id =
+            (omit_reasoning_item_ids && item.item_type() == Some("reasoning")).then(|| {
+                let mut value = item.as_value().clone();
+                if let Value::Object(map) = &mut value {
+                    map.remove("id");
+                }
+                InputItem::from_value(value)
+            });
+        let normalized_digest = without_reasoning_id.as_ref().map(digest_of);
+        let mut found = None;
         while remaining > 0 {
             remaining -= 1;
             if model_exchange[remaining] == digest {
-                found = true;
+                found = Some(item.clone());
+                break;
+            }
+            if normalized_digest.as_ref() == Some(&model_exchange[remaining]) {
+                found = without_reasoning_id.clone();
                 break;
             }
         }
-        if !found {
-            break;
+        match found {
+            Some(item) => matched.push(item),
+            None => break,
         }
-        matched += 1;
     }
-    session_items.len() - matched
+    matched.reverse();
+    (session_items.len() - matched.len(), matched)
 }
 
 /// The `call_id` of a tool or program call item.
@@ -423,7 +460,7 @@ impl OpenAIResponsesCompactionSession {
     /// Whether item ids must be ignored when matching stored history against the model
     /// exchange, inherited from the wrapped store. Port of `_ignore_ids_for_matching`.
     fn ignore_ids_for_matching(&self) -> bool {
-        self.underlying.manages_history_remotely()
+        self.underlying.ignores_item_ids_for_matching()
     }
 
     /// Fail when the wrapped store manages its own history on the provider's servers.
@@ -572,7 +609,7 @@ impl OpenAIResponsesCompactionSession {
     }
 
     async fn run_compaction_locked(&self, args: OpenAIResponsesCompactionArgs) -> Result<Usage> {
-        self.run_compaction_inner(args, None).await
+        self.run_compaction_inner(args, None, false).await
     }
 
     /// The compaction body.
@@ -585,6 +622,7 @@ impl OpenAIResponsesCompactionSession {
         &self,
         args: OpenAIResponsesCompactionArgs,
         model_exchange: Option<&[String]>,
+        omit_reasoning_item_ids: bool,
     ) -> Result<Usage> {
         let (response_id, mut resolved_mode) = {
             let mut state = self.state.lock().await;
@@ -617,13 +655,14 @@ impl OpenAIResponsesCompactionSession {
 
         // A manual call always replaces the whole history, so its budget is checked up front,
         // before the compaction API is asked to do any work.
-        let session_items = if model_exchange.is_none() {
-            self.all_underlying_items().await?
-        } else {
-            self.store()
-                .get_items(Some(ALL_SESSION_ITEMS_LIMIT))
-                .await?
-        };
+        // An automatic compaction shows the hook the history the run could read (the store's
+        // default view); the exact replaceable window is read, and approved again, afterwards.
+        // A manual call still bounds its rollback budget on the complete history, but then
+        // compacts the window the store's retrieval settings expose, as Python does.
+        if model_exchange.is_none() && self.max_rollback_items.is_some() {
+            self.all_underlying_items().await?;
+        }
+        let session_items = self.store().get_items(None).await?;
         let candidates = select_compaction_candidate_items(&session_items);
         let approved_mode = resolved_mode;
         let approved_items = session_items.clone();
@@ -652,15 +691,15 @@ impl OpenAIResponsesCompactionSession {
                 // exchange covers its complete history before the whole of it is replaced.
                 // Without this a store whose history is longer than the run loaded would have
                 // the older part summarized away by a chain that never contained it.
-                let bounded = store.get_items(Some(window)).await?;
-                let complete = bounded.len() < window;
-                if !complete
-                    || match_model_exchange_suffix(
-                        &bounded,
-                        model_exchange,
-                        self.ignore_ids_for_matching(),
-                    ) > 0
-                {
+                let stored = store.get_items(Some(window)).await?;
+                let complete = stored.len() < window;
+                let (uncovered, bounded) = match_model_exchange(
+                    &stored,
+                    model_exchange,
+                    self.ignore_ids_for_matching(),
+                    omit_reasoning_item_ids,
+                );
+                if !complete || uncovered > 0 {
                     log::warn!(target: crate::logger::LOG_TARGET,
                         "Skipped automatic compaction because the stored history could not be \
                          fully matched to the latest model exchange and this store cannot \
@@ -668,8 +707,29 @@ impl OpenAIResponsesCompactionSession {
                     );
                     return Ok(Usage::default());
                 }
+                // `bounded` is the whole history (a read shorter than its window is complete),
+                // so it is also what gets checked, approved and compacted. Keep tool and
+                // approval groups intact, including calls whose outputs are still pending.
+                if !has_complete_tool_groups(&bounded) {
+                    log::warn!(target: crate::logger::LOG_TARGET,
+                        "Skipped automatic compaction because the stored history splits a tool \
+                         call group; history was retained"
+                    );
+                    return Ok(Usage::default());
+                }
+                if bounded != approved_items
+                    && !(self.should_trigger)(&CompactionContext {
+                        response_id: response_id.clone(),
+                        compaction_mode: resolved_mode,
+                        compaction_candidate_items: select_compaction_candidate_items(&bounded),
+                        session_items: bounded.clone(),
+                    })
+                {
+                    log::debug!(target: crate::logger::LOG_TARGET, "skip: decision hook declined the reloaded compaction snapshot");
+                    return Ok(Usage::default());
+                }
                 return self
-                    .compact_whole_history(response_id, resolved_mode, context.session_items)
+                    .compact_whole_history(response_id, resolved_mode, bounded, false)
                     .await;
             };
             if found.items.len() != found.handles.len() {
@@ -679,11 +739,13 @@ impl OpenAIResponsesCompactionSession {
                 ));
             }
 
-            suffix_start = match_model_exchange_suffix(
+            let (start, matched_items) = match_model_exchange(
                 &found.items,
                 model_exchange,
                 self.ignore_ids_for_matching(),
+                omit_reasoning_item_ids,
             );
+            suffix_start = start;
             if suffix_start == found.items.len() {
                 log::warn!(target: crate::logger::LOG_TARGET,
                     "Skipped automatic compaction because the stored history could not be \
@@ -719,7 +781,8 @@ impl OpenAIResponsesCompactionSession {
                 suffix_start += boundary;
             }
 
-            items_to_compact = found.items[suffix_start..].to_vec();
+            // The matched items in the form the model saw them, from the replaceable boundary.
+            items_to_compact = matched_items[suffix_start - start..].to_vec();
 
             // Keep tool and approval groups intact, including calls whose outputs are still
             // pending: wait for them rather than compacting the call away.
@@ -752,7 +815,7 @@ impl OpenAIResponsesCompactionSession {
 
         let Some(snapshot) = snapshot else {
             return self
-                .compact_whole_history(response_id, resolved_mode, context.session_items)
+                .compact_whole_history(response_id, resolved_mode, context.session_items, true)
                 .await;
         };
 
@@ -782,6 +845,7 @@ impl OpenAIResponsesCompactionSession {
         response_id: Option<String>,
         resolved_mode: ResolvedCompactionMode,
         session_items: Vec<InputItem>,
+        window_only: bool,
     ) -> Result<Usage> {
         // Check the rollback budget before the request, so an oversized history costs nothing.
         // The automatic path reaches here only when the store has no atomic suffix
@@ -798,7 +862,14 @@ impl OpenAIResponsesCompactionSession {
         // those items. This also refreshes the rollback snapshot, so a failed replacement
         // cannot revive items that expired meanwhile.
         let current_items = self.all_underlying_items().await?;
-        if current_items != session_items {
+        // A manual call compacted the store's retrieval window, so that is the view that must
+        // be unchanged; the complete history is still what a failed replacement restores.
+        let unchanged = if window_only {
+            self.store().get_items(None).await? == session_items
+        } else {
+            current_items == session_items
+        };
+        if !unchanged {
             log::warn!(target: crate::logger::LOG_TARGET,
                 "Skipped compaction replacement because the stored history changed while the \
                  compaction request was in flight; history was retained"
@@ -942,10 +1013,8 @@ impl OpenAIResponsesCompactionSession {
             state.last_unstored_response_id.as_deref(),
         );
         drop(state);
-        let session_items = self
-            .store()
-            .get_items(Some(ALL_SESSION_ITEMS_LIMIT))
-            .await?;
+        // The hook sees the window the store's retrieval settings expose, as in a run.
+        let session_items = self.store().get_items(None).await?;
         let context = CompactionContext {
             response_id: Some(response_id.to_string()),
             compaction_mode: mode,
@@ -972,6 +1041,11 @@ impl Session for OpenAIResponsesCompactionSession {
     /// Automatic suffix replacement needs the exchange, so the runner records it.
     fn wants_model_exchange(&self) -> bool {
         true
+    }
+
+    /// The runner digests the model exchange the way the wrapped store hands items back.
+    fn ignores_item_ids_for_matching(&self) -> bool {
+        self.ignore_ids_for_matching()
     }
 
     /// Compact through `wrap(stored)` instead of the stored form an outer session transforms.
@@ -1034,6 +1108,7 @@ impl Session for OpenAIResponsesCompactionSession {
                 force,
             },
             model_exchange,
+            info.omit_reasoning_item_ids,
         )
         .await
     }

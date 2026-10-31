@@ -238,7 +238,161 @@ pub(super) fn validate_envelope(value: &Value, version: &str) -> Result<()> {
             ));
         }
     }
+    validate_pending_session_write(value, version)?;
+    validate_terminal_marker(value, version)?;
     Ok(())
+}
+
+/// The keys a pending Session write may carry beyond the four base keys, gated by the schema
+/// version that introduced each. Released readers validate the object by exact key set.
+fn pending_write_keys(version: &str) -> (Vec<&'static str>, Vec<&'static str>) {
+    let compaction = if schema_version_at_least(version, 1, 18) {
+        vec![
+            "response_id",
+            "store",
+            "has_local_tool_outputs",
+            "append_acknowledged",
+            "compaction_model_exchange",
+        ]
+    } else {
+        Vec::new()
+    };
+    let held = if schema_version_at_least(version, 1, 19) {
+        vec!["held", "reasoning_item_id_policy", "current_response"]
+    } else {
+        Vec::new()
+    };
+    (compaction, held)
+}
+
+fn is_policy_literal(value: &Value) -> bool {
+    matches!(value, Value::Null) || matches!(value.as_str(), Some("preserve" | "omit"))
+}
+
+/// Port of the pending Session write validation of `_deserialize_run_state`.
+fn validate_pending_session_write(value: &Value, version: &str) -> Result<()> {
+    let Some(pending) = value.get("pending_session_write").filter(|v| !v.is_null()) else {
+        return Ok(());
+    };
+    let invalid = || AgentsError::user("Run state pending Session write is invalid");
+    let step_type = value
+        .get("current_step")
+        .and_then(|s| s.get("type"))
+        .and_then(Value::as_str);
+    let current_turn = value
+        .get("current_turn")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let Value::Object(map) = pending else {
+        return Err(invalid());
+    };
+    if !schema_version_at_least(version, 1, 17)
+        || !matches!(
+            step_type,
+            Some("next_step_run_again" | "next_step_interruption")
+        )
+    {
+        return Err(invalid());
+    }
+    let (compaction, held_keys) = pending_write_keys(version);
+    let base = ["session_id", "items", "before", "persisted_count"];
+    if !base.iter().all(|k| map.contains_key(*k))
+        || map.keys().any(|k| {
+            !base.contains(&k.as_str())
+                && !compaction.contains(&k.as_str())
+                && !held_keys.contains(&k.as_str())
+        })
+    {
+        return Err(invalid());
+    }
+    let held = map.get("held");
+    if held.is_some_and(|h| !h.is_boolean()) {
+        return Err(invalid());
+    }
+    let is_held = held == Some(&Value::Bool(true));
+    let before = map.get("before").filter(|b| !b.is_null());
+    if is_held && (before.is_some() || !map.contains_key("current_response")) {
+        return Err(invalid());
+    }
+    if map
+        .get("reasoning_item_id_policy")
+        .is_some_and(|p| !is_policy_literal(p))
+    {
+        return Err(invalid());
+    }
+    let items = map.get("items").and_then(Value::as_array);
+    if let Some(boundary) = map.get("current_response") {
+        let ok = boundary.as_object().is_some_and(|b| {
+            b.len() == 2
+                && b.get("turn")
+                    .and_then(Value::as_i64)
+                    .is_some_and(|t| (0..=current_turn).contains(&t))
+                && b.get("start").and_then(Value::as_i64).is_some_and(|start| {
+                    items.is_some_and(|i| start >= 0 && start as usize <= i.len())
+                })
+        });
+        if !ok {
+            return Err(invalid());
+        }
+    }
+    if !is_held
+        && (map.contains_key("reasoning_item_id_policy") || map.contains_key("current_response"))
+    {
+        return Err(invalid());
+    }
+    if !map.get("session_id").is_some_and(Value::is_string)
+        || !items.is_some_and(|i| !i.is_empty() && i.iter().all(Value::is_object))
+    {
+        return Err(invalid());
+    }
+    if before.is_some_and(|b| {
+        !b.as_array()
+            .is_some_and(|rows| rows.iter().all(Value::is_string))
+    }) {
+        return Err(invalid());
+    }
+    if !map.get("persisted_count").is_some_and(|n| n.is_u64()) {
+        return Err(invalid());
+    }
+    if map
+        .get("response_id")
+        .is_some_and(|v| !v.is_null() && !v.is_string())
+        || map
+            .get("store")
+            .is_some_and(|v| !v.is_null() && !v.is_boolean())
+        || map
+            .get("append_acknowledged")
+            .is_some_and(|v| !v.is_boolean())
+        || (map.get("append_acknowledged") == Some(&Value::Bool(true)) && before.is_none())
+        || map
+            .get("has_local_tool_outputs")
+            .is_some_and(|v| !v.is_boolean())
+    {
+        return Err(invalid());
+    }
+    if let Some(exchange) = map.get("compaction_model_exchange") {
+        let ok = exchange.as_object().is_some_and(|e| {
+            e.len() == 2
+                && e.get("item_digests")
+                    .and_then(Value::as_array)
+                    .is_some_and(|d| d.iter().all(Value::is_string))
+                && e.get("reasoning_item_id_policy")
+                    .is_some_and(is_policy_literal)
+        });
+        if !ok {
+            return Err(invalid());
+        }
+    }
+    Ok(())
+}
+
+/// The terminal marker is only honored on the schema boundary that introduced it.
+fn validate_terminal_marker(value: &Value, version: &str) -> Result<()> {
+    match value.get("terminal_unrecoverable") {
+        None | Some(Value::Null) => Ok(()),
+        Some(Value::Bool(true)) if schema_version_at_least(version, 1, 17) => Ok(()),
+        Some(_) => Err(AgentsError::user("Run state terminal marker is invalid")),
+    }
 }
 
 /// Whether a serialized tool guardrail result belongs to the `expected` list. Port of the type
@@ -317,16 +471,25 @@ pub(super) fn reconstruct_legacy_pending_bindings(state: &mut RunState) {
         {
             continue;
         }
-        state
-            .tool_invocations
-            .entry(id.call_id)
-            .or_insert(ToolInvocationRecord {
-                invocation_type: id.invocation_type,
-                approval_scope: id.approval_scope,
-                fingerprint: id.fingerprint,
-                executed: true,
-                completed: true,
-            });
+        // A pending call bound to other arguments under the same id loses to the completed
+        // call: the id was already used for a different invocation, which the resumed run
+        // refuses instead of running the changed call.
+        let record = ToolInvocationRecord {
+            invocation_type: id.invocation_type,
+            approval_scope: id.approval_scope,
+            fingerprint: id.fingerprint,
+            executed: true,
+            completed: true,
+        };
+        match state.tool_invocations.get(&id.call_id) {
+            Some(existing) if !existing.completed && existing.fingerprint != record.fingerprint => {
+                state.tool_invocations.insert(id.call_id, record);
+            }
+            Some(_) => {}
+            None => {
+                state.tool_invocations.insert(id.call_id, record);
+            }
+        }
     }
 }
 
@@ -492,6 +655,62 @@ fn agent_ref_with_identity(name: &str, identity: Option<&str>) -> Value {
         Some(identity) if identity != name => json!({ "name": name, "identity": identity }),
         _ => agent_ref(name),
     }
+}
+
+/// Give every approval item owned by the agent called `name` that agent's identity key, so a
+/// restored snapshot can tell same-named agents apart.
+fn stamp_approval_owner_identity(value: &mut Value, name: &str, identity: &str) {
+    match value {
+        Value::Object(map) => {
+            if map.get("type").and_then(Value::as_str) == Some("tool_approval_item")
+                && let Some(Value::Object(agent)) = map.get_mut("agent")
+                && agent.get("name").and_then(Value::as_str) == Some(name)
+                && !agent.contains_key("identity")
+            {
+                agent.insert("identity".into(), Value::String(identity.to_string()));
+            }
+            for child in map.values_mut() {
+                stamp_approval_owner_identity(child, name, identity);
+            }
+        }
+        Value::Array(items) => {
+            for child in items {
+                stamp_approval_owner_identity(child, name, identity);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Call ids of parked approvals whose recorded owner is another agent sharing the current
+/// agent's name. From schema 1.7 duplicate-named owners are persisted by identity, and an owner
+/// that resolves to a sibling (or carries no identity, which resolves to the first agent of that
+/// name) does not own the call; earlier schemas named owners by agent name only. Port of
+/// `_approval_matches_agent`.
+pub(super) fn foreign_owner_call_ids(state: &RunState, value: &Value) -> BTreeSet<String> {
+    let current_identity = state
+        .current_agent_identity
+        .as_deref()
+        .unwrap_or(&state.current_agent_name);
+    state
+        .interruptions
+        .iter()
+        .zip(
+            value
+                .get("current_step")
+                .and_then(|step| step.get("data"))
+                .and_then(|data| data.get("interruptions"))
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten(),
+        )
+        .filter(|(item, _)| item.agent == state.current_agent_name)
+        .filter(|(item, wire)| {
+            let owner = agent_identity_of(wire.get("agent")).unwrap_or_else(|| item.agent.clone());
+            owner != current_identity
+        })
+        .map(|(item, _)| item.call_id().to_string())
+        .collect()
 }
 
 fn agent_identity_of(value: Option<&Value>) -> Option<String> {
@@ -1014,6 +1233,23 @@ fn function_call_from_raw(raw: &Value) -> Option<crate::items::FunctionCall> {
     })
 }
 
+/// A `tool_call_output_item` holding a `local_shell_call_output` whose call id or output is not
+/// a usable string. Python validates the shell output strictly and drops such an item.
+fn is_invalid_local_shell_output_item(item: &Value) -> bool {
+    item.get("type").and_then(Value::as_str) == Some("tool_call_output_item")
+        && item
+            .get("raw_item")
+            .filter(|raw| {
+                raw.get("type").and_then(Value::as_str) == Some("local_shell_call_output")
+            })
+            .is_some_and(|raw| {
+                raw.get("call_id")
+                    .and_then(Value::as_str)
+                    .is_none_or(str::is_empty)
+                    || !raw.get("output").is_some_and(Value::is_string)
+            })
+}
+
 fn run_item_from_wire(value: &Value) -> Result<RunItem> {
     let mut value = value.clone();
     if let Value::Object(m) = &mut value {
@@ -1497,22 +1733,18 @@ fn processed_response_from_wire(value: &Value) -> Result<ProcessedResponseSnapsh
             })
             .transpose()?
             .unwrap_or_default(),
+        // Python keeps only list-shaped bindings and ignores the rest.
         mcp_tool_bindings: value
             .get("mcp_tool_bindings")
             .and_then(Value::as_object)
             .map(|m| {
                 m.iter()
-                    .map(|(k, v)| {
-                        let labels = v
-                            .as_array()
-                            .map(|a| {
-                                a.iter()
-                                    .filter_map(Value::as_str)
-                                    .map(str::to_string)
-                                    .collect()
-                            })
-                            .unwrap_or_default();
-                        (k.clone(), labels)
+                    .filter_map(|(k, v)| {
+                        let parts = v.as_array()?;
+                        let server = parts.first()?.as_str()?.to_string();
+                        let tool = parts.get(1)?.as_str()?.to_string();
+                        let index = parts.get(2).and_then(Value::as_u64).map(|i| i as usize);
+                        Some((k.clone(), (server, tool, index)))
                     })
                     .collect()
             })
@@ -1803,6 +2035,9 @@ pub(super) fn to_wire(state: &RunState, include_tracing_api_key: bool) -> Result
                     .collect::<Vec<_>>(),
             },
         })
+    } else if state.pending_session_write.is_some() {
+        // A standing pending write is only valid on a resumable step.
+        json!({"type": "next_step_run_again"})
     } else {
         Value::Null
     };
@@ -1916,8 +2151,13 @@ pub(super) fn to_wire(state: &RunState, include_tracing_api_key: bool) -> Result
             "model_input_start": state.model_input_start,
             "final_output": state.final_output,
             "server_conversation": state.server_conversation,
+            "withheld_output_call_ids": state.withheld_output_call_ids,
         },
     });
+    // Approvals parked by a duplicate-named current agent record which duplicate owns them.
+    if let Some(identity) = state.current_agent_identity.as_deref() {
+        stamp_approval_owner_identity(&mut envelope, &state.current_agent_name, identity);
+    }
     if let Some(sandbox) = &state.sandbox
         && let Value::Object(map) = &mut envelope
     {
@@ -2009,12 +2249,24 @@ pub(super) fn from_wire(value: &Value, version: &str) -> Result<RunState> {
     let context = value.get("context").cloned().unwrap_or(Value::Null);
     let rust = value.get("rust").cloned().unwrap_or(Value::Null);
 
+    // A snapshot that carries a ledger, or predates it, loses a shell output its strict model
+    // rejects (one without a call id) instead of failing: the completed-invocation check then
+    // decides whether the loss is tolerable. Any other snapshot refuses the item.
+    let (strict_major, strict_minor) = super::STRICT_APPROVAL_BINDING_MIN_SCHEMA_VERSION;
+    let drops_invalid_shell_output = !schema_version_at_least(version, strict_major, strict_minor)
+        || context
+            .get("tool_invocations")
+            .and_then(Value::as_object)
+            .is_some_and(|ledger| !ledger.is_empty());
     let generated_items = value
         .get("generated_items")
         .and_then(Value::as_array)
         .map(|items| {
             items
                 .iter()
+                .filter(|item| {
+                    !(drops_invalid_shell_output && is_invalid_local_shell_output_item(item))
+                })
                 .map(run_item_from_wire)
                 .collect::<Result<Vec<_>>>()
         })
@@ -2185,6 +2437,15 @@ pub(super) fn from_wire(value: &Value, version: &str) -> Result<RunState> {
         server_sent_items: rust_usize("server_sent_items", 0),
         server_input_sent: rust_bool("server_input_sent"),
         session_saved_items: rust_usize("session_saved_items", 0),
+        withheld_output_call_ids: rust
+            .get("withheld_output_call_ids")
+            .and_then(Value::as_array)
+            .map(|ids| {
+                ids.iter()
+                    .filter_map(|id| id.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default(),
         input_saved_to_session: rust_bool("input_saved_to_session"),
         final_output: rust.get("final_output").cloned().filter(|v| !v.is_null()),
         trace_id: value
@@ -2255,6 +2516,7 @@ pub(super) fn from_wire(value: &Value, version: &str) -> Result<RunState> {
         // Derived by `RunState::from_json` once the schema version is known; the wire format
         // never carries it.
         restored_unbound_approval_call_ids: Default::default(),
+        foreign_owner_call_ids: Default::default(),
         nested_history_owned_items: Vec::new(),
         tool_input: context.get("tool_input").cloned().filter(|v| !v.is_null()),
         current_response_boundary_unproven: !current_response_boundary_proven(value, version),

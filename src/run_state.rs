@@ -181,6 +181,11 @@ pub struct RunState {
     /// tail of `generated_items`, so a resume settles them together with the resolved turn.
     #[serde(default)]
     pub pending_session_write: Option<Value>,
+    /// Call ids of tool outputs a failed turn committed but never announced to a stream
+    /// consumer, because output guardrails could still have rejected them. The retry announces
+    /// exactly these. Rust-only: it travels under the envelope's `rust` key.
+    #[serde(default)]
+    pub withheld_output_call_ids: Vec<String>,
     /// Canonical identity of every tool call the run has seen, keyed by call id. Mirrors
     /// `RunContextWrapper._tool_invocations`: it binds an approval decision to the exact call
     /// it was given for, so a replay with mutated arguments is rejected rather than reused.
@@ -201,6 +206,12 @@ pub struct RunState {
     /// decision replaces the unbound one, the way Python's `_apply_approval_decision` does.
     #[serde(skip)]
     pub restored_unbound_approval_call_ids: BTreeSet<String>,
+    /// Call ids of parked approvals that belong to another agent sharing the current agent's
+    /// name (schema 1.7+ persists duplicate-name owners by identity). A decision on them
+    /// authorizes nothing for the current agent; unlike an unbound decision, a fresh decision
+    /// on the stale item does not change that. Derived on read, never written.
+    #[serde(skip)]
+    pub foreign_owner_call_ids: BTreeSet<String>,
     /// The snapshot's `context_meta` says its context cannot be rebuilt from the payload
     /// alone: it was written from a type the JSON does not describe, or omitted outright.
     /// Mirrors `_context_meta_requires_deserializer`. Read-only; derived on deserialization.
@@ -303,8 +314,10 @@ pub struct ProcessedResponseSnapshot {
     pub mcp_approval_requests: Vec<Value>,
     /// The approvals the turn is waiting on.
     pub interruptions: Vec<ToolApprovalItem>,
-    /// Hosted-MCP server labels bound to each call id.
-    pub mcp_tool_bindings: BTreeMap<String, Vec<String>>,
+    /// The MCP recipient each local MCP call was made to, keyed by call id, as `(server log
+    /// name, raw tool name, index in the agent's server list)`. An approval is only honoured
+    /// on the recipient it was granted for.
+    pub mcp_tool_bindings: BTreeMap<String, (String, String, Option<usize>)>,
     /// Index into `RunState::tool_output_guardrail_results` where the results of this
     /// response's still-pending tool calls start. Mirrors
     /// `ProcessedResponse.tool_output_guardrail_result_start` (schema 1.20); `None` when the
@@ -516,6 +529,14 @@ impl RunState {
             state.restored_unbound_approval_call_ids = state.unbound_approval_call_ids();
         } else if !is_legacy_rust {
             wire::reconstruct_legacy_pending_bindings(&mut state);
+            // A per-call decision (or restored history call) the reconstruction could not bind
+            // to an invocation is asked again. Port of the legacy branch of
+            // `_mark_restored_unbound_approval_call_ids`.
+            let unbound = state.unbound_approval_call_ids();
+            state.restored_unbound_approval_call_ids.extend(unbound);
+        }
+        if !is_legacy_rust && wire::schema_version_at_least(version, 1, 7) {
+            state.foreign_owner_call_ids = wire::foreign_owner_call_ids(&state, &value);
         }
         if state.context_requires_restoration {
             // Python logs the same warning here and leaves the decision to the caller;

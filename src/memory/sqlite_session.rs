@@ -29,14 +29,15 @@ fn sql_err(e: rusqlite::Error) -> AgentsError {
     AgentsError::other(format!("SQLite error: {e}"))
 }
 
-/// A table name is a bare ASCII identifier or a SQL double-quoted one (`"my table"`, with `""`
+/// A table name is a bare identifier (Unicode letters, digits and `_`, as SQLite and Python accept)
+/// or a SQL double-quoted one (`"my table"`, with `""`
 /// for an embedded quote).
 ///
 /// Python interpolates the configured names into SQL verbatim, so its released `SQLiteSession`
 /// accepts SQL-quoted identifiers (and, by accident, any SQL fragment). Rust accepts the same
 /// quoted identifiers but nothing else, so a table name can never inject SQL.
 fn valid_identifier(name: &str) -> bool {
-    if !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+    if !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_') {
         return true;
     }
     let Some(inner) = name

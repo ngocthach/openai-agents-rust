@@ -704,6 +704,24 @@ impl MountStrategy for VercelCloudBucketMountStrategy {
                 ));
             }
         }
+        // A URL that carries userinfo, a query or a fragment may hold a signature or token, and
+        // the endpoint reaches the mount command's argument vector, which is not a secret
+        // channel. Refuse it rather than put it there.
+        if let Some(endpoint) = &self.endpoint_url {
+            let carries_authority = reqwest::Url::parse(endpoint).is_ok_and(|url| {
+                url.query().is_some()
+                    || url.fragment().is_some()
+                    || !url.username().is_empty()
+                    || url.password().is_some()
+            });
+            if carries_authority {
+                return Err(SandboxError::new(
+                    ErrorCode::MountConfigInvalid,
+                    "the Vercel cloud bucket mount does not support exposing the configured \
+                     credential fields; use a plain endpoint_url without a signature",
+                ));
+            }
+        }
         if self.access_key_id.is_some() != self.secret_access_key.is_some() {
             return Err(SandboxError::new(
                 ErrorCode::MountConfigInvalid,

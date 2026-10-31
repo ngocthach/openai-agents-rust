@@ -822,7 +822,11 @@ impl SandboxRunner {
                 .enqueue_result(guard.session().as_ref(), &prepared.rollout_id, result)
                 .await
         {
-            log::warn!(target: crate::logger::LOG_TARGET, "Failed to record the sandbox memory rollout: {error}");
+            // The error can carry model or tool data, so both logging policies apply.
+            crate::logger::log_model_and_tool_action_warning(
+                "Failed to enqueue sandbox memory after run",
+                &error,
+            );
         }
 
         let suspend = matches!(&result, Ok(result) if !result.interruptions.is_empty());
@@ -941,11 +945,8 @@ impl SandboxRunner {
                 let Some(prepared) = prepared_slot.lock().expect("poisoned").take() else {
                     return;
                 };
-                let memory_manager = active_memory_manager(
-                    &prepared,
-                    &starting_name,
-                    &completion.last_agent_name,
-                );
+                let memory_manager =
+                    active_memory_manager(&prepared, &starting_name, &completion.last_agent_name);
                 let PreparedRest {
                     agent_guards,
                     rollout_id,
@@ -981,7 +982,10 @@ impl SandboxRunner {
                         .enqueue_rollout_payload(guard.session().as_ref(), &rollout_id, &payload)
                         .await
                     {
-                        log::warn!(target: crate::logger::LOG_TARGET, "Failed to record the sandbox memory rollout: {error}");
+                        crate::logger::log_model_and_tool_action_warning(
+                            "Failed to enqueue sandbox memory after streamed run",
+                            &error,
+                        );
                     }
                 }
                 release_agent_guards(agent_guards, completion.is_suspended(), &rollout_id).await;

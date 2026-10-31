@@ -62,11 +62,11 @@ use crate::sandbox::errors::{ErrorCode, SandboxError, SandboxResult};
 use crate::sandbox::manifest::{DEFAULT_MANIFEST_ROOT, Manifest};
 use crate::sandbox::retry::{RetryPolicy, is_transient_sandbox_error, retry_async};
 use crate::sandbox::session::{
-    ExecRequest, SandboxClient, SandboxSession, restore_session_snapshot, shell_quote,
-    workspace_archive_excludes,
+    ExecRequest, SandboxClient, SandboxSession, clear_workspace_root_on_resume,
+    live_workspace_matches_snapshot_on_resume, shell_quote, workspace_archive_excludes,
 };
 use crate::sandbox::snapshot::{Snapshot, SnapshotSpec, resolve_snapshot};
-use crate::sandbox::state::SandboxSessionState;
+use crate::sandbox::state::{SandboxSessionState, SnapshotFingerprint};
 use crate::sandbox::types::{ExecResult, User};
 use crate::sandbox::workspace_paths::provider_scratch_path;
 
@@ -733,6 +733,8 @@ impl SandboxClient for VercelSandboxClient {
 
     async fn create(&self, manifest: Option<Manifest>) -> SandboxResult<Arc<dyn SandboxSession>> {
         let manifest = resolve_manifest_root(manifest.unwrap_or_default());
+        // Refuse an unusable mount layout before a sandbox exists to be billed for.
+        validate_s3_mount_topology(&manifest)?;
         let token = self.options.resolved_token()?;
         let mut envs = self.options.env.clone();
         for (key, value) in manifest.environment() {
@@ -804,7 +806,14 @@ impl SandboxClient for VercelSandboxClient {
             Some(response) => parse_json::<SessionOnly>(response, "load a Vercel session")
                 .await
                 .ok()
-                .filter(|loaded| loaded.session.status.as_deref() == Some("running"))
+                // A `pending` sandbox is still starting and keeps its workspace, so it is waited
+                // for below; every other state either runs or cannot reach `running` again.
+                .filter(|loaded| {
+                    matches!(
+                        loaded.session.status.as_deref(),
+                        Some("running" | "pending")
+                    )
+                })
                 .map(|loaded| SandboxAndSession {
                     sandbox: SandboxRecord {
                         name: sandbox_name.clone(),
@@ -814,22 +823,39 @@ impl SandboxClient for VercelSandboxClient {
                 }),
             None => None,
         };
-        let created = match reattached {
-            Some(created) => created,
-            // The original session is gone: create a replacement and hydrate it from the snapshot.
-            None => self.create_sandbox(&token, &envs, None).await?,
+        let build = |created: SandboxAndSession, manifest: Manifest| {
+            VercelSandboxSession::new(
+                self.options.clone(),
+                token.clone(),
+                self.http.clone(),
+                created,
+                manifest,
+                Some(state.snapshot.clone()),
+            )
+            .with_session_key(state.session_id.clone())
+            .with_snapshot_id(state.snapshot_id.clone())
+            .resuming()
         };
-        let session = VercelSandboxSession::new(
-            self.options.clone(),
-            token,
-            self.http.clone(),
-            created,
-            manifest,
-            Some(state.snapshot.clone()),
-        )
-        .with_session_key(state.session_id.clone())
-        .with_snapshot_id(state.snapshot_id.clone())
-        .resuming();
+        if let Some(created) = reattached {
+            let record = state
+                .snapshot_fingerprint
+                .clone()
+                .zip(state.snapshot_fingerprint_version.clone())
+                .map(|(fingerprint, version)| SnapshotFingerprint {
+                    fingerprint,
+                    version,
+                });
+            let session = build(created, manifest.clone())
+                .with_state_preserved(true)
+                .with_snapshot_fingerprint(record);
+            // A sandbox that never reaches `running` is replaced, as a missing one is.
+            if session.wait_until_running().await.is_ok() {
+                return Ok(Arc::new(session));
+            }
+        }
+        // The original session is gone: create a replacement and hydrate it from the snapshot.
+        let created = self.create_sandbox(&token, &envs, None).await?;
+        let session = build(created, manifest);
         session.wait_until_running().await?;
         Ok(Arc::new(session))
     }
@@ -837,6 +863,79 @@ impl SandboxClient for VercelSandboxClient {
     async fn delete(&self, session: Arc<dyn SandboxSession>) -> SandboxResult<()> {
         session.shutdown().await
     }
+}
+
+/// Check where a manifest puts its Vercel S3 mounts.
+///
+/// Mirrors Python's `_vercel_s3_mount_map`: a mount may not replace the workspace root, sit outside
+/// it, overlap another mount, or overlap an entry the manifest materializes (a directory entry
+/// that merely contains the mount is fine).
+fn validate_s3_mount_topology(manifest: &Manifest) -> SandboxResult<()> {
+    let root = mount_path_key(manifest.root());
+    let invalid = |message: &str, mount_path: &str| {
+        SandboxError::new(ErrorCode::MountConfigInvalid, message.to_string())
+            .with_context("backend", BACKEND_ID)
+            .with_context("mount_path", mount_path.to_string())
+    };
+    let targets: Vec<(String, bool)> = manifest
+        .mount_targets()
+        .into_iter()
+        .map(|(mount, path)| {
+            (
+                mount_path_key(&path),
+                mount.strategy.strategy_type() == VERCEL_S3_MOUNT_STRATEGY,
+            )
+        })
+        .collect();
+    let contains = |outer: &str, inner: &str| {
+        inner == outer || inner.starts_with(&format!("{}/", outer.trim_end_matches('/')))
+    };
+    // Misconfigured mounts fail here, before a sandbox exists to be billed for.
+    for (mount, _) in manifest.mount_targets() {
+        if mount.strategy.strategy_type() == VERCEL_S3_MOUNT_STRATEGY {
+            mount.strategy.validate(mount)?;
+        }
+    }
+    for (index, (path, is_vercel)) in targets.iter().enumerate() {
+        if !is_vercel {
+            continue;
+        }
+        if *path == root {
+            return Err(invalid(
+                "Vercel does not support mounting an S3 bucket at the workspace root",
+                path,
+            ));
+        }
+        if !contains(&root, path) {
+            return Err(invalid(
+                "Vercel S3 mount paths must stay within the workspace root",
+                path,
+            ));
+        }
+        for (other_index, (other, _)) in targets.iter().enumerate() {
+            if other_index != index && (contains(path, other) || contains(other, path)) {
+                return Err(invalid(
+                    "Vercel S3 mount paths must not overlap other mounts",
+                    path,
+                ));
+            }
+        }
+        for (entry_path, entry) in manifest.iter_entries() {
+            if entry.as_mount().is_some() {
+                continue;
+            }
+            let entry_path = mount_path_key(&entry_path);
+            let is_dir = matches!(entry.kind, crate::sandbox::entries::EntryKind::Dir { .. });
+            let ancestor_dir = is_dir && entry_path != *path && contains(&entry_path, path);
+            if !ancestor_dir && (contains(path, &entry_path) || contains(&entry_path, path)) {
+                return Err(invalid(
+                    "Vercel S3 mount paths must not overlap manifest entries",
+                    path,
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Apply the Vercel workspace root when the manifest still carries the SDK-wide default.
@@ -894,6 +993,10 @@ pub struct VercelSandboxSession {
     snapshot: Option<SnapshotSpec>,
     snapshot_id: String,
     resuming: bool,
+    /// Whether this session reattached a sandbox that kept its workspace and system state.
+    state_preserved: bool,
+    /// The workspace fingerprint the stored snapshot was taken from.
+    snapshot_fingerprint: std::sync::Mutex<Option<SnapshotFingerprint>>,
     /// Whether the session is inside [`start`](SandboxSession::start), the only point at which
     /// its S3 mount topology may be applied.
     s3_mounts_startable: AtomicBool,
@@ -903,6 +1006,8 @@ pub struct VercelSandboxSession {
     detached_s3_mounts: std::sync::Mutex<BTreeSet<String>>,
     /// Whether the fixed S3 mount topology has already been applied once.
     s3_mounts_started: AtomicBool,
+    /// Workspace paths registered at runtime that a workspace archive leaves out.
+    persist_skips: std::sync::Mutex<BTreeSet<String>>,
 }
 
 /// The mutable provider identity: a snapshot restore replaces both halves.
@@ -959,10 +1064,13 @@ impl VercelSandboxSession {
             terminated: tokio::sync::Mutex::new(false),
             snapshot,
             resuming: false,
+            state_preserved: false,
+            snapshot_fingerprint: std::sync::Mutex::new(None),
             s3_mounts_startable: AtomicBool::new(false),
             active_s3_mounts: std::sync::Mutex::new(BTreeSet::new()),
             detached_s3_mounts: std::sync::Mutex::new(BTreeSet::new()),
             s3_mounts_started: AtomicBool::new(false),
+            persist_skips: std::sync::Mutex::new(BTreeSet::new()),
         }
     }
 
@@ -1069,6 +1177,18 @@ impl VercelSandboxSession {
 
     fn with_snapshot_id(mut self, snapshot_id: String) -> Self {
         self.snapshot_id = snapshot_id;
+        self
+    }
+
+    /// Mark the sandbox as one that survived the pause with its workspace intact.
+    fn with_state_preserved(mut self, preserved: bool) -> Self {
+        self.state_preserved = preserved;
+        self
+    }
+
+    /// Carry the workspace fingerprint a resumed snapshot was taken from.
+    fn with_snapshot_fingerprint(self, record: Option<SnapshotFingerprint>) -> Self {
+        *self.snapshot_fingerprint.lock().expect("poisoned") = record;
         self
     }
 
@@ -1387,6 +1507,86 @@ impl VercelSandboxSession {
         })
     }
 
+    /// Apply the manifest with every S3 mount attached last.
+    ///
+    /// Mirrors Python, which activates the mounts only after all other entries are written: an
+    /// entry written after the mount is attached (or one that reaches the mount path through an
+    /// alias) would land in the bucket, and a failed entry write must not leave a credential
+    /// already handed to the sandbox. With `ephemeral_only`, only the ephemeral entries are
+    /// re-applied, as a resume does.
+    async fn apply_deferring_mounts(&self, ephemeral_only: bool) -> SandboxResult<()> {
+        if !self.has_s3_mounts() {
+            let manifest = self.manifest.clone();
+            return if ephemeral_only {
+                manifest.apply_ephemeral(self).await.map(|_| ())
+            } else {
+                manifest.apply(self).await.map(|_| ())
+            };
+        }
+        let is_s3 = |mount: &crate::sandbox::mounts::Mount| {
+            mount.strategy.strategy_type() == VERCEL_S3_MOUNT_STRATEGY
+        };
+        let rest = self.manifest.split_mounts(&is_s3, false);
+        let mounts = self.manifest.split_mounts(&is_s3, true);
+        if ephemeral_only {
+            rest.apply_ephemeral(self).await?;
+            mounts.apply_ephemeral(self).await?;
+        } else {
+            rest.apply(self).await?;
+            // The accounts were provisioned with the first half.
+            mounts.apply_without_account_provisioning(self).await?;
+        }
+        Ok(())
+    }
+
+    /// Restore the stored snapshot into the workspace, then re-apply the ephemeral entries with
+    /// the S3 mounts last.
+    ///
+    /// The same steps as the shared `restore_session_snapshot`, whose final step applies the
+    /// ephemeral entries in manifest order.
+    async fn restore_deferring_mounts(&self) -> SandboxResult<bool> {
+        let snapshot = self.snapshot();
+        if !snapshot.restorable().await? {
+            return Ok(false);
+        }
+        if live_workspace_matches_snapshot_on_resume(self).await {
+            self.apply_deferring_mounts(true).await?;
+            return Ok(true);
+        }
+        let archive = snapshot
+            .restore_with(self.dependencies().map(Arc::as_ref))
+            .await?;
+        self.validate_restorable_archive(&archive)?;
+        clear_workspace_root_on_resume(self).await?;
+        self.hydrate_workspace(&archive).await?;
+        if !self.system_state_preserved_on_start() {
+            self.manifest.provision_accounts(self).await?;
+        }
+        self.apply_deferring_mounts(true).await?;
+        Ok(true)
+    }
+
+    /// Replace provider text in `result`'s error when a credentialed mount is in play.
+    ///
+    /// A provider error can echo the environment a mount command was handed, so a session that
+    /// carries a mount credential reports only the error code. Mirrors Python's
+    /// `_replace_protected_mount_error`.
+    fn redacted<T>(&self, result: SandboxResult<T>) -> SandboxResult<T> {
+        result.map_err(|error| {
+            crate::sandbox::sandboxes::docker::redact_for_protected_mounts(&self.manifest, error)
+        })
+    }
+
+    /// Check a workspace tar before any byte of it is uploaded.
+    ///
+    /// Beyond the generic hydrate policy, no member may overlap a path the manifest owns as
+    /// ephemeral (an S3 mount's path included): the archive is extracted as validated.
+    fn validate_tar_archive(&self, archive: &[u8]) -> SandboxResult<()> {
+        let mut options = crate::sandbox::archive::TarValidationOptions::hydrate();
+        options.reject_rel_paths = self.manifest.ephemeral_persistence_paths();
+        crate::sandbox::archive::validate_tar_bytes(archive, &options)
+    }
+
     /// Stop the runtime session exactly once.
     async fn terminate(&self) -> SandboxResult<()> {
         let mut terminated = self.terminated.lock().await;
@@ -1398,17 +1598,24 @@ impl VercelSandboxSession {
             .send()
             .await
             .map_err(|e| transport("stop the Vercel sandbox", e))?;
-        self.started.store(false, Ordering::SeqCst);
-        *terminated = true;
-        if response.status() == reqwest::StatusCode::NOT_FOUND {
-            return Ok(());
+        // A session that is already gone is as good as stopped.
+        let stopped = if response.status() == reqwest::StatusCode::NOT_FOUND {
+            Ok(())
+        } else {
+            expect_success(
+                response,
+                "stop the Vercel sandbox",
+                ErrorCode::WorkspaceStopError,
+            )
+            .await
+        };
+        // Only a confirmed stop ends the session: a failed one leaves cleanup retryable, so a
+        // second `shutdown` tries again instead of reporting a sandbox that still runs as closed.
+        if stopped.is_ok() {
+            self.started.store(false, Ordering::SeqCst);
+            *terminated = true;
         }
-        expect_success(
-            response,
-            "stop the Vercel sandbox",
-            ErrorCode::WorkspaceStopError,
-        )
-        .await
+        stopped
     }
 }
 
@@ -1424,6 +1631,26 @@ impl SandboxSession for VercelSandboxSession {
 
     fn backend_id(&self) -> &str {
         BACKEND_ID
+    }
+
+    fn persist_skip_registry(&self) -> Option<&std::sync::Mutex<BTreeSet<String>>> {
+        Some(&self.persist_skips)
+    }
+
+    fn system_state_preserved_on_start(&self) -> bool {
+        self.state_preserved
+    }
+
+    fn resume_snapshot_fingerprint(&self) -> Option<SnapshotFingerprint> {
+        // A replacement sandbox starts empty, so the restore must not be skipped for it.
+        if !self.state_preserved {
+            return None;
+        }
+        self.snapshot_fingerprint.lock().expect("poisoned").clone()
+    }
+
+    fn record_snapshot_fingerprint(&self, record: Option<SnapshotFingerprint>) {
+        *self.snapshot_fingerprint.lock().expect("poisoned") = record;
     }
 
     fn as_any(&self) -> Option<&dyn std::any::Any> {
@@ -1468,18 +1695,13 @@ impl SandboxSession for VercelSandboxSession {
         // may attach is exactly the manifest application below.
         self.s3_mounts_startable.store(true, Ordering::SeqCst);
         let result = if self.resuming {
-            match restore_session_snapshot(self).await {
-                Ok(false) => self
-                    .manifest
-                    .clone()
-                    .apply_ephemeral(self)
-                    .await
-                    .map(|_| ()),
+            match self.restore_deferring_mounts().await {
+                Ok(false) => self.apply_deferring_mounts(true).await,
                 Ok(true) => Ok(()),
                 Err(error) => Err(error),
             }
         } else {
-            self.manifest.clone().apply(self).await.map(|_| ())
+            self.apply_deferring_mounts(false).await
         };
         self.s3_mounts_startable.store(false, Ordering::SeqCst);
         // Python closes the window on success, and on failure only once a mount actually
@@ -1497,11 +1719,11 @@ impl SandboxSession for VercelSandboxSession {
     }
 
     async fn stop(&self) -> SandboxResult<()> {
-        self.terminate().await
+        self.redacted(self.terminate().await)
     }
 
     async fn shutdown(&self) -> SandboxResult<()> {
-        self.terminate().await
+        self.redacted(self.terminate().await)
     }
 
     async fn running(&self) -> SandboxResult<bool> {
@@ -1522,21 +1744,26 @@ impl SandboxSession for VercelSandboxSession {
             ..request.clone()
         }
         .resolved_argv();
-        self.run_command(argv, cwd, &envs, request.timeout, sudo)
-            .await
+        self.redacted(
+            self.run_command(argv, cwd, &envs, request.timeout, sudo)
+                .await,
+        )
     }
 
     async fn read_file(&self, path: &str) -> SandboxResult<Vec<u8>> {
-        let resolved = self.normalize_path(path)?;
-        self.download_at(&resolved, None).await
+        // The in-sandbox resolver sees a symlink the lexical check cannot.
+        let resolved = self.redacted(self.validate_remote_path_access(path, false, false).await)?;
+        self.redacted(self.download_at(&resolved, None).await)
     }
 
     async fn read_bounded_unchecked(&self, path: &str, max_bytes: usize) -> SandboxResult<Vec<u8>> {
         if max_bytes == 0 {
             return Err(bounded_read_zero());
         }
+        // A bounded read stays on the lexical check: the in-sandbox resolver costs extra
+        // commands per read, and the bounded-read contract tests drive it without one.
         let resolved = self.normalize_path(path)?;
-        self.download_at(&resolved, Some(max_bytes)).await
+        self.redacted(self.download_at(&resolved, Some(max_bytes)).await)
     }
 
     fn exposed_ports(&self) -> Vec<u16> {
@@ -1557,23 +1784,23 @@ impl SandboxSession for VercelSandboxSession {
             .routes
             .get(&port)
             .cloned();
-        url.as_deref().and_then(endpoint_from_url).ok_or_else(|| {
+        self.redacted(url.as_deref().and_then(endpoint_from_url).ok_or_else(|| {
             exposed_port_unavailable(
                 BACKEND_ID,
                 port,
                 &self.options.exposed_ports,
                 ExposedPortUnavailable::BackendUnavailable,
             )
-        })
+        }))
     }
 
     async fn write_file(&self, path: &str, contents: &[u8]) -> SandboxResult<()> {
-        let resolved = self.normalize_path_for_write(path)?;
+        let resolved = self.redacted(self.validate_remote_path_access(path, true, false).await)?;
         // `fs/write` only accepts a gzipped tar whose entry names are relative to `x-cwd`.
         let relative = resolved.trim_start_matches('/');
         let mut archive = TarGzBuilder::new();
         archive.add_file(relative, contents, 0o644);
-        self.write_archive("/", archive.finish()).await
+        self.redacted(self.write_archive("/", archive.finish()).await)
     }
 
     fn session_state(&self) -> SandboxSessionState {
@@ -1590,6 +1817,7 @@ impl SandboxSession for VercelSandboxSession {
             handle.sandbox_name, handle.session_id
         )))
         .with_snapshot(self.snapshot.clone().unwrap_or_default())
+        .with_snapshot_fingerprint(self.snapshot_fingerprint.lock().expect("poisoned").clone())
     }
 
     fn snapshot(&self) -> Arc<dyn Snapshot> {
@@ -1597,36 +1825,63 @@ impl SandboxSession for VercelSandboxSession {
     }
 
     async fn persist_workspace(&self) -> SandboxResult<Vec<u8>> {
-        if self.options.workspace_persistence == WorkspacePersistence::Snapshot {
-            let snapshot_id = self.create_native_snapshot().await?;
-            return Ok(encode_snapshot_ref(&snapshot_id));
-        }
-        let root = self.manifest.root().to_string();
-        let archive_path = self.resolve_internal_path(&provider_scratch_path(&format!(
-            "{}.tar.gz",
-            self.session_key
-        )))?;
-        let mut command = format!(
-            "tar -czf {archive} -C {root}",
-            archive = shell_quote(&archive_path),
-            root = shell_quote(&root),
-        );
-        for exclude in workspace_archive_excludes(&self.manifest, &root) {
-            command.push_str(&format!(" --exclude {}", shell_quote(&exclude)));
-        }
-        command.push_str(" .");
-        // Command output arrives as text, so the archive travels over the filesystem API.
-        let result = self
-            .run_command(
-                vec!["sh".into(), "-lc".into(), command],
-                root.clone(),
-                &self.command_envs(),
-                None,
-                false,
-            )
-            .await?;
-        if !result.ok() {
-            // The scratch tarball may be partly written; it must not outlive the failure.
+        let result: SandboxResult<Vec<u8>> = async {
+            if self.options.workspace_persistence == WorkspacePersistence::Snapshot {
+                let snapshot_id = self.create_native_snapshot().await?;
+                return Ok(encode_snapshot_ref(&snapshot_id));
+            }
+            let root = self.manifest.root().to_string();
+            let archive_path = self.resolve_internal_path(&provider_scratch_path(&format!(
+                "{}.tar.gz",
+                self.session_key
+            )))?;
+            // `--no-wildcards` makes every `--exclude` a literal path: a mount or entry named
+            // `cache[1]` must exclude itself, not match a sibling named `cache1`.
+            let mut command = format!(
+                "tar -czf {archive} -C {root} --no-wildcards",
+                archive = shell_quote(&archive_path),
+                root = shell_quote(&root),
+            );
+            for exclude in workspace_archive_excludes(&self.manifest, &root) {
+                command.push_str(&format!(" --exclude {}", shell_quote(&exclude)));
+            }
+            for skipped in self.persist_workspace_skip_paths() {
+                command.push_str(&format!(
+                    " --exclude {}",
+                    shell_quote(&format!("./{skipped}"))
+                ));
+            }
+            command.push_str(" .");
+            // Command output arrives as text, so the archive travels over the filesystem API.
+            let result = self
+                .run_command(
+                    vec!["sh".into(), "-lc".into(), command],
+                    root.clone(),
+                    &self.command_envs(),
+                    None,
+                    false,
+                )
+                .await?;
+            if !result.ok() {
+                // The scratch tarball may be partly written; it must not outlive the failure.
+                let _ = self
+                    .run_command(
+                        vec!["rm".into(), "-f".into(), "--".into(), archive_path.clone()],
+                        "/".to_string(),
+                        &self.command_envs(),
+                        None,
+                        false,
+                    )
+                    .await;
+                return Err(SandboxError::new(
+                    ErrorCode::SnapshotPersistError,
+                    format!(
+                        "Failed to archive workspace `{root}`: {}",
+                        result.stderr_text().trim()
+                    ),
+                ));
+            }
+            let archive = self.download_at(&archive_path, None).await;
             let _ = self
                 .run_command(
                     vec!["rm".into(), "-f".into(), "--".into(), archive_path.clone()],
@@ -1636,47 +1891,43 @@ impl SandboxSession for VercelSandboxSession {
                     false,
                 )
                 .await;
-            return Err(SandboxError::new(
-                ErrorCode::SnapshotPersistError,
-                format!(
-                    "Failed to archive workspace `{root}`: {}",
-                    result.stderr_text().trim()
-                ),
-            ));
+            archive.map_err(|error| {
+                SandboxError::new(
+                    ErrorCode::SnapshotPersistError,
+                    format!(
+                        "Failed to download the workspace archive: {}",
+                        error.message
+                    ),
+                )
+            })
         }
-        let archive = self.download_at(&archive_path, None).await;
-        let _ = self
-            .run_command(
-                vec!["rm".into(), "-f".into(), "--".into(), archive_path.clone()],
-                "/".to_string(),
-                &self.command_envs(),
-                None,
-                false,
-            )
-            .await;
-        archive.map_err(|error| {
-            SandboxError::new(
-                ErrorCode::SnapshotPersistError,
-                format!(
-                    "Failed to download the workspace archive: {}",
-                    error.message
-                ),
-            )
-        })
+        .await;
+        self.redacted(result)
     }
 
     fn validate_restorable_archive(&self, archive: &[u8]) -> SandboxResult<()> {
         if decode_snapshot_ref(archive).is_some() {
             return Ok(());
         }
-        crate::sandbox::archive::validate_hydrate_archive(archive)
+        self.validate_tar_archive(archive)
     }
 
     async fn hydrate_workspace(&self, archive: &[u8]) -> SandboxResult<()> {
         if let Some(snapshot_id) = decode_snapshot_ref(archive) {
+            // A native snapshot restore replaces the sandbox, and a replacement has none of the
+            // mounts this session attached at creation.
+            if self.has_s3_mounts() {
+                return Err(SandboxError::new(
+                    ErrorCode::MountConfigInvalid,
+                    "Vercel S3 mounts cannot be restored from a native snapshot; the mount \
+                     topology is fixed when the sandbox is created",
+                )
+                .with_context("backend", BACKEND_ID)
+                .with_retryable(false));
+            }
             return self.restore_native_snapshot(&snapshot_id).await;
         }
-        crate::sandbox::archive::validate_hydrate_archive(archive)?;
+        self.validate_tar_archive(archive)?;
         let root = self.manifest.root().to_string();
         self.mkdir(&root, true).await?;
         // `fs/write` extracts a gzipped tar directly, which is exactly the archive format

@@ -714,8 +714,10 @@ fn normalize_agent_tool_input(tool_name: &str, schema: &Value, parsed: Value) ->
             _ => true,
         });
         if !matches {
+            // Like Pydantic's validation error, the detail echoes the offending input; it
+            // only reaches the message while tool data may be logged.
             return Err(fail(format!(
-                "field `{name}` must be of type {}",
+                "field `{name}` must be of type {} (input: {value})",
                 types.join(" or ")
             )));
         }

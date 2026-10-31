@@ -218,6 +218,49 @@ impl Manifest {
             .filter_map(|path| self.entries.get_key_value(path))
     }
 
+    /// A copy of this manifest split by mount: with `only_mounts` false, everything except the
+    /// mounts `select` picks; with `only_mounts` true, only those mounts (and the directories
+    /// that hold them).
+    ///
+    /// A backend that must attach some mounts after every other entry has been written applies
+    /// the two halves one after the other, the second without re-provisioning accounts.
+    pub fn split_mounts(&self, select: &dyn Fn(&Mount) -> bool, only_mounts: bool) -> Manifest {
+        fn filter(
+            entry: &Entry,
+            select: &dyn Fn(&Mount) -> bool,
+            only_mounts: bool,
+        ) -> Option<Entry> {
+            match &entry.kind {
+                EntryKind::Mount { mount } => (select(mount) == only_mounts).then(|| entry.clone()),
+                EntryKind::Dir { children } => {
+                    let kept: BTreeMap<String, Entry> = children
+                        .iter()
+                        .filter_map(|(name, child)| {
+                            filter(child, select, only_mounts).map(|child| (name.clone(), child))
+                        })
+                        .collect();
+                    if only_mounts && kept.is_empty() {
+                        return None;
+                    }
+                    let mut copy = entry.clone();
+                    copy.kind = EntryKind::Dir { children: kept };
+                    Some(copy)
+                }
+                _ => (!only_mounts).then(|| entry.clone()),
+            }
+        }
+        let mut copy = self.clone();
+        copy.entries = BTreeMap::new();
+        copy.entry_order = Vec::new();
+        for (path, entry) in self.entries_in_order() {
+            if let Some(kept) = filter(entry, select, only_mounts) {
+                copy.entries.insert(path.clone(), kept);
+                copy.entry_order.push(path.clone());
+            }
+        }
+        copy
+    }
+
     /// Variables whose values are fetched when the session starts.
     pub fn resolved_environment(&self) -> &Environment {
         &self.resolved_environment

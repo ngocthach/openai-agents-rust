@@ -53,8 +53,11 @@ import threading
 from typing import Any
 
 
-def _fail(message: str) -> None:
-    json.dump({"error": message}, sys.stdout)
+def _fail(message: str, retryable: bool | None = None) -> None:
+    payload: dict[str, Any] = {"error": message}
+    if retryable is not None:
+        payload["retryable"] = retryable
+    json.dump(payload, sys.stdout)
     sys.stdout.write("\n")
     sys.stdout.flush()
     raise SystemExit(1)
@@ -474,7 +477,7 @@ async def _main() -> None:
     try:
         response = await handler(modal, request)
     except Exception as error:
-        _fail(f"{type(error).__name__}: {error}")
+        _fail(f"{type(error).__name__}: {error}", _modal_retryability(error))
     json.dump(response, sys.stdout)
     sys.stdout.write("\n")
     sys.stdout.flush()

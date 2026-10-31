@@ -43,7 +43,9 @@ pub use provider::{
 pub use scope::{current_span, current_trace};
 pub use span_data::SpanData;
 pub use spans::{Span, SpanError, Trace, gen_group_id, gen_span_id, gen_trace_id};
-pub use trace_state::{TraceState, hash_tracing_api_key, reattach_trace, trace_id_was_started};
+pub use trace_state::{
+    TraceState, clear_started_trace_ids, hash_tracing_api_key, reattach_trace, trace_id_was_started,
+};
 
 /// Builder for a trace.
 #[derive(Debug, Clone, Default)]

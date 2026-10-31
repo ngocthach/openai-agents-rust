@@ -726,6 +726,34 @@ impl UnixLocalSandboxSession {
         }
     }
 
+    /// The resolved directory that holds `host`, or `None` when it cannot be resolved.
+    async fn parent_identity(host: &Path) -> Option<PathBuf> {
+        tokio::fs::canonicalize(host.parent()?).await.ok()
+    }
+
+    /// Fail when the directory holding `host` now resolves somewhere else than it did before.
+    ///
+    /// Operations that act on the entry itself (`rm`, `mv`, `same_file`) never follow a leaf
+    /// link, so the leaf is not compared, but a parent replaced by a link after validation would
+    /// send the operation out of the workspace. The resolution is taken before and after the
+    /// window in which a workspace process could swap the parent, and a difference refuses the
+    /// operation. It compares resolutions rather than re-running grant policy, so entries that
+    /// a grant names exactly (whose parent is not itself granted) keep working.
+    fn refuse_swapped_parent(
+        before: Option<PathBuf>,
+        after: Option<PathBuf>,
+        path: &str,
+    ) -> SandboxResult<()> {
+        if before == after {
+            return Ok(());
+        }
+        Err(SandboxError::new(
+            ErrorCode::InvalidManifestPath,
+            format!("`{path}` changed while it was being validated"),
+        )
+        .with_context("path", path.to_string()))
+    }
+
     /// Confirm that an opened handle is still the workspace file `host` names.
     ///
     /// Validation canonicalizes the path, but a workspace process can replace a directory with a
@@ -1718,6 +1746,13 @@ fn pin_existing_prefix(path: &Path) -> PathBuf {
     }
 }
 
+/// `O_NONBLOCK` for the platforms this backend runs on, so no `libc` dependency is needed to ask
+/// for a non-blocking open.
+#[cfg(target_os = "linux")]
+const O_NONBLOCK: i32 = 0o4000;
+#[cfg(all(unix, not(target_os = "linux")))]
+const O_NONBLOCK: i32 = 0x0004;
+
 /// Refuse a workspace entry that exists but is not a regular file.
 ///
 /// Mirrors the `fstat` check Python's `_unix_local_file_ops` performs on every descriptor it
@@ -2070,7 +2105,14 @@ impl SandboxSession for UnixLocalSandboxSession {
             SandboxError::new(code, format!("Failed to read `{path}`: {e}"))
         };
         use tokio::io::AsyncReadExt as _;
-        let mut file = tokio::fs::File::open(&host).await.map_err(read_error)?;
+        // Non-blocking, so a FIFO swapped in after the entry check is opened (and then refused
+        // as not a regular file) instead of blocking forever waiting for a writer.
+        let mut file = tokio::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(O_NONBLOCK)
+            .open(&host)
+            .await
+            .map_err(read_error)?;
         let handle = file.metadata().await.map_err(read_error)?;
         if !handle.is_file() {
             return Err(SandboxError::new(
@@ -2094,6 +2136,11 @@ impl SandboxSession for UnixLocalSandboxSession {
     async fn mv(&self, source: &str, destination: &str) -> SandboxResult<()> {
         let from = self.host_path_for(source, true).await?;
         let to = self.host_path_for(destination, true).await?;
+        let from_before = Self::parent_identity(&from).await;
+        let to_before = Self::parent_identity(&to).await;
+        self.run_after_validate(&from);
+        Self::refuse_swapped_parent(from_before, Self::parent_identity(&from).await, source)?;
+        Self::refuse_swapped_parent(to_before, Self::parent_identity(&to).await, destination)?;
         let metadata = tokio::fs::symlink_metadata(&from).await.map_err(|e| {
             SandboxError::new(
                 ErrorCode::ExecNonZero,
@@ -2220,6 +2267,15 @@ impl SandboxSession for UnixLocalSandboxSession {
         }
         let left_host = self.host_path_for(left, false).await?;
         let right_host = self.host_path_for(right, false).await?;
+        let left_before = Self::parent_identity(&left_host).await;
+        let right_before = Self::parent_identity(&right_host).await;
+        self.run_after_validate(&left_host);
+        Self::refuse_swapped_parent(left_before, Self::parent_identity(&left_host).await, left)?;
+        Self::refuse_swapped_parent(
+            right_before,
+            Self::parent_identity(&right_host).await,
+            right,
+        )?;
         let stat = async |path: &std::path::Path| {
             if follow_symlinks {
                 tokio::fs::metadata(path).await
@@ -2244,6 +2300,9 @@ impl SandboxSession for UnixLocalSandboxSession {
     /// spelling is kept so callers that match entries against the workspace root still do.
     async fn ls(&self, path: &str) -> SandboxResult<Vec<crate::sandbox::types::FileEntry>> {
         use std::os::unix::fs::MetadataExt as _;
+        let host = self.host_path_for(path, false).await?;
+        // A directory swapped for a link after validation must not be listed through it.
+        self.run_after_validate(&host);
         let host = self.host_path_for(path, false).await?;
         let base = match tokio::fs::canonicalize(&host).await {
             Ok(real) => match self
@@ -2308,6 +2367,9 @@ impl SandboxSession for UnixLocalSandboxSession {
         // link in that position points at, so the normalized spelling is used instead.
         self.host_path_for(path, true).await?;
         let host = PathBuf::from(self.normalize_path_for_write(path)?);
+        let parent_before = Self::parent_identity(&host).await;
+        self.run_after_validate(&host);
+        Self::refuse_swapped_parent(parent_before, Self::parent_identity(&host).await, path)?;
         if recursive {
             self.refuse_removal_over_read_only_grants(&host, path)
                 .await?;
@@ -2365,6 +2427,9 @@ impl SandboxSession for UnixLocalSandboxSession {
     /// directory the caller asked for.
     async fn mkdir(&self, path: &str, parents: bool) -> SandboxResult<()> {
         let host = self.host_path_for(path, true).await?;
+        // A directory or parent swapped for a link after validation must not be created through.
+        self.run_after_validate(&host);
+        let host = self.host_path_for(path, true).await?;
         let host = self.resolve_for_create(host, path, true).await?;
         if let Ok(metadata) = tokio::fs::symlink_metadata(&host).await
             && metadata.is_dir()
@@ -2412,6 +2477,7 @@ impl SandboxSession for UnixLocalSandboxSession {
             .write(true)
             .create(true)
             .truncate(false)
+            .custom_flags(O_NONBLOCK)
             .open(&host)
             .await
             .map_err(failed)?;

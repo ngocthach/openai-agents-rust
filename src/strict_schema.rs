@@ -11,6 +11,12 @@ const MAX_SCHEMA_DEPTH: usize = 100;
 const ADDITIONAL_PROPERTIES_ERROR: &str = "additionalProperties should not be set for object types. \
 If you really need this, update the function or output tool to not use a strict schema.";
 
+const OPEN_OBJECT_ERROR: &str = "JSON schema contains an object that permits undeclared properties and cannot be converted \
+to a strict schema without changing its accepted values.";
+
+const UNVALIDATED_REF_ERROR: &str =
+    "JSON schema contains a reference whose target was not validated for strict mode.";
+
 const NESTED_RESOURCE_REF_ERROR: &str = "JSON schema contains a reference owned by or crossing a nested `$id` resource that cannot \
 be resolved against the document root.";
 
@@ -86,6 +92,17 @@ fn strip_unsupported_format(obj: &mut Map<String, Value>) {
 /// into `anyOf`, single-entry `allOf` is merged, `$ref`s with siblings are inlined, and
 /// `default: null` is dropped.
 pub fn ensure_strict_json_schema(schema: &Value) -> Result<Value> {
+    ensure_strict_json_schema_with(schema, false)
+}
+
+/// [`ensure_strict_json_schema`] that, with `reject_open_objects`, refuses instead of closing an
+/// object schema that allows undeclared properties, and any `$ref` it did not inline. Python's
+/// `_reject_open_objects`: MCP tool schemas are served as-is when converting them would change
+/// the arguments they accept.
+pub(crate) fn ensure_strict_json_schema_with(
+    schema: &Value,
+    reject_open_objects: bool,
+) -> Result<Value> {
     validate_depth(schema, 1)?;
     let Value::Object(obj) = schema else {
         return Err(AgentsError::user("Expected JSON schema to be an object"));
@@ -99,7 +116,10 @@ pub fn ensure_strict_json_schema(schema: &Value) -> Result<Value> {
         }));
     }
     let root = schema.clone();
-    let mut budget = MAX_SCHEMA_NODES;
+    let mut budget = Budget {
+        remaining: MAX_SCHEMA_NODES,
+        reject_open_objects,
+    };
     let strict = ensure_strict(schema.clone(), &root, &mut budget, 1, true, false)?;
     ensure_strict_root(strict)
 }
@@ -141,13 +161,20 @@ fn ensure_strict_root(mut schema: Value) -> Result<Value> {
     Ok(schema)
 }
 
-fn spend(budget: &mut usize) -> Result<()> {
-    if *budget == 0 {
+/// Conversion state shared across the recursion: the remaining node allowance and whether open
+/// objects are an error.
+struct Budget {
+    remaining: usize,
+    reject_open_objects: bool,
+}
+
+fn spend(budget: &mut Budget) -> Result<()> {
+    if budget.remaining == 0 {
         return Err(AgentsError::user(
             "JSON schema is too large to convert to strict mode.",
         ));
     }
-    *budget -= 1;
+    budget.remaining -= 1;
     Ok(())
 }
 
@@ -181,7 +208,7 @@ fn json_values_equal(left: &Value, right: &Value) -> bool {
 fn resolve_non_constraining_ref_chain(
     root: &Value,
     schema: &Map<String, Value>,
-    budget: &mut usize,
+    budget: &mut Budget,
 ) -> Result<Value> {
     let mut resolved = schema.clone();
     let mut seen_refs: Vec<String> = Vec::new();
@@ -225,7 +252,7 @@ fn resolve_non_constraining_ref_chain(
 fn ensure_strict(
     schema: Value,
     root: &Value,
-    budget: &mut usize,
+    budget: &mut Budget,
     depth: usize,
     is_root: bool,
     inside_nested_resource: bool,
@@ -311,6 +338,15 @@ fn ensure_strict(
         Some(Value::Array(a)) => a.iter().any(|t| t == "object"),
         _ => false,
     };
+    if budget.reject_open_objects
+        && is_object
+        && obj
+            .get("properties")
+            .is_none_or(|p| p.as_object().is_some_and(|m| m.is_empty()))
+        && obj.get("additionalProperties") != Some(&Value::Bool(false))
+    {
+        return Err(AgentsError::user(OPEN_OBJECT_ERROR));
+    }
     if is_object {
         match obj.get("additionalProperties") {
             None => {
@@ -456,6 +492,10 @@ fn ensure_strict(
             false,
             inside_nested_resource,
         );
+    }
+
+    if budget.reject_open_objects && obj.contains_key("$ref") {
+        return Err(AgentsError::user(UNVALIDATED_REF_ERROR));
     }
 
     Ok(Value::Object(obj))

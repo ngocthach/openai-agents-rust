@@ -25,15 +25,6 @@ pub(crate) fn log_model_action_error(message: &str, detail: &dyn fmt::Display) {
     }
 }
 
-/// Warn about a failure involving model data, with the detail only when redaction is off.
-pub(crate) fn log_model_action_warning(message: &str, detail: &dyn fmt::Display) {
-    if dont_log_model_data() {
-        log::warn!(target: crate::logger::LOG_TARGET, "{message}");
-    } else {
-        log::warn!(target: crate::logger::LOG_TARGET, "{message}: {detail}");
-    }
-}
-
 /// Log model data at debug level, naming it only when redaction is off.
 pub(crate) fn log_model_data_debug(message: &str, detail: &dyn fmt::Display) {
     if dont_log_model_data() {

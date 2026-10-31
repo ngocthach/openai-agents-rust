@@ -99,6 +99,12 @@ impl StreamedAudioResult {
                 return None;
             }
             let event = this.events.recv().await?;
+            if let VoiceStreamEvent::Error(error) = &event {
+                crate::logger::log_model_and_tool_action_error(
+                    "Error processing voice output",
+                    error.as_ref(),
+                );
+            }
             if matches!(
                 event,
                 VoiceStreamEvent::Error(_)
@@ -360,7 +366,7 @@ impl AudioResultWriter {
                     get_trace_error(include_text, &error),
                     Some(json!({"text": if include_text { text } else { String::new() }})),
                 );
-                log::error!(target: crate::logger::LOG_TARGET, "Error streaming voice audio: {error}");
+                crate::logger::log_model_action_error("Error streaming voice audio", &error);
                 let _ = events.send(VoiceStreamEvent::Error(Arc::new(error)));
             }
         }

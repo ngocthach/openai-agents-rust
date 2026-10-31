@@ -42,10 +42,11 @@ use super::super::ports::{
     exposed_port_unavailable,
 };
 use crate::sandbox::session::{
-    ExecRequest, SandboxClient, SandboxSession, restore_session_snapshot,
+    ExecRequest, SandboxClient, SandboxSession, live_workspace_matches_snapshot_on_resume,
+    restore_session_snapshot,
 };
 use crate::sandbox::snapshot::{Snapshot, SnapshotSpec, resolve_snapshot};
-use crate::sandbox::state::SandboxSessionState;
+use crate::sandbox::state::{SandboxSessionState, SnapshotFingerprint};
 use crate::sandbox::types::ExecResult;
 
 use super::pty::{CloudflarePtySessions, pty_url};
@@ -371,6 +372,23 @@ impl SandboxClient for CloudflareSandboxClient {
             ));
         }
         state.verify_manifest(&manifest)?;
+        // The worker holds the bucket credentials for as long as the sandbox lives, so a
+        // sandbox attached with them is never reattached from a persisted state: a new session
+        // is created from the current trusted configuration instead.
+        if state.mount_authority_redacted
+            || state.mount_authority_rebound
+            || manifest
+                .mount_targets()
+                .iter()
+                .any(|(mount, _)| mount.strategy.carries_credentials(mount))
+        {
+            return Err(SandboxError::new(
+                ErrorCode::MountConfigInvalid,
+                "Cloudflare sandbox sessions with protected bucket configuration cannot be \
+                 resumed; create a new session from current trusted configuration",
+            )
+            .with_context("backend", "cloudflare"));
+        }
         Self::check_manifest(&manifest)?;
         let worker_url = self.worker_url()?;
         let sandbox_id = state.provider_id.clone().ok_or_else(|| {
@@ -401,7 +419,19 @@ impl SandboxClient for CloudflareSandboxClient {
                     .resuming(),
             ));
         }
-        Ok(Arc::new(session))
+        let record = state
+            .snapshot_fingerprint
+            .clone()
+            .zip(state.snapshot_fingerprint_version.clone())
+            .map(|(fingerprint, version)| SnapshotFingerprint {
+                fingerprint,
+                version,
+            });
+        Ok(Arc::new(
+            session
+                .with_state_preserved(true)
+                .with_snapshot_fingerprint(record),
+        ))
     }
 
     async fn delete(&self, session: Arc<dyn SandboxSession>) -> SandboxResult<()> {
@@ -421,6 +451,16 @@ pub struct CloudflareSandboxSession {
     snapshot_id: String,
     exposed_ports: Vec<u16>,
     resuming: bool,
+    /// The worker still served this sandbox when the session resumed, so its accounts and
+    /// packages survived the pause.
+    state_preserved: bool,
+    /// A mount transition ended in an unknown state and the sandbox was deleted: the session
+    /// refuses further work.
+    mount_transition_terminal: AtomicBool,
+    /// The workspace fingerprint the stored snapshot was taken from.
+    snapshot_fingerprint: std::sync::Mutex<Option<SnapshotFingerprint>>,
+    /// Workspace-relative paths a persist leaves out of the archive.
+    persist_skip_paths: std::sync::Mutex<std::collections::BTreeSet<String>>,
     ptys: CloudflarePtySessions,
 }
 
@@ -441,6 +481,10 @@ impl CloudflareSandboxSession {
             snapshot_id,
             exposed_ports: Vec::new(),
             resuming: false,
+            state_preserved: false,
+            mount_transition_terminal: AtomicBool::new(false),
+            snapshot_fingerprint: std::sync::Mutex::new(None),
+            persist_skip_paths: std::sync::Mutex::new(std::collections::BTreeSet::new()),
             ptys: CloudflarePtySessions::new(),
         }
     }
@@ -467,6 +511,40 @@ impl CloudflareSandboxSession {
     pub fn resuming(mut self) -> Self {
         self.resuming = true;
         self
+    }
+
+    /// Carry the workspace fingerprint a resumed snapshot was taken from.
+    pub fn with_snapshot_fingerprint(self, record: Option<SnapshotFingerprint>) -> Self {
+        *self.snapshot_fingerprint.lock().expect("poisoned") = record;
+        self
+    }
+
+    /// Record that the sandbox survived the pause this session resumes from.
+    pub fn with_state_preserved(mut self, preserved: bool) -> Self {
+        self.state_preserved = preserved;
+        self
+    }
+
+    /// Refuse work once a mount transition left the sandbox in an unknown state.
+    fn ensure_usable(&self) -> SandboxResult<()> {
+        if self.mount_transition_terminal.load(Ordering::SeqCst) {
+            return Err(SandboxError::new(
+                ErrorCode::MountFailed,
+                "sandbox session is unavailable after an ambiguous mount transition",
+            )
+            .with_context("backend", "cloudflare"));
+        }
+        Ok(())
+    }
+
+    /// Tag a failed `DELETE` with the backend and, when the worker answered, the
+    /// status.
+    fn delete_failure(&self, error: SandboxError, status: Option<u16>) -> SandboxError {
+        let mut error = error.with_context("backend", "cloudflare");
+        if let Some(status) = status {
+            error = error.with_context("http_status", status.to_string());
+        }
+        error
     }
 
     /// The worker endpoint behind this session.
@@ -578,6 +656,83 @@ impl CloudflareSandboxSession {
         ))
     }
 
+    /// Restore the stored snapshot, detaching live bucket mounts first.
+    ///
+    /// A sandbox the worker kept alive across the pause still has its buckets attached, and
+    /// unpacking an archive over an attached bucket would write through it, so each mount is
+    /// detached first and `restore_session_snapshot` attaches them again afterwards. A workspace
+    /// that already matches the snapshot is not unpacked, so its mounts are left alone.
+    async fn restore_snapshot_on_resume(&self) -> SandboxResult<bool> {
+        let detached: Vec<(&crate::sandbox::mounts::Mount, String)> = if self.state_preserved {
+            self.manifest
+                .mount_targets()
+                .into_iter()
+                .filter(|(mount, _)| !mount.strategy.supports_native_snapshot_detach())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        if detached.is_empty()
+            || !self.snapshot().restorable().await?
+            || live_workspace_matches_snapshot_on_resume(self).await
+        {
+            return restore_session_snapshot(self).await;
+        }
+        // Detached in order. A failure while re-attaching them afterwards is terminal, so a
+        // failing re-attach is never retried here: `start` deletes the sandbox instead.
+        let mut torn_down: Vec<&(&crate::sandbox::mounts::Mount, String)> = Vec::new();
+        for entry in &detached {
+            let (mount, path) = entry;
+            if let Err(cause) = mount
+                .strategy
+                .teardown_for_snapshot(mount, self, path)
+                .await
+            {
+                self.reattach(&torn_down).await;
+                return Err(SandboxError::new(
+                    ErrorCode::WorkspaceStartError,
+                    format!("failed to detach mounts for {}", self.manifest.root()),
+                )
+                .with_context("path", self.manifest.root().to_string())
+                .caused_by(&cause)
+                .with_context("cause", cause.message.clone()));
+            }
+            torn_down.push(entry);
+        }
+        match restore_session_snapshot(self).await {
+            // The restore re-attaches the buckets itself when it succeeds, and a failing
+            // re-attach is the terminal case `start` handles.
+            Ok(restored) => Ok(restored),
+            Err(error)
+                if matches!(
+                    error.code,
+                    ErrorCode::MountFailed | ErrorCode::MountConfigInvalid
+                ) =>
+            {
+                Err(error)
+            }
+            // Any other failure (the archive, the hydrate) leaves the buckets detached, so they
+            // are put back before the error is returned, as Python's transition helper does.
+            Err(error) => {
+                self.reattach(&torn_down).await;
+                Err(error)
+            }
+        }
+    }
+
+    /// Attach the given buckets again, in reverse order, best effort.
+    async fn reattach(&self, mounts: &[&(&crate::sandbox::mounts::Mount, String)]) {
+        for (mount, path) in mounts.iter().rev().map(|entry| (&entry.0, &entry.1)) {
+            if let Err(error) = mount
+                .strategy
+                .restore_after_snapshot(mount, self, path)
+                .await
+            {
+                log::warn!(target: crate::logger::LOG_TARGET, "failed to re-attach a bucket after a failed resume: {error}");
+            }
+        }
+    }
+
     /// Decode a worker body that may arrive either raw or SSE-encoded.
     ///
     /// The worker streams larger payloads as `metadata` / `chunk` / `complete` events, with
@@ -687,6 +842,7 @@ impl CloudflareSandboxSession {
         body: Option<Vec<u8>>,
         code: ErrorCode,
     ) -> SandboxResult<Vec<u8>> {
+        self.ensure_usable()?;
         let url = self.connection.url(path);
         let mut builder = self
             .connection
@@ -765,7 +921,7 @@ impl SandboxSession for CloudflareSandboxSession {
         }
         self.started.store(true, Ordering::SeqCst);
         let applied = if self.resuming {
-            match restore_session_snapshot(self).await {
+            match self.restore_snapshot_on_resume().await {
                 Ok(false) => self.manifest.apply_ephemeral(self).await.map(|_| ()),
                 Ok(true) => Ok(()),
                 Err(error) => Err(error),
@@ -773,7 +929,28 @@ impl SandboxSession for CloudflareSandboxSession {
         } else {
             self.manifest.apply(self).await.map(|_| ())
         };
-        applied.inspect_err(|_| self.started.store(false, Ordering::SeqCst))?;
+        if let Err(error) = applied {
+            self.started.store(false, Ordering::SeqCst);
+            // A mount that failed while a resumed workspace was being re-attached leaves the
+            // sandbox half-mounted, so it is deleted rather than reused and the session is
+            // unusable from then on. Mirrors Python's `_reapply_ephemeral_manifest_on_resume`.
+            // A sandbox that was already deleted stays unusable too.
+            if self.resuming {
+                let deleted = *self.deleted.lock().await;
+                let bare_mount_failure = !deleted
+                    && matches!(
+                        error.code,
+                        ErrorCode::MountFailed | ErrorCode::MountConfigInvalid
+                    );
+                if deleted || bare_mount_failure {
+                    self.mount_transition_terminal.store(true, Ordering::SeqCst);
+                }
+                if bare_mount_failure && let Err(stop) = self.shutdown().await {
+                    return Err(stop.with_context("reason", "terminal_delete_failed"));
+                }
+            }
+            return Err(error);
+        }
         Ok(())
     }
 
@@ -801,17 +978,25 @@ impl SandboxSession for CloudflareSandboxSession {
             .send()
             .await
             .map_err(|error| {
-                SandboxError::new(
-                    ErrorCode::WorkspaceStopError,
-                    format!("`DELETE /sandbox` failed: {error}"),
+                self.delete_failure(
+                    SandboxError::new(
+                        ErrorCode::WorkspaceStopError,
+                        format!("`DELETE /sandbox` failed: {error}"),
+                    ),
+                    None,
                 )
             })?;
         self.started.store(false, Ordering::SeqCst);
         let status = response.status();
         if status.is_client_error() && status.as_u16() != 404 || status.is_server_error() {
-            return Err(SandboxError::new(
-                ErrorCode::WorkspaceStopError,
-                http_error_message("DELETE /sandbox", status.as_u16(), None),
+            // The reply body is never read: after an ambiguous mount transition it may echo the
+            // mount request, which carries bucket credentials.
+            return Err(self.delete_failure(
+                SandboxError::new(
+                    ErrorCode::WorkspaceStopError,
+                    http_error_message("DELETE /sandbox", status.as_u16(), None),
+                ),
+                Some(status.as_u16()),
             ));
         }
         *deleted = true;
@@ -842,6 +1027,7 @@ impl SandboxSession for CloudflareSandboxSession {
     }
 
     async fn exec(&self, request: ExecRequest) -> SandboxResult<ExecResult> {
+        self.ensure_usable()?;
         let argv = self.exec_argv(&request)?;
         let timeout = request.timeout.unwrap_or(self.connection.exec_timeout);
         match tokio::time::timeout(
@@ -861,8 +1047,27 @@ impl SandboxSession for CloudflareSandboxSession {
         }
     }
 
+    async fn mkdir(&self, path: &str, parents: bool) -> SandboxResult<()> {
+        // The worker's own filesystem decides: a workspace symlink can lead out of the root, or
+        // onto a read-only grant.
+        let resolved = self.validate_remote_path_access(path, true, false).await?;
+        let mut command = vec!["mkdir".to_string()];
+        if parents {
+            command.push("-p".to_string());
+        }
+        command.extend(["--".to_string(), resolved.clone()]);
+        let result = self.exec(ExecRequest::argv(command.clone())).await?;
+        if !result.ok() {
+            self.check_mkdir_access(&resolved, parents, None).await?;
+            return Err(SandboxError::exec_nonzero(&command, &result));
+        }
+        Ok(())
+    }
+
     async fn read_file(&self, path: &str) -> SandboxResult<Vec<u8>> {
-        let resolved = self.normalize_path(path)?;
+        self.ensure_usable()?;
+        // The worker's own filesystem decides: a workspace symlink can lead out of the root.
+        let resolved = self.validate_remote_path_access(path, false, false).await?;
         let url = self.file_url(&resolved);
         let response = self
             .connection
@@ -883,8 +1088,8 @@ impl SandboxSession for CloudflareSandboxSession {
                 format!("`{resolved}` does not exist in the sandbox workspace"),
             ));
         }
-        let body = response.bytes().await.unwrap_or_default();
         if !status.is_success() {
+            let body = response.bytes().await.unwrap_or_default();
             return Err(SandboxError::new(
                 ErrorCode::ExecTransportError,
                 http_error_message(
@@ -894,6 +1099,13 @@ impl SandboxSession for CloudflareSandboxSession {
                 ),
             ));
         }
+        // A body that fails part-way is an error, never an empty file.
+        let body = response.bytes().await.map_err(|error| {
+            SandboxError::new(
+                ErrorCode::ExecTransportError,
+                format!("Failed to read `{path}`: {error}"),
+            )
+        })?;
         Self::decode_streamed_payload(&body)
     }
 
@@ -906,13 +1118,14 @@ impl SandboxSession for CloudflareSandboxSession {
     /// refused with `reason = "bounded_read_wire_limit"` — the convention the core
     /// [`read_bounded`](SandboxSession::read_bounded) doc names — rather than decoded.
     async fn read_bounded_unchecked(&self, path: &str, max_bytes: usize) -> SandboxResult<Vec<u8>> {
+        self.ensure_usable()?;
         if max_bytes == 0 {
             return Err(SandboxError::new(
                 ErrorCode::SandboxConfigInvalid,
                 "read_bounded max_bytes must be positive",
             ));
         }
-        let resolved = self.normalize_path(path)?;
+        let resolved = self.validate_remote_path_access(path, false, false).await?;
         let url = self.file_url(&resolved);
         let response = self
             .connection
@@ -986,7 +1199,8 @@ impl SandboxSession for CloudflareSandboxSession {
     }
 
     async fn write_file(&self, path: &str, contents: &[u8]) -> SandboxResult<()> {
-        let resolved = self.normalize_path_for_write(path)?;
+        self.ensure_usable()?;
+        let resolved = self.validate_remote_path_access(path, true, false).await?;
         let url = self.file_url(&resolved);
         let response = self
             .connection
@@ -1024,6 +1238,13 @@ impl SandboxSession for CloudflareSandboxSession {
                 .into_iter()
                 .map(|e| e.trim_start_matches("./").to_string())
                 .collect();
+        // Paths other components asked to keep out of the archive, such as a mount's scratch
+        // directory.
+        excludes.extend(
+            self.persist_workspace_skip_paths()
+                .into_iter()
+                .map(|path| path.trim_start_matches("./").to_string()),
+        );
         excludes.sort();
         excludes.dedup();
         let query = if excludes.is_empty() {
@@ -1079,6 +1300,21 @@ impl SandboxSession for CloudflareSandboxSession {
         ))
     }
 
+    /// The sandbox's own filesystem decides every path, so `rm`, `ls` and `mv` resolve it first.
+    fn resolves_paths_remotely(&self) -> bool {
+        true
+    }
+
+    fn system_state_preserved_on_start(&self) -> bool {
+        self.state_preserved
+    }
+
+    fn persist_skip_registry(
+        &self,
+    ) -> Option<&std::sync::Mutex<std::collections::BTreeSet<String>>> {
+        Some(&self.persist_skip_paths)
+    }
+
     fn supports_pty(&self) -> bool {
         true
     }
@@ -1125,7 +1361,20 @@ impl SandboxSession for CloudflareSandboxSession {
         .with_snapshot(self.snapshot.clone().unwrap_or_default());
         state.snapshot_id = self.snapshot_id.clone();
         state.exposed_ports = self.exposed_ports.clone();
-        state
+        state.with_snapshot_fingerprint(self.snapshot_fingerprint.lock().expect("poisoned").clone())
+    }
+
+    fn resume_snapshot_fingerprint(&self) -> Option<SnapshotFingerprint> {
+        // Only a sandbox the worker kept alive can still hold the workspace the fingerprint
+        // describes; a replacement starts empty, so the restore must not be skipped for it.
+        if !self.state_preserved {
+            return None;
+        }
+        self.snapshot_fingerprint.lock().expect("poisoned").clone()
+    }
+
+    fn record_snapshot_fingerprint(&self, record: Option<SnapshotFingerprint>) {
+        *self.snapshot_fingerprint.lock().expect("poisoned") = record;
     }
 
     fn snapshot(&self) -> Arc<dyn Snapshot> {

@@ -84,7 +84,8 @@ impl BlaxelPtySessions {
                 return Err(SandboxError::new(
                     ErrorCode::ExecTimeout,
                     format!("Command `{command}` timed out opening the terminal"),
-                ));
+                )
+                .with_context("timeout_s", connect_timeout.as_secs_f64().to_string()));
             }
         };
         let (mut sink, stream) = socket.split();

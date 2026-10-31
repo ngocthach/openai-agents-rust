@@ -409,7 +409,7 @@ pub trait SandboxSession: Send + Sync + fmt::Debug {
         if recursive {
             policy.validate_recursive_remove(path)?;
         }
-        if self.has_read_only_grant() {
+        if self.has_read_only_grant() || self.resolves_paths_remotely() {
             self.validate_remote_path_access(path, true, recursive)
                 .await?;
         }
@@ -658,7 +658,11 @@ pub trait SandboxSession: Send + Sync + fmt::Debug {
 
     /// List a directory.
     async fn ls(&self, path: &str) -> SandboxResult<Vec<FileEntry>> {
-        let resolved = self.normalize_path(path)?;
+        let resolved = if self.resolves_paths_remotely() {
+            self.validate_remote_path_access(path, false, false).await?
+        } else {
+            self.normalize_path(path)?
+        };
         let command = vec![
             "ls".to_string(),
             "-la".to_string(),
@@ -704,7 +708,7 @@ pub trait SandboxSession: Send + Sync + fmt::Debug {
         };
         // With a read-only grant in play, an alias the lexical check cannot see could point a
         // writable-looking path at protected data, so the sandbox resolves the real tree.
-        if self.has_read_only_grant() {
+        if self.has_read_only_grant() || self.resolves_paths_remotely() {
             self.validate_remote_path_access(path, true, recursive)
                 .await?;
         }
@@ -1037,6 +1041,17 @@ pub trait SandboxSession: Send + Sync + fmt::Debug {
             }
             _ => Err(SandboxError::exec_nonzero(&argv, &result)),
         }
+    }
+
+    /// Whether `rm`, `ls` and `mv` resolve every path inside the sandbox first.
+    ///
+    /// Mirrors Python's base class, which runs `_validate_remote_path_access` for those
+    /// operations so a workspace symlink cannot lead a lexically safe path out of the root. The
+    /// default is `false` because the resolver costs extra `exec` round trips and local
+    /// backends check through the real filesystem already; a provider whose files live behind an
+    /// API turns it on.
+    fn resolves_paths_remotely(&self) -> bool {
+        false
     }
 
     /// Whether any extra path grant is read-only, which is what makes a recursive removal need
@@ -1720,6 +1735,29 @@ pub fn workspace_archive_excludes(manifest: &Manifest, root: &str) -> Vec<String
     excludes
 }
 
+/// `tar --exclude=...` arguments that skip `skip_relpaths` in an archive rooted at `.`.
+///
+/// Paths are sorted by their POSIX form and anchored with `./`, because a bare pattern also
+/// matches unrelated nested paths of the same name. Empty and `.` paths are dropped, and an
+/// absolute path is treated as workspace-relative. Mirrors `shell_tar_exclude_args`.
+pub fn shell_tar_exclude_args<I, P>(skip_relpaths: I) -> Vec<String>
+where
+    I: IntoIterator<Item = P>,
+    P: AsRef<std::path::Path>,
+{
+    let mut posix: Vec<String> = skip_relpaths
+        .into_iter()
+        .map(|path| path.as_ref().to_string_lossy().replace('\\', "/"))
+        .collect();
+    posix.sort();
+    posix
+        .iter()
+        .map(|path| path.trim_start_matches('/'))
+        .filter(|path| !path.is_empty() && *path != ".")
+        .map(|path| format!("--exclude={}", shell_quote(&format!("./{path}"))))
+        .collect()
+}
+
 /// Capture a session's workspace as a gzipped tar through the backend's own `tar`.
 ///
 /// This is the body of the default [`SandboxSession::persist_workspace_once`], extracted so a
@@ -1988,8 +2026,21 @@ async fn mv_via_exec<S: SandboxSession + ?Sized>(
     user: Option<&User>,
 ) -> SandboxResult<()> {
     // A move writes at both ends: it unlinks the source and creates the destination.
-    let source = session.normalize_path_for_write(source)?;
-    let destination = session.normalize_path_for_write(destination)?;
+    let (source, destination) = if session.resolves_paths_remotely() {
+        (
+            session
+                .validate_remote_path_access(source, true, false)
+                .await?,
+            session
+                .validate_remote_path_access(destination, true, false)
+                .await?,
+        )
+    } else {
+        (
+            session.normalize_path_for_write(source)?,
+            session.normalize_path_for_write(destination)?,
+        )
+    };
     let script = "if [ ! -L \"$1\" ] && [ ! -f \"$1\" ]; then \
          printf \"%s\\n\" \"Move source must be a regular file or symlink\" >&2; exit 1; fi; \
          exec mv -fT -- \"$1\" \"$2\"";

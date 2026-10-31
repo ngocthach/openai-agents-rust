@@ -78,7 +78,7 @@ use crate::sandbox::session::{
     workspace_archive_excludes,
 };
 use crate::sandbox::snapshot::{Snapshot, SnapshotSpec, resolve_snapshot};
-use crate::sandbox::state::SandboxSessionState;
+use crate::sandbox::state::{SandboxSessionState, SnapshotFingerprint};
 use crate::sandbox::types::{ExecResult, FileEntry, Permissions};
 use crate::sandbox::workspace_paths::provider_scratch_path;
 
@@ -678,6 +678,7 @@ impl SandboxClient for DaytonaSandboxClient {
                 .ok(),
             None => None,
         };
+        let reattached = sandbox.is_some();
         let sandbox = match sandbox {
             Some(sandbox) => sandbox,
             // The original sandbox is gone: create a replacement and hydrate it from the snapshot.
@@ -696,6 +697,19 @@ impl SandboxClient for DaytonaSandboxClient {
             Some(state.snapshot.clone()),
         )
         .with_snapshot_id(state.snapshot_id.clone())
+        .with_state_preserved(reattached)
+        .with_snapshot_fingerprint(if reattached {
+            state
+                .snapshot_fingerprint
+                .clone()
+                .zip(state.snapshot_fingerprint_version.clone())
+                .map(|(fingerprint, version)| SnapshotFingerprint {
+                    fingerprint,
+                    version,
+                })
+        } else {
+            None
+        })
         .resuming();
         // A run that ended with `stop` left the sandbox stopped; it has to be started again
         // before the toolbox answers.
@@ -730,6 +744,12 @@ pub struct DaytonaSandboxSession {
     snapshot: Option<SnapshotSpec>,
     snapshot_id: String,
     resuming: bool,
+    /// Workspace-relative paths a persist leaves out of the archive.
+    persist_skips: Mutex<std::collections::BTreeSet<String>>,
+    /// The sandbox survived the pause this session resumes from.
+    state_preserved: bool,
+    /// The workspace fingerprint the stored snapshot was taken from.
+    snapshot_fingerprint: Mutex<Option<SnapshotFingerprint>>,
 }
 
 // The API key must never appear in a log line.
@@ -773,7 +793,22 @@ impl DaytonaSandboxSession {
             pty_handles: Mutex::new(HashMap::new()),
             snapshot,
             resuming: false,
+            persist_skips: Mutex::new(std::collections::BTreeSet::new()),
+            state_preserved: false,
+            snapshot_fingerprint: Mutex::new(None),
         }
+    }
+
+    /// Carry the workspace fingerprint a resumed snapshot was taken from.
+    fn with_snapshot_fingerprint(self, record: Option<SnapshotFingerprint>) -> Self {
+        *self.snapshot_fingerprint.lock().expect("poisoned") = record;
+        self
+    }
+
+    /// Record that the sandbox survived the pause this session resumes from.
+    fn with_state_preserved(mut self, preserved: bool) -> Self {
+        self.state_preserved = preserved;
+        self
     }
 
     /// Reuse a persisted snapshot identity.
@@ -1282,7 +1317,8 @@ impl SandboxSession for DaytonaSandboxSession {
     }
 
     async fn read_file(&self, path: &str) -> SandboxResult<Vec<u8>> {
-        let resolved = self.normalize_path(path)?;
+        // The sandbox's own filesystem decides: a workspace symlink can lead out of the root.
+        let resolved = self.validate_remote_path_access(path, false, false).await?;
         self.download_at(&resolved, None).await
     }
 
@@ -1290,12 +1326,12 @@ impl SandboxSession for DaytonaSandboxSession {
         if max_bytes == 0 {
             return Err(bounded_read_zero());
         }
-        let resolved = self.normalize_path(path)?;
+        let resolved = self.validate_remote_path_access(path, false, false).await?;
         self.download_at(&resolved, Some(max_bytes)).await
     }
 
     async fn write_file(&self, path: &str, contents: &[u8]) -> SandboxResult<()> {
-        let resolved = self.normalize_path_for_write(path)?;
+        let resolved = self.validate_remote_path_access(path, true, false).await?;
         self.upload_at(&resolved, contents).await
     }
 
@@ -1354,8 +1390,21 @@ impl SandboxSession for DaytonaSandboxSession {
         true
     }
 
+    /// The sandbox's own filesystem decides every path, so `rm`, `ls` and `mv` resolve it first.
+    fn resolves_paths_remotely(&self) -> bool {
+        true
+    }
+
+    fn persist_skip_registry(&self) -> Option<&Mutex<std::collections::BTreeSet<String>>> {
+        Some(&self.persist_skips)
+    }
+
+    fn system_state_preserved_on_start(&self) -> bool {
+        self.state_preserved
+    }
+
     async fn ls(&self, path: &str) -> SandboxResult<Vec<FileEntry>> {
-        let resolved = self.normalize_path(path)?;
+        let resolved = self.validate_remote_path_access(path, false, false).await?;
         let what = "list a directory in the Daytona sandbox";
         let response = self
             .authorize(self.http.get(self.toolbox("/files")))
@@ -1370,9 +1419,26 @@ impl SandboxSession for DaytonaSandboxSession {
             .collect())
     }
 
+    async fn mkdir_as(
+        &self,
+        path: &str,
+        parents: bool,
+        user: Option<&crate::sandbox::User>,
+    ) -> SandboxResult<()> {
+        let Some(user) = user else {
+            return self.mkdir(path, parents).await;
+        };
+        // The toolbox files API runs as the sandbox's own user, so the requested user's
+        // permission is checked first and the folder is then created through the API.
+        let resolved = self.validate_remote_path_access(path, true, false).await?;
+        self.check_mkdir_access(&resolved, parents, Some(user))
+            .await?;
+        self.mkdir(path, parents).await
+    }
+
     async fn mkdir(&self, path: &str, _parents: bool) -> SandboxResult<()> {
         // The toolbox always creates the missing parents.
-        let resolved = self.normalize_path(path)?;
+        let resolved = self.validate_remote_path_access(path, true, false).await?;
         let what = "create a directory in the Daytona sandbox";
         let response = self
             .authorize(self.http.post(self.toolbox("/files/folder")))
@@ -1389,13 +1455,23 @@ impl SandboxSession for DaytonaSandboxSession {
     }
 
     async fn rm(&self, path: &str, recursive: bool) -> SandboxResult<()> {
-        let resolved = self.normalize_path(path)?;
+        if recursive {
+            self.workspace_path_policy()?
+                .validate_recursive_remove(path)?;
+        }
+        let resolved = self
+            .validate_remote_path_access(path, true, recursive)
+            .await?;
         self.remove_at(&resolved, recursive).await
     }
 
     async fn mv(&self, source: &str, destination: &str) -> SandboxResult<()> {
-        let source = self.normalize_path(source)?;
-        let destination = self.normalize_path(destination)?;
+        let source = self
+            .validate_remote_path_access(source, true, false)
+            .await?;
+        let destination = self
+            .validate_remote_path_access(destination, true, false)
+            .await?;
         let what = "move a path in the Daytona sandbox";
         let response = self
             .authorize(self.http.post(self.toolbox("/files/move")))
@@ -1498,6 +1574,20 @@ impl SandboxSession for DaytonaSandboxSession {
         )
         .with_provider_id(Some(self.sandbox_id.clone()))
         .with_snapshot(self.snapshot.clone().unwrap_or_default())
+        .with_snapshot_fingerprint(self.snapshot_fingerprint.lock().expect("poisoned").clone())
+    }
+
+    fn resume_snapshot_fingerprint(&self) -> Option<SnapshotFingerprint> {
+        // Only a sandbox that survived the pause can still hold the workspace the fingerprint
+        // describes; a replacement starts empty, so its restore must not be skipped.
+        if !self.state_preserved {
+            return None;
+        }
+        self.snapshot_fingerprint.lock().expect("poisoned").clone()
+    }
+
+    fn record_snapshot_fingerprint(&self, record: Option<SnapshotFingerprint>) {
+        *self.snapshot_fingerprint.lock().expect("poisoned") = record;
     }
 
     fn snapshot(&self) -> Arc<dyn Snapshot> {
@@ -1518,6 +1608,12 @@ impl SandboxSession for DaytonaSandboxSession {
         for exclude in workspace_archive_excludes(&self.manifest, &root) {
             command.push_str(&format!(" --exclude {}", shell_quote(&exclude)));
         }
+        for skipped in self.persist_workspace_skip_paths() {
+            command.push_str(&format!(
+                " --exclude {}",
+                shell_quote(&format!("./{skipped}"))
+            ));
+        }
         command.push_str(" .");
         // The toolbox reports command output as text, so the archive travels over the file API.
         // Python retries just this command on a transient transport failure
@@ -1535,7 +1631,20 @@ impl SandboxSession for DaytonaSandboxSession {
             },
             |error, _attempt| is_transient_sandbox_error(error),
         )
-        .await?;
+        .await
+        .map_err(|error| {
+            // A stopped sandbox has no container address the toolbox can reach, and starting it
+            // again is not something a retry does.
+            if error.message.contains("Is the Sandbox started")
+                || error.message.contains("failed to resolve container IP")
+            {
+                return SandboxError::new(ErrorCode::SnapshotPersistError, error.message)
+                    .with_retryable(false)
+                    .with_context("backend", "daytona")
+                    .with_context("reason", "sandbox_not_running");
+            }
+            error
+        })?;
         if !result.ok() {
             return Err(SandboxError::new(
                 ErrorCode::SnapshotPersistError,
@@ -1938,6 +2047,9 @@ impl DaytonaSandboxSession {
             Err(error) if is_no_subprotocol_error(&error) => {
                 Err(TerminalConnectError::NoSubProtocol)
             }
+            Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+                Err(TerminalConnectError::Http(response.status().as_u16()))
+            }
             Err(error) => Err(TerminalConnectError::Other(error.to_string())),
         }
     }
@@ -2292,6 +2404,8 @@ struct ConnectedTerminal {
 
 /// Why a PTY websocket could not be opened.
 enum TerminalConnectError {
+    /// The server answered the upgrade with an HTTP error.
+    Http(u16),
     /// The server accepted the upgrade without selecting a subprotocol.
     NoSubProtocol,
     /// Anything else.
@@ -2300,11 +2414,22 @@ enum TerminalConnectError {
 
 impl TerminalConnectError {
     fn into_sandbox_error(self) -> SandboxError {
+        if let TerminalConnectError::Http(status) = self {
+            let mut error = SandboxError::new(
+                ErrorCode::ExecTransportError,
+                format!("Failed to open the Daytona PTY websocket: HTTP {status}"),
+            )
+            .with_context("backend", "daytona")
+            .with_context("http_status", status.to_string());
+            error.retryable = daytona_status_retryable(status);
+            return error;
+        }
         let detail = match self {
             TerminalConnectError::NoSubProtocol => {
                 "the server selected no websocket subprotocol".to_string()
             }
             TerminalConnectError::Other(detail) => detail,
+            TerminalConnectError::Http(_) => unreachable!("handled above"),
         };
         SandboxError::new(
             ErrorCode::ExecTransportError,

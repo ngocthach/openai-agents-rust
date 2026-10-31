@@ -209,6 +209,10 @@ async fn run_turns(
     // However this task ends, including a panic or a cancellation, the consumer must still see
     // a terminal event instead of waiting on a session that can no longer produce audio.
     let _guard = SessionGuard(writer.clone());
+    let failure_message = match &input {
+        VoiceInput::Static(_) => "Error processing single voice turn",
+        VoiceInput::Streamed(_) => "Error processing voice turns",
+    };
     let outcome = match input {
         VoiceInput::Static(audio) => {
             run_single_turn(&audio, &stt, workflow.as_ref(), &writer, &config).await
@@ -220,7 +224,8 @@ async fn run_turns(
     match outcome {
         Ok(()) => writer.finish().await,
         Err(error) => {
-            log::error!(target: crate::logger::LOG_TARGET, "Error processing voice turns: {error}");
+            // Workflow errors can carry model and tool data, so both logging policies apply.
+            crate::logger::log_model_and_tool_action_error(failure_message, &error);
             // A synthesis failure already queued its own error, in audio order.
             if !writer.has_failed() {
                 writer.add_error(error);
@@ -265,7 +270,10 @@ async fn run_multi_turn(
                     emitted_intro = true;
                 }
                 Err(error) => {
-                    log::warn!(target: crate::logger::LOG_TARGET, "Voice workflow on_start failed: {error}");
+                    crate::logger::log_model_and_tool_action_warning(
+                        "Voice workflow on_start failed",
+                        &error,
+                    );
                     break;
                 }
             }

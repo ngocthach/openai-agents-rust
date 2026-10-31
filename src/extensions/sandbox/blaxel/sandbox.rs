@@ -897,6 +897,7 @@ pub struct BlaxelSandboxSession {
     resuming: bool,
     preserved_workspace: bool,
     ptys: BlaxelPtySessions,
+    persist_skip: std::sync::Mutex<std::collections::BTreeSet<String>>,
 }
 
 impl BlaxelSandboxSession {
@@ -919,6 +920,7 @@ impl BlaxelSandboxSession {
             resuming: false,
             preserved_workspace: false,
             ptys: BlaxelPtySessions::new(),
+            persist_skip: std::sync::Mutex::new(std::collections::BTreeSet::new()),
         }
     }
 
@@ -976,6 +978,18 @@ impl BlaxelSandboxSession {
         env
     }
 
+    /// The effective exec timeout: the request's, else the session's, and never zero.
+    ///
+    /// Mirrors Python's `_coerce_exec_timeout`: a non-positive timeout becomes one millisecond
+    /// rather than disabling the limit.
+    fn coerce_exec_timeout(&self, requested: Option<Duration>) -> Duration {
+        match requested {
+            None => self.connection.timeouts.exec,
+            Some(timeout) if timeout.is_zero() => Duration::from_millis(1),
+            Some(timeout) => timeout,
+        }
+    }
+
     /// The `POST /process` body for one command.
     fn process_body(&self, request: &ExecRequest) -> SandboxResult<Value> {
         let command = request
@@ -988,14 +1002,16 @@ impl BlaxelSandboxSession {
             None => self.manifest.root().to_string(),
             Some(cwd) => self.normalize_path(cwd)?,
         };
-        let timeout = request.timeout.unwrap_or(self.connection.timeouts.exec);
+        let timeout = self.coerce_exec_timeout(request.timeout);
         let mut body = Map::new();
         body.insert("command".to_string(), Value::String(command));
         body.insert("workingDir".to_string(), Value::String(working_dir));
         body.insert("waitForCompletion".to_string(), Value::Bool(true));
+        // Whole seconds, rounded up, as Python sends: the sandbox API takes the timeout in
+        // milliseconds but the SDK only ever rounds it to a second.
         body.insert(
             "timeout".to_string(),
-            Value::from(timeout.as_millis().max(1) as u64),
+            Value::from(timeout.as_secs_f64().ceil().max(1.0) as u64 * 1000),
         );
         let env = self.resolved_env(request);
         if !env.is_empty() {
@@ -1062,18 +1078,20 @@ impl BlaxelSandboxSession {
             .await
             .map_err(|error| {
                 SandboxError::new(
-                    ErrorCode::WorkspaceWriteTypeError,
+                    ErrorCode::WorkspaceArchiveWriteError,
                     format!("blaxel filesystem write to `{resolved}` failed: {error}"),
                 )
+                .with_context("reason", "mkdir_failed")
             })?;
         if !response.status().is_success() {
             return Err(SandboxError::new(
-                ErrorCode::WorkspaceWriteTypeError,
+                ErrorCode::WorkspaceArchiveWriteError,
                 format!(
                     "blaxel filesystem write to `{resolved}` failed: HTTP {}",
                     response.status().as_u16()
                 ),
-            ));
+            )
+            .with_context("reason", "mkdir_failed"));
         }
         Ok(())
     }
@@ -1160,7 +1178,7 @@ impl BlaxelSandboxSession {
             .await
             .map_err(|error| {
                 SandboxError::new(
-                    ErrorCode::ExecTransportError,
+                    ErrorCode::WorkspaceArchiveReadError,
                     format!("Failed to read `{resolved}`: {error}"),
                 )
             })?;
@@ -1187,13 +1205,17 @@ impl BlaxelSandboxSession {
             let detail = blaxel_error_detail(&body)
                 .map(|detail| format!(": {detail}"))
                 .unwrap_or_default();
-            return Err(SandboxError::new(
-                ErrorCode::ExecTransportError,
+            let mut error = SandboxError::new(
+                ErrorCode::WorkspaceArchiveReadError,
                 format!(
                     "Failed to read `{resolved}`: HTTP {}{detail}",
                     status.as_u16()
                 ),
-            ));
+            );
+            if crate::sandbox::retry::is_transient_http_status(status.as_u16()) {
+                error = error.with_retryable(true);
+            }
+            return Err(error);
         }
         crate::sandbox::http::read_body_prefix(
             response,
@@ -1223,7 +1245,7 @@ impl BlaxelSandboxSession {
             .await
             .map_err(|error| {
                 SandboxError::new(
-                    ErrorCode::WorkspaceWriteTypeError,
+                    ErrorCode::WorkspaceArchiveWriteError,
                     format!("Failed to write `{resolved}`: {error}"),
                 )
             })?;
@@ -1231,7 +1253,7 @@ impl BlaxelSandboxSession {
         if !status.is_success() {
             let body = response.bytes().await.unwrap_or_default();
             return Err(SandboxError::new(
-                ErrorCode::WorkspaceWriteTypeError,
+                ErrorCode::WorkspaceArchiveWriteError,
                 format!(
                     "Failed to write `{resolved}`: HTTP {}{}",
                     status.as_u16(),
@@ -1258,14 +1280,14 @@ impl BlaxelSandboxSession {
         }
         let response = builder.send().await.map_err(|error| {
             SandboxError::new(
-                ErrorCode::WorkspaceWriteTypeError,
+                ErrorCode::WorkspaceArchiveWriteError,
                 format!("Failed to remove `{resolved}`: {error}"),
             )
         })?;
         let status = response.status();
         if !status.is_success() && status.as_u16() != 404 {
             return Err(SandboxError::new(
-                ErrorCode::WorkspaceWriteTypeError,
+                ErrorCode::WorkspaceArchiveWriteError,
                 format!("Failed to remove `{resolved}`: HTTP {}", status.as_u16()),
             ));
         }
@@ -1285,6 +1307,8 @@ impl BlaxelSandboxSession {
             crate::sandbox::session::workspace_archive_excludes(&self.manifest, &root)
                 .into_iter()
                 .map(|e| e.trim_start_matches("./").to_string())
+                .chain(self.persist_workspace_skip_paths())
+                .filter(|relative| !relative.is_empty() && relative != ".")
                 .collect();
         excludes.sort();
         excludes.dedup();
@@ -1311,6 +1335,10 @@ impl SandboxSession for BlaxelSandboxSession {
     }
 
     async fn start(&self) -> SandboxResult<()> {
+        // Before any provider work, as Python's `_validate_manifest_application` runs first: an
+        // unsafe mount must be refused before the sandbox is touched, and without echoing the
+        // mount's credentials.
+        self.manifest.validate_mount_credential_boundaries()?;
         self.started.store(true, Ordering::SeqCst);
         if self.preserved_workspace {
             // A reconnected paused sandbox still holds the files the last run left behind, so
@@ -1319,14 +1347,18 @@ impl SandboxSession for BlaxelSandboxSession {
         }
         // Blaxel base images run as root and ship no workspace directory, and the manifest
         // materializer runs its first `mkdir` with the workspace root as the working directory,
-        // so the root is created from `/` first.
+        // so the root is created from `/` first. As in Python, a failure here is only logged:
+        // materialization retries the directory and reports the real error.
         let root = self.manifest.root().to_string();
-        self.mkdir(&root, true).await.map_err(|error| {
-            SandboxError::new(
-                ErrorCode::WorkspaceStartError,
-                format!("failed to create the workspace root `{root}`: {error}"),
-            )
-        })?;
+        if let Err(error) = self
+            .filesystem_put(&root, json!({"isDirectory": true, "permissions": "0755"}))
+            .await
+        {
+            crate::logger::log_tool_action_debug(
+                "Workspace root mkdir failed; retrying during materialization",
+                &error,
+            );
+        }
         let applied = if self.resuming {
             match restore_session_snapshot(self).await {
                 Ok(false) => self.manifest.apply_ephemeral(self).await.map(|_| ()),
@@ -1355,24 +1387,31 @@ impl SandboxSession for BlaxelSandboxSession {
             return Ok(());
         }
         let path = format!("/sandboxes/{}", self.connection.sandbox_name);
-        let response = self
+        // As in Python, a failed delete is logged rather than raised: shutdown runs in cleanup
+        // paths where a second error would hide the first.
+        let response = match self
             .connection
             .control_request(reqwest::Method::DELETE, &path)
             .timeout(self.connection.timeouts.cleanup)
             .send()
             .await
-            .map_err(|error| {
-                SandboxError::new(
-                    ErrorCode::WorkspaceStopError,
-                    format!("`DELETE {path}` failed: {error}"),
-                )
-            })?;
+        {
+            Ok(response) => response,
+            Err(error) => {
+                crate::logger::log_tool_action_warning(
+                    "Sandbox delete failed during shutdown",
+                    &error,
+                );
+                return Ok(());
+            }
+        };
         let status = response.status();
         if (status.is_client_error() && status.as_u16() != 404) || status.is_server_error() {
-            return Err(SandboxError::new(
-                ErrorCode::WorkspaceStopError,
-                format!("`DELETE {path}` failed: HTTP {}", status.as_u16()),
-            ));
+            crate::logger::log_tool_action_warning(
+                "Sandbox delete failed during shutdown",
+                &format!("`DELETE {path}` failed: HTTP {}", status.as_u16()),
+            );
+            return Ok(());
         }
         *deleted = true;
         Ok(())
@@ -1386,12 +1425,25 @@ impl SandboxSession for BlaxelSandboxSession {
             .timeout(Duration::from_secs(10))
             .send()
             .await;
-        Ok(response.map(|r| r.status().is_success()).unwrap_or(false))
+        match response {
+            Ok(response) if response.status().is_success() => Ok(true),
+            Ok(response) => {
+                crate::logger::log_tool_action_debug(
+                    "Sandbox health check failed",
+                    &format!("HTTP {}", response.status().as_u16()),
+                );
+                Ok(false)
+            }
+            Err(error) => {
+                crate::logger::log_tool_action_debug("Sandbox health check failed", &error);
+                Ok(false)
+            }
+        }
     }
 
     async fn exec(&self, request: ExecRequest) -> SandboxResult<ExecResult> {
         let body = self.process_body(&request)?;
-        let timeout = request.timeout.unwrap_or(self.connection.timeouts.exec);
+        let timeout = self.coerce_exec_timeout(request.timeout);
         let response = self
             .connection
             .sandbox_request(reqwest::Method::POST, "/process")
@@ -1408,31 +1460,52 @@ impl SandboxSession for BlaxelSandboxSession {
                             request.command.join(" ")
                         ),
                     )
+                    .with_context("timeout_s", timeout.as_secs_f64().to_string())
                 } else {
                     SandboxError::new(
                         ErrorCode::ExecTransportError,
                         format!("Blaxel exec failed: {error}"),
                     )
+                    .with_context("backend", "blaxel")
+                    .with_context("provider_error", error.to_string())
                 }
             })?;
         let status = response.status();
-        let payload = response.bytes().await.unwrap_or_default();
+        // The request timeout covers the body too, so a command that outlives it can fail here
+        // rather than in `send`.
+        let payload = match response.bytes().await {
+            Ok(payload) => payload,
+            Err(error) if error.is_timeout() => {
+                return Err(SandboxError::new(
+                    ErrorCode::ExecTimeout,
+                    format!(
+                        "Command `{}` timed out after {timeout:?}",
+                        request.command.join(" ")
+                    ),
+                )
+                .with_context("timeout_s", timeout.as_secs_f64().to_string()));
+            }
+            Err(error) => {
+                return Err(SandboxError::new(
+                    ErrorCode::ExecTransportError,
+                    format!("Blaxel exec failed: {error}"),
+                )
+                .with_context("backend", "blaxel")
+                .with_context("provider_error", error.to_string()));
+            }
+        };
         if !status.is_success() {
-            let code = if matches!(status.as_u16(), 408 | 504) {
-                ErrorCode::ExecTimeout
-            } else {
-                ErrorCode::ExecTransportError
-            };
-            return Err(SandboxError::new(
-                code,
-                format!(
-                    "Blaxel exec failed: HTTP {}{}",
-                    status.as_u16(),
-                    blaxel_error_detail(&payload)
-                        .map(|detail| format!(": {detail}"))
-                        .unwrap_or_default()
-                ),
-            ));
+            if matches!(status.as_u16(), 408 | 504) {
+                return Err(SandboxError::new(
+                    ErrorCode::ExecTimeout,
+                    format!(
+                        "Command `{}` timed out after {timeout:?}: HTTP {}",
+                        request.command.join(" "),
+                        status.as_u16()
+                    ),
+                ));
+            }
+            return Err(exec_status_error(status.as_u16(), &payload));
         }
         let payload: Value = serde_json::from_slice(&payload).map_err(|error| {
             SandboxError::new(
@@ -1444,7 +1517,8 @@ impl SandboxSession for BlaxelSandboxSession {
     }
 
     async fn read_file(&self, path: &str) -> SandboxResult<Vec<u8>> {
-        let resolved = self.normalize_path(path)?;
+        // The sandbox's own filesystem decides: a workspace symlink can lead out of the root.
+        let resolved = self.validate_remote_path_access(path, false, false).await?;
         self.read_internal(&resolved, None).await
     }
 
@@ -1452,12 +1526,12 @@ impl SandboxSession for BlaxelSandboxSession {
         if max_bytes == 0 {
             return Err(crate::sandbox::http::bounded_read_zero());
         }
-        let resolved = self.normalize_path(path)?;
+        let resolved = self.validate_remote_path_access(path, false, false).await?;
         self.read_internal(&resolved, Some(max_bytes)).await
     }
 
     async fn write_file(&self, path: &str, contents: &[u8]) -> SandboxResult<()> {
-        let resolved = self.normalize_path_for_write(path)?;
+        let resolved = self.validate_remote_path_access(path, true, false).await?;
         self.write_internal(&resolved, contents).await
     }
 
@@ -1471,10 +1545,10 @@ impl SandboxSession for BlaxelSandboxSession {
     }
 
     async fn mkdir(&self, path: &str, parents: bool) -> SandboxResult<()> {
-        let resolved = self.normalize_path(path)?;
-        if resolved == "/" {
+        if self.normalize_path(path)? == "/" {
             return Ok(());
         }
+        let resolved = self.validate_remote_path_access(path, true, false).await?;
         // The Blaxel filesystem service creates intermediate directories itself, so `parents`
         // only decides whether a missing parent is an error worth reporting.
         let _ = parents;
@@ -1486,12 +1560,19 @@ impl SandboxSession for BlaxelSandboxSession {
     }
 
     async fn rm(&self, path: &str, recursive: bool) -> SandboxResult<()> {
-        let resolved = self.normalize_path(path)?;
+        if recursive {
+            // A recursive removal of an ancestor is a write to every grant under it.
+            self.workspace_path_policy()?
+                .validate_recursive_remove(path)?;
+        }
+        let resolved = self
+            .validate_remote_path_access(path, true, recursive)
+            .await?;
         self.remove_internal(&resolved, recursive).await
     }
 
     async fn ls(&self, path: &str) -> SandboxResult<Vec<FileEntry>> {
-        let resolved = self.normalize_path(path)?;
+        let resolved = self.validate_remote_path_access(path, false, false).await?;
         let url_path = format!("/filesystem/{}", encode_sandbox_path(&resolved));
         let response = self
             .connection
@@ -1553,20 +1634,47 @@ impl SandboxSession for BlaxelSandboxSession {
                 is_transient_sandbox_error(error) || error.code == ErrorCode::ExecTimeout
             },
         )
-        .await?;
+        .await;
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => {
+                let _ = self.remove_internal(&tar_path, false).await;
+                return Err(SandboxError::new(
+                    ErrorCode::WorkspaceArchiveReadError,
+                    format!("Failed to archive workspace `{root}`: {}", error.message),
+                )
+                .with_context("path", root)
+                .caused_by(&error));
+            }
+        };
         if !result.ok() {
             let _ = self.remove_internal(&tar_path, false).await;
             return Err(SandboxError::new(
-                ErrorCode::SnapshotPersistError,
+                ErrorCode::WorkspaceArchiveReadError,
                 format!(
                     "Failed to archive workspace `{root}`: {}",
                     result.stderr_text().trim()
                 ),
-            ));
+            )
+            .with_context("path", root)
+            .with_context("reason", "tar_failed")
+            .with_context("output", result.stderr_text())
+            .with_retryable(false));
         }
         let archive = self.read_internal(&tar_path, None).await;
         let _ = self.remove_internal(&tar_path, false).await;
-        archive
+        archive.map_err(|error| {
+            if error.code == ErrorCode::WorkspaceArchiveReadError {
+                error
+            } else {
+                SandboxError::new(
+                    ErrorCode::WorkspaceArchiveReadError,
+                    format!("Failed to read the workspace archive: {}", error.message),
+                )
+                .with_context("path", root.clone())
+                .caused_by(&error)
+            }
+        })
     }
 
     fn validate_restorable_archive(&self, archive: &[u8]) -> SandboxResult<()> {
@@ -1574,45 +1682,73 @@ impl SandboxSession for BlaxelSandboxSession {
     }
 
     async fn hydrate_workspace(&self, archive: &[u8]) -> SandboxResult<()> {
-        crate::sandbox::archive::validate_hydrate_archive(archive)?;
         let root = self.manifest.root().to_string();
-        let tar_path = self.tar_path("hydrate");
-        self.mkdir(&root, true).await?;
-        self.write_internal(&tar_path, archive)
-            .await
-            .map_err(|error| {
-                SandboxError::new(
-                    ErrorCode::SnapshotRestoreError,
-                    format!("Failed to upload the workspace archive: {error}"),
-                )
-            })?;
-        let command = format!(
-            "tar -C {root} -xf {tar}",
-            root = shell_quote(&root),
-            tar = shell_quote(&tar_path),
-        );
-        let result = self
-            .exec(
-                ExecRequest::shell(command)
-                    .with_timeout(Some(self.connection.timeouts.workspace_tar)),
+        crate::sandbox::archive::validate_hydrate_archive(archive).map_err(|error| {
+            SandboxError::new(
+                ErrorCode::WorkspaceArchiveWriteError,
+                format!("failed to write archive for path: {root}"),
             )
-            .await;
-        let _ = self.remove_internal(&tar_path, false).await;
-        let result = result?;
-        if !result.ok() {
-            return Err(SandboxError::new(
-                ErrorCode::SnapshotRestoreError,
-                format!(
-                    "Failed to restore the sandbox workspace: {}",
-                    result.stderr_text().trim()
-                ),
-            ));
+            .with_context("path", root.clone())
+            .with_context("reason", "unsafe_or_invalid_tar")
+            .with_context("detail", error.message.clone())
+        })?;
+        let tar_path = self.tar_path("hydrate");
+        let write_error = |error: SandboxError| {
+            if error.code == ErrorCode::WorkspaceArchiveWriteError {
+                error
+            } else {
+                SandboxError::new(
+                    ErrorCode::WorkspaceArchiveWriteError,
+                    format!("failed to write archive for path: {root}"),
+                )
+                .with_context("path", root.clone())
+                .with_context("cause", error.message.clone())
+                .caused_by(&error)
+            }
+        };
+        let outcome: SandboxResult<()> = async {
+            self.mkdir(&root, true).await?;
+            self.write_internal(&tar_path, archive).await?;
+            let command = format!(
+                "tar -C {root} -xf {tar}",
+                root = shell_quote(&root),
+                tar = shell_quote(&tar_path),
+            );
+            let result = self
+                .exec(
+                    ExecRequest::shell(command)
+                        .with_timeout(Some(self.connection.timeouts.workspace_tar)),
+                )
+                .await?;
+            if !result.ok() {
+                return Err(SandboxError::new(
+                    ErrorCode::WorkspaceArchiveWriteError,
+                    format!("failed to write archive for path: {root}"),
+                )
+                .with_context("path", root.clone())
+                .with_context("reason", "tar_extract_failed")
+                .with_context("output", result.stderr_text()));
+            }
+            Ok(())
         }
-        Ok(())
+        .await;
+        // Cleanup is best effort: a leftover scratch archive is not worth masking the outcome.
+        let _ = self.remove_internal(&tar_path, false).await;
+        outcome.map_err(write_error)
     }
 
     fn as_any(&self) -> Option<&dyn std::any::Any> {
         Some(self)
+    }
+
+    fn persist_skip_registry(
+        &self,
+    ) -> Option<&std::sync::Mutex<std::collections::BTreeSet<String>>> {
+        Some(&self.persist_skip)
+    }
+
+    fn resolves_paths_remotely(&self) -> bool {
+        true
     }
 
     fn supports_pty(&self) -> bool {
@@ -1786,6 +1922,93 @@ async fn parse_control_plane_body(
             format!("`{operation}` returned a malformed body: {error}"),
         )
     })
+}
+
+/// Blaxel's documented structured error codes and whether a retry can help
+/// (<https://docs.blaxel.ai/troubleshooting/error-codes>).
+fn blaxel_error_code_retryable(code: &str) -> Option<bool> {
+    match code {
+        "ROUTE_NOT_FOUND"
+        | "WORKLOAD_NOT_FOUND"
+        | "WORKSPACE_NOT_FOUND"
+        | "AUTHENTICATION_REQUIRED"
+        | "AUTHENTICATION_FAILED"
+        | "FORBIDDEN"
+        | "BAD_REQUEST"
+        | "USAGE_LIMIT_EXCEEDED"
+        | "POLICY_VIOLATION" => Some(false),
+        "WORKLOAD_UNAVAILABLE" => Some(true),
+        _ => None,
+    }
+}
+
+/// The `(retryable, code)` a structured Blaxel error body carries.
+///
+/// An explicit `retryable` boolean wins; otherwise the code is looked up in the documented table.
+fn blaxel_provider_retryability(body: &[u8]) -> (Option<bool>, Option<String>) {
+    let Ok(payload) = serde_json::from_slice::<Value>(body) else {
+        return (None, None);
+    };
+    let structured = match payload.get("error") {
+        Some(nested) if nested.is_object() => nested,
+        _ => &payload,
+    };
+    let code = structured
+        .get("code")
+        .and_then(Value::as_str)
+        .filter(|code| !code.is_empty());
+    if let Some(retryable) = structured.get("retryable").and_then(Value::as_bool) {
+        return (Some(retryable), code.map(str::to_string));
+    }
+    match code {
+        Some(code) => (blaxel_error_code_retryable(code), Some(code.to_string())),
+        None => (None, None),
+    }
+}
+
+/// The transport error for a non-success `POST /process` status.
+///
+/// Mirrors Python's `_blaxel_exec_transport_error`: the message is `HTTP <status>: <message>`,
+/// the context names the backend, status, provider detail and structured code, and a transient
+/// status is retryable unless the body says otherwise.
+fn exec_status_error(status: u16, body: &[u8]) -> SandboxError {
+    let message = serde_json::from_slice::<Value>(body)
+        .ok()
+        .and_then(|payload| {
+            let nested = payload.get("error").filter(|nested| nested.is_object());
+            nested
+                .and_then(|nested| nested.get("message"))
+                .or_else(|| payload.get("message"))
+                .or_else(|| payload.get("error").filter(|error| error.is_string()))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .or_else(|| {
+            let text = String::from_utf8_lossy(body).trim().to_string();
+            (!text.is_empty()).then_some(text)
+        });
+    let detail = match message {
+        Some(message) => format!("HTTP {status}: {message}"),
+        None => format!("HTTP {status}"),
+    };
+    let (mut retryable, code) = blaxel_provider_retryability(body);
+    if retryable.is_none() && crate::sandbox::retry::is_transient_http_status(status) {
+        retryable = Some(true);
+    }
+    let mut error = SandboxError::new(
+        ErrorCode::ExecTransportError,
+        format!("Blaxel exec failed: {detail}"),
+    )
+    .with_context("backend", "blaxel")
+    .with_context("http_status", status.to_string())
+    .with_context("provider_error", detail);
+    if let Some(code) = code {
+        error = error.with_context("provider_error_code", code);
+    }
+    if let Some(retryable) = retryable {
+        error = error.with_retryable(retryable);
+    }
+    error
 }
 
 /// Render Blaxel's structured error payload (`{"error": {"code", "message"}}`).

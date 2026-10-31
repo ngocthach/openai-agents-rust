@@ -36,6 +36,73 @@ pub(crate) struct ToolEnv<'a, C> {
     pub pending_approvals: &'a BTreeSet<String>,
 }
 
+/// A one-way latch that tasks can wait on: set once, observed by any number of waiters.
+pub(crate) struct Signal(tokio::sync::watch::Sender<bool>);
+
+impl Signal {
+    pub(crate) fn new() -> Self {
+        Signal(tokio::sync::watch::channel(false).0)
+    }
+
+    pub(crate) fn set(&self) {
+        self.0.send_replace(true);
+    }
+
+    pub(crate) fn is_set(&self) -> bool {
+        *self.0.borrow()
+    }
+
+    /// Resolves once the signal is set (immediately when it already is).
+    pub(crate) async fn wait(&self) {
+        let mut rx = self.0.subscribe();
+        let _ = rx.wait_for(|set| *set).await;
+    }
+}
+
+/// How long a tool that already ran may keep finalizing after a sibling failed.
+pub(crate) fn post_invoke_wait<C>(config: &RunConfig<C>) -> std::time::Duration {
+    config
+        .tool_post_invoke_wait
+        .unwrap_or(std::time::Duration::from_millis(100))
+}
+
+/// Per-call state shared between a running function tool and its batch.
+pub(crate) struct FunctionTaskCtl {
+    /// The tool body returned: from here on the call finalizes its output instead of being
+    /// cancelled when a sibling fails.
+    post_invoke: std::sync::atomic::AtomicBool,
+    /// Output committed before the end hooks, kept if the call is abandoned during them.
+    committed: std::sync::Mutex<Option<ToolExecResult>>,
+    cancel: Signal,
+}
+
+impl FunctionTaskCtl {
+    fn new() -> Self {
+        FunctionTaskCtl {
+            post_invoke: std::sync::atomic::AtomicBool::new(false),
+            committed: std::sync::Mutex::new(None),
+            cancel: Signal::new(),
+        }
+    }
+
+    fn in_post_invoke(&self) -> bool {
+        self.post_invoke.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn enter_post_invoke(&self) {
+        self.post_invoke
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn commit(&self, result: ToolExecResult) {
+        *self.committed.lock().expect("commit slot") = Some(result);
+    }
+
+    fn take_committed(&self) -> Option<ToolExecResult> {
+        self.committed.lock().expect("commit slot").take()
+    }
+}
+
 /// The approval decision in force for `call_id`, honouring the restored binding rule.
 ///
 /// Port of the `_restored_unbound_approval_call_ids` branch of
@@ -90,6 +157,8 @@ pub(crate) struct ToolBatchFailure {
     /// Whether the selected failure's own output was committed before it failed (a
     /// post-output step), rather than the call failing without output.
     pub failure_committed: bool,
+    /// The batch was stopped because another tool category failed; `error` is a placeholder.
+    pub sibling_stopped: bool,
 }
 
 /// Result of executing one tool call.
@@ -247,6 +316,7 @@ pub(crate) async fn execute_function_tool<C: Send + Sync + 'static>(
     env: &ToolEnv<'_, C>,
     call: FunctionCall,
     tool: Arc<FunctionTool<C>>,
+    ctl: &FunctionTaskCtl,
 ) -> std::result::Result<ToolExecResult, ToolFailure> {
     let mut input_results = Vec::new();
     let mut output_results = Vec::new();
@@ -469,6 +539,7 @@ pub(crate) async fn execute_function_tool<C: Send + Sync + 'static>(
             },
             None => invocation.await,
         };
+        ctl.enter_post_invoke();
 
         if let Some(nested) = env.ctx.take_nested_interruptions(&call.call_id) {
             // A nested run parked on an approval resumes later; the call has not finished.
@@ -595,6 +666,21 @@ pub(crate) async fn execute_function_tool<C: Send + Sync + 'static>(
             }
         }
 
+        // The default failure text and a guardrail's rejection are SDK-generated errors, which a
+        // schema-backed tool called by a program answers as a JSON error object.
+        let make_outcome = |output: ToolOutput| match &output {
+            ToolOutput::Text(text) if sdk_generated_text || output_rejected => {
+                error_outcome(tool.output_json_schema.as_ref(), &call, text.clone())
+            }
+            _ => output_outcome(&call, output),
+        };
+        // Accepted output is recorded before the end hooks, so a call abandoned during them
+        // still contributes it.
+        ctl.commit(finish(
+            make_outcome(output.clone()),
+            input_results.clone(),
+            output_results.clone(),
+        ));
         if let Some(h) = env.hooks {
             h.on_tool_end(&tool_ctx, env.agent, &tool_enum, &output)
                 .await;
@@ -603,18 +689,7 @@ pub(crate) async fn execute_function_tool<C: Send + Sync + 'static>(
             h.on_tool_end(&tool_ctx, env.agent, &tool_enum, &output)
                 .await;
         }
-        // The default failure text and a guardrail's rejection are SDK-generated errors, which a
-        // schema-backed tool called by a program answers as a JSON error object.
-        if let ToolOutput::Text(text) = &output
-            && (sdk_generated_text || output_rejected)
-        {
-            return Ok(error_outcome(
-                tool.output_json_schema.as_ref(),
-                &call,
-                text.clone(),
-            ));
-        }
-        Ok(output_outcome(&call, output))
+        Ok(make_outcome(output))
     };
     let outcome = scope::with_span(span.clone(), Box::pin(run)).await;
     match &outcome {
@@ -678,11 +753,26 @@ pub(crate) async fn execute_function_tool<C: Send + Sync + 'static>(
     Ok(result)
 }
 
+/// How one function tool task ended.
+#[allow(clippy::large_enum_variant)]
+enum TaskEnd {
+    Done(std::result::Result<ToolExecResult, ToolFailure>),
+    /// Cancelled by the batch before it reached its post-invoke phase (or abandoned after the
+    /// wait).
+    Cancelled,
+}
+
 /// Execute tool calls concurrently (bounded by `max_function_tool_concurrency`), preserving
 /// the call order in the results.
+///
+/// `stop` is the sibling-category failure signal: when it fires the batch is wound down like a
+/// failed batch. `on_selected` runs as soon as the batch has selected its own failure, before
+/// its siblings are drained.
 pub(crate) async fn execute_function_tools<C: Send + Sync + 'static>(
     env: &ToolEnv<'_, C>,
     runs: Vec<(FunctionCall, Arc<FunctionTool<C>>)>,
+    stop: Option<&Signal>,
+    on_selected: &(dyn Fn() + Sync),
 ) -> std::result::Result<Vec<ToolExecResult>, ToolBatchFailure> {
     if runs.is_empty() {
         return Ok(Vec::new());
@@ -695,11 +785,12 @@ pub(crate) async fn execute_function_tools<C: Send + Sync + 'static>(
         .max(1);
     // Up to `limit` calls run at once, and a finished call frees its slot immediately, so the
     // queue refills in call order however the in-flight calls complete. Port of the
-    // `_FunctionToolBatchExecutor` FIFO refill. On the first failure every sibling still in
-    // flight is cancelled (the stream is dropped); among the failures already finished the one
-    // with the lowest tool-call order wins (`_select_function_tool_failure` +
-    // `_cancel_function_tool_tasks`). Siblings that had already committed their output are
-    // kept, in call order, so a retry does not run them again.
+    // `_FunctionToolBatchExecutor` FIFO refill. On the first failure the siblings that have not
+    // reached their post-invoke phase are cancelled (dropped), the ones that have get a bounded
+    // wait to finish their output (`_raise_failure_after_draining_siblings`); among the
+    // failures the one with the lowest tool-call order wins (`_select_function_tool_failure`).
+    // Siblings that had already committed their output are kept, in call order, so a retry does
+    // not run them again.
     // Enablement is re-checked right before execution: a configured tool that became disabled
     // since the model saw it fails the batch before any call starts. Port of
     // `_FunctionToolBatchExecutor.execute`'s `resolve_enabled_function_tools` pass.
@@ -722,14 +813,26 @@ pub(crate) async fn execute_function_tools<C: Send + Sync + 'static>(
                 )),
                 completed: Vec::new(),
                 failure_committed: false,
+                sibling_stopped: false,
             });
         }
     }
-    // The in-flight set is refilled by hand so that, once a call fails, draining the
-    // already-finished siblings never starts a queued call.
+    // The in-flight set is refilled by hand so that, once a call fails, draining the siblings
+    // never starts a queued call.
     let mut queue = runs.into_iter().enumerate();
+    let ctls: std::sync::Mutex<Vec<(usize, Arc<FunctionTaskCtl>)>> =
+        std::sync::Mutex::new(Vec::new());
     let start = |(order, (call, tool)): (usize, (FunctionCall, Arc<FunctionTool<C>>))| {
-        Box::pin(async move { (order, execute_function_tool(env, call, tool).await) })
+        let ctl = Arc::new(FunctionTaskCtl::new());
+        ctls.lock().expect("ctls").push((order, ctl.clone()));
+        Box::pin(async move {
+            let end = tokio::select! {
+                biased;
+                r = execute_function_tool(env, call, tool, &ctl) => TaskEnd::Done(r),
+                _ = ctl.cancel.wait() => TaskEnd::Cancelled,
+            };
+            (order, ctl, end)
+        })
     };
     let mut in_flight = futures::stream::FuturesUnordered::new();
     for run in queue.by_ref().take(limit) {
@@ -740,38 +843,100 @@ pub(crate) async fn execute_function_tools<C: Send + Sync + 'static>(
         results.sort_by_key(|(order, _)| *order);
         results.into_iter().map(|(_, r)| r).collect::<Vec<_>>()
     };
-    while let Some((order, result)) = in_flight.next().await {
-        match result {
-            Ok(result) => {
+    // The failure the batch selected: (order, error, its own output was committed).
+    let mut chosen: Option<(usize, AgentsError, bool)> = None;
+    let mut sibling_stopped = false;
+    loop {
+        let next = match stop {
+            Some(stop) => tokio::select! {
+                biased;
+                n = in_flight.next() => n,
+                _ = stop.wait() => {
+                    sibling_stopped = true;
+                    break;
+                }
+            },
+            None => in_flight.next().await,
+        };
+        let Some((order, ctl, end)) = next else {
+            break;
+        };
+        match end {
+            TaskEnd::Done(Ok(result)) => {
                 results.push((order, result));
                 if let Some(run) = queue.next() {
                     in_flight.push(start(run));
                 }
             }
-            Err(failure) => {
-                let mut chosen = (order, failure.error, failure.committed.is_some());
-                results.extend(failure.committed.into_iter().map(|c| (order, c)));
-                while let Some(Some((other_order, sibling))) =
-                    futures::FutureExt::now_or_never(in_flight.next())
-                {
-                    match sibling {
-                        Ok(result) => results.push((other_order, result)),
-                        Err(other) => {
-                            let committed = other.committed.is_some();
-                            results.extend(other.committed.into_iter().map(|c| (other_order, c)));
-                            if other_order < chosen.0 {
-                                chosen = (other_order, other.error, committed);
-                            }
-                        }
-                    }
-                }
-                return Err(ToolBatchFailure {
-                    error: chosen.1,
-                    completed: into_ordered(results),
-                    failure_committed: chosen.2,
-                });
+            TaskEnd::Done(Err(failure)) => {
+                let committed = failure.committed.is_some();
+                results.extend(failure.committed.map(|c| (order, c)));
+                chosen = Some((order, failure.error, committed));
+                break;
             }
+            TaskEnd::Cancelled => results.extend(ctl.take_committed().map(|c| (order, c))),
         }
     }
-    Ok(into_ordered(results))
+    if chosen.is_none() && !sibling_stopped {
+        return Ok(into_ordered(results));
+    }
+    if chosen.is_some() {
+        on_selected();
+    }
+    // Wind the siblings down: calls still invoking are cancelled, calls already finalizing get
+    // a bounded wait and are abandoned after it, keeping any output they committed.
+    let live: Vec<Arc<FunctionTaskCtl>> = ctls
+        .lock()
+        .expect("ctls")
+        .iter()
+        .map(|(_, ctl)| ctl.clone())
+        .collect();
+    for ctl in &live {
+        if !ctl.in_post_invoke() {
+            ctl.cancel.set();
+        }
+    }
+    let mut absorb = |order: usize,
+                      ctl: Arc<FunctionTaskCtl>,
+                      end: TaskEnd,
+                      results: &mut Vec<(usize, ToolExecResult)>| {
+        match end {
+            TaskEnd::Done(Ok(result)) => results.push((order, result)),
+            TaskEnd::Done(Err(other)) => {
+                let committed = other.committed.is_some();
+                results.extend(other.committed.map(|c| (order, c)));
+                if chosen.as_ref().is_none_or(|c| order < c.0) {
+                    chosen = Some((order, other.error, committed));
+                }
+            }
+            TaskEnd::Cancelled => results.extend(ctl.take_committed().map(|c| (order, c))),
+        }
+    };
+    let drained = tokio::time::timeout(post_invoke_wait(env.config), async {
+        while let Some((order, ctl, end)) = in_flight.next().await {
+            absorb(order, ctl, end, &mut results);
+        }
+    })
+    .await;
+    if drained.is_err() {
+        for ctl in &live {
+            ctl.cancel.set();
+        }
+        while let Some((order, ctl, end)) = in_flight.next().await {
+            absorb(order, ctl, end, &mut results);
+        }
+    }
+    let (error, failure_committed) = match chosen {
+        Some((_, error, committed)) => (error, committed),
+        None => (
+            AgentsError::user("Tool execution stopped because a sibling tool failed."),
+            false,
+        ),
+    };
+    Err(ToolBatchFailure {
+        error,
+        completed: into_ordered(results),
+        failure_committed,
+        sibling_stopped,
+    })
 }

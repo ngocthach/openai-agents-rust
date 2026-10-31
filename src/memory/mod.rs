@@ -39,6 +39,11 @@ pub use dapr_session::{
 };
 #[cfg(feature = "encrypt")]
 pub use encrypted_session::EncryptedSession;
+
+/// How many items one Conversations items-create request carries; a longer append is split.
+pub(crate) fn openai_conversations_chunk_size() -> usize {
+    openai_conversations_session::MAX_ITEMS_PER_REQUEST
+}
 #[cfg(feature = "mongodb")]
 pub use mongodb_session::{
     DEFAULT_MESSAGES_COLLECTION, DEFAULT_SESSIONS_COLLECTION, MongoDBSession, generation_filter,
@@ -176,7 +181,26 @@ pub fn compaction_item_digest(item: &InputItem) -> String {
             }
         }
     }
-    value.to_string()
+    canonical_json(&value).to_string()
+}
+
+/// `value` with every object's keys in sorted order, so two spellings of one item that differ
+/// only in key order digest the same (Python fingerprints with `sort_keys=True`).
+fn canonical_json(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let mut entries: Vec<(&String, &Value)> = map.iter().collect();
+            entries.sort_by(|a, b| a.0.cmp(b.0));
+            Value::Object(
+                entries
+                    .into_iter()
+                    .map(|(key, value)| (key.clone(), canonical_json(value)))
+                    .collect(),
+            )
+        }
+        Value::Array(items) => Value::Array(items.iter().map(canonical_json).collect()),
+        other => other.clone(),
+    }
 }
 
 /// Information passed to [`Session::on_run_completed`] after the runner persisted a run.
@@ -197,6 +221,10 @@ pub struct SessionRunCompletion {
     /// back to replacing the whole stored history, which is what manual `run_compaction` calls
     /// and pre-existing callers already did.
     pub model_exchange: Vec<String>,
+    /// Whether the run omitted reasoning item ids from what it sent the model. A stored
+    /// reasoning item that still carries its id then matches the exchange without it, and is
+    /// compacted in the form the model saw.
+    pub omit_reasoning_item_ids: bool,
 }
 
 /// An opaque, store-specific identifier for one item inside a [`CompactionSnapshot`].
@@ -242,6 +270,14 @@ pub trait Session: Send + Sync + fmt::Debug {
     /// `true`.
     fn manages_history_remotely(&self) -> bool {
         false
+    }
+
+    /// Whether stored items come back without the ids they were written with, so replayed
+    /// history must be matched without them. Defaults to [`Session::manages_history_remotely`];
+    /// a local store that reassigns ids on write overrides it. Mirrors the
+    /// `_ignore_ids_for_matching` attribute of Python sessions.
+    fn ignores_item_ids_for_matching(&self) -> bool {
+        self.manages_history_remotely()
     }
 
     /// Retrieve history, the most recent `limit` items when set (chronological order).

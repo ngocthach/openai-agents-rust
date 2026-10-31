@@ -8,11 +8,10 @@ use serde_json::{Map, Value, json};
 use super::logging::{
     get_mcp_server_log_name, resolve_mcp_tool_description_for_model, resolve_mcp_tool_title,
 };
-use super::{MCPServer, MCPTool, ToolFilterContext};
+use super::{MCPServer, MCPTool, RequireApproval, ToolFilterContext};
 use crate::agent::MCPConfig;
 use crate::error::{AgentsError, Result};
 use crate::run_context::RunContext;
-use crate::strict_schema::ensure_strict_json_schema;
 use crate::tool::{FunctionTool, NeedsApproval, Tool, ToolOutput, ToolOutputPart};
 use crate::tracing::{SpanData, mcp_tools_span};
 
@@ -271,6 +270,8 @@ pub fn convert_call_tool_result(result: &Value, use_structured_content: bool) ->
 }
 
 fn prepare_schema(schema: &Value, strict: bool) -> (Value, bool) {
+    // An empty schema stays convertible: it declares no arguments at all.
+    let reject_open_objects = !matches!(schema, Value::Object(m) if m.is_empty());
     let mut schema = schema.clone();
     if let Value::Object(m) = &mut schema {
         // The MCP spec does not require `properties`, but the OpenAI function schema does.
@@ -278,7 +279,10 @@ fn prepare_schema(schema: &Value, strict: bool) -> (Value, bool) {
         // `MCPUtil.to_function_tool` does.
         m.entry("properties").or_insert_with(|| json!({}));
     }
-    if strict && let Ok(s) = ensure_strict_json_schema(&schema) {
+    if strict
+        && let Ok(s) =
+            crate::strict_schema::ensure_strict_json_schema_with(&schema, reject_open_objects)
+    {
         return (s, true);
     }
     (schema, false)
@@ -497,13 +501,23 @@ pub async fn to_function_tool_with_failure<C: Send + Sync + 'static>(
     f.strict_json_schema = strict;
     f.mcp_title = resolve_mcp_tool_title(tool);
     f.mcp_server_name = Some(get_mcp_server_log_name(server.name()));
-    f.needs_approval = NeedsApproval::Static(
-        server
-            .config()
-            .require_approval
-            .requires(agent_name, tool)
-            .await,
-    );
+    f.mcp_annotations = tool.annotations.clone();
+    f.mcp_tool_binding = Some((
+        get_mcp_server_log_name(server.name()),
+        tool.name.clone(),
+        None,
+    ));
+    f.needs_approval = match &server.config().require_approval {
+        // Evaluated per call, with the run's own context.
+        RequireApproval::DynamicWithContext(decide) => {
+            let (decide, agent_name, tool) = (decide.clone(), agent_name.to_string(), tool.clone());
+            NeedsApproval::Dynamic(Arc::new(move |context, _arguments, _call_id| {
+                let erased: Arc<dyn std::any::Any + Send + Sync> = Arc::new(context);
+                decide(erased, &agent_name, &tool)
+            }))
+        }
+        other => NeedsApproval::Static(other.requires(agent_name, tool).await),
+    };
 
     let policy = server.config().tool_policy::<C>();
     let failure = match policy {
@@ -653,17 +667,19 @@ pub async fn get_all_function_tools_for_agent<C: Send + Sync + 'static>(
         for (tool_index, t) in tools.iter().enumerate() {
             check_schema_depth(&t.input_schema)?;
             let exposed = exposed_names[tool_index].clone();
-            out.push(Tool::Function(Arc::new(
-                to_function_tool_with_failure(
-                    server.clone(),
-                    t,
-                    exposed,
-                    config.convert_schemas_to_strict,
-                    agent_name,
-                    config.failure_error_function.clone(),
-                )
-                .await,
-            )));
+            let mut function_tool = to_function_tool_with_failure(
+                server.clone(),
+                t,
+                exposed,
+                config.convert_schemas_to_strict,
+                agent_name,
+                config.failure_error_function.clone(),
+            )
+            .await;
+            if let Some((server_name, raw_name, _)) = function_tool.mcp_tool_binding.take() {
+                function_tool.mcp_tool_binding = Some((server_name, raw_name, Some(server_index)));
+            }
+            out.push(Tool::Function(Arc::new(function_tool)));
         }
     }
     Ok(out)

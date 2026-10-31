@@ -352,6 +352,55 @@ impl BlaxelCloudBucketMountStrategy {
         &self.config
     }
 
+    /// Write the credential file (when there is one), then create the mount point and mount.
+    async fn mount_with_credentials(
+        &self,
+        session: &dyn SandboxSession,
+        mount_path: &str,
+        credential_path: Option<&str>,
+    ) -> SandboxResult<()> {
+        if let (Some(path), Some(contents)) =
+            (credential_path, self.config.credential_file_contents())
+        {
+            session.write_file(path, contents.as_bytes()).await?;
+            let chmod = run_shell(
+                session,
+                &format!("chmod 600 {}", shell_quote(path)),
+                MOUNT_TIMEOUT_SECS,
+            )
+            .await?;
+            if !chmod.ok() {
+                return Err(SandboxError::new(
+                    ErrorCode::MountConfigInvalid,
+                    "failed to restrict mount credential file permissions",
+                )
+                .with_context("exit_code", chmod.exit_code.to_string()));
+            }
+        }
+        let command = self.config.mount_command(mount_path, credential_path);
+        run_shell(
+            session,
+            &format!("mkdir -p {}", shell_quote(mount_path)),
+            MOUNT_TIMEOUT_SECS,
+        )
+        .await?;
+        let result = run_shell(session, &command, MOUNT_TIMEOUT_SECS).await?;
+        if !result.ok() {
+            // The command text carries the mount options, never the credential itself, which
+            // lives only in the file that is about to be removed.
+            return Err(SandboxError::new(
+                ErrorCode::MountFailed,
+                format!(
+                    "{} mount failed at `{mount_path}` with exit code {}: {}",
+                    self.config.provider.tool(),
+                    result.exit_code,
+                    result.stderr_text().trim()
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     /// Install the FUSE tool when the image does not already ship it.
     async fn ensure_tool(&self, session: &dyn SandboxSession) -> SandboxResult<()> {
         let tool = self.config.provider.tool();
@@ -433,66 +482,54 @@ impl MountStrategy for BlaxelCloudBucketMountStrategy {
         self.config.validate()?;
         self.ensure_tool(session).await?;
 
+        // The credential file lives in the workspace root, so its path is registered as a
+        // persist skip path before anything is written: a snapshot taken while it exists must
+        // not archive it, and a registration the session refuses must leave no file behind.
         let credential_path = match self.config.credential_file_contents() {
             None => None,
-            Some(contents) => {
-                let path = format!(
-                    "{}/.openai-agents-{}-{}",
-                    session.workspace_root().trim_end_matches('/'),
-                    self.config.provider.as_str(),
+            Some(_) => {
+                let stem = match self.config.provider {
+                    BlaxelBucketProvider::Gcs => "gcs-creds",
+                    _ => "s3fs-passwd",
+                };
+                let relative = format!(
+                    ".openai-agents-{stem}-{}",
                     &uuid::Uuid::new_v4().simple().to_string()[..8]
                 );
-                session.write_file(&path, contents.as_bytes()).await?;
-                let chmod = run_shell(
-                    session,
-                    &format!("chmod 600 {}", shell_quote(&path)),
-                    MOUNT_TIMEOUT_SECS,
-                )
-                .await?;
-                if !chmod.ok() {
-                    let _ = session.rm(&path, false).await;
-                    return Err(SandboxError::new(
-                        ErrorCode::MountFailed,
-                        "failed to restrict the mount credential file permissions",
-                    ));
-                }
-                Some(path)
+                session.register_persist_workspace_skip_path(&relative)?;
+                Some(format!(
+                    "{}/{relative}",
+                    session.workspace_root().trim_end_matches('/')
+                ))
             }
         };
 
-        let command = self
-            .config
-            .mount_command(mount_path, credential_path.as_deref());
-        let mkdir = run_shell(
-            session,
-            &format!("mkdir -p {}", shell_quote(mount_path)),
-            MOUNT_TIMEOUT_SECS,
-        )
-        .await;
-        let result = match mkdir {
-            Err(error) => Err(error),
-            Ok(_) => run_shell(session, &command, MOUNT_TIMEOUT_SECS).await,
-        };
+        let outcome = self
+            .mount_with_credentials(session, mount_path, credential_path.as_deref())
+            .await;
         // The credential file is removed whether or not the mount came up, so it never outlives
-        // the activation that needed it.
+        // the activation that needed it. A removal that fails outranks the mount's own result:
+        // a credential left in the workspace is the more urgent fact.
         if let Some(path) = &credential_path {
-            let _ = session.rm(path, false).await;
+            let removal = run_shell(
+                session,
+                &format!("rm -f {}", shell_quote(path)),
+                MOUNT_TIMEOUT_SECS,
+            )
+            .await;
+            match removal {
+                Ok(result) if result.ok() => {}
+                Ok(result) => {
+                    return Err(SandboxError::new(
+                        ErrorCode::MountConfigInvalid,
+                        "failed to remove mount credential file",
+                    )
+                    .with_context("exit_code", result.exit_code.to_string()));
+                }
+                Err(error) => return Err(error),
+            }
         }
-        let result = result?;
-        if !result.ok() {
-            // The command text carries the mount options, never the credential itself, which
-            // lives only in the removed file.
-            return Err(SandboxError::new(
-                ErrorCode::MountFailed,
-                format!(
-                    "`{}` mount at `{mount_path}` failed with exit code {}: {}",
-                    self.config.provider.tool(),
-                    result.exit_code,
-                    result.stderr_text().trim()
-                ),
-            ));
-        }
-        Ok(())
+        outcome
     }
 
     async fn deactivate(
@@ -502,22 +539,53 @@ impl MountStrategy for BlaxelCloudBucketMountStrategy {
         mount_path: &str,
     ) -> SandboxResult<()> {
         let quoted = shell_quote(mount_path);
-        for command in [
-            format!("fusermount -u {quoted}"),
-            format!("umount {quoted}"),
-            format!("umount -l {quoted}"),
-        ] {
-            if run_shell(session, &command, MOUNT_TIMEOUT_SECS)
-                .await
-                .map(|result| result.ok())
-                .unwrap_or(false)
-            {
-                return Ok(());
+        // `fusermount` first, because it is FUSE-aware; then a plain `umount`; then a lazy one as
+        // the last resort. A failed unmount is only logged, as in Python: the mount point may
+        // already be gone, and teardown must not fail over it. The mount path is tool data, so
+        // the messages carry it only when the tool-data logging policy allows.
+        let attempts = [
+            (
+                format!("fusermount -u {quoted}"),
+                "fusermount",
+                "trying umount",
+            ),
+            (format!("umount {quoted}"), "umount", "trying lazy umount"),
+            (format!("umount -l {quoted}"), "", ""),
+        ];
+        let mut last_exit = 0;
+        for (index, (command, tool, next)) in attempts.iter().enumerate() {
+            let exit_code = match run_shell(session, command, MOUNT_TIMEOUT_SECS).await {
+                Ok(result) if result.ok() => return Ok(()),
+                Ok(result) => result.exit_code,
+                Err(_) => -1,
+            };
+            last_exit = exit_code;
+            if index + 1 == attempts.len() {
+                break;
+            }
+            if crate::debug::dont_log_tool_data() {
+                log::debug!(
+                    target: crate::logger::LOG_TARGET,
+                    "{tool} failed (exit {exit_code}), {next}"
+                );
+            } else {
+                log::debug!(
+                    target: crate::logger::LOG_TARGET,
+                    "{tool} failed for {mount_path} (exit {exit_code}), {next}"
+                );
             }
         }
-        // A mount point that is already gone is not an error worth failing teardown over, which
-        // matches the Python port's best-effort unmount.
-        log::warn!(target: crate::logger::LOG_TARGET, "every unmount attempt failed for the Blaxel mount at `{mount_path}`");
+        if crate::debug::dont_log_tool_data() {
+            log::warn!(
+                target: crate::logger::LOG_TARGET,
+                "all unmount attempts failed (last exit {last_exit})"
+            );
+        } else {
+            log::warn!(
+                target: crate::logger::LOG_TARGET,
+                "all unmount attempts failed for {mount_path} (last exit {last_exit})"
+            );
+        }
         Ok(())
     }
 }
@@ -818,7 +886,15 @@ impl MountStrategy for BlaxelDriveMountStrategy {
         mount_path: &str,
     ) -> SandboxResult<()> {
         let connection = self.connection(session, mount_path)?;
-        connection.unmount_drive(mount_path).await
+        // As in Python, a drive that will not detach is logged, not raised: the platform
+        // reclaims it with the sandbox, and a teardown error would hide the run's own result.
+        if let Err(error) = connection.unmount_drive(mount_path).await {
+            crate::logger::log_tool_action_warning(
+                "Drive detach failed (non-fatal)",
+                &error.message,
+            );
+        }
+        Ok(())
     }
 }
 

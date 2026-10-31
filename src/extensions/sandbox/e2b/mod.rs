@@ -90,7 +90,7 @@ use crate::sandbox::session::{
     workspace_archive_excludes,
 };
 use crate::sandbox::snapshot::{Snapshot, SnapshotSpec, resolve_snapshot};
-use crate::sandbox::state::SandboxSessionState;
+use crate::sandbox::state::{SandboxSessionState, SnapshotFingerprint};
 use crate::sandbox::types::{ExecResult, FileEntry, Permissions};
 use crate::sandbox::workspace_paths::provider_scratch_path;
 
@@ -673,7 +673,12 @@ impl SandboxClient for E2BSandboxClient {
                 self.options.api_base()
             ))
             .header("X-API-Key", &api_key)
-            .json(&json!({}))
+            // Reconnecting restarts the sandbox's lifetime clock, so the configured timeout
+            // goes with it.
+            .json(&match self.options.timeout_secs {
+                Some(timeout) => json!({ "timeout": timeout }),
+                None => json!({}),
+            })
             .send()
             .await
             .ok()
@@ -682,6 +687,7 @@ impl SandboxClient for E2BSandboxClient {
             Some(response) => Some(parse_json::<CreatedSandbox>(response, "connect").await?),
             None => None,
         };
+        let reattached = created.is_some();
         let (created, resuming) = match created {
             Some(created) => (created, true),
             // The original sandbox is gone: create a replacement and hydrate it from the snapshot.
@@ -701,6 +707,20 @@ impl SandboxClient for E2BSandboxClient {
         )
         .with_session_id(state.session_id.clone())
         .with_snapshot_id(state.snapshot_id.clone());
+        let session = session
+            .with_state_preserved(reattached)
+            .with_snapshot_fingerprint(if reattached {
+                state
+                    .snapshot_fingerprint
+                    .clone()
+                    .zip(state.snapshot_fingerprint_version.clone())
+                    .map(|(fingerprint, version)| SnapshotFingerprint {
+                        fingerprint,
+                        version,
+                    })
+            } else {
+                None
+            });
         Ok(Arc::new(if resuming {
             session.resuming()
         } else {
@@ -739,6 +759,13 @@ pub struct E2BSandboxSession {
     snapshot: Option<SnapshotSpec>,
     snapshot_id: String,
     resuming: bool,
+    /// The sandbox survived the pause this session resumes from, so its accounts and packages
+    /// are still there.
+    state_preserved: bool,
+    /// Workspace-relative paths a persist leaves out of the archive.
+    persist_skips: Mutex<std::collections::BTreeSet<String>>,
+    /// The workspace fingerprint the stored snapshot was taken from.
+    snapshot_fingerprint: Mutex<Option<SnapshotFingerprint>>,
 }
 
 // Neither the API key nor the sandbox access token may appear in a log line.
@@ -783,6 +810,9 @@ impl E2BSandboxSession {
             pty_pids: Arc::new(Mutex::new(HashMap::new())),
             snapshot,
             resuming: false,
+            state_preserved: false,
+            persist_skips: Mutex::new(std::collections::BTreeSet::new()),
+            snapshot_fingerprint: Mutex::new(None),
         }
     }
 
@@ -801,6 +831,18 @@ impl E2BSandboxSession {
     /// Restore the snapshot on start instead of materializing the full manifest.
     fn resuming(mut self) -> Self {
         self.resuming = true;
+        self
+    }
+
+    /// Carry the workspace fingerprint a resumed snapshot was taken from.
+    fn with_snapshot_fingerprint(self, record: Option<SnapshotFingerprint>) -> Self {
+        *self.snapshot_fingerprint.lock().expect("poisoned") = record;
+        self
+    }
+
+    /// Record that the sandbox survived the pause this session resumes from.
+    fn with_state_preserved(mut self, preserved: bool) -> Self {
+        self.state_preserved = preserved;
         self
     }
 
@@ -1290,6 +1332,12 @@ impl E2BSandboxSession {
         for exclude in workspace_archive_excludes(&self.manifest, &root) {
             command.push_str(&format!(" --exclude {}", shell_quote(&exclude)));
         }
+        for skipped in self.persist_workspace_skip_paths() {
+            command.push_str(&format!(
+                " --exclude {}",
+                shell_quote(&format!("./{skipped}"))
+            ));
+        }
         // envd reports command output as text, so the archive travels base64-encoded.
         command.push_str(" . | base64 -w0");
         let result = self
@@ -1449,7 +1497,8 @@ impl SandboxSession for E2BSandboxSession {
     }
 
     async fn read_file(&self, path: &str) -> SandboxResult<Vec<u8>> {
-        let resolved = self.normalize_path(path)?;
+        // The sandbox's own filesystem decides: a workspace symlink can lead out of the root.
+        let resolved = self.validate_remote_path_access(path, false, false).await?;
         self.download_at(&resolved, None).await
     }
 
@@ -1457,12 +1506,12 @@ impl SandboxSession for E2BSandboxSession {
         if max_bytes == 0 {
             return Err(bounded_read_zero());
         }
-        let resolved = self.normalize_path(path)?;
+        let resolved = self.validate_remote_path_access(path, false, false).await?;
         self.download_at(&resolved, Some(max_bytes)).await
     }
 
     async fn write_file(&self, path: &str, contents: &[u8]) -> SandboxResult<()> {
-        let resolved = self.normalize_path_for_write(path)?;
+        let resolved = self.validate_remote_path_access(path, true, false).await?;
         self.upload_at(&resolved, contents).await
     }
 
@@ -1498,8 +1547,21 @@ impl SandboxSession for E2BSandboxSession {
         true
     }
 
+    /// The sandbox's own filesystem decides every path, so `rm`, `ls` and `mv` resolve it first.
+    fn resolves_paths_remotely(&self) -> bool {
+        true
+    }
+
+    fn system_state_preserved_on_start(&self) -> bool {
+        self.state_preserved
+    }
+
+    fn persist_skip_registry(&self) -> Option<&Mutex<std::collections::BTreeSet<String>>> {
+        Some(&self.persist_skips)
+    }
+
     async fn ls(&self, path: &str) -> SandboxResult<Vec<FileEntry>> {
-        let resolved = self.normalize_path(path)?;
+        let resolved = self.validate_remote_path_access(path, false, false).await?;
         let value = self
             .connect_unary(
                 "filesystem.Filesystem/ListDir",
@@ -1516,12 +1578,18 @@ impl SandboxSession for E2BSandboxSession {
 
     async fn mkdir(&self, path: &str, _parents: bool) -> SandboxResult<()> {
         // envd's MakeDir always creates the missing parents.
-        let resolved = self.normalize_path(path)?;
+        let resolved = self.validate_remote_path_access(path, true, false).await?;
         self.make_dir(&resolved).await
     }
 
     async fn rm(&self, path: &str, recursive: bool) -> SandboxResult<()> {
-        let resolved = self.normalize_path(path)?;
+        if recursive {
+            self.workspace_path_policy()?
+                .validate_recursive_remove(path)?;
+        }
+        let resolved = self
+            .validate_remote_path_access(path, true, recursive)
+            .await?;
         if recursive {
             return self.remove_at(&resolved).await;
         }
@@ -1549,8 +1617,12 @@ impl SandboxSession for E2BSandboxSession {
     }
 
     async fn mv(&self, source: &str, destination: &str) -> SandboxResult<()> {
-        let source = self.normalize_path(source)?;
-        let destination = self.normalize_path(destination)?;
+        let source = self
+            .validate_remote_path_access(source, true, false)
+            .await?;
+        let destination = self
+            .validate_remote_path_access(destination, true, false)
+            .await?;
         self.connect_unary(
             "filesystem.Filesystem/Move",
             json!({ "source": source, "destination": destination }),
@@ -1648,6 +1720,20 @@ impl SandboxSession for E2BSandboxSession {
         )
         .with_provider_id(Some(self.sandbox_id()))
         .with_snapshot(self.snapshot.clone().unwrap_or_default())
+        .with_snapshot_fingerprint(self.snapshot_fingerprint.lock().expect("poisoned").clone())
+    }
+
+    fn resume_snapshot_fingerprint(&self) -> Option<SnapshotFingerprint> {
+        // Only a sandbox that survived the pause can still hold the workspace the fingerprint
+        // describes; a replacement starts empty, so its restore must not be skipped.
+        if !self.state_preserved {
+            return None;
+        }
+        self.snapshot_fingerprint.lock().expect("poisoned").clone()
+    }
+
+    fn record_snapshot_fingerprint(&self, record: Option<SnapshotFingerprint>) {
+        *self.snapshot_fingerprint.lock().expect("poisoned") = record;
     }
 
     fn snapshot(&self) -> Arc<dyn Snapshot> {
@@ -1655,8 +1741,23 @@ impl SandboxSession for E2BSandboxSession {
     }
 
     async fn persist_workspace(&self) -> SandboxResult<Vec<u8>> {
-        if self.options.workspace_persistence == WorkspacePersistence::Snapshot {
-            let snapshot_id = self.create_native_snapshot().await?;
+        // A native snapshot captures the whole sandbox and cannot leave a path out, so a
+        // registered skip path falls back to the tar archive.
+        if self.options.workspace_persistence == WorkspacePersistence::Snapshot
+            && self.persist_workspace_skip_paths().is_empty()
+        {
+            let timeout = self.options.timeouts.snapshot_tar;
+            let snapshot_id = tokio::time::timeout(timeout, self.create_native_snapshot())
+                .await
+                .map_err(|_| {
+                    SandboxError::new(
+                        ErrorCode::SnapshotPersistError,
+                        format!(
+                            "native_snapshot_failed: the E2B snapshot took longer than {timeout:?}"
+                        ),
+                    )
+                    .with_retryable(false)
+                })??;
             return Ok(encode_snapshot_ref(&snapshot_id));
         }
         // Python wraps the sandbox-side `tar` command in `@retry_async` on a transient transport

@@ -249,6 +249,10 @@ pub struct RunConfig<C> {
     pub reasoning_item_id_policy: ReasoningItemIdPolicy,
     /// Local tool execution settings.
     pub tool_execution: ToolExecutionConfig,
+    /// How long a tool that already ran keeps finalizing (output guardrails, custom data, end
+    /// hooks) after a sibling tool failed, before it is abandoned. `None` waits 100 ms, like
+    /// the Python SDK's post-invoke wait.
+    pub tool_post_invoke_wait: Option<std::time::Duration>,
     /// Unknown tool handling.
     pub tool_not_found_behavior: ToolNotFoundBehavior,
 }
@@ -278,6 +282,7 @@ impl<C> Clone for RunConfig<C> {
             session_settings: self.session_settings.clone(),
             reasoning_item_id_policy: self.reasoning_item_id_policy,
             tool_execution: self.tool_execution.clone(),
+            tool_post_invoke_wait: self.tool_post_invoke_wait,
             tool_not_found_behavior: self.tool_not_found_behavior,
             tool_name_collision_policy: self.tool_name_collision_policy,
             output_guardrail_blocked_message: self.output_guardrail_blocked_message.clone(),
@@ -328,6 +333,7 @@ impl<C> Default for RunConfig<C> {
             session_settings: None,
             reasoning_item_id_policy: ReasoningItemIdPolicy::Preserve,
             tool_execution: ToolExecutionConfig::default(),
+            tool_post_invoke_wait: None,
             tool_not_found_behavior: ToolNotFoundBehavior::RaiseError,
             tool_name_collision_policy: ToolNameCollisionPolicy::Warn,
             output_guardrail_blocked_message: None,
@@ -447,6 +453,12 @@ impl<C: Send + Sync + 'static> RunConfig<C> {
     /// Set local tool execution settings.
     pub fn with_tool_execution(mut self, config: ToolExecutionConfig) -> Self {
         self.tool_execution = config;
+        self
+    }
+
+    /// Set how long finalizing tools may outlive a failed sibling tool.
+    pub fn with_tool_post_invoke_wait(mut self, wait: std::time::Duration) -> Self {
+        self.tool_post_invoke_wait = Some(wait);
         self
     }
 

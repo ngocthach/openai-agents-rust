@@ -5,11 +5,15 @@ use std::sync::Arc;
 
 use serde_json::{Map, Value, json};
 
-use super::tools::{ToolEnv, format_tool_error_for};
+use super::tools::{
+    Signal, ToolBatchFailure, ToolEnv, ToolExecResult, execute_function_tools,
+    format_tool_error_for, post_invoke_wait,
+};
 use crate::editor::{ApplyPatchOperationType, ApplyPatchStatus};
 use crate::error::{AgentsError, Result};
 use crate::items::{FunctionCall, ToolApprovalItem};
 use crate::run_config::ToolErrorKind;
+use crate::tool::FunctionTool;
 use crate::tool::{
     ApplyPatchTool, ApplyPatchToolCustomDataContext, ComputerTool, ComputerToolCustomDataContext,
     ComputerToolSafetyCheckData, CustomTool, CustomToolCustomDataContext,
@@ -86,6 +90,9 @@ pub(crate) enum LocalOutcome {
         custom_data: Option<Value>,
     },
     Interruption(ToolApprovalItem),
+    /// The call was stopped by a failed sibling: before it ran (nothing to record), or while it
+    /// finalized (its committed output, if any, is in the call's [`NativeCtl`]).
+    Stopped,
     /// The tool ran, but a step after its side effect failed. The output is committed before
     /// the error propagates, so a retry does not repeat the side effect.
     OutputThenError {
@@ -308,13 +315,85 @@ async fn end_hooks<C: Send + Sync + 'static>(
 pub(crate) async fn execute_local_call<C: Send + Sync + 'static>(
     env: &ToolEnv<'_, C>,
     call: LocalCall<C>,
+    ctl: &NativeCtl<'_>,
 ) -> Result<LocalOutcome> {
-    match call {
-        LocalCall::Computer(raw, tool) => Box::pin(run_computer(env, raw, tool)).await,
-        LocalCall::Shell(raw, tool) => Box::pin(run_shell(env, raw, tool)).await,
-        LocalCall::LocalShell(raw, tool) => Box::pin(run_local_shell(env, raw, tool)).await,
-        LocalCall::ApplyPatch(raw, tool) => Box::pin(run_apply_patch(env, raw, tool)).await,
-        LocalCall::Custom(raw, tool) => Box::pin(run_custom(env, raw, tool)).await,
+    let mut run = Box::pin(async {
+        match call {
+            LocalCall::Computer(raw, tool) => Box::pin(run_computer(env, ctl, raw, tool)).await,
+            LocalCall::Shell(raw, tool) => Box::pin(run_shell(env, ctl, raw, tool)).await,
+            LocalCall::LocalShell(raw, tool) => {
+                Box::pin(run_local_shell(env, ctl, raw, tool)).await
+            }
+            LocalCall::ApplyPatch(raw, tool) => {
+                Box::pin(run_apply_patch(env, ctl, raw, tool)).await
+            }
+            LocalCall::Custom(raw, tool) => Box::pin(run_custom(env, ctl, raw, tool)).await,
+        }
+    });
+    let Some(stop) = ctl.stop else {
+        return run.await;
+    };
+    // A failed sibling cancels a call that is still invoking; one that already produced its
+    // output finalizes under its own bounded wait (`NativeCtl::post_invoke`).
+    tokio::select! {
+        biased;
+        r = &mut run => r,
+        _ = async {
+            stop.wait().await;
+            if ctl.in_post_invoke() {
+                std::future::pending::<()>().await;
+            }
+        } => Ok(LocalOutcome::Stopped),
+    }
+}
+
+/// Per-call state of a native tool call: the sibling failure signal it observes and the output
+/// it committed before finalizing.
+pub(crate) struct NativeCtl<'a> {
+    stop: Option<&'a Signal>,
+    wait: std::time::Duration,
+    in_post: std::sync::atomic::AtomicBool,
+    committed: std::sync::Mutex<Option<(Value, Value)>>,
+}
+
+impl<'a> NativeCtl<'a> {
+    pub(crate) fn new(stop: Option<&'a Signal>, wait: std::time::Duration) -> Self {
+        NativeCtl {
+            stop,
+            wait,
+            in_post: std::sync::atomic::AtomicBool::new(false),
+            committed: std::sync::Mutex::new(None),
+        }
+    }
+
+    fn in_post_invoke(&self) -> bool {
+        self.in_post.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Record the accepted output before its finalization (custom data, end hooks) runs.
+    fn commit(&self, raw_item: &Value, output: &Value) {
+        *self.committed.lock().expect("commit slot") = Some((raw_item.clone(), output.clone()));
+    }
+
+    /// The output committed by a call that was stopped while finalizing.
+    pub(crate) fn take_committed(&self) -> Option<(Value, Value)> {
+        self.committed.lock().expect("commit slot").take()
+    }
+
+    /// Run the finalization of a call that already produced its output. When a sibling fails
+    /// meanwhile it gets a bounded wait; `None` means it was abandoned.
+    async fn post_invoke<T>(&self, post: impl std::future::Future<Output = T>) -> Option<T> {
+        self.in_post
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let Some(stop) = self.stop else {
+            return Some(post.await);
+        };
+        let mut post = std::pin::pin!(post);
+        tokio::select! {
+            biased;
+            r = &mut post => Some(r),
+            _ = stop.wait() => tokio::time::timeout(self.wait, &mut post).await.ok(),
+        }
     }
 }
 
@@ -413,6 +492,7 @@ async fn run_computer_actions(
 
 async fn run_computer<C: Send + Sync + 'static>(
     env: &ToolEnv<'_, C>,
+    ctl: &NativeCtl<'_>,
     raw: Value,
     tool: Arc<ComputerTool<C>>,
 ) -> Result<LocalOutcome> {
@@ -467,20 +547,13 @@ async fn run_computer<C: Send + Sync + 'static>(
     let tool_ctx = ToolContext::from_call(env.ctx.clone(), &env.agent.name, &fc)
         .with_agent(env.agent.clone())
         .with_run_config(env.config.clone());
-    let run = async {
+    let invoke = async {
         let computer = tool.resolve(env.ctx).await?;
         start_hooks(env, &tool_ctx, &tool_enum).await;
-        let shot = run_computer_actions(computer.as_ref(), &raw).await?;
-        let image_url = if shot.is_empty() {
-            String::new()
-        } else {
-            format!("data:image/png;base64,{shot}")
-        };
-        end_hooks(env, &tool_ctx, &tool_enum, &shot).await;
-        Ok::<_, AgentsError>(image_url)
+        run_computer_actions(computer.as_ref(), &raw).await
     };
-    let image_url = match scope::with_span(span.clone(), Box::pin(run)).await {
-        Ok(u) => u,
+    let shot = match scope::with_span(span.clone(), Box::pin(invoke)).await {
+        Ok(s) => s,
         Err(e) => {
             let msg = e.to_string();
             record_local_tool_error(
@@ -494,8 +567,11 @@ async fn run_computer<C: Send + Sync + 'static>(
             return Err(e);
         }
     };
-    finish_span(env, &span, &image_url);
-    span.finish();
+    let image_url = if shot.is_empty() {
+        String::new()
+    } else {
+        format!("data:image/png;base64,{shot}")
+    };
     let mut raw_item = json!({
         "type": "computer_call_output",
         "call_id": call_id,
@@ -504,19 +580,33 @@ async fn run_computer<C: Send + Sync + 'static>(
     if let Some(acks) = acknowledged {
         raw_item["acknowledged_safety_checks"] = Value::Array(acks);
     }
-    let custom_data = match &tool.custom_data_extractor {
-        Some(extractor) => {
-            let ctx = ComputerToolCustomDataContext {
-                run_context: env.ctx,
-                tool: &tool,
-                tool_call: &raw,
-                output: &image_url,
-                raw_item: &raw_item,
-            };
-            normalize_custom_data(extractor(&ctx).await)
+    ctl.commit(&raw_item, &Value::String(image_url.clone()));
+    let post = async {
+        let custom_data = match &tool.custom_data_extractor {
+            Some(extractor) => {
+                let ctx = ComputerToolCustomDataContext {
+                    run_context: env.ctx,
+                    tool: &tool,
+                    tool_call: &raw,
+                    output: &image_url,
+                    raw_item: &raw_item,
+                };
+                normalize_custom_data(extractor(&ctx).await)
+            }
+            None => Ok(None),
+        };
+        if custom_data.is_ok() {
+            end_hooks(env, &tool_ctx, &tool_enum, &shot).await;
         }
-        None => Ok(None),
+        custom_data
     };
+    let Some(custom_data) = scope::with_span(span.clone(), Box::pin(ctl.post_invoke(post))).await
+    else {
+        span.finish();
+        return Ok(LocalOutcome::Stopped);
+    };
+    finish_span(env, &span, &image_url);
+    span.finish();
     match custom_data {
         Ok(custom_data) => Ok(LocalOutcome::Output {
             raw_item,
@@ -547,6 +637,7 @@ fn shell_rejection(call: &Value, call_id: &str, message: String) -> LocalOutcome
 
 async fn run_shell<C: Send + Sync + 'static>(
     env: &ToolEnv<'_, C>,
+    ctl: &NativeCtl<'_>,
     raw: Value,
     tool: Arc<ShellTool<C>>,
 ) -> Result<LocalOutcome> {
@@ -672,10 +763,18 @@ async fn run_shell<C: Send + Sync + 'static>(
         if let Some(p) = provider_meta {
             raw_item["provider_data"] = p;
         }
-        end_hooks(env, &tool_ctx, &tool_enum, &output_text).await;
         (raw_item, output_text)
     };
     let (raw_item, output_text) = scope::with_span(span.clone(), Box::pin(run)).await;
+    ctl.commit(&raw_item, &Value::String(output_text.clone()));
+    let post = end_hooks(env, &tool_ctx, &tool_enum, &output_text);
+    if scope::with_span(span.clone(), Box::pin(ctl.post_invoke(post)))
+        .await
+        .is_none()
+    {
+        span.finish();
+        return Ok(LocalOutcome::Stopped);
+    }
     finish_span(env, &span, &output_text);
     span.finish();
     Ok(LocalOutcome::Output {
@@ -687,6 +786,7 @@ async fn run_shell<C: Send + Sync + 'static>(
 
 async fn run_local_shell<C: Send + Sync + 'static>(
     env: &ToolEnv<'_, C>,
+    ctl: &NativeCtl<'_>,
     raw: Value,
     tool: Arc<LocalShellTool<C>>,
 ) -> Result<LocalOutcome> {
@@ -706,9 +806,17 @@ async fn run_local_shell<C: Send + Sync + 'static>(
         data: raw.clone(),
     })
     .await?;
-    end_hooks(env, &tool_ctx, &tool_enum, &result).await;
+    let raw_item = json!({"type": "local_shell_call_output", "call_id": call_id, "output": result});
+    ctl.commit(&raw_item, &Value::String(result.clone()));
+    if ctl
+        .post_invoke(end_hooks(env, &tool_ctx, &tool_enum, &result))
+        .await
+        .is_none()
+    {
+        return Ok(LocalOutcome::Stopped);
+    }
     Ok(LocalOutcome::Output {
-        raw_item: json!({"type": "local_shell_call_output", "call_id": call_id, "output": result}),
+        raw_item,
         output: Value::String(result),
         custom_data: None,
     })
@@ -716,6 +824,7 @@ async fn run_local_shell<C: Send + Sync + 'static>(
 
 async fn run_apply_patch<C: Send + Sync + 'static>(
     env: &ToolEnv<'_, C>,
+    ctl: &NativeCtl<'_>,
     raw: Value,
     tool: Arc<ApplyPatchTool<C>>,
 ) -> Result<LocalOutcome> {
@@ -835,26 +944,37 @@ async fn run_apply_patch<C: Send + Sync + 'static>(
         if !output_text.is_empty() {
             raw_item["output"] = json!(output_text);
         }
-        end_hooks(env, &tool_ctx, &tool_enum, &output_text).await;
         (raw_item, output_text, status)
     };
     let (raw_item, output_text, status) = scope::with_span(span.clone(), Box::pin(run)).await;
+    ctl.commit(&raw_item, &Value::String(output_text.clone()));
+    let post = async {
+        let custom_data = match &tool.custom_data_extractor {
+            Some(extractor) => {
+                let ctx = ApplyPatchToolCustomDataContext {
+                    run_context: env.ctx,
+                    tool: &tool,
+                    operations: &operations,
+                    output: &output_text,
+                    status,
+                    raw_item: &raw_item,
+                };
+                normalize_custom_data(extractor(&ctx).await)
+            }
+            None => Ok(None),
+        };
+        if custom_data.is_ok() {
+            end_hooks(env, &tool_ctx, &tool_enum, &output_text).await;
+        }
+        custom_data
+    };
+    let Some(custom_data) = scope::with_span(span.clone(), Box::pin(ctl.post_invoke(post))).await
+    else {
+        span.finish();
+        return Ok(LocalOutcome::Stopped);
+    };
     finish_span(env, &span, &output_text);
     span.finish();
-    let custom_data = match &tool.custom_data_extractor {
-        Some(extractor) => {
-            let ctx = ApplyPatchToolCustomDataContext {
-                run_context: env.ctx,
-                tool: &tool,
-                operations: &operations,
-                output: &output_text,
-                status,
-                raw_item: &raw_item,
-            };
-            normalize_custom_data(extractor(&ctx).await)
-        }
-        None => Ok(None),
-    };
     // The patch is applied: a failed custom data extraction keeps its output committed.
     match custom_data {
         Ok(custom_data) => Ok(LocalOutcome::Output {
@@ -872,6 +992,7 @@ async fn run_apply_patch<C: Send + Sync + 'static>(
 
 async fn run_custom<C: Send + Sync + 'static>(
     env: &ToolEnv<'_, C>,
+    ctl: &NativeCtl<'_>,
     raw: Value,
     tool: Arc<CustomTool<C>>,
 ) -> Result<LocalOutcome> {
@@ -923,7 +1044,7 @@ async fn run_custom<C: Send + Sync + 'static>(
         .with_run_config(env.config.clone());
     let run = async {
         start_hooks(env, &tool_ctx, &tool_enum).await;
-        let text = match tool.invoke(tool_ctx.clone(), input.clone()).await {
+        match tool.invoke(tool_ctx.clone(), input.clone()).await {
             Ok(t) => t,
             Err(e) => {
                 let msg = e.to_string();
@@ -938,45 +1059,224 @@ async fn run_custom<C: Send + Sync + 'static>(
                 log_tool_error("Custom tool failed", &msg);
                 msg
             }
-        };
-        end_hooks(env, &tool_ctx, &tool_enum, &text).await;
-        text
+        }
     };
     let text = scope::with_span(span.clone(), Box::pin(run)).await;
+    let mut outcome = output_item(text.clone());
+    let LocalOutcome::Output {
+        raw_item,
+        custom_data,
+        ..
+    } = &mut outcome
+    else {
+        unreachable!("output_item builds an output")
+    };
+    ctl.commit(raw_item, &Value::String(text.clone()));
+    let post = async {
+        let extracted = match &tool.custom_data_extractor {
+            Some(extractor) => {
+                let ctx = CustomToolCustomDataContext {
+                    tool_context: &tool_ctx,
+                    tool: &tool,
+                    input: &input,
+                    output: &text,
+                    raw_item,
+                };
+                normalize_custom_data(extractor(&ctx).await)
+            }
+            None => Ok(None),
+        };
+        if extracted.is_ok() {
+            end_hooks(env, &tool_ctx, &tool_enum, &text).await;
+        }
+        extracted
+    };
+    let Some(extracted) = scope::with_span(span.clone(), Box::pin(ctl.post_invoke(post))).await
+    else {
+        span.finish();
+        return Ok(LocalOutcome::Stopped);
+    };
     finish_span(env, &span, &text);
     span.finish();
-    let mut outcome = output_item(text.clone());
-    if let Some(extractor) = &tool.custom_data_extractor
-        && let LocalOutcome::Output {
-            raw_item,
-            custom_data,
-            ..
-        } = &mut outcome
-    {
-        let ctx = CustomToolCustomDataContext {
-            tool_context: &tool_ctx,
-            tool: &tool,
-            input: &input,
-            output: &text,
-            raw_item,
-        };
-        match normalize_custom_data(extractor(&ctx).await) {
-            Ok(data) => *custom_data = data,
-            Err(error) => {
-                // The tool ran: a failed custom data extraction keeps its output committed.
-                let LocalOutcome::Output {
-                    raw_item, output, ..
-                } = outcome
-                else {
-                    unreachable!("matched above")
-                };
-                return Ok(LocalOutcome::OutputThenError {
-                    raw_item,
-                    output,
-                    error,
-                });
-            }
+    match extracted {
+        Ok(data) => *custom_data = data,
+        Err(error) => {
+            // The tool ran: a failed custom data extraction keeps its output committed.
+            let LocalOutcome::Output {
+                raw_item, output, ..
+            } = outcome
+            else {
+                unreachable!("matched above")
+            };
+            return Ok(LocalOutcome::OutputThenError {
+                raw_item,
+                output,
+                error,
+            });
         }
     }
     Ok(outcome)
+}
+
+/// Which tool category selected the batch's failure first.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FailureSource {
+    Function,
+    Native,
+}
+
+/// The settled result of one turn's tool batch.
+pub(crate) struct ToolBatchOutcome {
+    pub functions: std::result::Result<Vec<ToolExecResult>, ToolBatchFailure>,
+    /// Native outputs and approvals as `(call index, outcome)`, in call order. A call stopped
+    /// while it finalized contributes the output it had committed.
+    pub locals: Vec<(usize, LocalOutcome)>,
+    /// The failure of a native call (a failed finalization keeps its output in `locals`).
+    pub native_error: Option<AgentsError>,
+    /// The native failure was selected before the function batch's own.
+    native_first: bool,
+}
+
+impl ToolBatchOutcome {
+    /// The error that fails the turn, if any: the category that failed first wins.
+    pub(crate) fn take_error(&mut self) -> Option<AgentsError> {
+        let function_error = match &mut self.functions {
+            Err(failure) if !failure.sibling_stopped => {
+                Some(std::mem::replace(&mut failure.error, AgentsError::user("")))
+            }
+            _ => None,
+        };
+        match (function_error, self.native_error.take()) {
+            (Some(f), Some(n)) => Some(if self.native_first { n } else { f }),
+            (f, n) => f.or(n),
+        }
+    }
+
+    /// Whether any call of the batch committed an output.
+    pub(crate) fn has_outputs(&self) -> bool {
+        let function_outputs = match &self.functions {
+            Ok(done) => !done.is_empty(),
+            Err(failure) => !failure.completed.is_empty(),
+        };
+        function_outputs
+            || self
+                .locals
+                .iter()
+                .any(|(_, o)| matches!(o, LocalOutcome::Output { .. }))
+    }
+}
+
+fn category_of<C>(call: &LocalCall<C>) -> usize {
+    match call {
+        LocalCall::Computer(..) => 0,
+        LocalCall::Custom(..) => 1,
+        LocalCall::Shell(..) => 2,
+        LocalCall::ApplyPatch(..) => 3,
+        LocalCall::LocalShell(..) => 4,
+    }
+}
+
+/// Run a turn's function tools and native tools (computer, shell, apply patch, custom, local
+/// shell) concurrently. Each native category runs its calls serially, the categories and the
+/// function batch run side by side. Port of `_execute_tool_plan`.
+///
+/// When one category fails, the others are wound down: calls still invoking are cancelled,
+/// queued native calls never start, and calls that already produced their output get a bounded
+/// wait to finalize it. Outputs committed so far are always returned.
+pub(crate) async fn run_tool_batch<C: Send + Sync + 'static>(
+    env: &ToolEnv<'_, C>,
+    functions: Vec<(FunctionCall, Arc<FunctionTool<C>>)>,
+    locals: Vec<LocalCall<C>>,
+    // Set as soon as any category selects its failure.
+    error_selected: &Signal,
+) -> ToolBatchOutcome {
+    // Stops the function batch (a native category failed).
+    let function_stop = Signal::new();
+    // Stops queued and in-flight native calls (any category failed).
+    let native_stop = Signal::new();
+    let first: std::sync::Mutex<Option<FailureSource>> = std::sync::Mutex::new(None);
+    let wait = post_invoke_wait(env.config);
+    let record_first = |source: FailureSource| {
+        first.lock().expect("first failure").get_or_insert(source);
+        error_selected.set();
+    };
+    let on_function_selected = || {
+        record_first(FailureSource::Function);
+        native_stop.set();
+    };
+
+    let mut categories: [Vec<(usize, LocalCall<C>)>; 5] = Default::default();
+    for (index, call) in locals.into_iter().enumerate() {
+        categories[category_of(&call)].push((index, call));
+    }
+    let native_error: std::sync::Mutex<Option<AgentsError>> = std::sync::Mutex::new(None);
+    let run_category = |calls: Vec<(usize, LocalCall<C>)>| {
+        let (native_stop, function_stop) = (&native_stop, &function_stop);
+        let (native_error, record_first) = (&native_error, &record_first);
+        async move {
+            let mut done: Vec<(usize, LocalOutcome)> = Vec::new();
+            for (index, call) in calls {
+                // A failure elsewhere is selected: queued calls never start.
+                if native_stop.is_set() {
+                    break;
+                }
+                let ctl = NativeCtl::new(Some(native_stop), wait);
+                let result = Box::pin(execute_local_call(env, call, &ctl)).await;
+                let fail = |error: AgentsError| {
+                    record_first(FailureSource::Native);
+                    native_error
+                        .lock()
+                        .expect("native error")
+                        .get_or_insert(error);
+                    native_stop.set();
+                    function_stop.set();
+                };
+                match result {
+                    Ok(LocalOutcome::Stopped) => {
+                        if let Some((raw_item, output)) = ctl.take_committed() {
+                            done.push((
+                                index,
+                                LocalOutcome::Output {
+                                    raw_item,
+                                    output,
+                                    custom_data: None,
+                                },
+                            ));
+                        }
+                    }
+                    Ok(LocalOutcome::OutputThenError {
+                        raw_item,
+                        output,
+                        error,
+                    }) => {
+                        done.push((
+                            index,
+                            LocalOutcome::Output {
+                                raw_item,
+                                output,
+                                custom_data: None,
+                            },
+                        ));
+                        fail(error);
+                    }
+                    Ok(outcome) => done.push((index, outcome)),
+                    Err(error) => fail(error),
+                }
+            }
+            done
+        }
+    };
+    let native = futures::future::join_all(categories.into_iter().map(run_category));
+    let function_batch =
+        execute_function_tools(env, functions, Some(&function_stop), &on_function_selected);
+    let (functions, categories) = futures::future::join(function_batch, native).await;
+    let mut locals: Vec<(usize, LocalOutcome)> = categories.into_iter().flatten().collect();
+    locals.sort_by_key(|(index, _)| *index);
+    let native_first = *first.lock().expect("first failure") == Some(FailureSource::Native);
+    ToolBatchOutcome {
+        functions,
+        locals,
+        native_error: native_error.into_inner().expect("native error"),
+        native_first,
+    }
 }

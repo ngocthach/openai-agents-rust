@@ -737,6 +737,35 @@ impl RunItem {
         }
     }
 
+    /// The tool name of a tool call item (`ToolCallItem.tool_name`); `None` for a call payload
+    /// that carries no `name` (a file search call) and for every other item kind.
+    pub fn tool_name(&self) -> Option<String> {
+        match &self.kind {
+            RunItemKind::ToolCall { raw_item } => raw_item
+                .get("name")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            _ => None,
+        }
+    }
+
+    /// The call identifier of a tool call or tool output item (`ToolCallItem.call_id`,
+    /// `ToolCallOutputItem.call_id`): the payload's non-empty `call_id`, else its `id`.
+    pub fn call_id(&self) -> Option<String> {
+        let raw = match &self.kind {
+            RunItemKind::ToolCall { raw_item } | RunItemKind::ToolCallOutput { raw_item, .. } => {
+                raw_item
+            }
+            _ => return None,
+        };
+        ["call_id", "id"].iter().find_map(|key| {
+            raw.get(*key)
+                .and_then(Value::as_str)
+                .filter(|v| !v.is_empty())
+                .map(str::to_string)
+        })
+    }
+
     /// SDK-only custom data attached to a tool output item.
     pub fn custom_data(&self) -> Option<&Value> {
         match &self.kind {
@@ -751,6 +780,64 @@ impl RunItem {
             RunItemKind::ToolCallOutput { output, .. } => Some(output),
             _ => None,
         }
+    }
+}
+
+/// The `input_*` parts of a JSON tool output that already has the shape of a structured output
+/// (`{"type": "text" | "image" | "file", ...}`, or a non-empty list of them, all valid). Port of
+/// `ItemHelpers._convert_tool_output_as_structured` for untyped values; unknown extra fields are
+/// ignored.
+fn structured_tool_output(value: &Value) -> Option<Vec<Value>> {
+    fn part(value: &Value) -> Option<Value> {
+        let map = value.as_object()?;
+        let text = |key: &str| match map.get(key) {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::String(s)) => Ok(Some(Value::String(s.clone()))),
+            Some(_) => Err(()),
+        };
+        let copy = |keys: &[&str], mut out: serde_json::Map<String, Value>| {
+            for key in keys {
+                if let Some(v) = text(key).ok()? {
+                    out.insert((*key).to_string(), v);
+                }
+            }
+            Some(out)
+        };
+        match map.get("type")?.as_str()? {
+            "text" => {
+                let text = text("text").ok()??;
+                Some(json!({"type": "input_text", "text": text}))
+            }
+            "image" => {
+                if let Some(detail) = map.get("detail").filter(|d| !d.is_null())
+                    && !matches!(detail.as_str(), Some("low" | "high" | "auto"))
+                {
+                    return None;
+                }
+                let out = copy(
+                    &["image_url", "file_id", "detail"],
+                    serde_json::Map::from_iter([("type".to_string(), json!("input_image"))]),
+                )?;
+                (out.contains_key("image_url") || out.contains_key("file_id"))
+                    .then_some(Value::Object(out))
+            }
+            "file" => {
+                let out = copy(
+                    &["file_data", "file_url", "file_id", "filename"],
+                    serde_json::Map::from_iter([("type".to_string(), json!("input_file"))]),
+                )?;
+                (out.contains_key("file_data")
+                    || out.contains_key("file_url")
+                    || out.contains_key("file_id"))
+                .then_some(Value::Object(out))
+            }
+            _ => None,
+        }
+    }
+    match value {
+        Value::Array(items) if !items.is_empty() => items.iter().map(part).collect(),
+        Value::Object(_) => part(value).map(|p| vec![p]),
+        _ => None,
     }
 }
 
@@ -893,7 +980,12 @@ impl ItemHelpers {
             ToolOutput::Text(s) => Value::String(s.clone()),
             ToolOutput::Json(v) => match v {
                 Value::String(s) => Value::String(s.clone()),
-                other => Value::String(other.to_string()),
+                // A dict (or non-empty list of dicts) with an explicit, valid `type` is a
+                // structured output, like the typed parts; anything else is stringified.
+                other => match structured_tool_output(other) {
+                    Some(parts) => Value::Array(parts),
+                    None => Value::String(other.to_string()),
+                },
             },
             ToolOutput::Parts(parts) => {
                 Value::Array(parts.iter().map(ToolOutputPart::to_input_content).collect())

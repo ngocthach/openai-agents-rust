@@ -666,6 +666,12 @@ pub struct FunctionTool<C> {
     invoke: InvokeFn<C>,
     pub(crate) is_agent_tool: bool,
     pub(crate) mcp_server_name: Option<String>,
+    /// The annotations the MCP server declared for this tool, captured when it was converted.
+    pub(crate) mcp_annotations: Option<Value>,
+    /// Which MCP server and raw tool this function tool calls: `(server log name, raw tool
+    /// name, index in the agent's server list)`. Persisted per call so an approved call can only
+    /// resume on the recipient it was approved for. Mirrors `FunctionTool._mcp_tool_binding`.
+    pub(crate) mcp_tool_binding: Option<(String, String, Option<usize>)>,
     /// Explicit origin metadata for items this tool produces; see [`FunctionTool::tool_origin`].
     pub(crate) tool_origin: Option<ToolOrigin>,
     pub(crate) namespace: Option<String>,
@@ -701,6 +707,8 @@ impl<C> Clone for FunctionTool<C> {
             invoke: self.invoke.clone(),
             is_agent_tool: self.is_agent_tool,
             mcp_server_name: self.mcp_server_name.clone(),
+            mcp_annotations: self.mcp_annotations.clone(),
+            mcp_tool_binding: self.mcp_tool_binding.clone(),
             tool_origin: self.tool_origin.clone(),
             namespace: self.namespace.clone(),
             namespace_description: self.namespace_description.clone(),
@@ -992,6 +1000,8 @@ impl<C: Send + Sync + 'static> FunctionTool<C> {
             invoke,
             is_agent_tool: false,
             mcp_server_name: None,
+            mcp_annotations: None,
+            mcp_tool_binding: None,
             tool_origin: None,
             allowed_callers: None,
             custom_data_extractor: None,
@@ -1393,6 +1403,13 @@ impl<C> FunctionTool<C> {
     /// The MCP server that provides this tool, if any.
     pub fn mcp_server_name(&self) -> Option<&str> {
         self.mcp_server_name.as_deref()
+    }
+
+    /// A copy of the annotations (`readOnlyHint`, `destructiveHint`, ...) the MCP server
+    /// declared for this tool when it was converted. `None` for tools that are not MCP tools
+    /// and for MCP tools without annotations. Mirrors `FunctionTool.mcp_annotations`.
+    pub fn mcp_annotations(&self) -> Option<Value> {
+        self.mcp_annotations.clone()
     }
 
     /// The tool spec exposed to models.

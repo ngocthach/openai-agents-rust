@@ -20,9 +20,7 @@ use crate::realtime::config::{
     RealtimeAudioStorage, RealtimeFunctionToolSpec, RealtimeModelTracing, RealtimeRunConfig,
     RealtimeSessionModelSettings, RealtimeToolErrorArgs, RealtimeToolErrorKind, RealtimeUserInput,
 };
-use crate::realtime::debug::{
-    log_model_action_warning, log_tool_action_error, log_tool_action_warning,
-};
+use crate::realtime::debug::{log_tool_action_error, log_tool_action_warning};
 use crate::realtime::events::{RealtimeEventInfo, RealtimeSessionEvent};
 use crate::realtime::handoffs::RealtimeHandoff;
 use crate::realtime::items::{
@@ -1818,13 +1816,17 @@ impl<C: Send + Sync + 'static> SessionInner<C> {
                 Ok(result) if result.output.tripwire_triggered => triggered.push(result),
                 Ok(_) => {}
                 Err(error) => {
-                    log_model_action_warning(
-                        &format!(
-                            "Realtime output guardrail {} raised an error; skipping it",
+                    // The guardrail name and error can carry model or tool data, so both
+                    // logging policies apply and the name appears only when they allow it.
+                    let message = if crate::logger::may_log_model_data(true) {
+                        format!(
+                            "Output guardrail raised an exception; skipping it (guardrail {})",
                             guardrail.name
-                        ),
-                        &error,
-                    );
+                        )
+                    } else {
+                        "Output guardrail raised an exception; skipping it".to_string()
+                    };
+                    crate::logger::log_model_and_tool_action_warning(&message, &error);
                 }
             }
         }

@@ -220,6 +220,12 @@ impl ToolFilter {
 
 type ApprovalFn = Arc<dyn Fn(&str, &MCPTool) -> BoxFuture<'static, bool> + Send + Sync>;
 
+/// An approval policy that also receives the run context, type-erased because [`MCPServer`] is
+/// not generic over the context type. The first argument holds a `RunContext<C>`.
+type ContextApprovalFn = Arc<
+    dyn Fn(Arc<dyn Any + Send + Sync>, &str, &MCPTool) -> BoxFuture<'static, bool> + Send + Sync,
+>;
+
 /// Approval policy for local MCP tools.
 #[derive(Clone, Default)]
 pub enum RequireApproval {
@@ -232,6 +238,9 @@ pub enum RequireApproval {
     PerTool(HashMap<String, bool>),
     /// Decide per tool from `(agent_name, tool)`.
     Dynamic(ApprovalFn),
+    /// Decide per call from `(run_context, agent_name, tool)`, evaluated when the tool is
+    /// called with that run's context. Build it with [`RequireApproval::dynamic_with_context`].
+    DynamicWithContext(ContextApprovalFn),
 }
 
 impl fmt::Debug for RequireApproval {
@@ -241,6 +250,7 @@ impl fmt::Debug for RequireApproval {
             RequireApproval::Always => write!(f, "Always"),
             RequireApproval::PerTool(m) => f.debug_tuple("PerTool").field(m).finish(),
             RequireApproval::Dynamic(_) => write!(f, "Dynamic(..)"),
+            RequireApproval::DynamicWithContext(_) => write!(f, "DynamicWithContext(..)"),
         }
     }
 }
@@ -268,9 +278,28 @@ impl RequireApproval {
         }))
     }
 
-    /// Whether `tool` requires approval for `agent_name`.
+    /// A per-call policy that sees the run's context, as Python's
+    /// `(run_context, agent, tool)` approval callable does. `C` is the run's context type; a run
+    /// with another context type never requires approval from this policy.
+    pub fn dynamic_with_context<C, F, Fut>(f: F) -> Self
+    where
+        C: Send + Sync + 'static,
+        F: Fn(crate::run_context::RunContext<C>, &str, &MCPTool) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = bool> + Send + 'static,
+    {
+        RequireApproval::DynamicWithContext(Arc::new(move |context, agent_name, tool| {
+            match context.downcast::<crate::run_context::RunContext<C>>() {
+                Ok(context) => Box::pin(f((*context).clone(), agent_name, tool)),
+                Err(_) => Box::pin(async { false }),
+            }
+        }))
+    }
+
+    /// Whether `tool` requires approval for `agent_name`, without a run context. A policy that
+    /// needs the run context is evaluated per call instead and reports `false` here.
     pub async fn requires(&self, agent_name: &str, tool: &MCPTool) -> bool {
         match self {
+            RequireApproval::DynamicWithContext(_) => false,
             RequireApproval::Never => false,
             RequireApproval::Always => true,
             RequireApproval::PerTool(m) => m.get(&tool.name).copied().unwrap_or(false),
@@ -777,7 +806,30 @@ struct Core {
     config: MCPServerConfig,
     connection: Mutex<Option<Connection>>,
     tools_cache: Mutex<Option<Vec<MCPTool>>>,
+    cache_state: std::sync::Mutex<ToolsCacheState>,
     session_id: Arc<std::sync::Mutex<Option<String>>>,
+}
+
+/// Bookkeeping that keeps concurrent `tools/list` refreshes and invalidations ordered: only the
+/// newest refresh that started after the latest invalidation may publish its result. Mirrors
+/// `_cache_dirty`, `_tools_cache_generation`, `_tools_refresh_sequence` and
+/// `_tools_last_published_refresh_sequence`.
+struct ToolsCacheState {
+    dirty: bool,
+    generation: u64,
+    refresh_sequence: u64,
+    last_published_sequence: u64,
+}
+
+impl Default for ToolsCacheState {
+    fn default() -> Self {
+        ToolsCacheState {
+            dirty: true,
+            generation: 0,
+            refresh_sequence: 0,
+            last_published_sequence: 0,
+        }
+    }
 }
 
 /// Turn an `rmcp` failure into an `AgentsError`, removing any credential it embeds.
@@ -980,6 +1032,20 @@ impl Core {
         Ok(guard)
     }
 
+    /// A handle on the live session that does not hold the connection lock, so requests run
+    /// concurrently on one session as they do in Python (a slow tool call must not queue every
+    /// other request behind it).
+    async fn peer(&self) -> Result<rmcp::service::Peer<RoleClient>> {
+        Ok(self
+            .session()
+            .await?
+            .as_ref()
+            .expect("session checked")
+            .service
+            .peer()
+            .clone())
+    }
+
     /// Whether the retry budget is unlimited (Python's `max_retry_attempts == -1`).
     fn unlimited_retries(&self) -> bool {
         self.config.max_retry_attempts < 0
@@ -1063,10 +1129,16 @@ impl Core {
         // never answers from a stale list.
         drop(self.session().await?);
         if self.config.cache_tools_list
+            && !self.cache_state.lock().unwrap().dirty
             && let Some(t) = self.tools_cache.lock().await.clone()
         {
             return Ok(t);
         }
+        let (refresh_generation, refresh_sequence) = {
+            let mut state = self.cache_state.lock().unwrap();
+            state.refresh_sequence += 1;
+            (state.generation, state.refresh_sequence)
+        };
         // Each page request retries on its own, as Python's `_list_tools_page` does, so a
         // transient failure on page N never refetches (or recounts) the pages already read.
         let mut out = Vec::new();
@@ -1076,8 +1148,7 @@ impl Core {
             let page_cursor = cursor.clone();
             let page = self
                 .retry(|| async {
-                    let guard = self.session().await?;
-                    let s = &guard.as_ref().expect("session checked").service;
+                    let s = self.peer().await?;
                     s.list_tools(page_cursor.clone().map(|c| {
                         rmcp::model::PaginatedRequestParams::default().with_cursor(Some(c))
                     }))
@@ -1100,7 +1171,16 @@ impl Core {
         }
         let tools = out;
         if self.config.cache_tools_list {
-            *self.tools_cache.lock().await = Some(tools.clone());
+            // Holding the cache lock across the check keeps two publishers from interleaving.
+            let mut cache = self.tools_cache.lock().await;
+            let mut state = self.cache_state.lock().unwrap();
+            if refresh_generation == state.generation
+                && refresh_sequence > state.last_published_sequence
+            {
+                *cache = Some(tools.clone());
+                state.dirty = false;
+                state.last_published_sequence = refresh_sequence;
+            }
         }
         Ok(tools)
     }
@@ -1114,6 +1194,9 @@ impl Core {
         arguments: Option<&Map<String, Value>>,
     ) -> Result<()> {
         let cache = self.tools_cache.lock().await;
+        if self.cache_state.lock().unwrap().dirty {
+            return Ok(());
+        }
         let Some(tool) = cache
             .as_ref()
             .and_then(|tools| tools.iter().find(|t| t.name == tool_name))
@@ -1209,11 +1292,10 @@ impl Core {
         }
 
         let attempt = async {
-            let guard = match self.session().await {
-                Ok(guard) => guard,
+            let s = match self.peer().await {
+                Ok(peer) => peer,
                 Err(e) => return SharedOutcome::Failed(e),
             };
-            let s = &guard.as_ref().expect("session checked").service;
             match s.call_tool(params.clone()).await {
                 Ok(result) => SharedOutcome::Done(result),
                 Err(e) if allow_isolated_retry && should_retry_in_isolated_session(&e) => {
@@ -1265,8 +1347,7 @@ impl Core {
         let mut cursor: Option<String> = None;
         let mut pages = 0usize;
         loop {
-            let guard = self.session().await?;
-            let s = &guard.as_ref().expect("session checked").service;
+            let s = self.peer().await?;
             let params = cursor
                 .clone()
                 .map(|c| rmcp::model::PaginatedRequestParams::default().with_cursor(Some(c)));
@@ -1280,7 +1361,6 @@ impl Core {
                     .filter_map(|p| serde_json::to_value(p).ok()),
             );
             let next = page.next_cursor.map(|c| c.to_string());
-            drop(guard);
             match self.check_pagination(next, cursor, pages, "prompts")? {
                 Some(next) => cursor = Some(next),
                 None => break,
@@ -1290,8 +1370,7 @@ impl Core {
     }
 
     async fn list_resources(&self, cursor: Option<&str>) -> Result<Value> {
-        let guard = self.session().await?;
-        let s = &guard.as_ref().expect("session checked").service;
+        let s = self.peer().await?;
         let params = cursor.map(|c| {
             rmcp::model::PaginatedRequestParams::default().with_cursor(Some(c.to_string()))
         });
@@ -1302,8 +1381,7 @@ impl Core {
     }
 
     async fn list_resource_templates(&self, cursor: Option<&str>) -> Result<Value> {
-        let guard = self.session().await?;
-        let s = &guard.as_ref().expect("session checked").service;
+        let s = self.peer().await?;
         let params = cursor.map(|c| {
             rmcp::model::PaginatedRequestParams::default().with_cursor(Some(c.to_string()))
         });
@@ -1316,8 +1394,7 @@ impl Core {
     async fn read_resource(&self, uri: &str) -> Result<Value> {
         let params: rmcp::model::ReadResourceRequestParams =
             serde_json::from_value(json!({"uri": uri}))?;
-        let guard = self.session().await?;
-        let s = &guard.as_ref().expect("session checked").service;
+        let s = self.peer().await?;
         let result = self
             .with_timeout(async { s.read_resource(params).await.map_err(svc_err) })
             .await?;
@@ -1340,8 +1417,7 @@ impl Core {
             req["arguments"] = json!(a);
         }
         let params: rmcp::model::GetPromptRequestParams = serde_json::from_value(req)?;
-        let guard = self.session().await?;
-        let s = &guard.as_ref().expect("session checked").service;
+        let s = self.peer().await?;
         let r = self
             .with_timeout(async { s.get_prompt(params).await.map_err(svc_err) })
             .await?;
@@ -1375,6 +1451,7 @@ macro_rules! mcp_server_type {
                         config: MCPServerConfig::default(),
                         connection: Mutex::new(None),
                         tools_cache: Mutex::new(None),
+                        cache_state: std::sync::Mutex::new(ToolsCacheState::default()),
                         session_id: Arc::new(std::sync::Mutex::new(None)),
                     },
                 }
@@ -1523,7 +1600,11 @@ macro_rules! mcp_server_type {
                 self.core.get_prompt(name, arguments).await
             }
             async fn invalidate_tools_cache(&self) {
-                *self.core.tools_cache.lock().await = None;
+                // The last list stays visible through `cached_tools`, but is never served or
+                // trusted for validation again; a refresh already in flight cannot publish.
+                let mut state = self.core.cache_state.lock().unwrap();
+                state.generation += 1;
+                state.dirty = true;
             }
         }
     };

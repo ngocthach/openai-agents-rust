@@ -83,6 +83,11 @@ impl RunCheckpoint {
         self.0.lock().unwrap_or_else(|e| e.into_inner()).take()
     }
 
+    /// A copy of the checkpoint a failed run left, without taking it.
+    pub(crate) fn peek(&self) -> Option<RunState> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
     pub(crate) fn set(&self, state: RunState) {
         *self.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(state);
     }
@@ -304,6 +309,10 @@ fn run_streamed_default<C: Send + Sync + 'static>(
     input: RunInput,
     options: RunOptions<C>,
 ) -> RunResultStreaming<C> {
+    // A failed streamed run still answers `to_state()` with the state it failed in.
+    let mut options = options;
+    let failure_slot = options.checkpoint.clone().unwrap_or_default();
+    options.checkpoint = Some(failure_slot.clone());
     let (tx, rx) = mpsc::unbounded_channel();
     let cancel = Arc::new(AtomicBool::new(false));
     let control = Arc::new(crate::result::StreamControl::default());
@@ -325,6 +334,7 @@ fn run_streamed_default<C: Send + Sync + 'static>(
     });
     let mut streaming = RunResultStreaming::new(rx, start_agent, cancel, control, handle);
     streaming.set_max_turns(max_turns);
+    streaming.set_failure_checkpoint(failure_slot);
     streaming
 }
 

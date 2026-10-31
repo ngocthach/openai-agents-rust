@@ -44,9 +44,10 @@ use crate::sandbox::retry::{RetryPolicy, is_transient_sandbox_error, retry_async
 use crate::sandbox::sandboxes::docker::DEFAULT_PYTHON_SANDBOX_IMAGE;
 use crate::sandbox::session::{
     ExecRequest, SandboxClient, SandboxSession, restore_session_snapshot,
+    with_ephemeral_mounts_removed,
 };
 use crate::sandbox::snapshot::{Snapshot, SnapshotSpec, resolve_snapshot};
-use crate::sandbox::state::SandboxSessionState;
+use crate::sandbox::state::{SandboxSessionState, SnapshotFingerprint};
 use crate::sandbox::types::ExecResult;
 
 use super::mounts::ModalCloudBucketMountStrategy;
@@ -548,10 +549,14 @@ impl ModalHelper {
                 }
                 _ => ErrorCode::ExecTransportError,
             };
-            return Err(SandboxError::new(
-                code,
-                format!("Modal helper `{op}` failed: {detail}"),
-            ));
+            let mut error =
+                SandboxError::new(code, format!("Modal helper `{op}` failed: {detail}"));
+            // The helper classifies the Modal exception type; a caller that retries on a
+            // transient failure needs to know which ones are permanent.
+            if let Some(retryable) = response.get("retryable").and_then(Value::as_bool) {
+                error = error.with_retryable(retryable);
+            }
+            return Err(error);
         }
         Ok(response)
     }
@@ -780,6 +785,8 @@ impl ModalSandboxClient {
         manifest: Manifest,
         image_id: Option<&str>,
     ) -> SandboxResult<ModalSandboxSession> {
+        // A mount whose path climbs out of the workspace would otherwise be dropped silently.
+        manifest.try_mount_targets()?;
         self.validate_manifest_for_workspace_persistence(&manifest)?;
         if image_id.is_none()
             && let Some(sandbox_id) = self
@@ -854,7 +861,14 @@ impl SandboxClient for ModalSandboxClient {
         state.verify_manifest(&manifest)?;
         let manifest = manifest.with_root(state.workspace_root.clone());
         let helper = ModalHelper::new(self.options.resolve_helper_command()?);
-        if let Some(sandbox_id) = state.provider_id.clone().filter(|id| !id.is_empty()) {
+        // A state whose mount authority was re-supplied by the caller must not reattach the
+        // sandbox that holds the old authority: a fresh one is created from the current manifest.
+        let reattachable = !state.mount_authority_rebound;
+        if let Some(sandbox_id) = state
+            .provider_id
+            .clone()
+            .filter(|id| reattachable && !id.is_empty())
+        {
             let running = helper
                 .call(json!({"op": "poll", "sandbox_id": sandbox_id}))
                 .await
@@ -862,10 +876,20 @@ impl SandboxClient for ModalSandboxClient {
                 .and_then(|response| response.get("running").and_then(Value::as_bool))
                 .unwrap_or(false);
             if running {
+                let record = state
+                    .snapshot_fingerprint
+                    .clone()
+                    .zip(state.snapshot_fingerprint_version.clone())
+                    .map(|(fingerprint, version)| SnapshotFingerprint {
+                        fingerprint,
+                        version,
+                    });
                 return Ok(Arc::new(
                     ModalSandboxSession::new(helper, sandbox_id, manifest, self.options.clone())
                         .with_snapshot(Some(state.snapshot.clone()))
                         .with_snapshot_id(state.snapshot_id.clone())
+                        .with_state_preserved(true)
+                        .with_snapshot_fingerprint(record)
                         .resuming(),
                 ));
             }
@@ -900,6 +924,11 @@ pub struct ModalSandboxSession {
     snapshot: Option<SnapshotSpec>,
     snapshot_id: String,
     resuming: bool,
+    /// Whether this session reattached a sandbox that kept its workspace and system state.
+    state_preserved: bool,
+    /// The workspace fingerprint the stored snapshot was taken from.
+    snapshot_fingerprint: std::sync::Mutex<Option<SnapshotFingerprint>>,
+    persist_skips: std::sync::Mutex<std::collections::BTreeSet<String>>,
 }
 
 impl ModalSandboxSession {
@@ -926,6 +955,9 @@ impl ModalSandboxSession {
             ptys: PtyManager::new(),
             snapshot: None,
             resuming: false,
+            state_preserved: false,
+            snapshot_fingerprint: std::sync::Mutex::new(None),
+            persist_skips: std::sync::Mutex::new(std::collections::BTreeSet::new()),
         }
     }
 
@@ -946,6 +978,18 @@ impl ModalSandboxSession {
     /// Reuse a persisted snapshot identity.
     pub fn with_snapshot_id(mut self, snapshot_id: String) -> Self {
         self.snapshot_id = snapshot_id;
+        self
+    }
+
+    /// Mark the sandbox as one that survived the pause with its workspace intact.
+    pub fn with_state_preserved(mut self, preserved: bool) -> Self {
+        self.state_preserved = preserved;
+        self
+    }
+
+    /// Carry the workspace fingerprint a resumed snapshot was taken from.
+    pub fn with_snapshot_fingerprint(self, record: Option<SnapshotFingerprint>) -> Self {
+        *self.snapshot_fingerprint.lock().expect("poisoned") = record;
         self
     }
 
@@ -977,30 +1021,36 @@ impl ModalSandboxSession {
     }
 
     /// Snapshot the sandbox filesystem and return the resulting Modal image id.
+    ///
+    /// The image captures the whole filesystem, so the paths a workspace archive excludes are set
+    /// aside first and put back afterwards, exactly as for a directory snapshot.
     pub async fn snapshot_filesystem(&self) -> SandboxResult<String> {
-        let response = self
-            .helper
-            .call(json!({
-                "op": "snapshot_filesystem",
-                "sandbox_id": self.sandbox_id(),
-                "timeout": self.options.snapshot_filesystem_timeout.as_secs(),
-            }))
-            .await?;
-        let image_id = response
-            .get("image_id")
-            .and_then(Value::as_str)
-            .filter(|id| !id.is_empty())
-            .ok_or_else(|| {
-                SandboxError::new(
-                    ErrorCode::SnapshotPersistError,
-                    "`snapshot_filesystem` returned no image id",
-                )
-            })?
-            .to_string();
-        if let Ok(mut slot) = self.image_id.lock() {
-            *slot = Some(image_id.clone());
-        }
-        Ok(image_id)
+        self.with_excluded_paths_stashed("filesystem", || async {
+            let response = self
+                .helper
+                .call(json!({
+                    "op": "snapshot_filesystem",
+                    "sandbox_id": self.sandbox_id(),
+                    "timeout": self.options.snapshot_filesystem_timeout.as_secs(),
+                }))
+                .await?;
+            let image_id = response
+                .get("image_id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .ok_or_else(|| {
+                    SandboxError::new(
+                        ErrorCode::SnapshotPersistError,
+                        "`snapshot_filesystem` returned no image id",
+                    )
+                })?
+                .to_string();
+            if let Ok(mut slot) = self.image_id.lock() {
+                *slot = Some(image_id.clone());
+            }
+            Ok(image_id)
+        })
+        .await
     }
 
     /// Snapshot the workspace root into a Modal image with `Sandbox.snapshot_directory`.
@@ -1012,29 +1062,187 @@ impl ModalSandboxSession {
     /// baked into an image that outlives the sandbox.
     pub async fn snapshot_directory(&self) -> SandboxResult<String> {
         let root = self.manifest.root().to_string();
-        let excluded = crate::sandbox::session::workspace_archive_excludes(&self.manifest, &root)
+        self.with_excluded_paths_stashed("directory", || async {
+            // The image captures the whole root, so durable mounts inside it are detached for
+            // the snapshot and attached again afterwards.
+            let mounts = self.durable_mounts_in_root()?;
+            with_ephemeral_mounts_removed(
+                self,
+                mounts,
+                || self.snapshot_directory_image(&root),
+                &root,
+                ErrorCode::WorkspaceArchiveReadError,
+                Some("snapshot_error_before_remount_corruption"),
+                true,
+            )
+            .await
+        })
+        .await
+    }
+
+    /// The durable (non-ephemeral) mounts at or under the workspace root that Modal does not
+    /// hold itself. Modal bucket mounts live outside the image, so they are never detached.
+    fn durable_mounts_in_root(
+        &self,
+    ) -> SandboxResult<Vec<(&crate::sandbox::mounts::Mount, String)>> {
+        let root = self.manifest.root().trim_end_matches('/').to_string();
+        Ok(self
+            .manifest
+            .try_mount_targets()?
             .into_iter()
-            .map(|relative| relative.trim_start_matches("./").to_string())
-            .filter(|relative| !relative.is_empty())
-            .collect::<Vec<_>>();
+            .filter(|(mount, path)| {
+                !mount.ephemeral
+                    && mount.strategy.strategy_type() != "modal_cloud_bucket"
+                    && (path.trim_end_matches('/') == root || path.starts_with(&format!("{root}/")))
+            })
+            .collect())
+    }
+
+    /// Run `operation` with every path a workspace archive excludes set aside, then put them back.
+    ///
+    /// The stash is restored whether or not `operation` succeeded, so a failure does not leave the
+    /// live workspace missing its ephemeral entries. A stash that fails part way is restored too,
+    /// because the removal may already have taken some of the paths.
+    async fn with_excluded_paths_stashed<T, F, Fut>(
+        &self,
+        kind: &str,
+        operation: F,
+    ) -> SandboxResult<T>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = SandboxResult<T>>,
+    {
+        let root = self.manifest.root().to_string();
+        let mut excluded =
+            crate::sandbox::session::workspace_archive_excludes(&self.manifest, &root)
+                .into_iter()
+                .map(|relative| relative.trim_start_matches("./").to_string())
+                .filter(|relative| !relative.is_empty())
+                .collect::<Vec<_>>();
+        for skipped in self.persist_workspace_skip_paths() {
+            if !excluded.contains(&skipped) {
+                excluded.push(skipped);
+            }
+        }
+        if kind == "filesystem" {
+            return self
+                .with_excluded_paths_held_in_memory(&root, &excluded, operation)
+                .await;
+        }
         let backup = (!excluded.is_empty()).then(|| {
             crate::sandbox::workspace_paths::provider_scratch_path(&format!(
-                "modal-snapshot-directory-ephemeral-{}.tar",
+                "modal-snapshot-{kind}-ephemeral-{}.tar",
                 self.session_id
             ))
         });
-        if let Some(backup) = &backup {
-            self.stash_excluded_paths(&root, &excluded, backup).await?;
+        if let Some(backup) = &backup
+            && let Err(error) = self.stash_excluded_paths(&root, &excluded, backup).await
+        {
+            // The removal may have taken some paths before it failed.
+            let _ = self.restore_excluded_paths(&root, backup).await;
+            return Err(error);
         }
-        let snapshot = self.snapshot_directory_image(&root).await;
+        let result = operation().await;
         if let Some(backup) = &backup {
-            // The stash is restored whether or not the snapshot succeeded, so a failure does not
-            // leave the live workspace missing its ephemeral entries.
             let restored = self.restore_excluded_paths(&root, backup).await;
-            snapshot.as_ref().map_err(Clone::clone)?;
+            let value = result?;
             restored?;
+            return Ok(value);
         }
-        snapshot
+        result
+    }
+
+    /// The filesystem-snapshot variant of [`with_excluded_paths_stashed`]: the set-aside archive
+    /// travels through this process, never through the sandbox's disk.
+    ///
+    /// A filesystem image captures the whole sandbox, `/tmp` included, so a stash file written
+    /// there would carry the paths it was meant to keep out (an rclone configuration holds a mount
+    /// credential) into an image that outlives the sandbox. The archive is therefore read from the
+    /// command's output, and written back only after the image exists.
+    async fn with_excluded_paths_held_in_memory<T, F, Fut>(
+        &self,
+        root: &str,
+        excluded: &[String],
+        operation: F,
+    ) -> SandboxResult<T>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = SandboxResult<T>>,
+    {
+        let quoted = excluded
+            .iter()
+            .map(|relative| crate::sandbox::session::shell_quote(relative))
+            .collect::<Vec<_>>()
+            .join(" ");
+        // A path that does not exist is skipped, and nothing at all is an empty archive.
+        let archive_script = format!(
+            "cd -- {root} && {{ for rel in {quoted}; do if [ -e \"$rel\" ]; then \
+             printf '%s\\n' \"$rel\"; fi; done; }} | (tar cf - -T - 2>/dev/null || true)",
+            root = crate::sandbox::session::shell_quote(root),
+        );
+        let archived = self
+            .helper_exec(
+                &["sh".to_string(), "-lc".to_string(), archive_script],
+                "/",
+                None,
+            )
+            .await?;
+        let backup = archived.stdout;
+        let mut absolute = vec!["rm".to_string(), "-rf".to_string(), "--".to_string()];
+        absolute.extend(
+            excluded
+                .iter()
+                .map(|relative| format!("{}/{relative}", root.trim_end_matches('/'))),
+        );
+        let removed = if backup.is_empty() {
+            Ok(())
+        } else {
+            self.helper_exec(&absolute, "/", None)
+                .await
+                .and_then(|removed| {
+                    if removed.ok() {
+                        Ok(())
+                    } else {
+                        Err(SandboxError::new(
+                            ErrorCode::SnapshotPersistError,
+                            format!(
+                                "failed to set aside the paths a Modal snapshot must not capture: {}",
+                                removed.stderr_text().trim()
+                            ),
+                        )
+                        .with_context("workspace_root", root))
+                    }
+                })
+        };
+        if let Err(error) = removed {
+            let _ = self.restore_from_memory(root, &backup).await;
+            return Err(error);
+        }
+        let result = operation().await;
+        let restored = self.restore_from_memory(root, &backup).await;
+        let value = result?;
+        restored?;
+        Ok(value)
+    }
+
+    /// Put an in-memory set-aside archive back into `root`. An empty archive has nothing to restore.
+    async fn restore_from_memory(&self, root: &str, backup: &[u8]) -> SandboxResult<()> {
+        if backup.is_empty() {
+            return Ok(());
+        }
+        let staged = crate::sandbox::workspace_paths::provider_scratch_path(&format!(
+            "modal-snapshot-filesystem-restore-{}.tar",
+            self.session_id
+        ));
+        self.helper
+            .call(json!({
+                "op": "write_file",
+                "sandbox_id": self.sandbox_id(),
+                "path": staged,
+                "data": BASE64.encode(backup),
+            }))
+            .await?;
+        self.restore_excluded_paths(root, &staged).await
     }
 
     /// Archive `excluded` out of `root` into `backup`, then delete them from the workspace.
@@ -1066,7 +1274,7 @@ impl ModalSandboxSession {
             return Err(SandboxError::new(
                 ErrorCode::SnapshotPersistError,
                 format!(
-                    "failed to set aside the paths a Modal directory snapshot must not capture: {}",
+                    "failed to set aside the paths a Modal snapshot must not capture: {}",
                     result.stderr_text().trim()
                 ),
             )
@@ -1089,7 +1297,7 @@ impl ModalSandboxSession {
             return Err(SandboxError::new(
                 ErrorCode::SnapshotPersistError,
                 format!(
-                    "failed to restore the paths set aside for a Modal directory snapshot: {}",
+                    "failed to restore the paths set aside for a Modal snapshot: {}",
                     result.stderr_text().trim()
                 ),
             )
@@ -1143,6 +1351,24 @@ impl ModalSandboxSession {
                 .with_context("snapshot_id", image_id)
                 .caused_by(&error)
             })?;
+        // The image replaced the root's contents, so the durable mounts inside it are attached
+        // again.
+        for (mount, path) in self.durable_mounts_in_root()? {
+            mount
+                .strategy
+                .restore_after_snapshot(mount, self, &path)
+                .await
+                .map_err(|error| {
+                    SandboxError::new(
+                        ErrorCode::SnapshotRestoreError,
+                        "failed to attach a mount again after restoring the Modal directory \
+                         snapshot",
+                    )
+                    .with_context("snapshot_id", image_id)
+                    .with_context("mount_path", path.clone())
+                    .caused_by(&error)
+                })?;
+        }
         Ok(())
     }
 
@@ -1241,6 +1467,17 @@ impl ModalSandboxSession {
         Ok(())
     }
 
+    /// Check a workspace tar before any byte of it leaves the host.
+    ///
+    /// Beyond the generic hydrate policy, no member may overlap a path the manifest owns as
+    /// ephemeral: the archive is extracted as validated, so there is no later point at which a
+    /// member could be dropped.
+    fn validate_tar_archive(&self, archive: &[u8]) -> SandboxResult<()> {
+        let mut options = crate::sandbox::archive::TarValidationOptions::hydrate();
+        options.reject_rel_paths = self.manifest.ephemeral_persistence_paths();
+        crate::sandbox::archive::validate_tar_bytes(archive, &options)
+    }
+
     /// Run the sandbox-side cleanup of PTY processes that finished or were pruned.
     async fn run_pty_cleanup(&self, commands: Vec<String>) {
         for command in commands {
@@ -1268,6 +1505,28 @@ impl SandboxSession for ModalSandboxSession {
 
     fn backend_id(&self) -> &str {
         "modal"
+    }
+
+    fn persist_skip_registry(
+        &self,
+    ) -> Option<&std::sync::Mutex<std::collections::BTreeSet<String>>> {
+        Some(&self.persist_skips)
+    }
+
+    fn system_state_preserved_on_start(&self) -> bool {
+        self.state_preserved
+    }
+
+    fn resume_snapshot_fingerprint(&self) -> Option<SnapshotFingerprint> {
+        // A replacement sandbox starts empty, so the restore must not be skipped for it.
+        if !self.state_preserved {
+            return None;
+        }
+        self.snapshot_fingerprint.lock().expect("poisoned").clone()
+    }
+
+    fn record_snapshot_fingerprint(&self, record: Option<SnapshotFingerprint>) {
+        *self.snapshot_fingerprint.lock().expect("poisoned") = record;
     }
 
     async fn start(&self) -> SandboxResult<()> {
@@ -1320,36 +1579,42 @@ impl SandboxSession for ModalSandboxSession {
     }
 
     async fn shutdown(&self) -> SandboxResult<()> {
-        self.terminate_pty_sessions().await;
-        let mut terminated = self.terminated.lock().await;
-        self.started.store(false, Ordering::SeqCst);
-        if *terminated {
-            return Ok(());
-        }
-        let response = self
-            .helper
-            .call(json!({"op": "terminate", "sandbox_id": self.sandbox_id()}))
-            .await
-            .map_err(|error| {
-                SandboxError::new(
+        let result: SandboxResult<()> = async {
+            self.terminate_pty_sessions().await;
+            let mut terminated = self.terminated.lock().await;
+            self.started.store(false, Ordering::SeqCst);
+            if *terminated {
+                return Ok(());
+            }
+            let response = self
+                .helper
+                .call(json!({"op": "terminate", "sandbox_id": self.sandbox_id()}))
+                .await
+                .map_err(|error| {
+                    SandboxError::new(
+                        ErrorCode::WorkspaceStopError,
+                        format!("failed to terminate the Modal sandbox: {error}"),
+                    )
+                })?;
+            if response.get("ok").and_then(Value::as_bool) == Some(false) {
+                return Err(SandboxError::new(
                     ErrorCode::WorkspaceStopError,
-                    format!("failed to terminate the Modal sandbox: {error}"),
-                )
-            })?;
-        if response.get("ok").and_then(Value::as_bool) == Some(false) {
-            return Err(SandboxError::new(
-                ErrorCode::WorkspaceStopError,
-                format!(
-                    "failed to terminate the Modal sandbox: {}",
-                    response
-                        .get("detail")
-                        .and_then(Value::as_str)
-                        .unwrap_or("unknown error")
-                ),
-            ));
+                    format!(
+                        "failed to terminate the Modal sandbox: {}",
+                        response
+                            .get("detail")
+                            .and_then(Value::as_str)
+                            .unwrap_or("unknown error")
+                    ),
+                ));
+            }
+            *terminated = true;
+            Ok(())
         }
-        *terminated = true;
-        Ok(())
+        .await;
+        result.map_err(|error| {
+            crate::sandbox::sandboxes::docker::redact_for_protected_mounts(&self.manifest, error)
+        })
     }
 
     async fn running(&self) -> SandboxResult<bool> {
@@ -1406,7 +1671,8 @@ impl SandboxSession for ModalSandboxSession {
     }
 
     async fn read_file(&self, path: &str) -> SandboxResult<Vec<u8>> {
-        let resolved = self.normalize_path(path)?;
+        // The in-sandbox resolver sees a symlink the lexical check cannot.
+        let resolved = self.validate_remote_path_access(path, false, false).await?;
         let response = self
             .helper
             .call(json!({
@@ -1425,7 +1691,7 @@ impl SandboxSession for ModalSandboxSession {
                 "read_bounded max_bytes must be positive",
             ));
         }
-        let resolved = self.normalize_path(path)?;
+        let resolved = self.validate_remote_path_access(path, false, false).await?;
         let response = self
             .helper
             .call(json!({
@@ -1439,7 +1705,7 @@ impl SandboxSession for ModalSandboxSession {
     }
 
     async fn write_file(&self, path: &str, contents: &[u8]) -> SandboxResult<()> {
-        let resolved = self.normalize_path_for_write(path)?;
+        let resolved = self.validate_remote_path_access(path, true, false).await?;
         self.helper
             .call(json!({
                 "op": "write_file",
@@ -1574,25 +1840,44 @@ impl SandboxSession for ModalSandboxSession {
     }
 
     async fn persist_workspace(&self) -> SandboxResult<Vec<u8>> {
-        match self.options.workspace_persistence {
-            ModalWorkspacePersistence::SnapshotFilesystem => {
-                let image_id = self.snapshot_filesystem().await?;
-                return Ok(encode_snapshot_filesystem_ref(&image_id));
+        let result: SandboxResult<Vec<u8>> = async {
+            // A mount that cannot be detached in place would be missing from, or baked into, a native
+            // image, so such a manifest persists as a tar archive instead, as Python's
+            // `_native_snapshot_requires_tar_fallback` does.
+            let native_snapshot_allowed = self
+                .manifest
+                .try_mount_targets()?
+                .iter()
+                .all(|(mount, _)| mount.strategy.supports_native_snapshot_detach());
+            let persistence = if native_snapshot_allowed {
+                self.options.workspace_persistence
+            } else {
+                ModalWorkspacePersistence::Tar
+            };
+            match persistence {
+                ModalWorkspacePersistence::SnapshotFilesystem => {
+                    let image_id = self.snapshot_filesystem().await?;
+                    return Ok(encode_snapshot_filesystem_ref(&image_id));
+                }
+                ModalWorkspacePersistence::SnapshotDirectory => {
+                    let image_id = self.snapshot_directory().await?;
+                    return Ok(encode_snapshot_directory_ref(&image_id));
+                }
+                ModalWorkspacePersistence::Tar => {}
             }
-            ModalWorkspacePersistence::SnapshotDirectory => {
-                let image_id = self.snapshot_directory().await?;
-                return Ok(encode_snapshot_directory_ref(&image_id));
-            }
-            ModalWorkspacePersistence::Tar => {}
+            // The tar flow is the trait's own `tar -czf -` over `exec`, retried on a transient
+            // transport failure exactly as Python's `@retry_async` wrapper does.
+            retry_async(
+                RetryPolicy::new(),
+                || default_persist_workspace(self),
+                |error, _attempt| is_transient_sandbox_error(error),
+            )
+            .await
         }
-        // The tar flow is the trait's own `tar -czf -` over `exec`, retried on a transient
-        // transport failure exactly as Python's `@retry_async` wrapper does.
-        retry_async(
-            RetryPolicy::new(),
-            || default_persist_workspace(self),
-            |error, _attempt| is_transient_sandbox_error(error),
-        )
-        .await
+        .await;
+        result.map_err(|error| {
+            crate::sandbox::sandboxes::docker::redact_for_protected_mounts(&self.manifest, error)
+        })
     }
 
     fn validate_restorable_archive(&self, archive: &[u8]) -> SandboxResult<()> {
@@ -1601,71 +1886,77 @@ impl SandboxSession for ModalSandboxSession {
         {
             return Ok(());
         }
-        crate::sandbox::archive::validate_hydrate_archive(archive)
+        self.validate_tar_archive(archive)
     }
 
     async fn hydrate_workspace(&self, archive: &[u8]) -> SandboxResult<()> {
-        if let Some(image_id) = decode_snapshot_filesystem_ref(archive) {
-            return self.restore_from_image(&image_id).await;
-        }
-        if let Some(image_id) = decode_snapshot_directory_ref(archive) {
-            return self.mount_snapshot_directory(&image_id).await;
-        }
-        crate::sandbox::archive::validate_hydrate_archive(archive)?;
-        let root = self.manifest.root().to_string();
-        // The archive is staged through the helper's own chunked stdin writer: a base64 command
-        // argument would exceed the kernel's per-argument limit for any real workspace.
-        let staged = crate::sandbox::workspace_paths::provider_scratch_path(&format!(
-            "modal-hydrate-{}.tar.gz",
-            uuid::Uuid::new_v4().simple()
-        ));
-        self.helper
-            .call(json!({
-                "op": "write_file",
-                "sandbox_id": self.sandbox_id(),
-                "path": staged,
-                "data": BASE64.encode(archive),
-            }))
-            .await
-            .map_err(|error| {
-                SandboxError::new(
-                    ErrorCode::SnapshotRestoreError,
-                    format!("Failed to upload the workspace archive: {error}"),
-                )
-            })?;
-        let script = format!(
-            "mkdir -p {root} && tar -xzf {staged} -C {root}",
-            root = crate::sandbox::session::shell_quote(&root),
-            staged = crate::sandbox::session::shell_quote(&staged),
-        );
-        // No timeout: extracting a large workspace must not be cut short, and the Python port
-        // does not bound it either.
-        let result = self
-            .helper_exec(&["sh".to_string(), "-c".to_string(), script], "/", None)
-            .await;
-        let _ = self
-            .helper_exec(
-                &[
-                    "rm".to_string(),
-                    "-f".to_string(),
-                    "--".to_string(),
-                    staged.clone(),
-                ],
-                "/",
-                None,
-            )
-            .await;
-        let result = result?;
-        if !result.ok() {
-            return Err(SandboxError::new(
-                ErrorCode::SnapshotRestoreError,
-                format!(
-                    "Failed to restore the Modal workspace: {}",
-                    result.stderr_text().trim()
-                ),
+        let result: SandboxResult<()> = async {
+            if let Some(image_id) = decode_snapshot_filesystem_ref(archive) {
+                return self.restore_from_image(&image_id).await;
+            }
+            if let Some(image_id) = decode_snapshot_directory_ref(archive) {
+                return self.mount_snapshot_directory(&image_id).await;
+            }
+            self.validate_tar_archive(archive)?;
+            let root = self.manifest.root().to_string();
+            // The archive is staged through the helper's own chunked stdin writer: a base64 command
+            // argument would exceed the kernel's per-argument limit for any real workspace.
+            let staged = crate::sandbox::workspace_paths::provider_scratch_path(&format!(
+                "modal-hydrate-{}.tar.gz",
+                uuid::Uuid::new_v4().simple()
             ));
+            self.helper
+                .call(json!({
+                    "op": "write_file",
+                    "sandbox_id": self.sandbox_id(),
+                    "path": staged,
+                    "data": BASE64.encode(archive),
+                }))
+                .await
+                .map_err(|error| {
+                    SandboxError::new(
+                        ErrorCode::SnapshotRestoreError,
+                        format!("Failed to upload the workspace archive: {error}"),
+                    )
+                })?;
+            let script = format!(
+                "mkdir -p {root} && tar -xzf {staged} -C {root}",
+                root = crate::sandbox::session::shell_quote(&root),
+                staged = crate::sandbox::session::shell_quote(&staged),
+            );
+            // No timeout: extracting a large workspace must not be cut short, and the Python port
+            // does not bound it either.
+            let result = self
+                .helper_exec(&["sh".to_string(), "-c".to_string(), script], "/", None)
+                .await;
+            let _ = self
+                .helper_exec(
+                    &[
+                        "rm".to_string(),
+                        "-f".to_string(),
+                        "--".to_string(),
+                        staged.clone(),
+                    ],
+                    "/",
+                    None,
+                )
+                .await;
+            let result = result?;
+            if !result.ok() {
+                return Err(SandboxError::new(
+                    ErrorCode::SnapshotRestoreError,
+                    format!(
+                        "Failed to restore the Modal workspace: {}",
+                        result.stderr_text().trim()
+                    ),
+                ));
+            }
+            Ok(())
         }
-        Ok(())
+        .await;
+        result.map_err(|error| {
+            crate::sandbox::sandboxes::docker::redact_for_protected_mounts(&self.manifest, error)
+        })
     }
 
     fn session_state(&self) -> SandboxSessionState {
@@ -1679,7 +1970,7 @@ impl SandboxSession for ModalSandboxSession {
         .with_snapshot(self.snapshot.clone().unwrap_or_default());
         state.snapshot_id = self.snapshot_id.clone();
         state.exposed_ports = self.options.exposed_ports.clone();
-        state
+        state.with_snapshot_fingerprint(self.snapshot_fingerprint.lock().expect("poisoned").clone())
     }
 
     fn snapshot(&self) -> Arc<dyn Snapshot> {
@@ -1698,6 +1989,13 @@ async fn default_persist_workspace(session: &ModalSandboxSession) -> SandboxResu
         command.push_str(&format!(
             " --exclude {}",
             crate::sandbox::session::shell_quote(&exclude)
+        ));
+    }
+    // Paths registered at runtime (generated mount config, sink output) are not durable state.
+    for skipped in session.persist_workspace_skip_paths() {
+        command.push_str(&format!(
+            " --exclude {}",
+            crate::sandbox::session::shell_quote(&format!("./{skipped}"))
         ));
     }
     command.push_str(" .");

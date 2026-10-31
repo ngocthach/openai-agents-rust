@@ -458,6 +458,8 @@ pub struct RunResultStreaming<C> {
     on_complete: Option<StreamCompletionHook>,
     max_turns: Option<usize>,
     run_loop_error: Option<String>,
+    /// Where the run left the state it failed in.
+    failure_checkpoint: Option<crate::run::RunCheckpoint>,
 }
 
 impl<C> fmt::Debug for RunResultStreaming<C> {
@@ -496,7 +498,12 @@ impl<C: Send + Sync + 'static> RunResultStreaming<C> {
             on_complete: None,
             max_turns: None,
             run_loop_error: None,
+            failure_checkpoint: None,
         }
+    }
+
+    pub(crate) fn set_failure_checkpoint(&mut self, slot: crate::run::RunCheckpoint) {
+        self.failure_checkpoint = Some(slot);
     }
 
     /// Record the turn limit of the run, so `max_turns()` can report it before completion.
@@ -716,9 +723,14 @@ impl<C: Send + Sync + 'static> RunResultStreaming<C> {
             .unwrap_or_default()
     }
 
-    /// A resumable snapshot, once complete.
+    /// A resumable snapshot, once complete. A run that failed answers with the state it failed
+    /// in, so a retry keeps the outputs its tools already produced.
     pub fn to_state(&self) -> Option<RunState> {
-        self.result.as_ref().map(RunResult::to_state)
+        self.result.as_ref().map(RunResult::to_state).or_else(|| {
+            self.failure_checkpoint
+                .as_ref()
+                .and_then(crate::run::RunCheckpoint::peek)
+        })
     }
 
     /// Model turns completed so far.
@@ -755,7 +767,10 @@ impl<C: Send + Sync + 'static> RunResultStreaming<C> {
                 None => "None".to_string(),
             }
         ));
-        out.push_str(&format!("\n- Is complete: {}", self.complete));
+        out.push_str(&format!(
+            "\n- Is complete: {}",
+            if self.complete { "True" } else { "False" }
+        ));
         out.push_str(&format!(
             "\n- Final output ({}):\n{}",
             final_output_kind(final_output),

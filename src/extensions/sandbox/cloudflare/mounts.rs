@@ -258,6 +258,12 @@ impl MountStrategy for CloudflareBucketMountStrategy {
         self.config.validate()
     }
 
+    fn carries_credentials(&self, _mount: &Mount) -> bool {
+        // The worker, not the sandbox, holds the access key pair, but it is still a secret the
+        // persisted session state and error text must never carry.
+        self.config.credentials.is_some()
+    }
+
     fn supports_native_snapshot_detach(&self) -> bool {
         // The worker holds the mount outside the workspace archive, so a snapshot must detach it
         // first and re-attach it afterwards.

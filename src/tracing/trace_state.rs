@@ -52,6 +52,14 @@ pub(crate) fn mark_trace_id_started(trace_id: &str) {
     }
 }
 
+/// Forget every started trace id, as a process restart would. Port of `_clear_started_trace_ids`;
+/// a resumed run in a fresh process must not reattach to a trace this process never started.
+pub fn clear_started_trace_ids() {
+    let mut guard = started_ids().lock().expect("started ids poisoned");
+    guard.order.clear();
+    guard.set.clear();
+}
+
 /// Whether `trace_id` was already started in this process. Port of `_trace_id_was_started`.
 pub fn trace_id_was_started(trace_id: Option<&str>) -> bool {
     let Some(trace_id) = trace_id.filter(|id| !id.is_empty() && *id != "no-op") else {

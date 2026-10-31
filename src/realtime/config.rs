@@ -174,9 +174,9 @@ impl RealtimeAudioFormat {
                 match kind {
                     Some("audio/pcm") => {
                         // The API supports one PCM rate; anything else is coerced, as in Python.
-                        let rate = value.get("rate").and_then(Value::as_f64);
-                        if let Some(rate) = rate
-                            && rate != 24000.0
+                        // Any other rate, a non-number included, is reported and coerced.
+                        if let Some(rate) = value.get("rate")
+                            && rate.as_f64() != Some(24000.0)
                         {
                             crate::realtime::debug::log_model_data_debug(
                                 "Unknown PCM rate in a realtime audio format",
