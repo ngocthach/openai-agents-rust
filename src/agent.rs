@@ -643,6 +643,8 @@ fn validate_codex_tool_name_collisions<C>(tools: &[Tool<C>]) -> Result<()> {
 type OutputExtractor<C> =
     Arc<dyn Fn(crate::result::RunResult<C>) -> BoxFuture<'static, Result<String>> + Send + Sync>;
 type InputBuilder = Arc<dyn Fn(&StructuredToolInput<'_>) -> String + Send + Sync>;
+type InputItemsBuilder =
+    Arc<dyn Fn(&StructuredToolInput<'_>) -> Vec<crate::items::InputItem> + Send + Sync>;
 type NestedStreamFn<C> =
     Arc<dyn Fn(AgentToolStreamEvent<C>) -> BoxFuture<'static, ()> + Send + Sync>;
 
@@ -665,6 +667,77 @@ impl<C> fmt::Debug for AgentToolStreamEvent<C> {
             .finish_non_exhaustive()
     }
 }
+
+/// Validate agent-tool arguments against the tool's object schema and keep only the declared
+/// fields. Port of `params_adapter.validate_python` plus `_normalize_tool_input`: a missing
+/// required field or a mistyped declared field is a `ModelBehaviorError`, whose detail is only
+/// included when tool data logging is allowed.
+fn normalize_agent_tool_input(tool_name: &str, schema: &Value, parsed: Value) -> Result<Value> {
+    let fail = |detail: String| {
+        let base = format!("Invalid JSON input for tool {tool_name}");
+        if crate::debug::dont_log_tool_data() {
+            crate::error::AgentsError::model_behavior(base)
+        } else {
+            crate::error::AgentsError::model_behavior(format!("{base}: {detail}"))
+        }
+    };
+    let Some(object) = parsed.as_object() else {
+        return Err(fail("the arguments must be a JSON object".to_string()));
+    };
+    let Some(properties) = schema.get("properties").and_then(Value::as_object) else {
+        return Ok(parsed);
+    };
+    if let Some(required) = schema.get("required").and_then(Value::as_array) {
+        for name in required.iter().filter_map(Value::as_str) {
+            if !object.contains_key(name) {
+                return Err(fail(format!("field `{name}` is required")));
+            }
+        }
+    }
+    for (name, value) in object {
+        let Some(declared) = properties.get(name).and_then(|p| p.get("type")) else {
+            continue;
+        };
+        let types: Vec<&str> = match declared {
+            Value::String(t) => vec![t.as_str()],
+            Value::Array(types) => types.iter().filter_map(Value::as_str).collect(),
+            _ => continue,
+        };
+        let matches = types.iter().any(|t| match *t {
+            "string" => value.is_string(),
+            "integer" => value.is_i64() || value.is_u64(),
+            "number" => value.is_number(),
+            "boolean" => value.is_boolean(),
+            "array" => value.is_array(),
+            "object" => value.is_object(),
+            "null" => value.is_null(),
+            _ => true,
+        });
+        if !matches {
+            return Err(fail(format!(
+                "field `{name}` must be of type {}",
+                types.join(" or ")
+            )));
+        }
+    }
+    let keeps_extras = !matches!(
+        schema.get("additionalProperties"),
+        None | Some(Value::Bool(false))
+    );
+    if keeps_extras {
+        return Ok(parsed);
+    }
+    Ok(Value::Object(
+        object
+            .iter()
+            .filter(|(name, _)| properties.contains_key(*name))
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect(),
+    ))
+}
+
+/// Default for [`AgentAsToolOptions::on_stream_max_pending_events`].
+pub const DEFAULT_ON_STREAM_MAX_PENDING_EVENTS: usize = 1024;
 
 /// What a structured agent-tool input builder receives.
 /// Mirrors `StructuredToolInputBuilderOptions`.
@@ -875,10 +948,17 @@ pub struct AgentAsToolOptions<C> {
     pub parameters: Option<Value>,
     /// Build the nested input message from structured arguments.
     pub input_builder: Option<InputBuilder>,
+    /// Build the nested input items from structured arguments (wins over `input_builder`).
+    pub input_items_builder: Option<InputItemsBuilder>,
     /// Include the input schema in the default structured input message.
     pub include_input_schema: bool,
     /// Receive the nested run's stream events.
     pub on_stream: Option<NestedStreamFn<C>>,
+    /// Most events that may wait for `on_stream` (excluding the one being handled); `None`
+    /// is unlimited. Defaults to [`DEFAULT_ON_STREAM_MAX_PENDING_EVENTS`]. When the backlog
+    /// stays full the nested run is cancelled and the tool fails through
+    /// `failure_error_function`. Has no effect without `on_stream`.
+    pub on_stream_max_pending_events: Option<usize>,
     /// Turn a failure of the nested run into a model-visible message instead of raising.
     pub failure_error_function: Option<crate::tool::ToolErrorFn<C>>,
 }
@@ -899,8 +979,10 @@ impl<C> Default for AgentAsToolOptions<C> {
             custom_output_extractor: None,
             parameters: None,
             input_builder: None,
+            input_items_builder: None,
             include_input_schema: false,
             on_stream: None,
+            on_stream_max_pending_events: Some(DEFAULT_ON_STREAM_MAX_PENDING_EVENTS),
             failure_error_function: None,
         }
     }
@@ -968,6 +1050,17 @@ impl<C: Send + Sync + 'static> AgentAsToolOptions<C> {
         self.input_builder = Some(Arc::new(f));
         self
     }
+
+    /// Build the nested input as a list of input items instead of a single message, like a
+    /// Python `input_builder` that returns `list[TResponseInputItem]`. Takes precedence over
+    /// [`input_builder`](Self::input_builder).
+    pub fn input_items_builder<F>(mut self, f: F) -> Self
+    where
+        F: Fn(&StructuredToolInput<'_>) -> Vec<crate::items::InputItem> + Send + Sync + 'static,
+    {
+        self.input_items_builder = Some(Arc::new(f));
+        self
+    }
     pub fn custom_output_extractor<F, Fut>(mut self, f: F) -> Self
     where
         F: Fn(crate::result::RunResult<C>) -> Fut + Send + Sync + 'static,
@@ -982,6 +1075,13 @@ impl<C: Send + Sync + 'static> AgentAsToolOptions<C> {
         Fut: Future<Output = ()> + Send + 'static,
     {
         self.on_stream = Some(Arc::new(move |e| Box::pin(f(e))));
+        self
+    }
+
+    /// Bound the events waiting for `on_stream` (`None` for no bound). A limit of `Some(0)` is
+    /// rejected when the tool is built.
+    pub fn on_stream_max_pending_events(mut self, limit: Option<usize>) -> Self {
+        self.on_stream_max_pending_events = limit;
         self
     }
 
@@ -1013,13 +1113,29 @@ impl<C: Send + Sync + 'static> Agent<C> {
     }
 
     /// Expose this agent as a tool with full options.
+    ///
+    /// Panics when the options are invalid; see [`try_as_tool_with`](Self::try_as_tool_with).
     pub fn as_tool_with(&self, options: AgentAsToolOptions<C>) -> crate::tool::FunctionTool<C> {
+        self.try_as_tool_with(options)
+            .unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    /// Expose this agent as a tool with full options, rejecting invalid options (an
+    /// `on_stream_max_pending_events` of zero) with a `UserError`.
+    pub fn try_as_tool_with(
+        &self,
+        options: AgentAsToolOptions<C>,
+    ) -> Result<crate::tool::FunctionTool<C>> {
         use crate::items::RunInput;
         use crate::run::{RunOptions, Runner};
         use crate::run_state::RunState;
         use crate::tool::{FunctionTool, ToolOutput};
-        use futures::StreamExt;
 
+        if options.on_stream_max_pending_events == Some(0) {
+            return Err(crate::error::AgentsError::user(
+                "on_stream_max_pending_events must be a positive integer or None",
+            ));
+        }
         let agent = Arc::new(self.clone());
         let name = options
             .tool_name
@@ -1031,7 +1147,9 @@ impl<C: Send + Sync + 'static> Agent<C> {
             .or_else(|| self.handoff_description.clone())
             .unwrap_or_default();
         // A custom input builder also opts into structured input, as in Python.
-        let structured = options.parameters.is_some() || options.input_builder.is_some();
+        let structured = options.parameters.is_some()
+            || options.input_builder.is_some()
+            || options.input_items_builder.is_some();
         let schema = options.parameters.clone().unwrap_or_else(|| {
             serde_json::json!({
                 "type": "object",
@@ -1055,8 +1173,11 @@ impl<C: Send + Sync + 'static> Agent<C> {
                     let parsed: Value = serde_json::from_str(payload).map_err(|e| {
                         crate::tool::invalid_tool_input_error(&tool_ctx.tool_name, payload, &e)
                     })?;
+                    // Like Python's `TypeAdapter(parameters).validate_python`: the arguments must
+                    // match the declared object schema, and undeclared fields are dropped.
+                    let parsed = normalize_agent_tool_input(&tool_ctx.tool_name, &schema, parsed)?;
                     let input_text = if structured {
-                        let schema_ref = if opts.include_input_schema {
+                        let schema_ref = if opts.include_input_schema && opts.parameters.is_some() {
                             Some(&schema)
                         } else {
                             None
@@ -1069,27 +1190,27 @@ impl<C: Send + Sync + 'static> Agent<C> {
                             summary: summary.as_deref(),
                             json_schema: schema_ref,
                         };
-                        match &opts.input_builder {
-                            Some(b) => b(&options),
-                            None => default_tool_input_builder(&options),
+                        match (&opts.input_items_builder, &opts.input_builder) {
+                            (Some(items), _) => RunInput::Items(items(&options)),
+                            (None, Some(b)) => RunInput::Text(b(&options)),
+                            (None, None) => RunInput::Text(default_tool_input_builder(&options)),
                         }
                     } else {
-                        // Only an `{"input": "<text>"}` object is unwrapped; any other arguments
-                        // reach the nested agent as the JSON the model sent, as Python does.
-                        match parsed.as_object() {
-                            Some(object) if object.len() == 1 => object
+                        // The default schema is `{"input": "<text>"}`, validated above.
+                        RunInput::Text(
+                            parsed
                                 .get("input")
                                 .and_then(Value::as_str)
-                                .map(str::to_string)
-                                .unwrap_or_else(|| args.clone()),
-                            _ => args.clone(),
-                        }
+                                .unwrap_or_default()
+                                .to_string(),
+                        )
                     };
                     let parent = tool_ctx.run_context().clone();
+                    // A plain agent tool must not inherit the caller's structured input.
                     let run_ctx = if structured {
                         parent.with_tool_input(parsed.clone())
                     } else {
-                        parent.clone()
+                        parent.without_tool_input()
                     };
                     let mut run_opts = RunOptions::with_run_context(run_ctx);
                     run_opts.shares_parent_context = true;
@@ -1101,8 +1222,11 @@ impl<C: Send + Sync + 'static> Agent<C> {
                     if let Some(m) = opts.max_turns {
                         run_opts.max_turns = Some(m);
                     }
+                    // Without an explicit run config the nested run inherits the caller's.
                     if let Some(c) = &opts.run_config {
                         run_opts.run_config = c.clone();
+                    } else if let Some(c) = &tool_ctx.run_config {
+                        run_opts.run_config = (**c).clone();
                     }
                     run_opts.hooks = opts.hooks.clone();
                     run_opts.previous_response_id = opts.previous_response_id.clone();
@@ -1110,32 +1234,20 @@ impl<C: Send + Sync + 'static> Agent<C> {
                     run_opts.session = opts.session.clone();
                     let input: RunInput = match parent.take_nested_state(&tool_ctx.tool_call_id) {
                         Some(state) => RunInput::State(Box::new(RunState::from_json(state)?)),
-                        None => RunInput::Text(input_text),
+                        None => input_text,
                     };
                     let run = async {
                         match &opts.on_stream {
                             Some(cb) => {
-                                let mut streamed = Runner::run_streamed_with_options(
+                                run_nested_streamed(
                                     agent.clone(),
                                     input,
                                     run_opts,
-                                );
-                                {
-                                    let mut events = std::pin::pin!(streamed.stream_events());
-                                    while let Some(ev) = events.next().await {
-                                        cb(AgentToolStreamEvent {
-                                            event: ev?,
-                                            agent: agent.clone(),
-                                            tool_call: tool_ctx.tool_call.clone(),
-                                        })
-                                        .await;
-                                    }
-                                }
-                                streamed.into_result().ok_or_else(|| {
-                                    crate::error::AgentsError::other(
-                                        "Nested agent run did not complete",
-                                    )
-                                })
+                                    cb.clone(),
+                                    opts.on_stream_max_pending_events,
+                                    tool_ctx.tool_call.clone(),
+                                )
+                                .await
                             }
                             None => Runner::run_with_options(agent.clone(), input, run_opts).await,
                         }
@@ -1179,8 +1291,151 @@ impl<C: Send + Sync + 'static> Agent<C> {
             self.name.clone(),
             tool.name.clone(),
         ));
-        tool
+        Ok(tool)
     }
+}
+
+/// Why dispatching a nested run's events stopped.
+enum StreamDispatchFailure {
+    /// The nested stream failed.
+    Stream(crate::error::AgentsError),
+    /// More than `limit` events were waiting for the handler.
+    Overflow(usize),
+}
+
+/// Cancels a nested streamed run unless disarmed, so dropping the tool call (the caller
+/// cancelled it) also stops the nested run.
+struct CancelNestedRunOnDrop(Option<crate::result::StreamCancelHandle>);
+
+impl Drop for CancelNestedRunOnDrop {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.take() {
+            handle.cancel(crate::result::CancelMode::Immediate);
+        }
+    }
+}
+
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|s| s.to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "handler panicked".to_string())
+}
+
+/// Run `agent` in streaming mode and hand each event to `handler` without letting a slow handler
+/// stall the nested run. Mirrors the producer/consumer dispatch of Python's `Agent.as_tool`:
+/// events wait in a queue of at most `max_pending` entries (not counting the one being
+/// handled), a handler panic is logged and does not fail the call, events already queued are
+/// delivered before a stream error is reported, and a backlog that stays full cancels the
+/// nested run and fails the call.
+async fn run_nested_streamed<C: Send + Sync + 'static>(
+    agent: Arc<Agent<C>>,
+    input: crate::items::RunInput,
+    run_opts: crate::run::RunOptions<C>,
+    handler: NestedStreamFn<C>,
+    max_pending: Option<usize>,
+    tool_call: Option<crate::items::FunctionCall>,
+) -> Result<crate::result::RunResult<C>> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use futures::{FutureExt, StreamExt};
+
+    let mut streamed =
+        crate::run::Runner::run_streamed_with_options(agent.clone(), input, run_opts);
+    let mut cancel_on_drop = CancelNestedRunOnDrop(Some(streamed.cancel_handle()));
+    let cancel = streamed.cancel_handle();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AgentToolStreamEvent<C>>();
+    let pending = Arc::new(AtomicUsize::new(0));
+
+    let producer_pending = pending.clone();
+    let start_agent = agent.clone();
+    let producer = {
+        let events_source = &mut streamed;
+        async move {
+            let mut current_agent = start_agent;
+            let mut events = std::pin::pin!(events_source.stream_events());
+            while let Some(event) = events.next().await {
+                let event = event.map_err(StreamDispatchFailure::Stream)?;
+                if let crate::stream_events::StreamEvent::AgentUpdated { new_agent } = &event {
+                    current_agent = new_agent.clone();
+                }
+                if let Some(limit) = max_pending
+                    && producer_pending.load(Ordering::SeqCst) >= limit
+                {
+                    // A burst of ready events must let a ready handler catch up first.
+                    tokio::task::yield_now().await;
+                    if producer_pending.load(Ordering::SeqCst) >= limit {
+                        return Err(StreamDispatchFailure::Overflow(limit));
+                    }
+                }
+                producer_pending.fetch_add(1, Ordering::SeqCst);
+                let _ = tx.send(AgentToolStreamEvent {
+                    event,
+                    agent: current_agent.clone(),
+                    tool_call: tool_call.clone(),
+                });
+            }
+            Ok(())
+        }
+    };
+    let consumer_pending = pending.clone();
+    let consumer = async move {
+        while let Some(payload) = rx.recv().await {
+            consumer_pending.fetch_sub(1, Ordering::SeqCst);
+            let call = std::panic::AssertUnwindSafe(async { handler(payload).await });
+            if let Err(panic) = call.catch_unwind().await {
+                crate::logger::log_model_and_tool_action_error(
+                    "Error while handling an agent tool on_stream event",
+                    &panic_message(panic.as_ref()),
+                );
+            }
+        }
+    };
+
+    let outcome = {
+        let mut producer = std::pin::pin!(producer);
+        let mut consumer = std::pin::pin!(consumer);
+        let mut consumer_done = false;
+        let produced = loop {
+            // Biased towards the handler, so a producer that yields on a full backlog always
+            // lets a ready handler catch up before it checks the backlog again.
+            tokio::select! {
+                biased;
+                _ = &mut consumer, if !consumer_done => consumer_done = true,
+                outcome = &mut producer => break outcome,
+            }
+        };
+        match produced {
+            Err(StreamDispatchFailure::Overflow(limit)) => {
+                // Stop upstream work first, then drop the handler without draining its backlog.
+                cancel.cancel(crate::result::CancelMode::Immediate);
+                Err(StreamDispatchFailure::Overflow(limit))
+            }
+            other => {
+                // Events already emitted are delivered before a stream failure is reported.
+                if !consumer_done {
+                    consumer.await;
+                }
+                other
+            }
+        }
+    };
+    cancel_on_drop.0 = None;
+    match outcome {
+        Ok(()) => {}
+        Err(StreamDispatchFailure::Stream(error)) => return Err(error),
+        Err(StreamDispatchFailure::Overflow(limit)) => {
+            let _ = streamed.finish().await;
+            return Err(crate::error::AgentsError::user(format!(
+                "Agent tool on_stream backlog exceeded on_stream_max_pending_events={limit}. \
+                 Use a faster handler, increase the limit, or set it to None."
+            )));
+        }
+    }
+    streamed
+        .into_result()
+        .ok_or_else(|| crate::error::AgentsError::other("Nested agent run did not complete"))
 }
 
 #[cfg(test)]

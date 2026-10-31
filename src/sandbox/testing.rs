@@ -26,6 +26,7 @@
 //! ```
 
 use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -239,6 +240,9 @@ impl SandboxStep {
 }
 
 /// The error a script raises when a run does not follow it.
+///
+/// The message and context name methods and positions only: the arguments of the failing call are
+/// never rendered, because they may carry paths or commands the test does not want in a log.
 fn script_error(kind: &str, message: String) -> SandboxError {
     SandboxError::new(ErrorCode::SandboxConfigInvalid, message).with_context("script", kind)
 }
@@ -255,16 +259,29 @@ pub struct ScriptedSandboxSession {
     manifest: Manifest,
     steps: Mutex<Vec<SandboxStep>>,
     calls: Mutex<Vec<SandboxCall>>,
+    /// Whether the script configures a PTY method; fixed when the script is built.
+    pty: bool,
+    running: AtomicBool,
 }
 
 impl ScriptedSandboxSession {
     /// A session following `steps`.
     pub fn new(steps: impl IntoIterator<Item = SandboxStep>) -> Self {
+        let steps: Vec<SandboxStep> = steps.into_iter().collect();
+        // The two PTY methods are one capability: configuring either one turns it on.
+        let pty = steps.iter().any(|step| {
+            matches!(
+                step.method,
+                SandboxMethod::PtyExecStart | SandboxMethod::PtyWriteStdin
+            )
+        });
         ScriptedSandboxSession {
             id: "scripted".to_string(),
             manifest: Manifest::new(),
-            steps: Mutex::new(steps.into_iter().collect()),
+            steps: Mutex::new(steps),
             calls: Mutex::new(Vec::new()),
+            pty,
+            running: AtomicBool::new(true),
         }
     }
 
@@ -308,7 +325,9 @@ impl ScriptedSandboxSession {
                 steps.len(),
                 pending.join(", ")
             ),
-        ))
+        )
+        .with_context("remaining_steps", steps.len().to_string())
+        .with_context("pending_methods", pending.join(",")))
     }
 
     /// Record a call and take the answer the script gives it.
@@ -330,42 +349,56 @@ impl ScriptedSandboxSession {
             call
         };
 
-        let step = {
-            let mut steps = self.steps.lock().expect("scripted session lock");
-            if steps.is_empty() {
-                return Err(script_error(
-                    "unexpected_call",
+        // The head step is only consumed once the call is accepted: a call that does not match
+        // it, or that its matcher rejects, leaves the script where it was so the test can retry.
+        let matcher = {
+            let steps = self.steps.lock().expect("scripted session lock");
+            let remaining = steps.len();
+            let mismatch = |expected: Option<SandboxMethod>, message: String| {
+                let mut error = script_error("unexpected_call", message)
+                    .with_context("call_index", call.call_index.to_string())
+                    .with_context("actual_method", method.as_str())
+                    .with_context("remaining_steps", remaining.to_string());
+                if let Some(expected) = expected {
+                    error = error.with_context("expected_method", expected.as_str());
+                }
+                error
+            };
+            let Some(head) = steps.first() else {
+                return Err(mismatch(
+                    None,
                     format!(
                         "unexpected sandbox `{method}` call #{}: no scripted steps remain",
                         call.call_index + 1
                     ),
                 ));
-            }
-            if steps[0].method != method {
-                return Err(script_error(
-                    "unexpected_call",
+            };
+            if head.method != method {
+                return Err(mismatch(
+                    Some(head.method),
                     format!(
                         "unexpected sandbox `{method}` call #{}; the script expected `{}`",
                         call.call_index + 1,
-                        steps[0].method
+                        head.method
                     ),
                 ));
             }
-            steps.remove(0)
+            head.matcher.clone()
         };
-
-        if let Some(matcher) = &step.matcher
+        if let Some(matcher) = matcher
             && !matcher(&call)
         {
             return Err(script_error(
                 "matcher_rejected",
                 format!(
-                    "the scripted sandbox step for `{method}` rejected call #{}: {:?}",
-                    call.call_index + 1,
-                    call.arguments
+                    "the scripted sandbox step for `{method}` rejected call #{}",
+                    call.call_index + 1
                 ),
-            ));
+            )
+            .with_context("call_index", call.call_index.to_string())
+            .with_context("method", method.as_str()));
         }
+        let step = self.steps.lock().expect("scripted session lock").remove(0);
 
         match step.outcome {
             StepOutcome::Value(value) => Ok(value),
@@ -398,23 +431,26 @@ impl SandboxSession for ScriptedSandboxSession {
     }
 
     fn supports_pty(&self) -> bool {
-        true
+        self.pty
     }
 
     async fn start(&self) -> SandboxResult<()> {
+        self.running.store(true, Ordering::SeqCst);
         Ok(())
     }
 
     async fn stop(&self) -> SandboxResult<()> {
+        self.running.store(false, Ordering::SeqCst);
         Ok(())
     }
 
     async fn shutdown(&self) -> SandboxResult<()> {
+        self.running.store(false, Ordering::SeqCst);
         Ok(())
     }
 
     async fn running(&self) -> SandboxResult<bool> {
-        Ok(true)
+        Ok(self.running.load(Ordering::SeqCst))
     }
 
     async fn exec(&self, request: ExecRequest) -> SandboxResult<ExecResult> {

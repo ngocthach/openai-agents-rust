@@ -50,7 +50,7 @@ async fn strict_matching_reports_unexpected_calls_and_leftovers() {
 
     // One call too many: the call is still recorded, then the run fails.
     let err = Runner::run(&agent, "third").await.unwrap_err().to_string();
-    assert!(err.contains("unexpected call"), "{err}");
+    assert!(err.contains("no scripted steps remain"), "{err}");
     assert_eq!(model.calls().len(), 3);
     assert!(
         model

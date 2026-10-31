@@ -73,6 +73,9 @@ pub struct Reasoning {
     /// Reasoning context carry-over (Responses API only).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context: Option<String>,
+    /// Provider options this SDK version does not model yet; they are forwarded unchanged.
+    #[serde(flatten, default, skip_serializing_if = "Map::is_empty")]
+    pub extra: Map<String, Value>,
 }
 
 impl Reasoning {
@@ -85,8 +88,10 @@ impl Reasoning {
     }
 }
 
-/// Backoff configuration for runner-managed model retries.
+/// Backoff configuration for runner-managed model retries. A partial JSON object keeps the
+/// defaults of the omitted fields.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ModelRetryBackoffSettings {
     /// Delay before the first retry, in seconds.
     pub initial_delay: f64,
@@ -118,6 +123,7 @@ impl Default for ModelRetryBackoffSettings {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModelRetrySettings {
     /// Number of retries after the initial attempt.
+    #[serde(default = "default_max_retries")]
     pub max_retries: u32,
     /// Backoff strategy.
     #[serde(default)]
@@ -128,6 +134,10 @@ pub struct ModelRetrySettings {
     /// Runtime-only retry policy (not serialized).
     #[serde(skip)]
     pub policy: Option<crate::retry::RetryPolicy>,
+}
+
+fn default_max_retries() -> u32 {
+    ModelRetrySettings::default().max_retries
 }
 
 fn default_retry_statuses() -> Vec<u16> {
@@ -295,6 +305,63 @@ impl ModelSettings {
         out
     }
 
+    /// Build settings from a JSON object, the Rust form of Python's dictionary
+    /// `model_settings`. Unknown keys in the settings and in the SDK-owned nested settings
+    /// (`tool_choice`, `retry`, `retry.backoff`, `context_management[i]`,
+    /// `prompt_cache_options`) are rejected so typos fail early; omitted fields keep their
+    /// defaults and unmodelled `reasoning` options are preserved.
+    pub fn from_value(value: Value) -> crate::error::Result<ModelSettings> {
+        use crate::error::AgentsError;
+        let Value::Object(map) = &value else {
+            return Err(AgentsError::user(format!(
+                "ModelSettings must be a ModelSettings instance or a dict, got {}",
+                json_type_name(&value)
+            )));
+        };
+        reject_unknown(map, MODEL_SETTINGS_FIELDS, "Unknown model settings")?;
+        if let Some(Value::Object(choice)) = map.get("tool_choice") {
+            reject_unknown(
+                choice,
+                &["server_label", "name"],
+                "Unknown model settings in tool_choice",
+            )?;
+        }
+        if let Some(Value::Object(retry)) = map.get("retry") {
+            reject_unknown(
+                retry,
+                &["max_retries", "backoff", "retry_statuses"],
+                "Unknown model settings in retry",
+            )?;
+            if let Some(Value::Object(backoff)) = retry.get("backoff") {
+                reject_unknown(
+                    backoff,
+                    &["initial_delay", "max_delay", "multiplier", "jitter"],
+                    "Unknown model settings in retry.backoff",
+                )?;
+            }
+        }
+        if let Some(Value::Array(entries)) = map.get("context_management") {
+            for (index, entry) in entries.iter().enumerate() {
+                if let Value::Object(entry) = entry {
+                    reject_unknown(
+                        entry,
+                        &["type", "compact_threshold"],
+                        &format!("Unknown model settings in context_management[{index}]"),
+                    )?;
+                }
+            }
+        }
+        if let Some(Value::Object(options)) = map.get("prompt_cache_options") {
+            reject_unknown(
+                options,
+                &["comparison_response_id", "mode", "prewarm", "ttl"],
+                "Unknown model settings in prompt_cache_options",
+            )?;
+        }
+        serde_json::from_value(value)
+            .map_err(|e| AgentsError::user(format!("Invalid model settings: {e}")))
+    }
+
     /// Serialize the subset of settings that is safe to record in traces.
     pub fn to_traceable_value(&self) -> Value {
         let mut m = Map::new();
@@ -370,6 +437,66 @@ impl ModelSettings {
         self.store = Some(store);
         self
     }
+}
+
+/// Every [`ModelSettings`] field, for [`ModelSettings::from_value`] validation.
+const MODEL_SETTINGS_FIELDS: &[&str] = &[
+    "temperature",
+    "top_p",
+    "frequency_penalty",
+    "presence_penalty",
+    "tool_choice",
+    "parallel_tool_calls",
+    "truncation",
+    "max_tokens",
+    "reasoning",
+    "verbosity",
+    "metadata",
+    "store",
+    "prompt_cache_retention",
+    "include_usage",
+    "response_include",
+    "top_logprobs",
+    "extra_query",
+    "extra_body",
+    "extra_headers",
+    "extra_args",
+    "retry",
+    "context_management",
+    "prompt_cache_options",
+    "preserve_raw_usage",
+    "timeout",
+];
+
+fn json_type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "bool",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
+fn reject_unknown(
+    map: &Map<String, Value>,
+    known: &[&str],
+    message: &str,
+) -> crate::error::Result<()> {
+    let mut unknown: Vec<&str> = map
+        .keys()
+        .map(String::as_str)
+        .filter(|key| !known.contains(key))
+        .collect();
+    if unknown.is_empty() {
+        return Ok(());
+    }
+    unknown.sort_unstable();
+    Err(crate::error::AgentsError::user(format!(
+        "{message}: {}",
+        unknown.join(", ")
+    )))
 }
 
 #[cfg(test)]

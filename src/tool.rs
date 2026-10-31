@@ -790,8 +790,10 @@ impl<C: Send + Sync + 'static> FunctionTool<C> {
             schema = empty_object_schema();
         }
         let f = Arc::new(f);
+        let constraint_schema = Arc::new(schema.clone());
         let invoke: InvokeFn<C> = Arc::new(move |ctx, args_json| {
             let f = f.clone();
+            let constraint_schema = constraint_schema.clone();
             Box::pin(async move {
                 let invalid_json = |payload: &str, e: serde_json::Error, tool_name: &str| {
                     invalid_tool_input_error(tool_name, payload, &e)
@@ -804,6 +806,16 @@ impl<C: Send + Sync + 'static> FunctionTool<C> {
                     if !value.is_object() {
                         return Err(invalid_tool_input_not_object(&ctx.tool_name));
                     }
+                    // Python validates arguments with pydantic, which enforces the schema's value
+                    // bounds; serde would accept any value of the right type.
+                    crate::strict_schema::validate_value_constraints(&constraint_schema, &value)
+                        .map_err(|message| {
+                            invalid_json(
+                                &args_json,
+                                <serde_json::Error as serde::de::Error>::custom(message),
+                                &ctx.tool_name,
+                            )
+                        })?;
                     serde_json::from_value(value)
                         .map_err(|e| invalid_json(&args_json, e, &ctx.tool_name))?
                 };
@@ -1795,6 +1807,15 @@ impl<C> Tool<C> {
                 .and_then(Value::as_str)
                 .unwrap_or("raw")
                 .to_string(),
+        }
+    }
+
+    /// The name tracing displays: the GA `computer` alias for the computer tool (whose runtime
+    /// name keeps the preview-era value for hooks and persisted state), the tool name otherwise.
+    pub fn trace_name(&self) -> String {
+        match self {
+            Tool::Computer(_) => "computer".into(),
+            other => other.name(),
         }
     }
 

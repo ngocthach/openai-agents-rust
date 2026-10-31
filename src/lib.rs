@@ -142,6 +142,10 @@ pub struct ReadmeDoctests;
 #[cfg(feature = "macros")]
 pub use openai_agents_sdk_macros::function_tool;
 
+/// The server-conversation delivery tracker, exposed so its contract can be tested directly.
+#[doc(hidden)]
+pub use run_internal::oai_conversation::ServerConversationTracker;
+
 #[doc(hidden)]
 pub mod __private {
     pub use schemars;

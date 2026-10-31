@@ -99,28 +99,79 @@ fn has_output_payload(item: &Value) -> bool {
 
 /// What a server-managed conversation has already accepted.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct ServerConversationTracker {
+pub struct ServerConversationTracker {
     state: ServerConversationState,
     restored_anonymous_tool_search_fingerprints: BTreeSet<String>,
     sent_initial_input: bool,
     primed_from_state: bool,
+    /// Initial input items offered to the model but not yet delivered (a `call_model_input_filter`
+    /// may drop some). They are offered again on the next call until a call carries them or the
+    /// server produces them.
+    remaining_initial_input: Option<Vec<InputItem>>,
 }
 
 impl ServerConversationTracker {
     /// The durable half of the tracker, for `RunState`.
-    pub(crate) fn state(&self) -> ServerConversationState {
+    pub fn state(&self) -> ServerConversationState {
         self.state.clone()
     }
 
+    /// Whether the run input has been offered to the model.
+    pub fn sent_initial_input(&self) -> bool {
+        self.sent_initial_input
+    }
+
+    /// Initial input items still waiting to be delivered.
+    pub fn remaining_initial_input(&self) -> Option<&[InputItem]> {
+        self.remaining_initial_input.as_deref()
+    }
+
+    /// Replace the initial input items still waiting to be delivered (`None` when none are).
+    pub fn set_remaining_initial_input(&mut self, items: Option<Vec<InputItem>>) {
+        self.remaining_initial_input = items.filter(|items| !items.is_empty());
+    }
+
+    /// Queue items a failed delivery should send again, ahead of anything already waiting, and
+    /// forget that they were sent. Port of `rewind_input`.
+    pub fn rewind_input(&mut self, items: &[InputItem]) {
+        if items.is_empty() {
+            return;
+        }
+        for item in items {
+            if let Some(fp) = fingerprint(&item.0, false) {
+                self.state.sent_item_fingerprints.remove(&fp);
+            }
+        }
+        let mut queue: Vec<InputItem> = items.to_vec();
+        queue.extend(self.remaining_initial_input.take().unwrap_or_default());
+        self.remaining_initial_input = Some(queue);
+    }
+
+    /// Drop the waiting initial items whose content is in `delivered`.
+    fn prune_remaining_initial_input(&mut self, delivered: &BTreeSet<String>) {
+        if delivered.is_empty() {
+            return;
+        }
+        if let Some(remaining) = self.remaining_initial_input.take() {
+            let kept: Vec<InputItem> = remaining
+                .into_iter()
+                .filter(|item| {
+                    fingerprint(&item.0, false).is_none_or(|fp| !delivered.contains(&fp))
+                })
+                .collect();
+            self.remaining_initial_input = (!kept.is_empty()).then_some(kept);
+        }
+    }
+
     /// Mark the run input as delivered (used when restoring a legacy index-based snapshot).
-    pub(crate) fn set_sent_initial_input(&mut self, sent: bool) {
+    pub fn set_sent_initial_input(&mut self, sent: bool) {
         self.sent_initial_input = sent;
     }
 
     /// The id a resumed run chains from: the most recent response that carries one. A response
     /// without an id (a non-Responses provider) does not break the chain. Port of the
     /// `latest_response_id` selection in `hydrate_from_state`.
-    pub(crate) fn latest_response_id(model_responses: &[ModelResponse]) -> Option<String> {
+    pub fn latest_response_id(model_responses: &[ModelResponse]) -> Option<String> {
         model_responses
             .iter()
             .rev()
@@ -129,7 +180,7 @@ impl ServerConversationTracker {
 
     /// Seed tracking from a prior run state so a resume does not replay sent content.
     /// Port of `hydrate_from_state`.
-    pub(crate) fn hydrate_from_state(
+    pub fn hydrate_from_state(
         &mut self,
         state: &ServerConversationState,
         original_input: &[InputItem],
@@ -139,6 +190,7 @@ impl ServerConversationTracker {
     ) {
         self.state = state.clone();
         self.primed_from_state = true;
+        self.remaining_initial_input = None;
 
         if input_already_sent {
             for item in original_input {
@@ -184,6 +236,20 @@ impl ServerConversationTracker {
             {
                 continue;
             }
+            // Only an item the server can be identified as holding is marked: one with an id, a
+            // tool call or its output, staged input, or a tool search item. Anything else (a
+            // bare message without an id) stays unsent. Mirrors `should_mark`.
+            let is_tool_call = matches!(
+                item.kind,
+                RunItemKind::ToolCall { .. } | RunItemKind::HandoffCall { .. }
+            );
+            let should_mark = normalize_server_item_id(raw.get("id")).is_some()
+                || (call_id_of(&raw).is_some() && (has_output_payload(&raw) || is_tool_call))
+                || matches!(item.kind, RunItemKind::Input { .. })
+                || is_tool_search_item(&raw);
+            if !should_mark {
+                continue;
+            }
             if let Some(id) = normalize_server_item_id(raw.get("id")) {
                 self.state.server_item_ids.insert(id);
             }
@@ -209,7 +275,8 @@ impl ServerConversationTracker {
     }
 
     /// Record what the server produced for a response. Port of `track_server_items`.
-    pub(crate) fn track_server_items(&mut self, response: &ModelResponse) {
+    pub fn track_server_items(&mut self, response: &ModelResponse) {
+        let mut produced = BTreeSet::new();
         for output in &response.output {
             let raw = output.to_value();
             if let Some(id) = normalize_server_item_id(raw.get("id")) {
@@ -224,36 +291,42 @@ impl ServerConversationTracker {
             // for a JSON item, so the content fingerprint plays the role Python's
             // `server_items` identity list plays.
             if let Some(fp) = fingerprint(&strip_internal_metadata(raw.clone()), false) {
-                self.state.server_output_fingerprints.insert(fp);
+                self.state.server_output_fingerprints.insert(fp.clone());
+                produced.insert(fp);
             }
         }
+        // An initial item the server produced itself no longer has to be delivered.
+        self.prune_remaining_initial_input(&produced);
     }
 
     /// Whether the server already holds this input item, by the same fingerprint that selects
     /// deltas. Staged input that was never delivered reads as unsent.
-    pub(crate) fn was_sent(&self, item: &InputItem) -> bool {
+    pub fn was_sent(&self, item: &InputItem) -> bool {
         fingerprint(&item.0, false)
             .is_some_and(|fp| self.state.sent_item_fingerprints.contains(&fp))
     }
 
     /// Record the items a successful model call delivered. Port of `mark_input_as_sent`.
-    pub(crate) fn mark_input_as_sent(&mut self, items: &[InputItem]) {
+    pub fn mark_input_as_sent(&mut self, items: &[InputItem]) {
+        let mut delivered = BTreeSet::new();
         for item in items {
             if let Some(id) = normalize_server_item_id(item.0.get("id")) {
                 self.state.server_item_ids.insert(id);
             }
             if let Some(fp) = fingerprint(&item.0, false) {
-                self.state.sent_item_fingerprints.insert(fp);
+                self.state.sent_item_fingerprints.insert(fp.clone());
+                delivered.insert(fp);
             }
             if let Some(fp) = anonymous_tool_search_fingerprint(&item.0) {
                 self.restored_anonymous_tool_search_fingerprints.insert(fp);
             }
         }
+        self.prune_remaining_initial_input(&delivered);
     }
 
     /// Whether this generated item still has to be sent to the server.
     /// Port of the filter inside `prepare_input`.
-    pub(crate) fn needs_send(&self, converted: &InputItem) -> bool {
+    pub fn needs_send(&self, converted: &InputItem) -> bool {
         let raw = &converted.0;
         if let Some(id) = normalize_server_item_id(raw.get("id"))
             && self.state.server_item_ids.contains(&id)
@@ -296,11 +369,14 @@ impl ServerConversationTracker {
 
     /// Mark the run input as delivered. Port of the `sent_initial_input` half of
     /// `prepare_input`.
-    pub(crate) fn take_initial_input(&mut self, original_input: &[InputItem]) -> Vec<InputItem> {
+    pub fn take_initial_input(&mut self, original_input: &[InputItem]) -> Vec<InputItem> {
         if self.sent_initial_input {
-            return Vec::new();
+            // Items a filter held back, or a retry rewound, are offered again.
+            return self.remaining_initial_input.clone().unwrap_or_default();
         }
         self.sent_initial_input = true;
+        self.remaining_initial_input =
+            (!original_input.is_empty()).then(|| original_input.to_vec());
         original_input.to_vec()
     }
 }

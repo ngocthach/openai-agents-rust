@@ -99,6 +99,9 @@ async fn consume_stream<C: Send + Sync + 'static>(
     let preserve = request.model_settings.preserve_raw_usage.unwrap_or(false);
     let mut stream = model.stream_response(request).await?;
     let mut final_response: Option<ModelResponse> = None;
+    // Items the stream finished one by one. Some backends leave the terminal response's output
+    // empty and only report items through `response.output_item.done`.
+    let mut streamed_output: Vec<Value> = Vec::new();
     while let Some(ev) = stream.next().await {
         let ev = ev?;
         let ty = ev.get("type").and_then(Value::as_str).unwrap_or_default();
@@ -108,6 +111,19 @@ async fn consume_stream<C: Send + Sync + 'static>(
         if ev.get("type").and_then(Value::as_str) == Some("response.completed")
             && let Some(r) = ev.get("response")
         {
+            let backfilled;
+            let r = if !streamed_output.is_empty()
+                && r.get("output")
+                    .and_then(Value::as_array)
+                    .is_none_or(|output| output.is_empty())
+            {
+                let mut patched = r.clone();
+                patched["output"] = Value::Array(streamed_output.clone());
+                backfilled = patched;
+                &backfilled
+            } else {
+                r
+            };
             let mut parsed = parse_response(r, None, preserve)?;
             if ev.get("hosted_multi_agent_pause").is_some() {
                 // A logical pause (a hosted response parked on a function call) carries no
@@ -131,6 +147,11 @@ async fn consume_stream<C: Send + Sync + 'static>(
             }
             _ => None,
         };
+        if ty == "response.output_item.done"
+            && let Some(item) = ev.get("item")
+        {
+            streamed_output.push(item.clone());
+        }
         sink.send(StreamEvent::RawResponse(ev));
         if let Some(error) = failure {
             return Err(error);

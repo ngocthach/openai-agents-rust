@@ -339,18 +339,24 @@ impl OpenAIChatCompletionsModel {
                         features.push("tool_namespace()");
                     }
                     if f.defer_loading {
-                        features.push("defer_loading");
+                        features.push("defer_loading=True");
                     }
                     if f.allowed_callers.is_some() {
                         features.push("allowed_callers");
                     }
+                    if f.output_json_schema.is_some() {
+                        features.push("output_json_schema");
+                    }
                     if !features.is_empty() {
+                        let name = match &f.namespace {
+                            Some(namespace) => format!("{namespace}.{}", f.name),
+                            None => f.name.clone(),
+                        };
                         return Err(AgentsError::user(format!(
                             "The following function-tool features are only supported with \
-                             OpenAI Responses models: {}. Tool `{}` cannot be used with \
+                             OpenAI Responses models: {}. Tool `{name}` cannot be used with \
                              OpenAIChatCompletionsModel.",
                             features.join(", "),
-                            f.name
                         )));
                     }
                     tools.push(f.to_chat_param())

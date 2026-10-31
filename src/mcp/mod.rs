@@ -17,7 +17,8 @@ pub use logging::{
     MCPToolMetadata, collect_mcp_list_tools_metadata, extract_mcp_tool_metadata,
     extract_mcp_tool_metadata_value, get_mcp_server_log_message, get_mcp_server_log_name,
     redact_credentials, resolve_mcp_tool_description, resolve_mcp_tool_description_for_model,
-    resolve_mcp_tool_title,
+    resolve_mcp_tool_description_for_model_value, resolve_mcp_tool_description_value,
+    resolve_mcp_tool_title, resolve_mcp_tool_title_value,
 };
 
 use std::any::Any;

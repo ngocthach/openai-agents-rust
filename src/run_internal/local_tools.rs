@@ -450,7 +450,8 @@ async fn run_computer<C: Send + Sync + 'static>(
             }
             None => log::warn!(target: crate::logger::LOG_TARGET,
                 "Computer call has pending safety checks, but no on_safety_check handler is \
-                 configured. The action will proceed without acknowledging the checks."
+                 configured. The action will proceed without acknowledging the checks. \
+                 Configure ComputerTool.on_safety_check to review or reject them."
             ),
         }
     }
@@ -481,12 +482,14 @@ async fn run_computer<C: Send + Sync + 'static>(
     let image_url = match scope::with_span(span.clone(), Box::pin(run)).await {
         Ok(u) => u,
         Err(e) => {
-            crate::tracing::record_tool_error_on_span(
+            let msg = e.to_string();
+            record_local_tool_error(
                 &span,
-                "Error running tool",
-                &e,
+                "computer",
+                &msg,
                 env.config.trace_include_sensitive_data,
             );
+            log_tool_error("Failed to execute computer action", &msg);
             span.finish();
             return Err(e);
         }

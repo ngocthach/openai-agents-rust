@@ -52,13 +52,28 @@ struct GraphNodeIds {
 }
 
 impl GraphNodeIds {
-    fn new<C>(agent: &Agent<C>) -> Self {
+    fn new<C>(agent: &Agent<C>, initially_visited: &HashSet<String>) -> Self {
         let mut nodes: Vec<(NodeKey, String)> = Vec::new();
+        let mut previsited: Vec<(NodeKey, String)> = Vec::new();
         let mut seen_keys: HashSet<NodeKey> = HashSet::new();
         let mut visited: HashSet<usize> = HashSet::new();
-        collect_nodes(agent, &mut visited, &mut seen_keys, &mut nodes);
+        collect_nodes(
+            agent,
+            initially_visited,
+            &mut visited,
+            &mut seen_keys,
+            &mut nodes,
+            &mut previsited,
+        );
 
         let escaped: Vec<(NodeKey, String, String)> = nodes
+            .into_iter()
+            .map(|(key, label)| {
+                let e = escape_label(&label);
+                (key, label, e)
+            })
+            .collect();
+        let escaped_previsited: Vec<(NodeKey, String, String)> = previsited
             .into_iter()
             .map(|(key, label)| {
                 let e = escape_label(&label);
@@ -69,25 +84,38 @@ impl GraphNodeIds {
         for (_, _, e) in &escaped {
             *label_counts.entry(e.as_str()).or_default() += 1;
         }
-        let raw_labels: HashSet<&str> = escaped.iter().map(|(_, _, e)| e.as_str()).collect();
+        let raw_labels: HashSet<&str> = escaped_previsited
+            .iter()
+            .chain(escaped.iter())
+            .map(|(_, _, e)| e.as_str())
+            .collect();
         let mut used_ids: HashSet<String> = ["__start__".to_string(), "__end__".to_string()].into();
         let mut generated: usize = 0;
         let mut ids = HashMap::new();
+        let mut generate_id = |key: NodeKey, used_ids: &HashSet<String>| loop {
+            let candidate = format!("__agents_graph_{}_{generated}__", key.kind());
+            generated += 1;
+            if !raw_labels.contains(candidate.as_str()) && !used_ids.contains(candidate.as_str()) {
+                break candidate;
+            }
+        };
+        // An agent the caller already drew keeps its label as id and reserves it.
+        for (key, label, escaped_label) in &escaped_previsited {
+            let node_id = if used_ids.contains(escaped_label.as_str()) {
+                generate_id(*key, &used_ids)
+            } else {
+                label.clone()
+            };
+            used_ids.insert(escape_label(&node_id));
+            ids.insert(*key, node_id);
+        }
         for (key, label, escaped_label) in &escaped {
             let node_id = if label_counts[escaped_label.as_str()] == 1
                 && !used_ids.contains(escaped_label.as_str())
             {
                 label.clone()
             } else {
-                loop {
-                    let candidate = format!("__agents_graph_{}_{generated}__", key.kind());
-                    generated += 1;
-                    if !raw_labels.contains(candidate.as_str())
-                        && !used_ids.contains(candidate.as_str())
-                    {
-                        break candidate;
-                    }
-                }
+                generate_id(*key, &used_ids)
             };
             used_ids.insert(escape_label(&node_id));
             ids.insert(*key, node_id);
@@ -102,12 +130,18 @@ impl GraphNodeIds {
 
 fn collect_nodes<C>(
     agent: &Agent<C>,
+    initially_visited: &HashSet<String>,
     visited: &mut HashSet<usize>,
     seen_keys: &mut HashSet<NodeKey>,
     out: &mut Vec<(NodeKey, String)>,
+    previsited: &mut Vec<(NodeKey, String)>,
 ) {
     let ptr = agent_ptr(agent);
     if !visited.insert(ptr) {
+        return;
+    }
+    if initially_visited.contains(&agent.name) {
+        previsited.push((NodeKey::Agent(ptr), agent.name.clone()));
         return;
     }
     fn add(
@@ -135,7 +169,14 @@ fn collect_nodes<C>(
     }
     for (i, handoff) in agent.handoffs.iter().enumerate() {
         match handoff.agent.as_ref() {
-            Some(target) => collect_nodes(target.as_ref(), visited, seen_keys, out),
+            Some(target) => collect_nodes(
+                target.as_ref(),
+                initially_visited,
+                visited,
+                seen_keys,
+                out,
+                previsited,
+            ),
             None => add(
                 seen_keys,
                 out,
@@ -150,17 +191,35 @@ const AGENT_NODE: &str = "shape=box, style=filled, fillcolor=lightyellow, width=
 const HANDOFF_NODE: &str =
     "shape=box, style=\"filled,rounded\", fillcolor=lightyellow, width=1.5, height=0.8";
 
-fn nodes<C>(
-    agent: &Agent<C>,
-    is_root: bool,
-    visited: &mut HashSet<usize>,
-    ids: &GraphNodeIds,
-    out: &mut String,
-) {
-    let ptr = agent_ptr(agent);
-    if !visited.insert(ptr) {
+/// Traversal state shared by the node and edge renderers.
+struct Walk<'a> {
+    ids: &'a GraphNodeIds,
+    /// Names the caller had already drawn before the call; they are skipped entirely.
+    initially_visited: &'a HashSet<String>,
+    /// Names reached by this traversal, reported back to the caller.
+    visited_names: &'a mut HashSet<String>,
+    visited: HashSet<usize>,
+}
+
+impl Walk<'_> {
+    /// Marks `agent` as drawn; false when it is already drawn or was drawn by the caller.
+    fn enter<C>(&mut self, agent: &Agent<C>) -> bool {
+        if self.visited.contains(&agent_ptr(agent)) || self.initially_visited.contains(&agent.name)
+        {
+            return false;
+        }
+        self.visited.insert(agent_ptr(agent));
+        self.visited_names.insert(agent.name.clone());
+        true
+    }
+}
+
+fn nodes<C>(agent: &Agent<C>, is_root: bool, walk: &mut Walk<'_>, out: &mut String) {
+    if !walk.enter(agent) {
         return;
     }
+    let ptr = agent_ptr(agent);
+    let ids = walk.ids;
     if is_root {
         out.push_str("\"__start__\" [label=\"__start__\", shape=ellipse, style=filled, fillcolor=lightblue, width=0.5, height=0.3];");
         out.push_str("\"__end__\" [label=\"__end__\", shape=ellipse, style=filled, fillcolor=lightblue, width=0.5, height=0.3];");
@@ -189,14 +248,16 @@ fn nodes<C>(
         match handoff.agent.as_ref() {
             Some(target) => {
                 // A target already drawn keeps its single node, as in the Python SDK.
-                if !visited.contains(&agent_ptr(target.as_ref())) {
+                if !walk.visited.contains(&agent_ptr(target.as_ref()))
+                    && !walk.initially_visited.contains(&target.name)
+                {
                     out.push_str(&format!(
                         "\"{}\" [label=\"{}\", {HANDOFF_NODE}];",
                         ids.id(NodeKey::Agent(agent_ptr(target.as_ref()))),
                         escape_label(&target.name)
                     ));
                 }
-                nodes(target.as_ref(), false, visited, ids, out);
+                nodes(target.as_ref(), false, walk, out);
             }
             None => out.push_str(&format!(
                 "\"{}\" [label=\"{}\", {HANDOFF_NODE}];",
@@ -207,17 +268,12 @@ fn nodes<C>(
     }
 }
 
-fn edges<C>(
-    agent: &Agent<C>,
-    is_root: bool,
-    visited: &mut HashSet<usize>,
-    ids: &GraphNodeIds,
-    out: &mut String,
-) {
-    let ptr = agent_ptr(agent);
-    if !visited.insert(ptr) {
+fn edges<C>(agent: &Agent<C>, is_root: bool, walk: &mut Walk<'_>, out: &mut String) {
+    if !walk.enter(agent) {
         return;
     }
+    let ptr = agent_ptr(agent);
+    let ids = walk.ids;
     let name = ids.id(NodeKey::Agent(ptr));
     if is_root {
         out.push_str(&format!("\"__start__\" -> \"{name}\";"));
@@ -248,7 +304,7 @@ fn edges<C>(
                     "\"{name}\" -> \"{}\";",
                     ids.id(NodeKey::Agent(agent_ptr(target.as_ref())))
                 ));
-                edges(target.as_ref(), false, visited, ids, out);
+                edges(target.as_ref(), false, walk, out);
             }
             None => out.push_str(&format!(
                 "\"{name}\" -> \"{}\";",
@@ -263,28 +319,63 @@ fn edges<C>(
 
 /// The DOT node declarations for `agent`, its tools, MCP servers and handoff graph.
 pub fn get_all_nodes<C>(agent: &Agent<C>) -> String {
-    let ids = GraphNodeIds::new(agent);
+    get_all_nodes_with_visited(agent, &mut HashSet::new())
+}
+
+/// Like [`get_all_nodes`], with the caller's set of already-drawn agent names. Names in the set
+/// on entry are skipped but keep their DOT id reserved; every agent drawn is added to the set.
+pub fn get_all_nodes_with_visited<C>(agent: &Agent<C>, visited: &mut HashSet<String>) -> String {
+    let initially = visited.clone();
+    let ids = GraphNodeIds::new(agent, &initially);
+    let mut walk = Walk {
+        ids: &ids,
+        initially_visited: &initially,
+        visited_names: visited,
+        visited: HashSet::new(),
+    };
     let mut out = String::new();
-    nodes(agent, true, &mut HashSet::new(), &ids, &mut out);
+    nodes(agent, true, &mut walk, &mut out);
     out
 }
 
 /// The DOT edge declarations for `agent`, its tools, MCP servers and handoff graph.
 pub fn get_all_edges<C>(agent: &Agent<C>) -> String {
-    let ids = GraphNodeIds::new(agent);
+    get_all_edges_with_visited(agent, &mut HashSet::new())
+}
+
+/// Like [`get_all_edges`], with the caller's set of already-drawn agent names (see
+/// [`get_all_nodes_with_visited`]).
+pub fn get_all_edges_with_visited<C>(agent: &Agent<C>, visited: &mut HashSet<String>) -> String {
+    let initially = visited.clone();
+    let ids = GraphNodeIds::new(agent, &initially);
+    let mut walk = Walk {
+        ids: &ids,
+        initially_visited: &initially,
+        visited_names: visited,
+        visited: HashSet::new(),
+    };
     let mut out = String::new();
-    edges(agent, true, &mut HashSet::new(), &ids, &mut out);
+    edges(agent, true, &mut walk, &mut out);
     out
 }
 
 /// The DOT source describing `agent`, its tools and its handoff graph.
 pub fn get_main_graph<C>(agent: &Agent<C>) -> String {
-    let ids = GraphNodeIds::new(agent);
+    let none = HashSet::new();
+    let ids = GraphNodeIds::new(agent, &none);
     let mut out = String::from(
         "\n    digraph G {\n        graph [splines=true];\n        node [fontname=\"Arial\"];\n        edge [penwidth=1.5];\n    ",
     );
-    nodes(agent, true, &mut HashSet::new(), &ids, &mut out);
-    edges(agent, true, &mut HashSet::new(), &ids, &mut out);
+    for render in [nodes::<C>, edges::<C>] {
+        let mut names = HashSet::new();
+        let mut walk = Walk {
+            ids: &ids,
+            initially_visited: &none,
+            visited_names: &mut names,
+            visited: HashSet::new(),
+        };
+        render(agent, true, &mut walk, &mut out);
+    }
     out.push('}');
     out
 }

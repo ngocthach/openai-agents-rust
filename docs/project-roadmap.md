@@ -28,6 +28,12 @@ Last updated: 2026-10-29.
 - MCP legacy HTTP+SSE transport
 - Extensions: tool output trimmer, Codex tool, hosted multi-agent (experimental)
 
+## 0.8.0 (released)
+
+- Completeness pass over the top-level Python test files: scripted model, server conversation tracker,
+  `as_tool`, computer actions, extension filters, MCP tool metadata, visualization; typed tool
+  arguments are validated against their schema bounds
+
 ## 0.7.0 (released)
 
 - Sandbox and runner-tracing parity completed: pause releases the sandbox like Python's, bounded reads

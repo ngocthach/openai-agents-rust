@@ -1,6 +1,7 @@
 //! Common handoff input filters. Mirrors `agents.extensions.handoff_filters`.
 
 use crate::handoffs::HandoffInputData;
+pub use crate::handoffs::{default_handoff_history_mapper, nest_handoff_history};
 use crate::items::{InputItem, RunItem, RunItemKind};
 
 const TOOL_TYPES: &[&str] = &[
@@ -35,7 +36,9 @@ const TOOL_TYPES: &[&str] = &[
 fn is_tool_item(item: &RunItem) -> bool {
     !matches!(
         item.kind,
-        RunItemKind::MessageOutput { .. } | RunItemKind::Input { .. }
+        RunItemKind::MessageOutput { .. }
+            | RunItemKind::Input { .. }
+            | RunItemKind::Compaction { .. }
     )
 }
 

@@ -39,6 +39,28 @@ pub struct RunErrorDetails {
     pub tool_output_guardrail_results: Vec<ToolOutputGuardrailResult>,
 }
 
+impl RunErrorDetails {
+    /// The multi-line summary Python's `pretty_print_run_error_details` builds for `str(details)`.
+    pub fn pretty_print(&self) -> String {
+        format!(
+            "RunErrorDetails:\n- Last agent: Agent(name=\"{}\", ...)\n- {} new item(s)\n- {} raw response(s)\n- {} input guardrail result(s)\n- {} output guardrail result(s)\n- {} tool input guardrail result(s)\n- {} tool output guardrail result(s)\n(See `RunErrorDetails` for more details)",
+            self.last_agent,
+            self.new_items.len(),
+            self.raw_responses.len(),
+            self.input_guardrail_results.len(),
+            self.output_guardrail_results.len(),
+            self.tool_input_guardrail_results.len(),
+            self.tool_output_guardrail_results.len(),
+        )
+    }
+}
+
+impl std::fmt::Display for RunErrorDetails {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.pretty_print())
+    }
+}
+
 /// All errors raised by the SDK.
 #[derive(Debug, thiserror::Error)]
 pub enum AgentsError {

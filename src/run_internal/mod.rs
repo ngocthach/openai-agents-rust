@@ -5,7 +5,7 @@ pub(crate) mod history;
 mod items;
 mod local_tools;
 mod model_call;
-mod oai_conversation;
+pub(crate) mod oai_conversation;
 pub(crate) mod prompt_cache_key;
 mod tool_caller;
 pub(crate) mod tool_invocation;
@@ -2048,7 +2048,7 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
             SpanData::Agent {
                 name: agent.name.clone(),
                 handoffs: Some(handoffs.iter().map(|h| h.agent_name.clone()).collect()),
-                tools: Some(tools.iter().map(Tool::name).collect()),
+                tools: Some(tools.iter().map(Tool::trace_name).collect()),
                 output_type: Some(
                     agent
                         .output_type
@@ -3363,7 +3363,22 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
                 agent: agent.clone(),
                 context: self.ctx.clone(),
             })
-            .await?;
+            .await;
+            let r = match r {
+                Ok(r) => r,
+                Err(error) => {
+                    if let Some(span) = scope::current_span() {
+                        span.set_error(
+                            "Error in call_model_input_filter",
+                            Some(json!({"error": crate::tracing::get_trace_error(
+                                self.config.trace_include_sensitive_data,
+                                &error.to_string(),
+                            )})),
+                        );
+                    }
+                    return Err(error);
+                }
+            };
             input = r.input;
             instructions = r.instructions;
         }
@@ -5364,14 +5379,15 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
         match &agent.output_type {
             Some(schema) if !schema.is_plain_text() => {
                 if text.is_empty() {
+                    // A missing or declining handler keeps the existing behavior: another turn.
                     let handler = self.error_handlers.invalid_final_output.clone();
-                    if handler.is_none() {
-                        return Ok(NextStep::RunAgain);
-                    }
                     let err = AgentsError::model_behavior(
                         "Model returned no final output for the structured output type.",
                     );
-                    return self.handled_final(handler, err).await;
+                    return Ok(self
+                        .try_handled_final(handler, &err)
+                        .await?
+                        .unwrap_or(NextStep::RunAgain));
                 }
                 match schema.validate_json(&text) {
                     Ok(v) => Ok(NextStep::FinalOutput(v)),
@@ -5391,11 +5407,23 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
         handler: Option<RunErrorHandler<C>>,
         err: AgentsError,
     ) -> Result<NextStep<C>> {
+        match self.try_handled_final(handler, &err).await? {
+            Some(step) => Ok(step),
+            None => Err(err),
+        }
+    }
+
+    /// Like [`Self::handled_final`], but `Ok(None)` when there is no handler or it declines.
+    async fn try_handled_final(
+        &mut self,
+        handler: Option<RunErrorHandler<C>>,
+        err: &AgentsError,
+    ) -> Result<Option<NextStep<C>>> {
         let Some(h) = handler else {
-            return Err(err);
+            return Ok(None);
         };
         let input = RunErrorHandlerInput {
-            error: Arc::new(clone_simple_error(&err)),
+            error: Arc::new(clone_simple_error(err)),
             context: self.ctx.clone(),
             run_data: RunErrorData {
                 input: self.original_input.clone(),
@@ -5412,7 +5440,7 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
         // A handler failure, or an invalid handler output, must not expose the details of a
         // data-redacted error.
         match h(input).await.map_err(|e| err.redact_follow_up(e))? {
-            None => Err(err),
+            None => Ok(None),
             Some(res) => {
                 // The model's own message stays; a kept handler output is appended as a new
                 // message, as `turn_resolution` does for refusals and invalid outputs.
@@ -5422,7 +5450,7 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
                 if let Some(item) = item {
                     self.push_item(item, Some(RunItemStreamEventName::MessageOutputCreated));
                 }
-                Ok(NextStep::FinalOutput(output))
+                Ok(Some(NextStep::FinalOutput(output)))
             }
         }
     }

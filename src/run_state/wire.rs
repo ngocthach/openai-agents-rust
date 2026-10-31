@@ -1117,8 +1117,12 @@ fn run_item_from_wire(value: &Value) -> Result<RunItem> {
         }
         // Read tolerantly like Python: a lookup key must be a mapping and the alias flag is
         // honoured only as a literal `true`.
-        if !m.get("tool_lookup_key").is_some_and(Value::is_object) {
-            m.remove("tool_lookup_key");
+        if let Some(key) = m
+            .remove("tool_lookup_key")
+            .as_ref()
+            .and_then(read_lookup_key)
+        {
+            m.insert("tool_lookup_key".into(), key);
         }
         if m.get("allow_bare_name_alias") != Some(&Value::Bool(true)) {
             m.remove("allow_bare_name_alias");
@@ -1215,6 +1219,27 @@ const ACTION_GROUPS: [(&str, &str); 6] = [
     ("shell_actions", "shell"),
     ("apply_patch_actions", "apply_patch"),
 ];
+
+/// Mirrors `deserialize_function_tool_lookup_key`: a persisted key is a mapping with a string
+/// `kind` and a non-empty string `name`; `namespaced` also needs a non-empty `namespace`.
+/// Anything else reads as no key.
+fn read_lookup_key(data: &Value) -> Option<Value> {
+    let name = data
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|n| !n.is_empty())?;
+    match data.get("kind")?.as_str()? {
+        kind @ ("bare" | "deferred_top_level") => Some(json!({"kind": kind, "name": name})),
+        "namespaced" => {
+            let namespace = data
+                .get("namespace")
+                .and_then(Value::as_str)
+                .filter(|n| !n.is_empty())?;
+            Some(json!({"kind": "namespaced", "namespace": namespace, "name": name}))
+        }
+        _ => None,
+    }
+}
 
 /// The lookup key Python matches a restored tool call against.
 /// Mirrors `serialize_function_tool_lookup_key(get_function_tool_lookup_key(...))`.

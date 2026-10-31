@@ -766,6 +766,14 @@ impl<C> RunContext<C> {
         }
     }
 
+    /// A clone that carries no nested tool input.
+    pub(crate) fn without_tool_input(&self) -> Self {
+        RunContext {
+            tool_input: None,
+            ..self.clone()
+        }
+    }
+
     /// A clone that shares everything but the invocation lifecycle, for a nested run.
     pub(crate) fn with_fresh_invocations(&self) -> Self {
         RunContext {

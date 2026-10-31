@@ -435,18 +435,44 @@ async fn agent_as_tool_input_string_is_passed_through() {
     assert_eq!(text, "hello");
 }
 
+/// The tool validates its arguments against `{"input": str}` before any nested run starts, as
+/// Python's `TypeAdapter(AgentAsToolInput).validate_python` does, so the nested agent is never
+/// called with arguments lacking `input`.
 #[tokio::test]
-async fn agent_as_tool_input_without_an_input_field_is_passed_as_json() {
-    let text = nested_input_for(r#"{"foo": "bar"}"#).await.unwrap();
-    assert_eq!(text, r#"{"foo": "bar"}"#);
+async fn agent_as_tool_input_without_an_input_field_is_rejected_before_the_nested_run() {
+    disable_tracing();
+    let worker_model = Arc::new(ScriptedModel::new());
+    let parent_model = Arc::new(ScriptedModel::new());
+    parent_model
+        .enqueue(ScriptedStep::output(vec![function_call(
+            "worker_tool",
+            r#"{"foo": "bar"}"#,
+        )]))
+        .unwrap();
+    parent_model
+        .enqueue(ScriptedStep::output(vec![assistant_message("parent done")]))
+        .unwrap();
+    let worker = Arc::new(Agent::<()>::new("worker").with_model_instance(worker_model.clone()));
+    let nested = worker.as_tool_with(AgentAsToolOptions {
+        tool_name: Some("worker_tool".into()),
+        tool_description: Some("Call the worker".into()),
+        ..Default::default()
+    });
+    let parent = Agent::<()>::new("parent")
+        .with_model_instance(parent_model)
+        .with_tool(nested);
+    Runner::run(&parent, "go").await.unwrap();
+    assert!(worker_model.calls().is_empty());
 }
 
+/// Fields the schema does not declare are dropped from the validated input (pydantic's default
+/// `extra="ignore"`), so only `input` reaches the nested agent.
 #[tokio::test]
-async fn agent_as_tool_input_with_extra_fields_keeps_every_field() {
+async fn agent_as_tool_input_with_extra_fields_drops_the_undeclared_ones() {
     let text = nested_input_for(r#"{"input": "hello", "target": "world"}"#)
         .await
         .unwrap();
-    assert_eq!(text, r#"{"input": "hello", "target": "world"}"#);
+    assert_eq!(text, "hello");
 }
 
 /// Runs an agent-as-tool whose structured input is rendered by `input_builder`, returning what
@@ -503,7 +529,7 @@ async fn structured_builder_view(
 #[tokio::test]
 async fn agent_as_tool_custom_input_builder_replaces_the_input() {
     let (_summary, _schema, nested_text) =
-        structured_builder_view(None, false, r#"{"foo": "bar"}"#).await;
+        structured_builder_view(None, false, r#"{"input": "x"}"#).await;
     assert_eq!(nested_text, "built input");
 }
 
@@ -511,7 +537,7 @@ async fn agent_as_tool_custom_input_builder_replaces_the_input() {
 async fn agent_as_tool_input_builder_without_descriptions_sees_no_summary() {
     // The default parameters carry no descriptions, so there is no summary, and the schema is
     // only passed on when `include_input_schema` is set.
-    let (summary, schema, _) = structured_builder_view(None, false, r#"{"foo": "bar"}"#).await;
+    let (summary, schema, _) = structured_builder_view(None, false, r#"{"input": "x"}"#).await;
     assert!(summary.is_none());
     assert!(schema.is_none());
 }
@@ -616,8 +642,7 @@ async fn agent_as_tool_input_builder_drops_the_summary_for_undescribable_fields(
             "description": "Arguments.",
             "properties": {"field": field},
         });
-        let (summary, _, _) =
-            structured_builder_view(Some(parameters), false, r#"{"field": 1}"#).await;
+        let (summary, _, _) = structured_builder_view(Some(parameters), false, r#"{}"#).await;
         assert!(
             summary.is_none(),
             "a field that cannot be described hides the summary"

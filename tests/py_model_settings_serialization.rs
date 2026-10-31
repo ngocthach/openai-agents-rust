@@ -152,6 +152,7 @@ fn reasoning_and_prompt_cache_serialization() {
             effort: Some("max".into()),
             context: Some("all_turns".into()),
             summary: None,
+            ..Default::default()
         }),
         prompt_cache_options: Some(json!({"mode": "explicit", "ttl": "30m"})),
         ..Default::default()

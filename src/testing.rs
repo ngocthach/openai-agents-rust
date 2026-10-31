@@ -355,18 +355,21 @@ pub enum ModelScriptError {
 impl fmt::Display for ModelScriptError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            // Python's wording: the step number is 1-based, the index 0-based.
             ModelScriptError::InvalidModelStep {
-                reason,
                 input_index,
                 detail,
-            } => write!(
+                ..
+            } => write!(f, "Scripted model step #{} {detail}.", input_index + 1),
+            ModelScriptError::UnexpectedModelCall { call, call_index } => write!(
                 f,
-                "Invalid scripted model step at index {input_index} ({reason}): {detail}"
-            ),
-            ModelScriptError::UnexpectedModelCall { call_index, .. } => write!(
-                f,
-                "ScriptedModel received an unexpected call (call index {call_index}): \
-                 no scripted steps remain."
+                "Unexpected {} model call #{}: no scripted steps remain.",
+                if call.streamed {
+                    "streaming"
+                } else {
+                    "non-streaming"
+                },
+                call_index + 1
             ),
             ModelScriptError::UnconsumedModelSteps { remaining_steps } => write!(
                 f,
@@ -397,6 +400,20 @@ pub struct ModelCall {
 pub type ScriptedResponder =
     Arc<dyn Fn(&ModelCall) -> std::result::Result<ScriptedStep, AgentsError> + Send + Sync>;
 
+/// Derives a step's result asynchronously from the call that triggered it.
+pub type ScriptedAsyncResponder = Arc<
+    dyn Fn(
+            ModelCall,
+        )
+            -> futures::future::BoxFuture<'static, std::result::Result<ScriptedStep, AgentsError>>
+        + Send
+        + Sync,
+>;
+
+/// Builds the exact event stream of a streamed call, one event (or error) at a time.
+pub type ScriptedStreamFactory =
+    Arc<dyn Fn(&ModelCall) -> futures::stream::BoxStream<'static, Result<Value>> + Send + Sync>;
+
 /// The response id [`ScriptedStep`] uses when none is given.
 pub const DEFAULT_SCRIPTED_RESPONSE_ID: &str = "resp-789";
 
@@ -420,8 +437,12 @@ pub struct ScriptedStep {
     pub error: Option<AgentsError>,
     /// Derive the result from the recorded call.
     pub responder: Option<ScriptedResponder>,
+    /// Derive the result from the recorded call, awaiting it first.
+    pub async_responder: Option<ScriptedAsyncResponder>,
     /// Emit exactly these stream events instead of synthesizing them.
     pub stream_events: Option<Vec<Value>>,
+    /// Produce the exact stream events lazily, so a stream can fail or block part-way.
+    pub stream_factory: Option<ScriptedStreamFactory>,
     /// Retry guidance reported for `error` through [`Model::get_retry_advice`].
     pub retry_advice: Option<crate::retry::ModelRetryAdvice>,
 }
@@ -436,7 +457,9 @@ impl Default for ScriptedStep {
             raw_usage: None,
             error: None,
             responder: None,
+            async_responder: None,
             stream_events: None,
+            stream_factory: None,
             retry_advice: None,
         }
     }
@@ -452,7 +475,15 @@ impl fmt::Debug for ScriptedStep {
             .field("raw_usage", &self.raw_usage)
             .field("error", &self.error)
             .field("responder", &self.responder.as_ref().map(|_| "Fn(..)"))
+            .field(
+                "async_responder",
+                &self.async_responder.as_ref().map(|_| "Fn(..)"),
+            )
             .field("stream_events", &self.stream_events)
+            .field(
+                "stream_factory",
+                &self.stream_factory.as_ref().map(|_| "Fn(..)"),
+            )
             .field("retry_advice", &self.retry_advice)
             .finish()
     }
@@ -486,10 +517,41 @@ impl ScriptedStep {
         }
     }
 
+    /// A step whose result is derived asynchronously from the recorded call.
+    pub fn respond_async<F, Fut>(responder: F) -> Self
+    where
+        F: Fn(ModelCall) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = std::result::Result<ScriptedStep, AgentsError>>
+            + Send
+            + 'static,
+    {
+        ScriptedStep {
+            async_responder: Some(Arc::new(move |call| Box::pin(responder(call)))),
+            ..Default::default()
+        }
+    }
+
     /// A step emitting an exact event sequence; `output` is what the non-streamed path returns.
     pub fn stream(events: Vec<Value>) -> Self {
         ScriptedStep {
             stream_events: Some(events),
+            ..Default::default()
+        }
+    }
+
+    /// A step whose exact event stream is built from the recorded call and polled lazily.
+    ///
+    /// An `Err` item fails the call part-way through; dropping the stream drops whatever the
+    /// factory returned.
+    pub fn stream_with<F>(factory: F) -> Self
+    where
+        F: Fn(&ModelCall) -> futures::stream::BoxStream<'static, Result<Value>>
+            + Send
+            + Sync
+            + 'static,
+    {
+        ScriptedStep {
+            stream_factory: Some(Arc::new(factory)),
             ..Default::default()
         }
     }
@@ -514,20 +576,23 @@ impl ScriptedStep {
 
     fn validate(&self, input_index: usize) -> std::result::Result<(), ModelScriptError> {
         let selected = u8::from(self.error.is_some())
-            + u8::from(self.responder.is_some())
-            + u8::from(self.stream_events.is_some());
-        if selected > 1 {
+            + u8::from(self.responder.is_some() || self.async_responder.is_some())
+            + u8::from(self.stream_events.is_some() || self.stream_factory.is_some());
+        if selected > 1
+            || (self.responder.is_some() && self.async_responder.is_some())
+            || (self.stream_events.is_some() && self.stream_factory.is_some())
+        {
             return Err(ModelScriptError::InvalidModelStep {
                 reason: ModelStepReason::ConflictingOutcomes,
                 input_index,
-                detail: "cannot combine error, responder and stream_events outcomes".into(),
+                detail: "cannot combine error, responder, and stream_events outcomes".into(),
             });
         }
         if self.retry_advice.is_some() && self.error.is_none() {
             return Err(ModelScriptError::InvalidModelStep {
                 reason: ModelStepReason::InvalidRetryAdvice,
                 input_index,
-                detail: "retry_advice requires an error".into(),
+                detail: "requires an error and a ModelRetryAdvice value".into(),
             });
         }
         Ok(())
@@ -621,7 +686,12 @@ impl ScriptedModel {
     }
 
     /// Record the call and resolve the step it consumes, following responders.
-    fn next_step(&self, request: &ModelRequest, streamed: bool) -> Result<ScriptedStep> {
+    ///
+    /// A responder's step never entered the queue, so it is validated here instead, and a
+    /// responder may itself return another responder, which is followed in turn. A responder that
+    /// fails forgets the retry advice remembered for an error with the same message, so advice
+    /// attached to an earlier scripted error cannot leak onto a later failure.
+    async fn next_step(&self, request: &ModelRequest, streamed: bool) -> Result<ScriptedStep> {
         let call = ModelCall {
             request: request.clone(),
             streamed,
@@ -631,51 +701,54 @@ impl ScriptedModel {
             calls.push(call.clone());
             calls.len() - 1
         };
-        let mut step = self
-            .steps
-            .lock()
-            .expect("poisoned")
-            .pop_front()
-            .ok_or_else(|| {
-                AgentsError::from(ModelScriptError::UnexpectedModelCall {
-                    call: Box::new(call.clone()),
-                    call_index,
-                })
-            })?;
-        // A responder may itself return a step, but never another responder, so one hop is all
-        // that can happen.
-        if let Some(responder) = step.responder.take() {
-            step = responder(&call)?;
-            // A responder's step never entered the queue, so it is validated here instead. A
-            // nested responder is rejected rather than silently dropped.
-            step.validate(call_index)?;
-            if step.responder.is_some() {
-                return Err(ModelScriptError::InvalidModelStep {
-                    reason: ModelStepReason::InvalidResponder,
-                    input_index: call_index,
-                    detail: "a responder cannot return another responder".into(),
+        let popped = self.steps.lock().expect("poisoned").pop_front();
+        let mut step = popped.ok_or_else(|| {
+            AgentsError::from(ModelScriptError::UnexpectedModelCall {
+                call: Box::new(call.clone()),
+                call_index,
+            })
+        })?;
+        loop {
+            let next = if let Some(responder) = step.responder.take() {
+                responder(&call)
+            } else if let Some(responder) = step.async_responder.take() {
+                responder(call.clone()).await
+            } else {
+                break;
+            };
+            step = match next {
+                Ok(next) => next,
+                Err(error) => {
+                    self.forget_retry_advice(&error);
+                    return Err(error);
                 }
-                .into());
-            }
+            };
+            step.validate(0)?;
         }
         Ok(step)
     }
 
-    fn model_response(&self, step: &ScriptedStep, request: &ModelRequest) -> ModelResponse {
+    fn model_response(&self, step: &ScriptedStep, request: &ModelRequest) -> Result<ModelResponse> {
+        // A step reporting no usage (or an all-zero one) falls back to the model's default usage,
+        // and that to a single counted request.
         let usage = step
             .usage
             .clone()
+            .filter(|usage| *usage != Usage::default())
             .or_else(|| self.default_usage.lock().expect("poisoned").clone())
-            .unwrap_or_default();
-        ModelResponse {
-            output: step.output.clone(),
+            .unwrap_or_else(|| Usage {
+                requests: 1,
+                ..Default::default()
+            });
+        Ok(ModelResponse {
+            output: convert_output_items(&step.output)?,
             usage,
             response_id: step.response_id.clone(),
             request_id: step.request_id.clone(),
             raw_usage: preserve_raw_usage(request)
                 .then(|| step.raw_usage.clone())
                 .flatten(),
-        }
+        })
     }
 
     /// Raise a step's error, remembering any retry advice attached to it.
@@ -686,6 +759,17 @@ impl ScriptedModel {
             .clone()
             .map(|advice| (error.to_string(), advice));
         Some(error)
+    }
+
+    /// Drop the remembered advice when it belongs to an error with this message.
+    fn forget_retry_advice(&self, error: &AgentsError) {
+        let mut guard = self.last_retry_advice.lock().expect("poisoned");
+        if guard
+            .as_ref()
+            .is_some_and(|(message, _)| *message == error.to_string())
+        {
+            *guard = None;
+        }
     }
 
     fn span_for(&self) -> crate::tracing::Span {
@@ -718,21 +802,117 @@ fn preserve_raw_usage(request: &ModelRequest) -> bool {
     request.model_settings.preserve_raw_usage == Some(true)
 }
 
+/// Normalize scripted output items the way Python's `_convert_output_items` does: an
+/// `apply_patch_call` must carry a non-empty call id, an item id that is non-empty when given
+/// (defaulting to the call id), and a status of `in_progress` or `completed` (default
+/// `completed`).
+fn convert_output_items(output: &[OutputItem]) -> Result<Vec<OutputItem>> {
+    output
+        .iter()
+        .map(|item| match item {
+            OutputItem::Other(value)
+                if value.get("type").and_then(Value::as_str) == Some("apply_patch_call") =>
+            {
+                convert_apply_patch_call(value)
+            }
+            other => Ok(other.clone()),
+        })
+        .collect()
+}
+
+fn convert_apply_patch_call(value: &Value) -> Result<OutputItem> {
+    let call_id = match value.get("call_id").and_then(Value::as_str) {
+        Some(call_id) if !call_id.is_empty() => call_id,
+        _ => {
+            return Err(AgentsError::model_behavior(
+                "Tool invocations require a non-empty string call ID before execution.",
+            ));
+        }
+    };
+    let item_id = match value.get("id") {
+        Some(Value::String(id)) if !id.is_empty() => id.as_str(),
+        Some(_) => {
+            return Err(AgentsError::model_behavior(
+                "Apply-patch tool calls require a non-empty string item ID when provided.",
+            ));
+        }
+        None => call_id,
+    };
+    let status = match value.get("status") {
+        None => "completed",
+        Some(Value::String(status)) if matches!(status.as_str(), "in_progress" | "completed") => {
+            status.as_str()
+        }
+        Some(other) => {
+            return Err(AgentsError::user(format!(
+                "Invalid apply_patch_call status {other}: expected \"in_progress\" or \"completed\""
+            )));
+        }
+    };
+    let mut converted = json!({
+        "type": "apply_patch_call",
+        "id": item_id,
+        "call_id": call_id,
+        "status": status,
+        "operation": value.get("operation").cloned().unwrap_or(Value::Null),
+    });
+    if let Some(caller) = value.get("caller") {
+        converted["caller"] = caller.clone();
+    }
+    Ok(OutputItem::Other(converted))
+}
+
+/// Item kinds whose real streams carry events the automatic stream cannot reproduce. Python
+/// rejects them with a pointer to the exact-stream step; a stream carrying them has to be scripted
+/// event by event. Other raw items (shell, program, tool search, web search, ...) pass through as
+/// a bare added/done pair.
+const UNSUPPORTED_AUTOMATIC_STREAM_ITEMS: &[&str] = &[
+    "custom_tool_call",
+    "code_interpreter_call",
+    "mcp_call",
+    "image_generation_call",
+];
+
+/// Reject output the automatic stream cannot express.
+fn check_automatic_stream_support(output: &[OutputItem]) -> Result<()> {
+    for item in output {
+        if let OutputItem::Other(value) = item {
+            let kind = value
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            if UNSUPPORTED_AUTOMATIC_STREAM_ITEMS.contains(&kind) {
+                return Err(AgentsError::model_behavior(format!(
+                    "Automatic streaming does not support {kind}. \
+                     Use ScriptedStep::stream(...) to provide exact normalized stream events."
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl Model for ScriptedModel {
     async fn get_response(&self, request: ModelRequest) -> Result<ModelResponse> {
         let span = self.span_for();
         span.start();
-        let result = (|| {
-            let mut step = self.next_step(&request, false)?;
+        // A cancelled call (a timeout drops this future) still finishes its span, and records the
+        // timeout when the attempt that owns the call timed out.
+        let mut guard =
+            crate::tracing::ModelSpanGuard::new(&span, "Error", request.tracing.include_data());
+        let result = async {
+            let mut step = self.next_step(&request, false).await?;
             if let Some(error) = self.raise(&mut step) {
                 return Err(error);
             }
-            Ok(self.model_response(&step, &request))
-        })();
+            self.model_response(&step, &request)
+        }
+        .await;
         if let Err(error) = &result {
             Self::record_span_error(&span, error, &request);
         }
+        guard.disarm();
         span.finish();
         result
     }
@@ -740,26 +920,53 @@ impl Model for ScriptedModel {
     async fn stream_response(&self, request: ModelRequest) -> Result<ResponseEventStream> {
         let span = self.span_for();
         span.start();
-        let result = (|| {
-            let mut step = self.next_step(&request, true)?;
+        let mut guard =
+            crate::tracing::ModelSpanGuard::new(&span, "Error", request.tracing.include_data());
+        let prepared = async {
+            let mut step = self.next_step(&request, true).await?;
             if let Some(error) = self.raise(&mut step) {
                 return Err(error);
             }
-            match &step.stream_events {
-                Some(events) => Ok(events.clone()),
-                None => Ok(scripted_stream_events(
-                    &step,
-                    self.model_response(&step, &request),
-                )),
+            if let Some(factory) = &step.stream_factory {
+                let call = ModelCall {
+                    request: request.clone(),
+                    streamed: true,
+                };
+                return Ok(factory(&call));
             }
-        })();
-        match result {
-            Ok(events) => {
-                span.finish();
-                Ok(futures::stream::iter(events.into_iter().map(Ok)).boxed())
+            let events = match &step.stream_events {
+                Some(events) => events.clone(),
+                None => {
+                    check_automatic_stream_support(&step.output)?;
+                    let response = self.model_response(&step, &request)?;
+                    let converted = ScriptedStep {
+                        output: response.output.clone(),
+                        ..Default::default()
+                    };
+                    scripted_stream_events(&converted, response)
+                }
+            };
+            Ok(futures::stream::iter(events.into_iter().map(Ok)).boxed())
+        }
+        .await;
+        match prepared {
+            Ok(stream) => {
+                // The span stays open while the consumer drains the stream: a failure part-way is
+                // recorded on it, and dropping the stream (an early exit or a cancellation)
+                // finishes it.
+                let request_for_errors = request;
+                Ok(stream
+                    .map(move |event| {
+                        if let Err(error) = &event {
+                            Self::record_span_error(guard.span(), error, &request_for_errors);
+                        }
+                        event
+                    })
+                    .boxed())
             }
             Err(error) => {
                 Self::record_span_error(&span, &error, &request);
+                guard.disarm();
                 span.finish();
                 Err(error)
             }
@@ -901,12 +1108,17 @@ fn message_part_events(part: &crate::items::MessageContent) -> Vec<Value> {
     use crate::items::MessageContent;
     match part {
         MessageContent::OutputText {
-            text, annotations, ..
+            text,
+            annotations,
+            logprobs,
         } => {
+            // The delta, the done event and the finished part carry the scripted log probabilities;
+            // the part the stream opens with is still empty.
+            let logprobs = logprobs.clone().unwrap_or_else(|| json!([]));
             let mut out = vec![
                 json!({"type": "response.content_part.added",
                        "part": {"type": "output_text", "text": "", "annotations": [], "logprobs": []}}),
-                json!({"type": "response.output_text.delta", "delta": text, "logprobs": []}),
+                json!({"type": "response.output_text.delta", "delta": text, "logprobs": logprobs}),
             ];
             for (annotation_index, annotation) in annotations.iter().enumerate() {
                 out.push(json!({
@@ -915,10 +1127,12 @@ fn message_part_events(part: &crate::items::MessageContent) -> Vec<Value> {
                     "annotation": annotation,
                 }));
             }
-            out.push(json!({"type": "response.output_text.done", "text": text, "logprobs": []}));
+            out.push(
+                json!({"type": "response.output_text.done", "text": text, "logprobs": logprobs}),
+            );
             out.push(json!({"type": "response.content_part.done",
                             "part": {"type": "output_text", "text": text,
-                                     "annotations": annotations, "logprobs": []}}));
+                                     "annotations": annotations, "logprobs": logprobs}}));
             out
         }
         MessageContent::Refusal { refusal } => vec![
@@ -950,8 +1164,20 @@ fn in_progress_output_item(item: &OutputItem) -> Value {
                 value["content"] = json!([]);
             }
             value["status"] = json!("in_progress");
+            if let Some(object) = value.as_object_mut() {
+                object.remove("encrypted_content");
+            }
         }
-        _ => {}
+        OutputItem::FunctionCall(_) => {
+            value["arguments"] = json!("");
+            value["status"] = json!("in_progress");
+        }
+        OutputItem::Other(inner)
+            if inner.get("type").and_then(Value::as_str) == Some("apply_patch_call") =>
+        {
+            value["status"] = json!("in_progress");
+        }
+        OutputItem::Other(_) => {}
     }
     value
 }
@@ -968,6 +1194,24 @@ fn completed_response_value(response: &ModelResponse) -> Value {
     usage["input_tokens"] = json!(response.usage.input_tokens);
     usage["output_tokens"] = json!(response.usage.output_tokens);
     usage["total_tokens"] = json!(response.usage.total_tokens);
+    // The request count and per-request breakdown ride on the usage object so a streamed run
+    // reports the same usage as a non-streamed one (Python's `_agents_sdk_request_count`).
+    usage["requests"] = json!(response.usage.requests);
+    if !response.usage.request_usage_entries.is_empty() {
+        usage["request_usage_entries"] =
+            serde_json::to_value(&response.usage.request_usage_entries).unwrap_or(Value::Null);
+    }
+    // A provider payload that already carries token details keeps them verbatim.
+    if usage.get("input_tokens_details").is_none() {
+        usage["input_tokens_details"] = json!({
+            "cached_tokens": response.usage.input_tokens_details.cached_tokens,
+            "cache_write_tokens": response.usage.input_tokens_details.cache_write_tokens,
+        });
+    }
+    if usage.get("output_tokens_details").is_none() {
+        usage["output_tokens_details"] =
+            json!({"reasoning_tokens": response.usage.output_tokens_details.reasoning_tokens});
+    }
     let mut completed = json!({
         "id": response.response_id,
         "status": "completed",

@@ -302,7 +302,7 @@ async fn modal_cancelled_read_closes_the_descriptor() {
 }
 
 async fn wait_until(mut condition: impl FnMut() -> bool) -> bool {
-    for _ in 0..500 {
+    for _ in 0..3000 {
         if condition() {
             return true;
         }

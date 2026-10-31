@@ -585,6 +585,195 @@ fn percent_decode_ref(reference: &str) -> Result<String> {
     })
 }
 
+/// Check a tool-argument object against the value constraints its JSON schema declares.
+///
+/// Python validates arguments with the pydantic model built from the function signature, so a
+/// `Field(ge=0, le=100)` or `min_length` bound rejects a bad model call. Rust deserializes with
+/// serde, which ignores those bounds, so this enforces the same keywords the schema emits:
+/// `minimum`, `maximum`, `exclusiveMinimum`, `exclusiveMaximum`, `multipleOf`, `minLength`,
+/// `maxLength`, `pattern`, `minItems`, `maxItems`, `uniqueItems`, `enum` and `const`, through
+/// `$ref`, `allOf`, `anyOf`, `oneOf`, `properties`, `additionalProperties` and `items`. Shape
+/// errors (types, required fields) stay with serde. Returns the first violation, prefixed with
+/// the path to the offending value.
+pub(crate) fn validate_value_constraints(
+    root: &Value,
+    value: &Value,
+) -> std::result::Result<(), String> {
+    validate_node(root, root, value, "", 0)
+}
+
+fn validate_node(
+    root: &Value,
+    schema: &Value,
+    value: &Value,
+    path: &str,
+    depth: usize,
+) -> std::result::Result<(), String> {
+    let at = |message: String| {
+        if path.is_empty() {
+            message
+        } else {
+            format!("{path}: {message}")
+        }
+    };
+    let Value::Object(schema) = schema else {
+        return match schema {
+            Value::Bool(false) => Err(at("Input is not allowed".to_string())),
+            _ => Ok(()),
+        };
+    };
+    if depth > MAX_SCHEMA_DEPTH {
+        return Ok(());
+    }
+    if let Some(reference) = schema.get("$ref").and_then(Value::as_str)
+        && let Ok(target) = resolve_ref(root, reference)
+    {
+        validate_node(root, &target, value, path, depth + 1)?;
+    }
+    if let Some(all) = schema.get("allOf").and_then(Value::as_array) {
+        for sub in all {
+            validate_node(root, sub, value, path, depth + 1)?;
+        }
+    }
+    for keyword in ["anyOf", "oneOf"] {
+        if let Some(options) = schema.get(keyword).and_then(Value::as_array) {
+            let mut first_error = None;
+            let matched = options.iter().any(|option| {
+                match validate_node(root, option, value, path, depth + 1) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        first_error.get_or_insert(e);
+                        false
+                    }
+                }
+            });
+            if !matched && let Some(error) = first_error {
+                return Err(error);
+            }
+        }
+    }
+    if let Some(allowed) = schema.get("enum").and_then(Value::as_array)
+        && !allowed.contains(value)
+    {
+        return Err(at("Input should be one of the allowed values".to_string()));
+    }
+    if let Some(expected) = schema.get("const")
+        && expected != value
+    {
+        return Err(at(format!("Input should be {expected}")));
+    }
+    match value {
+        Value::Number(n) => {
+            let Some(x) = n.as_f64() else { return Ok(()) };
+            let bound = |key: &str| schema.get(key).and_then(Value::as_f64);
+            if let Some(b) = bound("minimum")
+                && x < b
+            {
+                return Err(at(format!("Input should be greater than or equal to {b}")));
+            }
+            if let Some(b) = bound("maximum")
+                && x > b
+            {
+                return Err(at(format!("Input should be less than or equal to {b}")));
+            }
+            if let Some(b) = bound("exclusiveMinimum")
+                && x <= b
+            {
+                return Err(at(format!("Input should be greater than {b}")));
+            }
+            if let Some(b) = bound("exclusiveMaximum")
+                && x >= b
+            {
+                return Err(at(format!("Input should be less than {b}")));
+            }
+            if let Some(m) = bound("multipleOf")
+                && m > 0.0
+                && ((x / m).round() * m - x).abs() > f64::EPSILON * x.abs().max(1.0)
+            {
+                return Err(at(format!("Input should be a multiple of {m}")));
+            }
+        }
+        Value::String(text) => {
+            let length = text.chars().count() as u64;
+            if let Some(b) = schema.get("minLength").and_then(Value::as_u64)
+                && length < b
+            {
+                return Err(at(format!("String should have at least {b} characters")));
+            }
+            if let Some(b) = schema.get("maxLength").and_then(Value::as_u64)
+                && length > b
+            {
+                return Err(at(format!("String should have at most {b} characters")));
+            }
+            if let Some(pattern) = schema.get("pattern").and_then(Value::as_str)
+                && let Ok(re) = regex::Regex::new(pattern)
+                && !re.is_match(text)
+            {
+                return Err(at(format!("String should match pattern '{pattern}'")));
+            }
+        }
+        Value::Array(items) => {
+            if let Some(b) = schema.get("minItems").and_then(Value::as_u64)
+                && (items.len() as u64) < b
+            {
+                return Err(at(format!("List should have at least {b} items")));
+            }
+            if let Some(b) = schema.get("maxItems").and_then(Value::as_u64)
+                && items.len() as u64 > b
+            {
+                return Err(at(format!("List should have at most {b} items")));
+            }
+            if schema.get("uniqueItems") == Some(&Value::Bool(true))
+                && items
+                    .iter()
+                    .enumerate()
+                    .any(|(i, a)| items[..i].contains(a))
+            {
+                return Err(at("Items should be unique".to_string()));
+            }
+            let prefix = schema
+                .get("prefixItems")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len);
+            for (i, item) in items.iter().enumerate() {
+                let item_path = format!("{path}[{i}]");
+                let item_schema = if i < prefix {
+                    schema.get("prefixItems").and_then(|p| p.get(i))
+                } else {
+                    schema
+                        .get("items")
+                        .filter(|s| s.is_object() || s.is_boolean())
+                };
+                if let Some(item_schema) = item_schema {
+                    validate_node(root, item_schema, item, &item_path, depth + 1)?;
+                }
+            }
+        }
+        Value::Object(map) => {
+            let properties = schema.get("properties").and_then(Value::as_object);
+            for (key, item) in map {
+                let item_path = if path.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{path}.{key}")
+                };
+                match properties.and_then(|p| p.get(key)) {
+                    Some(property) => validate_node(root, property, item, &item_path, depth + 1)?,
+                    None => {
+                        if let Some(extra) =
+                            schema.get("additionalProperties").filter(|a| a.is_object())
+                        {
+                            validate_node(root, extra, item, &item_path, depth + 1)?;
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

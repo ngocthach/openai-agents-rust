@@ -309,21 +309,37 @@ pub fn extract_mcp_tool_metadata(tool: &MCPTool) -> MCPToolMetadata {
     }
 }
 
-/// [`extract_mcp_tool_metadata`] for a hosted-MCP tool, which arrives as raw JSON.
+/// [`resolve_mcp_tool_title`] for a tool that arrives as raw JSON (hosted MCP).
 ///
 /// Python's resolvers take `Any` and read either a mapping key or an attribute; the Rust
-/// equivalents are this `Value` form for hosted MCP and the [`MCPTool`] form for local MCP.
+/// equivalents are the `*_value` forms for raw JSON and the [`MCPTool`] forms for local MCP.
+pub fn resolve_mcp_tool_title_value(tool: &Value) -> Option<String> {
+    non_empty(tool.get("title").and_then(Value::as_str)).or_else(|| {
+        non_empty(
+            tool.get("annotations")
+                .and_then(|a| a.get("title"))
+                .and_then(Value::as_str),
+        )
+    })
+}
+
+/// [`resolve_mcp_tool_description`] for a tool that arrives as raw JSON (hosted MCP).
+pub fn resolve_mcp_tool_description_value(tool: &Value) -> Option<String> {
+    non_empty(tool.get("description").and_then(Value::as_str))
+}
+
+/// [`resolve_mcp_tool_description_for_model`] for a tool that arrives as raw JSON.
+pub fn resolve_mcp_tool_description_for_model_value(tool: &Value) -> String {
+    resolve_mcp_tool_description_value(tool)
+        .or_else(|| resolve_mcp_tool_title_value(tool))
+        .unwrap_or_default()
+}
+
+/// [`extract_mcp_tool_metadata`] for a hosted-MCP tool, which arrives as raw JSON.
 pub fn extract_mcp_tool_metadata_value(tool: &Value) -> MCPToolMetadata {
-    let field = |key: &str| non_empty(tool.get(key).and_then(Value::as_str));
     MCPToolMetadata {
-        description: field("description"),
-        title: field("title").or_else(|| {
-            non_empty(
-                tool.get("annotations")
-                    .and_then(|a| a.get("title"))
-                    .and_then(Value::as_str),
-            )
-        }),
+        description: resolve_mcp_tool_description_value(tool),
+        title: resolve_mcp_tool_title_value(tool),
     }
 }
 
@@ -336,7 +352,17 @@ pub fn collect_mcp_list_tools_metadata(
 ) -> BTreeMap<(String, String), MCPToolMetadata> {
     let mut out = BTreeMap::new();
     for item in items {
-        let raw = item.get("raw_item").unwrap_or(item);
+        // Python: `raw_item or item`, so a falsy `raw_item` falls back to the item itself.
+        let raw = item
+            .get("raw_item")
+            .filter(|raw| match raw {
+                Value::Null | Value::Bool(false) => false,
+                Value::String(s) => !s.is_empty(),
+                Value::Array(a) => !a.is_empty(),
+                Value::Object(o) => !o.is_empty(),
+                _ => true,
+            })
+            .unwrap_or(item);
         if raw.get("type").and_then(Value::as_str) != Some("mcp_list_tools") {
             continue;
         }

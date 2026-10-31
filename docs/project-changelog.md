@@ -1,5 +1,86 @@
 # Changelog
 
+## 0.8.0 (2026-10-31)
+
+Closes the gaps a completeness check found in the 0.6.0/0.7.0 parity work: about 450 cases of top-level
+Python test files had never been assigned to a port, among them the scripted model, the server
+conversation tracker, start-hook tool concurrency, computer actions, extension filters, MCP tool
+metadata, visualization and `as_tool`. All 174 top-level Python test files are now cited by at least one
+Rust port or a recorded Python-only reason (`plans/reports/py-test-parity-core5-leftover*.md`).
+
+Python test-parity fixes (leftover files `test_scripted_model`, `test_scripted_sandbox`,
+`test_server_conversation_tracker`, `test_streamed_terminal_output_backfill`,
+`test_streaming_tool_call_arguments`, `test_start_hook_tool_concurrency`; see
+`plans/reports/py-test-parity-core5-leftover1.md`):
+
+- The scripted test model (`ScriptedModel`) matches Python's streamed events and usage: function-call and
+  reasoning payloads are announced as in progress, logprobs are preserved, and `response.completed` usage
+  carries the request count and per-request entries. Responders may return other responders, and
+  `ScriptedStep::respond_async` / `ScriptedStep::stream_with` are new. Breaking: `ScriptedStep` has two
+  new public fields (use `..Default::default()`), `ModelScriptError` display text changed, and scripted
+  default usage is one request instead of zero.
+- Input items held back by a `call_model_input_filter` are offered again on the next call instead of
+  being dropped for good, and server-conversation hydration only marks items the server holds.
+- A streamed response whose terminal output is empty is backfilled from the
+  `response.output_item.done` items.
+- The scripted sandbox session no longer consumes a step on a rejected matcher, reports payload-free
+  structured failures, and derives `supports_pty()` and `running()` from its script.
+
+Deliberate difference: the automatic scripted stream rejects fewer item kinds than Python (shell, program
+and tool-search items pass through as bare added/done events), because seven streamed tests script them
+through it. Python's start-hook concurrency tests mutate `agent.tools` on a shared agent; a Rust `Agent`
+is read-only while it runs, so those cases are Python-only and the isolation guarantees are ported.
+
+
+Python test-parity fixes (leftover files `test_extension_filters`, `test_mcp_tool_metadata`,
+`test_visualization` and the completeness sweep; see `plans/reports/py-test-parity-core5-leftover3.md`):
+
+- Typed function-tool arguments are checked against the value bounds in their JSON schema before
+  the call (`minimum`, `maximum`, `exclusiveMinimum`, `exclusiveMaximum`, `multipleOf`, `minLength`,
+  `maxLength`, `pattern`, `minItems`, `maxItems`, `uniqueItems`, `enum`, `const`), through nested
+  models and lists. A violation is reported as `Invalid JSON input for tool X`, as Python's pydantic
+  validation does; before, serde accepted any value of the right type. Adds a direct `regex`
+  dependency for `pattern`.
+- `RunErrorDetails` implements `Display` (and `pretty_print`) with Python's `str(details)` summary.
+- `extensions::handoff_filters::remove_all_tools` keeps compaction items, as Python does, and the
+  module re-exports `nest_handoff_history` and `default_handoff_history_mapper`.
+- A persisted `tool_lookup_key` that is not a valid key (missing or empty `name`, unknown `kind`,
+  `namespaced` without a namespace) reads as no key instead of being kept verbatim.
+- `extensions::visualization` gains `get_all_nodes_with_visited` / `get_all_edges_with_visited`, which
+  take the caller's set of already-drawn agent names; a previously drawn agent is skipped but keeps its
+  node id reserved.
+- `mcp` gains `resolve_mcp_tool_title_value`, `resolve_mcp_tool_description_value` and
+  `resolve_mcp_tool_description_for_model_value` for tools that arrive as raw JSON, and
+  `collect_mcp_list_tools_metadata` treats an empty `raw_item` as absent.
+
+Python test-parity fixes (leftover files `test_agent_as_tool`, `test_computer_action`,
+`test_call_model_input_filter`, `test_invalid_final_output_handler`, `test_agent_config`,
+`test_tool_converter`; see `plans/reports/py-test-parity-core5-leftover2.md`):
+
+- `Agent::as_tool` validates the arguments against the tool's object schema (the default
+  `{"input": str}` or `parameters`) and drops undeclared fields, reporting `Invalid JSON input for
+  tool X`; a plain agent tool no longer inherits the caller's structured tool input; with no
+  explicit `run_config` the nested run inherits the caller's.
+- `AgentAsToolOptions::on_stream` events go through a bounded queue (`on_stream_max_pending_events`,
+  default 1024, `None` for unbounded): a slow handler no longer stalls the nested run, a panicking
+  handler is logged and does not fail the call, events emitted before a stream error are still
+  delivered, an overflowing backlog cancels the nested run and fails the tool, and the event agent
+  follows handoffs. New `Agent::try_as_tool_with` (rejects a zero limit; `as_tool_with` panics) and
+  `AgentAsToolOptions::input_items_builder` (a builder that returns input items).
+- An empty structured model turn with an `invalid_final_output` handler that declines runs another
+  turn instead of failing the run.
+- A failing `call_model_input_filter` records `Error in call_model_input_filter` on the turn span; a
+  failing computer action records `tool_name: computer` on its span and logs
+  `Failed to execute computer action`; the agent span lists the GA `computer` tool name
+  (`Tool::trace_name`); the missing-`on_safety_check` warning ends with `Configure
+  ComputerTool.on_safety_check to review or reject them.`
+- Chat Completions rejects `output_json_schema` tools like the other Responses-only function-tool
+  features and names them as Python does (`defer_loading=True`, `namespace.tool`).
+- `ModelSettings::from_value` builds settings from a JSON object, rejecting unknown keys at every
+  level (`Unknown model settings in retry.backoff: ...`). Breaking: `Reasoning` gains a public
+  `extra` map that keeps unmodelled reasoning options (struct literals need `..Default::default()`);
+  a partial `retry` / `retry.backoff` object keeps defaults for omitted fields.
+
 ## 0.7.0 (2026-10-31)
 
 Completes the sandbox and runner-tracing parity work that 0.6.0 left open. All 806 cases of the Python
