@@ -13,16 +13,12 @@
 //! `extra_path_grants`). Rust's error context holds strings, so the same keys carry the same
 //! values, with `extra_path_grants` rendered as a JSON array.
 //!
-//! Not ported, because they patch Python's `os` module and the module-private
-//! `_OPEN_SUPPORTS_DIR_FD` / `_HAS_O_DIRECTORY` flags to simulate a path being swapped for a
-//! symlink between validation and open: `test_local_dir_copy_falls_back_when_safe_dir_fd_open_unavailable`,
-//! `..._revalidates_swapped_paths_during_open`, `..._pins_parent_directories_during_open`,
-//! `..._fallback_rejects_swapped_parent_directory`, `..._apply_rejects_source_root_swapped_to_symlink_after_validation`
-//! and its `_fallback_` twin. Rust reads every host file with `O_NOFOLLOW`, so a source swapped
-//! for a link after validation fails to open instead of being followed; the symlinked-leaf tests
-//! below assert the same refusal. `test_git_repo_copies_to_a_posix_destination_from_a_windows_host`
-//! is likewise Python-only: sandbox destinations are `&str` POSIX paths here, so a host-native
-//! `PureWindowsPath` cannot reach the copy command.
+//! Not ported here: `test_local_dir_copy_falls_back_when_safe_dir_fd_open_unavailable` (it
+//! switches off Python's `_OPEN_SUPPORTS_DIR_FD` / `_HAS_O_DIRECTORY` flags; Rust always walks
+//! with directory descriptors) and `test_git_repo_copies_to_a_posix_destination_from_a_windows_host`
+//! (sandbox destinations are `&str` POSIX paths here, so a host-native `PureWindowsPath` cannot
+//! reach the copy command). The swap-between-validation-and-open cases are ported in
+//! `py_core7_a_entries_swaps.rs`.
 #![cfg(feature = "sandbox")]
 #![cfg(unix)]
 

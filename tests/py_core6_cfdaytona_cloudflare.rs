@@ -1022,10 +1022,12 @@ async fn hydrate_rejects_an_unsafe_tar_without_contacting_the_worker() {
 // ---------------------------------------------------------------------------------------------
 
 /// `test_cloudflare_shutdown_does_not_log_protected_mount_authority` and
-/// `test_cloudflare_shutdown_logs_respect_tool_data_policy` (redacted case): a failed delete
-/// reports its status and never the provider body, which may echo a mount secret.
+/// `test_cloudflare_shutdown_logs_respect_tool_data_policy` (redacted case): a failed delete is
+/// swallowed, as Python's `_shutdown_backend` does, and neither a log line nor an error carries
+/// the provider body, which may echo a mount secret. Only a terminal mount transition surfaces
+/// the failure (`resume_reapply_surfaces_terminal_delete_failure`).
 #[tokio::test]
-async fn failed_shutdown_never_echoes_the_provider_body() {
+async fn failed_shutdown_is_swallowed_and_never_echoes_the_provider_body() {
     let sentinel = "cloudflare-secret-access-key";
     let server = worker(move |request| {
         if request.method == "DELETE" {
@@ -1044,26 +1046,32 @@ async fn failed_shutdown_never_echoes_the_provider_body() {
         .await
         .expect("create");
 
-    let error = session.shutdown().await.expect_err("delete failed");
+    session
+        .shutdown()
+        .await
+        .expect("a failed delete does not fail teardown");
 
-    assert_eq!(error.code, ErrorCode::WorkspaceStopError);
-    assert!(error.message.contains("HTTP 502"), "{}", error.message);
-    assert!(!format!("{error:?}").contains(sentinel), "{error:?}");
+    let deletes: Vec<_> = server
+        .requests()
+        .into_iter()
+        .filter(|request| request.method == "DELETE")
+        .collect();
+    assert_eq!(deletes.len(), 1);
     server.stop();
 }
 
-/// `test_cloudflare_shutdown_does_not_log_protected_mount_exception`: a transport failure whose
-/// text would carry a secret is reported as a stop error. (The connection error text comes from
-/// the local socket, so the sentinel cannot appear; this pins the error class.)
+/// `test_cloudflare_shutdown_does_not_log_protected_mount_exception`: a transport failure on the
+/// delete is swallowed as well.
 #[tokio::test]
-async fn shutdown_transport_failure_is_a_stop_error() {
+async fn shutdown_transport_failure_is_swallowed() {
     let server = worker(|_| exec_ok()).await;
     let session = client(&server).create(None).await.expect("create");
     server.stop();
 
-    let error = session.shutdown().await.expect_err("worker is gone");
-
-    assert_eq!(error.code, ErrorCode::WorkspaceStopError);
+    session
+        .shutdown()
+        .await
+        .expect("an unreachable worker does not fail teardown");
 }
 
 // ---------------------------------------------------------------------------------------------

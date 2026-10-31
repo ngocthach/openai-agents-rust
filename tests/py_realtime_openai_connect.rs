@@ -1339,7 +1339,7 @@ async fn no_auto_interrupt_on_vad_speech_started() {
     let (model, _events) = connect(&server, None, None).await;
     let _ = server.next_frame("session.update").await;
 
-    server.push(json!({"type": "input_audio_buffer.speech_started"}));
+    server.push(json!({"type": "input_audio_buffer.speech_started", "event_id": "evt"}));
     send_marker(&model).await;
 
     let frames = server.frames_before_marker().await;

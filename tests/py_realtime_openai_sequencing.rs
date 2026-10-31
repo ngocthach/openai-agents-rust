@@ -27,13 +27,15 @@ use serde_json::{Value, json};
 mod support;
 use support::*;
 
-const SENTINEL: &str = "py.test.sentinel";
+/// A server event the transport recognises but does not act on: the barrier that shows every
+/// event pushed before it was handled.
+const SENTINEL: &str = "input_audio_buffer.cleared";
 
 async fn settle(
     server: &MockRealtimeServer,
     events: &mut RealtimeModelEvents,
 ) -> Vec<RealtimeModelEvent> {
-    server.push(json!({"type": SENTINEL}));
+    server.push(json!({"type": SENTINEL, "event_id": "barrier"}));
     let mut collected = Vec::new();
     tokio::time::timeout(TIMEOUT, async {
         while let Some(event) = events.recv().await {
@@ -129,12 +131,12 @@ async fn custom_voice_response_events_update_response_sequencer() {
     );
 
     let with_voice = json!({
-        "type": "response.created",
+        "type": "response.created", "event_id": "evt",
         "response": {"audio": {"output": {"voice": {"id": "voice_test"}}}},
     });
     server.push(with_voice.clone());
     server.push(json!({
-        "type": "response.done",
+        "type": "response.done", "event_id": "evt",
         "response": {"audio": {"output": {"voice": {"id": "voice_test"}}}},
     }));
     let emitted = settle(&server, &mut events).await;

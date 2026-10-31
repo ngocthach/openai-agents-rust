@@ -25,14 +25,16 @@ use serde_json::{Value, json};
 mod support;
 use support::*;
 
-const SENTINEL: &str = "py.test.sentinel";
+/// A server event the transport recognises but does not act on: the barrier that shows every
+/// event pushed before it was handled.
+const SENTINEL: &str = "input_audio_buffer.cleared";
 
 /// Everything emitted for the events pushed so far, minus connection status; see the events file.
 async fn settle(
     server: &MockRealtimeServer,
     events: &mut RealtimeModelEvents,
 ) -> Vec<RealtimeModelEvent> {
-    server.push(json!({"type": SENTINEL}));
+    server.push(json!({"type": SENTINEL, "event_id": "barrier"}));
     let mut collected = Vec::new();
     tokio::time::timeout(TIMEOUT, async {
         while let Some(event) = events.recv().await {
@@ -456,7 +458,7 @@ async fn interrupt_force_cancel_overrides_auto_cancellation() {
 async fn response_only_interrupt_targets_response_without_touching_audio() {
     let (mut server, model, mut events) = manual_cancellation(None).await;
     server.push(audio_delta("response_1", "audio_item", FIFTY_MS));
-    server.push(json!({"type": "response.created", "response": {}}));
+    server.push(json!({"type": "response.created", "event_id": "evt", "response": {}}));
     let _ = settle(&server, &mut events).await;
 
     send_interrupt(&model, response_only("response_1")).await;
@@ -484,7 +486,7 @@ async fn response_only_interrupt_targets_response_without_touching_audio() {
 #[tokio::test]
 async fn concurrent_response_only_interrupts_cancel_response_once() {
     let (mut server, model, mut events) = manual_cancellation(None).await;
-    server.push(json!({"type": "response.created", "response": {}}));
+    server.push(json!({"type": "response.created", "event_id": "evt", "response": {}}));
     let _ = settle(&server, &mut events).await;
 
     let (first, second) = tokio::join!(
@@ -609,7 +611,7 @@ async fn response_only_interrupt_skips_cancel_after_response_done() {
 async fn normal_interrupt_targets_response_and_interrupts_audio() {
     let (mut server, model, mut events) = manual_cancellation(None).await;
     server.push(audio_delta("response_1", "audio_item", FIFTY_MS));
-    server.push(json!({"type": "response.created", "response": {}}));
+    server.push(json!({"type": "response.created", "event_id": "evt", "response": {}}));
     let _ = settle(&server, &mut events).await;
 
     send_interrupt(
@@ -662,7 +664,7 @@ async fn playback_only_interrupt_does_not_stop_newer_response_audio() {
     let tracker = RealtimePlaybackTracker::shared();
     let (mut server, model, mut events) = old_and_new_audio(&tracker).await;
     tracker.on_play_ms("new_audio_item", 0, 50.0);
-    server.push(json!({"type": "response.created", "response": {}}));
+    server.push(json!({"type": "response.created", "event_id": "evt", "response": {}}));
     let _ = settle(&server, &mut events).await;
 
     send_interrupt(&model, RealtimeInterrupt::playback_only("old_response")).await;

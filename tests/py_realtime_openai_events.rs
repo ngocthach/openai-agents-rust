@@ -22,7 +22,9 @@ use serde_json::{Value, json};
 mod support;
 use support::*;
 
-const SENTINEL: &str = "py.test.sentinel";
+/// A server event the transport recognises but does not act on: the barrier that shows every
+/// event pushed before it was handled.
+const SENTINEL: &str = "input_audio_buffer.cleared";
 
 /// Everything the transport emitted for the events pushed so far, minus connection status.
 ///
@@ -32,7 +34,7 @@ async fn settle(
     server: &MockRealtimeServer,
     events: &mut RealtimeModelEvents,
 ) -> Vec<RealtimeModelEvent> {
-    server.push(json!({"type": SENTINEL}));
+    server.push(json!({"type": SENTINEL, "event_id": "barrier"}));
     let mut collected = Vec::new();
     tokio::time::timeout(TIMEOUT, async {
         while let Some(event) = events.recv().await {
@@ -155,7 +157,7 @@ async fn handle_malformed_json_continues() {
 #[tokio::test]
 async fn handle_invalid_event_schema_emits_an_error() {
     let (server, model, mut events) = ready().await;
-    server.push(json!({"type": "response.output_audio.delta"}));
+    server.push(json!({"type": "response.output_audio.delta", "content_index": 0, "event_id": "evt", "output_index": 0}));
     let emitted = settle(&server, &mut events).await;
 
     assert_eq!(
@@ -171,14 +173,15 @@ async fn handle_invalid_event_schema_emits_an_error() {
     server.stop();
 }
 
-/// `test_handle_unknown_event_type_ignored`: an unknown type is forwarded, never an error.
+/// `test_handle_unknown_event_type_ignored`: Python validates every server event against the
+/// known event union, so an unknown type is reported as a validation error, never an exception.
 #[tokio::test]
 async fn handle_unknown_event_type_ignored() {
     let (server, model, mut events) = ready().await;
     server.push(json!({"type": "unknown.event.type", "data": "some data"}));
     let emitted = settle(&server, &mut events).await;
 
-    assert_eq!(kinds(&emitted), ["raw_server_event", "other"]);
+    assert_eq!(kinds(&emitted), ["raw_server_event", "error"]);
     assert!(
         !emitted
             .iter()
@@ -194,7 +197,7 @@ async fn handle_unknown_event_type_ignored() {
 async fn response_done_emits_typed_usage_before_turn_ended() {
     let (server, model, mut events) = ready().await;
     server.push(json!({
-        "type": "response.done",
+        "type": "response.done", "event_id": "evt",
         "response": {
             "id": "response_1",
             "status": "cancelled",
@@ -229,7 +232,7 @@ async fn response_done_emits_typed_usage_before_turn_ended() {
 #[tokio::test]
 async fn response_done_without_usage_skips_usage_event() {
     let (server, model, mut events) = ready().await;
-    server.push(json!({"type": "response.done", "response": {}}));
+    server.push(json!({"type": "response.done", "event_id": "evt", "response": {}}));
     let emitted = settle(&server, &mut events).await;
     assert_eq!(kinds(&emitted), ["raw_server_event", "turn_ended"]);
     model.close().await.unwrap();
@@ -241,7 +244,7 @@ async fn response_done_without_usage_skips_usage_event() {
 async fn convert_response_usage_preserves_modality_details() {
     let (server, model, mut events) = ready().await;
     server.push(json!({
-        "type": "response.done",
+        "type": "response.done", "event_id": "evt",
         "response": {"id": "r", "usage": {
             "total_tokens": 253,
             "input_tokens": 132,
@@ -294,7 +297,7 @@ async fn convert_response_usage_preserves_modality_details() {
 async fn convert_response_usage_preserves_missing_details_and_derives_total() {
     let (server, model, mut events) = ready().await;
     server.push(json!({
-        "type": "response.done",
+        "type": "response.done", "event_id": "evt",
         "response": {"id": "r", "usage": {
             "input_tokens": 12,
             "output_tokens": 3,
@@ -422,7 +425,7 @@ async fn retrieved_completed_item_keeps_status_in_session_history() {
     })
     .await;
     // Give the retrieved event time to be processed, ordered behind a sentinel.
-    server.push(json!({"type": SENTINEL}));
+    server.push(json!({"type": SENTINEL, "event_id": "barrier"}));
     wait_for_session_raw_sentinel(&session).await;
 
     let history = session.history();
@@ -539,7 +542,7 @@ async fn handle_audio_delta_state_management() {
 async fn backward_compat_output_item_added_and_done() {
     let (server, model, mut events) = ready().await;
     server.push(json!({
-        "type": "response.output_item.added",
+        "type": "response.output_item.added", "event_id": "evt", "output_index": 0,
         "item": {
             "id": "m1",
             "type": "message",
@@ -551,7 +554,7 @@ async fn backward_compat_output_item_added_and_done() {
         },
     }));
     server.push(json!({
-        "type": "response.output_item.done",
+        "type": "response.output_item.done", "event_id": "evt", "output_index": 0,
         "item": {
             "id": "m1",
             "type": "message",
@@ -576,7 +579,7 @@ async fn backward_compat_output_item_added_and_done() {
 async fn text_mode_output_item_content() {
     let (server, model, mut events) = ready().await;
     server.push(json!({
-        "type": "response.output_item.added",
+        "type": "response.output_item.added", "event_id": "evt", "output_index": 0,
         "item": {
             "id": "text_item_1",
             "type": "message",
@@ -631,7 +634,7 @@ async fn output_text_delta_emits_normalized_event() {
 async fn output_audio_content_type_normalized() {
     let (server, model, mut events) = ready().await;
     server.push(json!({
-        "type": "response.output_item.added",
+        "type": "response.output_item.added", "event_id": "evt", "output_index": 0,
         "item": {
             "id": "audio_item_1",
             "type": "message",
@@ -738,7 +741,7 @@ async fn speech_started_truncates_when_response_ongoing() {
     let (model, mut events) = connect(&server, None, Some(tracker.clone())).await;
     let _ = server.next_frame("session.update").await;
     server.push(session_created(Some(pcm16())));
-    server.push(json!({"type": "response.created", "response": {"id": "r1"}}));
+    server.push(json!({"type": "response.created", "event_id": "evt", "response": {"id": "r1"}}));
     server.push(audio_delta("r1", "i1", 0, &[b'a'; 48_000]));
     let _ = settle(&server, &mut events).await;
     tracker.on_play_ms("i1", 0, 5_000.0);

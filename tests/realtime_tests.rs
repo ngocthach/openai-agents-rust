@@ -964,7 +964,7 @@ async fn the_sip_model_attaches_to_a_call_and_forwards_events() {
         }
         ws.send(Message::text(
             json!({
-                "type": "conversation.item.deleted",
+                "type": "conversation.item.deleted", "event_id": "evt",
                 "item_id": "item_gone",
             })
             .to_string(),
@@ -1035,7 +1035,7 @@ async fn the_playback_tracker_decides_where_audio_is_truncated() {
         // Negotiate pcm16, then send 100 ms of audio (24 kHz, 2 bytes per sample).
         ws.send(Message::text(
             json!({
-                "type": "session.created",
+                "type": "session.created", "event_id": "evt",
                 "session": {
                     "type": "realtime",
                     "model": "gpt-realtime-2.1",
@@ -1049,7 +1049,7 @@ async fn the_playback_tracker_decides_where_audio_is_truncated() {
         let silence = base64_encode(&vec![0u8; 4800]);
         ws.send(Message::text(
             json!({
-                "type": "response.output_audio.delta",
+                "type": "response.output_audio.delta", "event_id": "evt", "output_index": 0,
                 "item_id": "item_1",
                 "content_index": 0,
                 "response_id": "resp_1",
@@ -1939,18 +1939,19 @@ async fn the_transport_re_requests_an_item_the_server_rewrote() {
         let silence = base64_encode(&[0u8; 48]);
         for event in [
             json!({
-                "type": "response.output_audio.delta",
+                "type": "response.output_audio.delta", "event_id": "evt", "output_index": 0,
                 "item_id": "item_1",
                 "content_index": 0,
                 "response_id": "resp_1",
                 "delta": silence,
             }),
             json!({
-                "type": "conversation.item.input_audio_transcription.completed",
+                "type": "conversation.item.input_audio_transcription.completed", "content_index": 0, "event_id": "evt",
                 "item_id": "user_1",
                 "transcript": "hello",
+                "usage": {"type": "tokens", "total_tokens": 1},
             }),
-            json!({"type": "conversation.item.truncated", "item_id": "item_1"}),
+            json!({"type": "conversation.item.truncated", "audio_end_ms": 0, "content_index": 0, "event_id": "evt", "item_id": "item_1"}),
         ] {
             ws.send(Message::text(event.to_string())).await.unwrap();
         }
@@ -2206,7 +2207,7 @@ async fn websocket_model_speaks_the_ga_protocol_against_a_mock_server() {
         // Acknowledge the session, then push one server event the client must map.
         ws.send(Message::text(
             json!({
-                "type": "session.created",
+                "type": "session.created", "event_id": "evt",
                 "session": {"type": "realtime", "model": "gpt-realtime-2.1"},
             })
             .to_string(),
@@ -2215,7 +2216,7 @@ async fn websocket_model_speaks_the_ga_protocol_against_a_mock_server() {
         .unwrap();
         ws.send(Message::text(
             json!({
-                "type": "response.output_audio_transcript.delta",
+                "type": "response.output_audio_transcript.delta", "content_index": 0, "event_id": "evt", "output_index": 0,
                 "item_id": "item_1",
                 "response_id": "resp_1",
                 "delta": "hello from the server",

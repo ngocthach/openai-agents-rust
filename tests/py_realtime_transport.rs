@@ -149,7 +149,7 @@ async fn deliver_audio(
         json!({"type": "audio/pcm", "rate": 24000}),
     )));
     server.push(json!({
-        "type": "response.output_audio.delta",
+        "type": "response.output_audio.delta", "event_id": "evt", "output_index": 0,
         "item_id": "item_1",
         "content_index": 0,
         "response_id": "resp_1",
@@ -227,9 +227,10 @@ async fn interrupt_sends_truncate_when_a_response_is_ongoing() {
     server.push(session_created(Some(
         json!({"type": "audio/pcm", "rate": 24000}),
     )));
-    server.push(json!({"type": "response.created", "response": {"id": "resp_1"}}));
+    server
+        .push(json!({"type": "response.created", "event_id": "evt", "response": {"id": "resp_1"}}));
     server.push(json!({
-        "type": "response.output_audio.delta",
+        "type": "response.output_audio.delta", "event_id": "evt", "output_index": 0,
         "item_id": "item_1",
         "content_index": 0,
         "response_id": "resp_1",
@@ -299,7 +300,7 @@ async fn audio_state_accumulates_across_deltas() {
     // Two half-second deltas for the same item accumulate into one second of audio.
     for _ in 0..2 {
         server.push(json!({
-            "type": "response.output_audio.delta",
+            "type": "response.output_audio.delta", "event_id": "evt", "output_index": 0,
             "item_id": "item_1",
             "content_index": 0,
             "response_id": "resp_1",
@@ -338,7 +339,7 @@ async fn audio_delta_before_a_negotiated_format_does_not_fail() {
     // No audio format in session.created, which is what a transcription-only session looks like.
     server.push(session_created(None));
     server.push(json!({
-        "type": "response.output_audio.delta",
+        "type": "response.output_audio.delta", "event_id": "evt", "output_index": 0,
         "item_id": "item_1",
         "content_index": 0,
         "response_id": "resp_1",

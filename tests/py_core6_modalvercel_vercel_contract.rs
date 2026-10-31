@@ -330,3 +330,140 @@ async fn a_pending_reconnect_observes_the_transition() {
         server.stop();
     }
 }
+
+fn state_for(provider_id: &str) -> SandboxSessionState {
+    SandboxSessionState::new("vercel", "state-1", "/vercel/sandbox", &Manifest::new())
+        .with_provider_id(Some(provider_id.to_string()))
+}
+
+/// Answer a session lookup with the session id named in the path.
+fn lookup_named(request: &Recorded, status: &str) -> MockResponse {
+    let id = request.path.rsplit('/').next().unwrap_or("session-1");
+    let loaded = body(status, id);
+    MockResponse::json(json!({ "session": loaded["session"], "routes": loaded["routes"] }))
+}
+
+/// `test_installed_provider_resumes_legacy_id_without_name`: a state that carries only a bare
+/// id (no sandbox name) resumes onto that running session without creating another, and
+/// cleanup stops it without a `DELETE`.
+#[tokio::test]
+async fn a_bare_legacy_id_resumes_without_creating_a_sandbox() {
+    let inner = handler();
+    let server = MockServer::start(move |request: &Recorded| {
+        if request.method == "GET" && request.path.starts_with("/v2/sandboxes/sessions/") {
+            return lookup_named(request, "running");
+        }
+        inner(request)
+    })
+    .await;
+    let client = VercelSandboxClient::with_options(options(&server));
+
+    let resumed = client
+        .resume(&state_for("legacy-id"), Manifest::new())
+        .await
+        .expect("a bare id resumes");
+
+    assert_eq!(
+        resumed.session_state().provider_id.as_deref(),
+        Some("legacy-id:legacy-id")
+    );
+    assert_eq!(server.count("POST", "/v3/sandboxes"), 0, "nothing created");
+    client.delete(resumed).await.expect("delete");
+    assert_eq!(
+        server.count("POST", "/v2/sandboxes/sessions/legacy-id/stop"),
+        1
+    );
+    assert!(
+        server
+            .requests()
+            .iter()
+            .all(|request| request.method != "DELETE")
+    );
+    server.stop();
+
+    let Err(malformed) = VercelSandboxClient::with_options(VercelSandboxClientOptions::new())
+        .resume(&state_for(""), Manifest::new())
+        .await
+    else {
+        panic!("an empty identity is refused");
+    };
+    assert_eq!(malformed.code, ErrorCode::SessionStateInvalid);
+}
+
+/// `test_installed_provider_does_not_adopt_replacement_session`: when the saved session was
+/// replaced (the lookup of its id no longer finds a running session), resume creates a new
+/// sandbox under a new identity and never touches the replacement.
+#[tokio::test]
+async fn resume_does_not_adopt_a_replacement_session() {
+    let inner = handler();
+    let server = MockServer::start(move |request: &Recorded| {
+        if request.method == "GET" && request.path == "/v2/sandboxes/sessions/session-1" {
+            return lookup_named(request, "stopped");
+        }
+        if request.method == "POST" && request.path == "/v3/sandboxes" {
+            return MockResponse::json(body("running", "session-2"));
+        }
+        inner(request)
+    })
+    .await;
+    let client = VercelSandboxClient::with_options(options(&server));
+
+    let resumed = client
+        .resume(&state_for("agents-test:session-1"), Manifest::new())
+        .await
+        .expect("resume");
+
+    assert_eq!(server.count("POST", "/v3/sandboxes"), 1);
+    assert_eq!(
+        resumed.session_state().provider_id.as_deref(),
+        Some("agents-test:session-2")
+    );
+    assert!(
+        server
+            .requests()
+            .iter()
+            .all(|request| request.method != "DELETE" && !request.path.ends_with("/stop")),
+        "the replaced session is left alone"
+    );
+    server.stop();
+}
+
+/// `test_installed_provider_cleanup_preserves_concurrent_replacement`: cleanup stops the session
+/// it owns by id, so a replacement created meanwhile keeps running and no `DELETE` is sent.
+#[tokio::test]
+async fn cleanup_stops_only_the_owned_session() {
+    let created = Counter::new();
+    let inner = handler();
+    let counted = created.clone();
+    let server = MockServer::start(move |request: &Recorded| {
+        if request.method == "POST" && request.path == "/v3/sandboxes" {
+            let id = format!("session-{}", counted.next("create") + 1);
+            return MockResponse::json(body("running", &id));
+        }
+        inner(request)
+    })
+    .await;
+    let client = VercelSandboxClient::with_options(options(&server));
+    let original = client.create(None).await.expect("create");
+    let replacement = client.create(None).await.expect("replacement");
+
+    client.delete(original).await.expect("delete");
+
+    assert_eq!(
+        server.count("POST", "/v2/sandboxes/sessions/session-1/stop"),
+        1
+    );
+    assert_eq!(
+        server.count("POST", "/v2/sandboxes/sessions/session-2/stop"),
+        0,
+        "the replacement keeps running"
+    );
+    assert!(
+        server
+            .requests()
+            .iter()
+            .all(|request| request.method != "DELETE")
+    );
+    drop(replacement);
+    server.stop();
+}
