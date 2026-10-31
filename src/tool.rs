@@ -466,6 +466,12 @@ pub struct FunctionToolCustomDataContext<'a, C> {
     pub output: &'a ToolOutput,
     /// The raw output item that will be replayed to the model.
     pub raw_item: &'a Value,
+    /// The `_meta` of the MCP call result for an MCP tool, `None` otherwise. Mirrors Python's
+    /// `FunctionToolCustomDataContext.result_meta`.
+    ///
+    /// Adding this field is breaking for code that builds the struct with a literal; the SDK
+    /// itself is the only constructor.
+    pub result_meta: Option<Value>,
 }
 
 impl<C> fmt::Debug for FunctionToolCustomDataContext<'_, C> {
@@ -538,6 +544,18 @@ pub(crate) fn invalid_tool_input_error(
     AgentsError::model_behavior(message)
 }
 
+/// The error for a tool input that parses as JSON but is not an object. The payload is not
+/// echoed, so it needs no tool-data gate.
+pub(crate) fn invalid_tool_input_not_object(tool_name: &str) -> AgentsError {
+    log::debug!(
+        target: crate::logger::LOG_TARGET,
+        "Invalid JSON input for tool {tool_name}: expected a JSON object"
+    );
+    AgentsError::model_behavior(format!(
+        "Invalid JSON input for tool {tool_name}: expected a JSON object"
+    ))
+}
+
 /// One shared [`default_tool_error_function`] handle per context type, so a configuration
 /// that defaults to it (such as `MCPConfig::default`) can later be recognized by identity.
 pub(crate) fn shared_default_tool_error_function<C: 'static>() -> ToolErrorFn<C> {
@@ -598,6 +616,9 @@ pub struct FunctionTool<C> {
     pub description: String,
     /// JSON schema of the parameters.
     pub params_json_schema: Value,
+    /// The parameters schema as given, before strict conversion. Turning strictness off restores
+    /// it, as Python keeps the original schema for `strict_json_schema=False`.
+    pub(crate) raw_params_json_schema: Value,
     /// Whether the schema is strict.
     pub strict_json_schema: bool,
     /// Enablement check.
@@ -657,6 +678,7 @@ impl<C> Clone for FunctionTool<C> {
             name: self.name.clone(),
             description: self.description.clone(),
             params_json_schema: self.params_json_schema.clone(),
+            raw_params_json_schema: self.raw_params_json_schema.clone(),
             strict_json_schema: self.strict_json_schema,
             is_enabled: self.is_enabled.clone(),
             needs_approval: self.needs_approval.clone(),
@@ -706,11 +728,51 @@ impl<C: Send + Sync + 'static> FunctionTool<C> {
     ///
     /// `Args` must implement `schemars::JsonSchema` and `serde::Deserialize`; its schema is used
     /// as the tool parameters (converted to strict mode).
+    ///
+    /// # Panics
+    ///
+    /// Panics when the argument type's schema cannot be made strict, as Python's
+    /// `function_tool` raises at definition time. Use [`try_new`](Self::try_new) to get the
+    /// error instead.
     pub fn new<Args, F, Fut, T>(
         name: impl Into<String>,
         description: impl Into<String>,
         f: F,
     ) -> Self
+    where
+        Args: JsonSchema + DeserializeOwned + Send + 'static,
+        F: Fn(ToolContext<C>, Args) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<T>> + Send + 'static,
+        T: IntoToolOutput + Send + 'static,
+    {
+        Self::try_new(name, description, f).unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    /// Fallible form of [`new`](Self::new). Returns `UserError` when the argument type's schema
+    /// cannot be made strict, instead of falling back to a non-strict tool.
+    pub fn try_new<Args, F, Fut, T>(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        f: F,
+    ) -> Result<Self>
+    where
+        Args: JsonSchema + DeserializeOwned + Send + 'static,
+        F: Fn(ToolContext<C>, Args) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<T>> + Send + 'static,
+        T: IntoToolOutput + Send + 'static,
+    {
+        Self::try_new_with_strictness(name, description, true, f)
+    }
+
+    /// Typed constructor with an explicit strictness flag, the analog of Python's
+    /// `function_tool(strict_mode=...)`. With `strict` unset the schema is kept as generated, so an
+    /// argument type such as a map is accepted; with it set the schema must be strict-convertible.
+    pub fn try_new_with_strictness<Args, F, Fut, T>(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        strict: bool,
+        f: F,
+    ) -> Result<Self>
     where
         Args: JsonSchema + DeserializeOwned + Send + 'static,
         F: Fn(ToolContext<C>, Args) -> Fut + Send + Sync + 'static,
@@ -737,7 +799,12 @@ impl<C: Send + Sync + 'static> FunctionTool<C> {
                 let args: Args = if args_json.trim().is_empty() {
                     serde_json::from_str("{}").map_err(|e| invalid_json("{}", e, &ctx.tool_name))?
                 } else {
-                    serde_json::from_str(&args_json)
+                    let value: Value = serde_json::from_str(&args_json)
+                        .map_err(|e| invalid_json(&args_json, e, &ctx.tool_name))?;
+                    if !value.is_object() {
+                        return Err(invalid_tool_input_not_object(&ctx.tool_name));
+                    }
+                    serde_json::from_value(value)
                         .map_err(|e| invalid_json(&args_json, e, &ctx.tool_name))?
                 };
                 let out = f(ctx, args).await?;
@@ -759,9 +826,20 @@ impl<C: Send + Sync + 'static> FunctionTool<C> {
             }
             serde_json::from_value::<Args>(args.clone()).is_ok()
         });
-        let mut tool = Self::build(name.into(), description.into(), schema, invoke);
+        let mut tool = if strict {
+            Self::build_strict(name.into(), description.into(), schema, invoke)?
+        } else {
+            Self::finish(
+                name.into(),
+                description.into(),
+                schema.clone(),
+                schema,
+                false,
+                invoke,
+            )
+        };
         tool.approval_args_check = Some(approval_args_check);
-        tool
+        Ok(tool)
     }
 
     /// Create a tool without parameters.
@@ -808,15 +886,85 @@ impl<C: Send + Sync + 'static> FunctionTool<C> {
         Self::build(name.into(), description.into(), params_json_schema, invoke)
     }
 
+    /// Fallible form of [`new_raw`](Self::new_raw) with an explicit strictness flag.
+    ///
+    /// With `strict` set, a schema that cannot be made strict is an error instead of a silent
+    /// downgrade to a non-strict tool; with it unset the schema is kept exactly as given. Mirrors
+    /// `FunctionTool(params_json_schema=..., strict_json_schema=...)`, whose constructor raises
+    /// `UserError` in the strict case.
+    pub fn try_new_raw<F, Fut, T>(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        params_json_schema: Value,
+        strict: bool,
+        f: F,
+    ) -> Result<Self>
+    where
+        F: Fn(ToolContext<C>, String) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<T>> + Send + 'static,
+        T: IntoToolOutput + Send + 'static,
+    {
+        let raw = params_json_schema.clone();
+        let schema = if strict {
+            ensure_strict_json_schema(&params_json_schema)?
+        } else {
+            params_json_schema
+        };
+        let f = Arc::new(f);
+        let invoke: InvokeFn<C> = Arc::new(move |ctx, args| {
+            let f = f.clone();
+            Box::pin(async move { Ok(f(ctx, args).await?.into_tool_output()) })
+        });
+        Ok(Self::finish(
+            name.into(),
+            description.into(),
+            schema,
+            raw,
+            strict,
+            invoke,
+        ))
+    }
+
+    /// Build a strict tool from a schema, failing when it cannot be made strict.
+    fn build_strict(
+        name: String,
+        description: String,
+        schema: Value,
+        invoke: InvokeFn<C>,
+    ) -> Result<Self> {
+        let strict = ensure_strict_json_schema(&schema)?;
+        Ok(Self::finish(
+            name,
+            description,
+            strict,
+            schema,
+            true,
+            invoke,
+        ))
+    }
+
     fn build(name: String, description: String, schema: Value, invoke: InvokeFn<C>) -> Self {
+        let raw = schema.clone();
         let (schema, strict) = match ensure_strict_json_schema(&schema) {
             Ok(s) => (s, true),
             Err(_) => (schema, false),
         };
+        Self::finish(name, description, schema, raw, strict, invoke)
+    }
+
+    fn finish(
+        name: String,
+        description: String,
+        schema: Value,
+        raw: Value,
+        strict: bool,
+        invoke: InvokeFn<C>,
+    ) -> Self {
         FunctionTool {
             name,
             description,
             params_json_schema: schema,
+            raw_params_json_schema: raw,
             strict_json_schema: strict,
             is_enabled: IsEnabled::Static(true),
             needs_approval: NeedsApproval::Static(false),
@@ -845,14 +993,26 @@ impl<C: Send + Sync + 'static> FunctionTool<C> {
         }
     }
 
-    /// Use a non-strict schema (keeps the schema as provided).
+    /// Set whether the parameters schema is strict. Turning strictness off restores the schema
+    /// as given; turning it on converts it again, and leaves the tool as it is when the schema
+    /// cannot be made strict.
     pub fn with_strict_json_schema(mut self, strict: bool) -> Self {
-        self.strict_json_schema = strict;
+        if strict {
+            if let Ok(schema) = ensure_strict_json_schema(&self.raw_params_json_schema) {
+                self.params_json_schema = schema;
+                self.strict_json_schema = true;
+            }
+        } else {
+            self.params_json_schema = self.raw_params_json_schema.clone();
+            self.strict_json_schema = false;
+        }
         self
     }
 
-    /// Replace the parameters schema.
+    /// Replace the parameters schema. The new schema is the one a later
+    /// [`with_strict_json_schema`](Self::with_strict_json_schema) call starts from.
     pub fn with_params_json_schema(mut self, schema: Value) -> Self {
+        self.raw_params_json_schema = schema.clone();
         self.params_json_schema = schema;
         self
     }
@@ -919,6 +1079,16 @@ impl<C: Send + Sync + 'static> FunctionTool<C> {
         self
     }
 
+    /// Set the per-call timeout, rejecting a zero duration. Mirrors `FunctionTool`, whose
+    /// `timeout_seconds` must be greater than 0.
+    pub fn try_with_timeout(mut self, timeout: Duration) -> Result<Self> {
+        if timeout.is_zero() {
+            return Err(AgentsError::user("timeout_seconds must be greater than 0."));
+        }
+        self.timeout = Some(timeout);
+        Ok(self)
+    }
+
     /// Set the timeout behaviour.
     pub fn with_timeout_behavior(mut self, behavior: ToolTimeoutBehavior) -> Self {
         self.timeout_behavior = behavior;
@@ -978,7 +1148,23 @@ impl<C: Send + Sync + 'static> FunctionTool<C> {
     /// knows its shape. Mirrors `function_tool(output_json_schema=...)`.
     ///
     /// Returns an error when the schema is not a JSON object schema or cannot be made strict.
-    pub fn with_output_json_schema(mut self, schema: Value) -> Result<Self> {
+    pub fn with_output_json_schema(self, schema: Value) -> Result<Self> {
+        if self.output_validator.is_some() {
+            return Err(AgentsError::user(
+                "output_type and output_json_schema cannot both be provided.",
+            ));
+        }
+        self.set_output_json_schema(schema)
+    }
+
+    fn set_output_json_schema(mut self, mut schema: Value) -> Result<Self> {
+        // A JSON Schema type array holding only "object" means the same as "object".
+        if let Some(types) = schema.get("type").and_then(Value::as_array)
+            && types.len() == 1
+            && types[0].as_str() == Some("object")
+        {
+            schema["type"] = Value::String("object".into());
+        }
         if schema.get("type").and_then(Value::as_str) != Some("object") {
             return Err(AgentsError::user(
                 "Function tool output_json_schema must define a JSON object schema.",
@@ -1008,7 +1194,13 @@ impl<C: Send + Sync + 'static> FunctionTool<C> {
     where
         T: JsonSchema + DeserializeOwned + 'static,
     {
-        let mut schema = schemars::schema_for!(T).to_value();
+        // The tool's result is serialized, so the schema uses serialization names (for example a
+        // `#[serde(rename(serialize = ...))]` field), as Python's output schema does.
+        let mut schema = schemars::generate::SchemaSettings::default()
+            .for_serialize()
+            .into_generator()
+            .into_root_schema_for::<T>()
+            .to_value();
         if let Value::Object(m) = &mut schema {
             m.remove("$schema");
         }
@@ -1019,7 +1211,12 @@ impl<C: Send + Sync + 'static> FunctionTool<C> {
                  directly.",
             ));
         }
-        let mut tool = self.with_output_json_schema(schema)?;
+        if self.output_json_schema.is_some() {
+            return Err(AgentsError::user(
+                "output_type and output_json_schema cannot both be provided.",
+            ));
+        }
+        let mut tool = self.set_output_json_schema(schema)?;
         tool.output_validator = Some(Arc::new(|value: &Value| {
             serde_json::from_value::<T>(value.clone())
                 .map(|_| ())
@@ -1071,13 +1268,43 @@ impl<C: Send + Sync + 'static> FunctionTool<C> {
     }
 }
 
+/// The error for a tool output that does not match its declared type. The detail echoes the
+/// offending value, so it is dropped unless the logging policy allows tool data.
+fn output_mismatch(tool_name: &str, detail: &str) -> AgentsError {
+    let base = format!(
+        "Function tool {tool_name} returned an output that does not match its declared output type"
+    );
+    AgentsError::user(if !crate::debug::dont_log_tool_data() {
+        format!("{base}: {detail}")
+    } else {
+        base
+    })
+}
+
 impl<C> FunctionTool<C> {
     /// Invoke the tool with raw JSON arguments (bypasses guardrails, approvals and timeouts).
     pub async fn invoke(&self, ctx: ToolContext<C>, arguments: String) -> Result<ToolOutput> {
         let name = ctx.tool_name.clone();
-        let output = self.invoke_body(ctx, arguments).await?;
-        self.validate_output(&name, &output)?;
-        Ok(output)
+        let run_context = ctx.run_context().clone();
+        match self.invoke_body(ctx, arguments).await {
+            Ok(output) => {
+                self.validate_output(&name, &output)?;
+                Ok(output)
+            }
+            // A custom failure handler supplies the output in place of the error, as Python's
+            // `on_invoke_tool` does. The default policy is applied by the runner instead.
+            Err(error) if !self.uses_default_failure_error_function => {
+                match &self.failure_error_function {
+                    Some(handler) => {
+                        let text = handler(&run_context, &error);
+                        self.validate_failure_text(&name, &text)?;
+                        Ok(ToolOutput::Text(text))
+                    }
+                    None => Err(error),
+                }
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Run the tool body without checking the declared output type. The runner validates
@@ -1088,6 +1315,9 @@ impl<C> FunctionTool<C> {
         ctx: ToolContext<C>,
         arguments: String,
     ) -> Result<ToolOutput> {
+        if !crate::debug::dont_log_tool_data() {
+            log::debug!(target: crate::logger::LOG_TARGET, "Tool call args: {arguments}");
+        }
         (self.invoke)(ctx, arguments).await
     }
 
@@ -1095,23 +1325,26 @@ impl<C> FunctionTool<C> {
     /// Port of `_validate_function_tool_output`: the validation error echoes the offending
     /// value, so it is dropped unless the logging policy allows tool data.
     pub(crate) fn validate_output(&self, tool_name: &str, output: &ToolOutput) -> Result<()> {
+        self.check_output_value(tool_name, &output.to_json_value())
+    }
+
+    /// Check a custom failure handler's text against the declared output type. The handler's
+    /// text is the tool's structured result, so it must be a JSON document that matches the type.
+    pub(crate) fn validate_failure_text(&self, tool_name: &str, text: &str) -> Result<()> {
+        if self.output_validator.is_none() {
+            return Ok(());
+        }
+        match serde_json::from_str::<Value>(text) {
+            Ok(value) => self.check_output_value(tool_name, &value),
+            Err(error) => Err(output_mismatch(tool_name, &error.to_string())),
+        }
+    }
+
+    fn check_output_value(&self, tool_name: &str, value: &Value) -> Result<()> {
         let Some(validate) = &self.output_validator else {
             return Ok(());
         };
-        match validate(&output.to_json_value()) {
-            Ok(()) => Ok(()),
-            Err(detail) => {
-                let base = format!(
-                    "Function tool {tool_name} returned an output that does not match its \
-                     declared output type"
-                );
-                Err(AgentsError::user(if !crate::debug::dont_log_tool_data() {
-                    format!("{base}: {detail}")
-                } else {
-                    base
-                }))
-            }
-        }
+        validate(value).map_err(|detail| output_mismatch(tool_name, &detail))
     }
 
     /// Convert to a Responses API `function` tool param.

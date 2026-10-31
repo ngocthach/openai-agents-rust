@@ -638,6 +638,9 @@ pub struct RunContext<C> {
     /// clones (every run that reuses this context), fresh for a nested agent-tool context.
     /// Mirrors the `executed`/`completed` flags of `RunContextWrapper._tool_invocations`.
     uncommitted: Arc<Mutex<BTreeSet<String>>>,
+    /// Computers lazily created by computer tools for this run, keyed by tool id. Shared by
+    /// clones like `uncommitted`, fresh for a nested agent-tool context.
+    computers: Arc<Mutex<BTreeMap<u64, crate::tool::ResolvedComputer>>>,
 }
 
 impl<C> Clone for RunContext<C> {
@@ -647,6 +650,7 @@ impl<C> Clone for RunContext<C> {
             inner: self.inner.clone(),
             tool_input: self.tool_input.clone(),
             uncommitted: self.uncommitted.clone(),
+            computers: self.computers.clone(),
         }
     }
 }
@@ -667,6 +671,7 @@ impl<C> RunContext<C> {
             inner: Arc::new(Mutex::new(Inner::default())),
             tool_input: None,
             uncommitted: Arc::default(),
+            computers: Arc::default(),
         }
     }
 
@@ -677,6 +682,7 @@ impl<C> RunContext<C> {
             inner: Arc::new(Mutex::new(Inner::default())),
             tool_input: None,
             uncommitted: Arc::default(),
+            computers: Arc::default(),
         }
     }
 
@@ -713,6 +719,37 @@ impl<C> RunContext<C> {
         self.inner.lock().expect("run context poisoned").usage = usage;
     }
 
+    /// The computer this run already created for the computer tool `tool_id`, if any.
+    pub(crate) fn run_computer(&self, tool_id: u64) -> Option<Arc<dyn crate::computer::Computer>> {
+        self.computers
+            .lock()
+            .expect("run context poisoned")
+            .get(&tool_id)
+            .map(|c| c.computer.clone())
+    }
+
+    /// Keep a computer created for this run. If another resolve stored one first, that one is
+    /// returned and `created` is dropped.
+    pub(crate) fn store_run_computer(
+        &self,
+        tool_id: u64,
+        created: crate::tool::ResolvedComputer,
+    ) -> Arc<dyn crate::computer::Computer> {
+        self.computers
+            .lock()
+            .expect("run context poisoned")
+            .entry(tool_id)
+            .or_insert(created)
+            .computer
+            .clone()
+    }
+
+    /// Remove every computer this run created, so the caller can dispose of them.
+    pub(crate) fn take_run_computers(&self) -> Vec<crate::tool::ResolvedComputer> {
+        let mut computers = self.computers.lock().expect("run context poisoned");
+        std::mem::take(&mut *computers).into_values().collect()
+    }
+
     /// Structured input of the current `Agent::as_tool` invocation, if any.
     pub fn tool_input(&self) -> Option<&Value> {
         self.tool_input.as_deref()
@@ -725,6 +762,7 @@ impl<C> RunContext<C> {
             inner: self.inner.clone(),
             tool_input: Some(Arc::new(tool_input)),
             uncommitted: self.uncommitted.clone(),
+            computers: self.computers.clone(),
         }
     }
 
@@ -732,6 +770,7 @@ impl<C> RunContext<C> {
     pub(crate) fn with_fresh_invocations(&self) -> Self {
         RunContext {
             uncommitted: Arc::default(),
+            computers: Arc::default(),
             ..self.clone()
         }
     }

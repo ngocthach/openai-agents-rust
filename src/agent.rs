@@ -601,6 +601,10 @@ impl<C: Send + Sync + 'static> Agent<C> {
                         out.push(t.clone());
                     }
                 }
+                Tool::Shell(shell) => {
+                    shell.validate()?;
+                    out.push(t.clone());
+                }
                 other => out.push(other.clone()),
             }
         }
@@ -707,8 +711,38 @@ pub fn default_tool_input_builder(options: &StructuredToolInput<'_>) -> String {
     sections.join("\n")
 }
 
+/// The text an agent tool returns when it has no custom output extractor. Port of the default
+/// extraction in Python's `as_tool`: a non-empty final output wins. Otherwise, unless output
+/// guardrails already checked the final output, the latest non-empty message or string tool
+/// output of the nested run is used.
+fn default_agent_tool_output<C>(result: &crate::result::RunResult<C>) -> String {
+    let has_final_output = match &result.final_output {
+        None | Some(Value::Null) => false,
+        Some(Value::String(text)) => !text.is_empty(),
+        Some(_) => true,
+    };
+    if has_final_output || !result.output_guardrail_results.is_empty() {
+        return result.final_output_text().unwrap_or_default();
+    }
+    for item in result.new_items.iter().rev() {
+        if let crate::items::RunItemKind::MessageOutput { .. } = &item.kind {
+            let text = crate::items::ItemHelpers::text_message_output(item);
+            if !text.is_empty() {
+                return text;
+            }
+        }
+        if let crate::items::RunItemKind::ToolCallOutput { output, .. } = &item.kind
+            && let Some(text) = output.as_str()
+            && !text.is_empty()
+        {
+            return text.to_string();
+        }
+    }
+    result.final_output_text().unwrap_or_default()
+}
+
 /// The simple JSON schema types a field summary can describe.
-const SIMPLE_JSON_SCHEMA_TYPES: [&str; 5] = ["string", "number", "integer", "boolean", "null"];
+const SIMPLE_JSON_SCHEMA_TYPES: [&str; 4] = ["string", "number", "integer", "boolean"];
 
 fn schema_description(value: &Value) -> Option<&str> {
     value
@@ -747,24 +781,29 @@ fn describe_schema_field(field: &Value) -> Option<(String, Option<&str>)> {
             };
             Some((label, description))
         }
-        Some(Value::String(t)) if SIMPLE_JSON_SCHEMA_TYPES.contains(&t.as_str()) => {
-            Some((t.clone(), description))
-        }
+        Some(Value::String(t)) => SIMPLE_JSON_SCHEMA_TYPES
+            .contains(&t.as_str())
+            .then(|| (t.clone(), description)),
         _ => match (obj.get("enum"), obj.get("const")) {
+            // Labels follow Python's `_format_enum_label` and `_format_literal_label`.
             (Some(Value::Array(values)), _) => {
                 let label = if values.is_empty() {
                     "enum".to_string()
                 } else {
-                    values
+                    let mut preview = values
                         .iter()
                         .take(5)
-                        .map(|v| v.to_string())
+                        .map(Value::to_string)
                         .collect::<Vec<_>>()
-                        .join(" | ")
+                        .join(" | ");
+                    if values.len() > 5 {
+                        preview.push_str(" | ...");
+                    }
+                    format!("enum({preview})")
                 };
                 Some((label, description))
             }
-            (_, Some(value)) => Some((value.to_string(), description)),
+            (_, Some(value)) => Some((format!("literal({value})"), description)),
             _ => None,
         },
     }
@@ -1022,11 +1061,9 @@ impl<C: Send + Sync + 'static> Agent<C> {
                         } else {
                             None
                         };
-                        let summary = if schema_ref.is_none() {
-                            build_schema_summary(&schema)
-                        } else {
-                            None
-                        };
+                        // The summary is always derived; the full schema is opt-in. The default
+                        // builder prefers the schema when it is present.
+                        let summary = build_schema_summary(&schema);
                         let options = StructuredToolInput {
                             params: &parsed,
                             summary: summary.as_deref(),
@@ -1037,11 +1074,16 @@ impl<C: Send + Sync + 'static> Agent<C> {
                             None => default_tool_input_builder(&options),
                         }
                     } else {
-                        parsed
-                            .get("input")
-                            .and_then(Value::as_str)
-                            .map(str::to_string)
-                            .unwrap_or_else(|| args.clone())
+                        // Only an `{"input": "<text>"}` object is unwrapped; any other arguments
+                        // reach the nested agent as the JSON the model sent, as Python does.
+                        match parsed.as_object() {
+                            Some(object) if object.len() == 1 => object
+                                .get("input")
+                                .and_then(Value::as_str)
+                                .map(str::to_string)
+                                .unwrap_or_else(|| args.clone()),
+                            _ => args.clone(),
+                        }
                     };
                     let parent = tool_ctx.run_context().clone();
                     let run_ctx = if structured {
@@ -1118,9 +1160,7 @@ impl<C: Send + Sync + 'static> Agent<C> {
                     }
                     match &opts.custom_output_extractor {
                         Some(ex) => Ok(ToolOutput::Text(ex(result).await?)),
-                        None => Ok(ToolOutput::Text(
-                            result.final_output_text().unwrap_or_default(),
-                        )),
+                        None => Ok(ToolOutput::Text(default_agent_tool_output(&result))),
                     }
                 }
             });

@@ -39,12 +39,24 @@ async fn with_timeout<T>(
     fut: impl std::future::Future<Output = Result<T>>,
 ) -> Result<T> {
     match timeout {
-        Some(secs) if secs > 0.0 => tokio::time::timeout(Duration::from_secs_f64(secs), fut)
-            .await
-            .map_err(|_| AgentsError::ModelTimeoutError {
-                timeout_seconds: secs,
-                run_data: None,
-            })?,
+        Some(secs) if secs > 0.0 => {
+            // The attempt's future owns the model span. It is only dropped after this function
+            // returns, so the timeout is recorded in the slot first and the span can record it
+            // when it is dropped. Python cancels the model task and marks it the same way.
+            let slot = crate::tracing::ModelTimeoutSlot::default();
+            let mut fut = std::pin::pin!(crate::tracing::scope_model_timeout(slot.clone(), fut));
+            tokio::select! {
+                biased;
+                out = &mut fut => out,
+                _ = tokio::time::sleep(Duration::from_secs_f64(secs)) => {
+                    slot.mark_timed_out(secs);
+                    Err(AgentsError::ModelTimeoutError {
+                        timeout_seconds: secs,
+                        run_data: None,
+                    })
+                }
+            }
+        }
         _ => fut.await,
     }
 }

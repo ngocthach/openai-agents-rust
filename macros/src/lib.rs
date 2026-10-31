@@ -117,8 +117,9 @@ fn parse_docs(lines: &[String]) -> (String, Vec<(String, String)>) {
                     ));
                 }
                 _ if !t.is_empty() => {
+                    // A wrapped description keeps its line break, as griffe does.
                     if let Some(last) = args.last_mut() {
-                        last.1.push(' ');
+                        last.1.push('\n');
                         last.1.push_str(t);
                     }
                 }
@@ -340,7 +341,8 @@ mod tests {
         let (d, a) = parse_docs(&lines);
         assert_eq!(d, "Get the weather.");
         assert_eq!(a[0], ("city".into(), "The city.".into()));
-        assert_eq!(a[1].1, "Number of days to forecast.");
+        // griffe keeps the line break of a wrapped argument description; so does the macro.
+        assert_eq!(a[1].1, "Number of days\nto forecast.");
         let google: Vec<String> = ["Sum.", "Args:", "    a: first", "    b: second"]
             .iter()
             .map(|s| s.to_string())

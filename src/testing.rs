@@ -196,6 +196,14 @@ pub fn response_to_stream_events(response: &ModelResponse) -> Vec<Value> {
                 "input_tokens": response.usage.input_tokens,
                 "output_tokens": response.usage.output_tokens,
                 "total_tokens": response.usage.total_tokens,
+                // The streamed usage carries the same token details as the non-streamed response.
+                "input_tokens_details": {
+                    "cached_tokens": response.usage.input_tokens_details.cached_tokens,
+                    "cache_write_tokens": response.usage.input_tokens_details.cache_write_tokens,
+                },
+                "output_tokens_details": {
+                    "reasoning_tokens": response.usage.output_tokens_details.reasoning_tokens,
+                },
             }
         }
     }));
@@ -690,7 +698,18 @@ impl ScriptedModel {
         } else {
             crate::tracing::REDACTED_TRACE_ERROR_MESSAGE.to_string()
         };
-        span.set_error("Error", Some(json!({"message": message})));
+        // Python records the exception class name next to the message; the Rust error kind plays
+        // that role.
+        let name = match error {
+            AgentsError::UserError { .. } => "UserError",
+            AgentsError::ModelBehaviorError { .. } => "ModelBehaviorError",
+            AgentsError::ModelRefusalError { .. } => "ModelRefusalError",
+            AgentsError::ModelTimeoutError { .. } => "ModelTimeoutError",
+            AgentsError::MaxTurnsExceeded { .. } => "MaxTurnsExceeded",
+            AgentsError::ApiError { .. } => "ApiError",
+            _ => "AgentsError",
+        };
+        span.set_error("Error", Some(json!({"name": name, "message": message})));
     }
 }
 

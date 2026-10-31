@@ -383,6 +383,12 @@ impl OpenAIChatCompletionsModel {
         // `tool_choice` is sent whenever it is set, so `tool_choice: "none"` without tools
         // still reaches the provider, as in the Python SDK.
         if let Some(tc) = &s.tool_choice {
+            if matches!(tc, ToolChoice::Named(n) if n == "programmatic_tool_calling") {
+                return Err(AgentsError::user(
+                    "tool_choice='programmatic_tool_calling' is only supported with OpenAI \
+                     Responses models and cannot be used with Chat Completions-compatible models.",
+                ));
+            }
             body.insert("tool_choice".into(), convert_chat_tool_choice(tc));
         }
         if let Some(schema) = &req.output_schema
@@ -2993,6 +2999,11 @@ impl Model for OpenAIChatCompletionsModel {
     async fn get_response(&self, request: ModelRequest) -> Result<ModelResponse> {
         let body = self.transformed_body(&request, false)?;
         let span = self.start_span(&request, &body);
+        let mut guard = crate::tracing::ModelSpanGuard::new(
+            &span,
+            "Error getting response",
+            request.tracing.include_data(),
+        );
         let result = async {
             let (value, request_id) = self
                 .client
@@ -3032,6 +3043,7 @@ impl Model for OpenAIChatCompletionsModel {
                 crate::logger::log_model_action_error("Error getting response", e);
             }
         }
+        guard.disarm();
         span.finish();
         result
     }

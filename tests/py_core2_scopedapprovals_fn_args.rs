@@ -380,14 +380,21 @@ async fn preparation_is_preserved_on_copied_tools() {
         let effects = log::<String>();
         let e = effects.clone();
         let s = seen.clone();
-        let tool = FunctionTool::<()>::new("operation", "", move |_ctx, args: RequestArgs| {
-            let e = e.clone();
-            async move {
-                let environment = args.request["environment"].clone();
-                e.lock().unwrap().push(environment.clone());
-                Ok(environment)
-            }
-        })
+        // A map argument has no strict schema; Python's `strict_mode=False`.
+        let tool = FunctionTool::<()>::try_new_with_strictness(
+            "operation",
+            "",
+            false,
+            move |_ctx, args: RequestArgs| {
+                let e = e.clone();
+                async move {
+                    let environment = args.request["environment"].clone();
+                    e.lock().unwrap().push(environment.clone());
+                    Ok(environment)
+                }
+            },
+        )
+        .unwrap()
         .with_needs_approval_fn(move |_ctx, mut params, _id| {
             let s = s.clone();
             async move {
@@ -433,14 +440,21 @@ async fn parallel_calls_keep_distinct_prepared_values() {
     let executed = log::<i64>();
     let e = executed.clone();
     let (fs, sf) = (first_started.clone(), second_finished.clone());
-    let tool = FunctionTool::<()>::new("operation", "", move |_ctx, args: ValueRequest| {
-        let e = e.clone();
-        async move {
-            let value = args.request["value"];
-            e.lock().unwrap().push(value);
-            Ok(value.to_string())
-        }
-    })
+    // A map argument has no strict schema; Python's `strict_mode=False`.
+    let tool = FunctionTool::<()>::try_new_with_strictness(
+        "operation",
+        "",
+        false,
+        move |_ctx, args: ValueRequest| {
+            let e = e.clone();
+            async move {
+                let value = args.request["value"];
+                e.lock().unwrap().push(value);
+                Ok(value.to_string())
+            }
+        },
+    )
+    .unwrap()
     .with_needs_approval_fn(move |_ctx, params, _id| {
         let (fs, sf) = (fs.clone(), sf.clone());
         async move {
@@ -619,14 +633,21 @@ async fn cancelled_policy_does_not_reuse_preparation_for_a_new_run() {
     let effects = log::<String>();
     let make = || {
         let (p, s, e) = (policies.clone(), started.clone(), effects.clone());
-        FunctionTool::<()>::new("operation", "", move |_ctx, args: StrRequest| {
-            let e = e.clone();
-            async move {
-                let value = args.request["value"].clone();
-                e.lock().unwrap().push(value.clone());
-                Ok(value)
-            }
-        })
+        // A map argument has no strict schema; Python's `strict_mode=False`.
+        FunctionTool::<()>::try_new_with_strictness(
+            "operation",
+            "",
+            false,
+            move |_ctx, args: StrRequest| {
+                let e = e.clone();
+                async move {
+                    let value = args.request["value"].clone();
+                    e.lock().unwrap().push(value.clone());
+                    Ok(value)
+                }
+            },
+        )
+        .unwrap()
         .with_needs_approval_fn(move |_ctx, params, _id| {
             let (p, s) = (p.clone(), s.clone());
             async move {

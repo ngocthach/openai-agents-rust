@@ -31,6 +31,9 @@ pub struct ToolContext<C> {
     pub run_config: Option<Arc<RunConfig<C>>>,
     /// SDK-only data the tool body attached to its output item.
     custom_data: Arc<std::sync::Mutex<Option<serde_json::Value>>>,
+    /// The `_meta` of the MCP call result, when this tool is an MCP tool. Read by the
+    /// custom-data extractor as `result_meta`.
+    result_meta: Arc<std::sync::Mutex<Option<serde_json::Value>>>,
 }
 
 impl<C> Clone for ToolContext<C> {
@@ -46,6 +49,7 @@ impl<C> Clone for ToolContext<C> {
             agent: self.agent.clone(),
             run_config: self.run_config.clone(),
             custom_data: self.custom_data.clone(),
+            result_meta: self.result_meta.clone(),
         }
     }
 }
@@ -58,6 +62,21 @@ impl<C> fmt::Debug for ToolContext<C> {
             .field("agent_name", &self.agent_name)
             .field("tool_namespace", &self.tool_namespace)
             .finish_non_exhaustive()
+    }
+}
+
+/// The name a model tool call is traced and tracked under: `namespace.name`, or the bare name
+/// when the call has no namespace or its namespace is the synthetic one of a deferred top-level
+/// tool. Port of `get_tool_call_trace_name`.
+pub(crate) fn call_trace_name(call: &FunctionCall) -> String {
+    match call
+        .extra
+        .get("namespace")
+        .and_then(serde_json::Value::as_str)
+        .filter(|ns| !ns.is_empty())
+    {
+        Some(ns) if ns != call.name => format!("{ns}.{}", call.name),
+        _ => call.name.clone(),
     }
 }
 
@@ -78,10 +97,17 @@ impl<C> ToolContext<C> {
             tool_arguments: call.arguments.clone(),
             tool_call: Some(call.clone()),
             agent_name: agent_name.to_string(),
-            tool_namespace: None,
+            // Python infers the namespace from the model's tool call.
+            tool_namespace: call
+                .extra
+                .get("namespace")
+                .and_then(serde_json::Value::as_str)
+                .filter(|ns| !ns.is_empty())
+                .map(str::to_string),
             agent: None,
             run_config: None,
             custom_data: Arc::new(std::sync::Mutex::new(None)),
+            result_meta: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -103,6 +129,7 @@ impl<C> ToolContext<C> {
             agent: None,
             run_config: None,
             custom_data: Arc::new(std::sync::Mutex::new(None)),
+            result_meta: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -141,6 +168,21 @@ impl<C> ToolContext<C> {
         }
     }
 
+    /// Record the `_meta` of the MCP call result for this invocation (shared by clones).
+    #[cfg(feature = "mcp")]
+    pub(crate) fn set_result_meta(&self, meta: Option<serde_json::Value>) {
+        *self.result_meta.lock().expect("tool context poisoned") = meta;
+    }
+
+    /// The `_meta` of the MCP call result, or `None` for a tool that is not an MCP tool.
+    /// Mirrors `FunctionToolCustomDataContext.result_meta`.
+    pub fn result_meta(&self) -> Option<serde_json::Value> {
+        self.result_meta
+            .lock()
+            .expect("tool context poisoned")
+            .clone()
+    }
+
     /// The SDK-only data attached with [`set_custom_data`](Self::set_custom_data).
     pub fn custom_data(&self) -> Option<serde_json::Value> {
         self.custom_data
@@ -151,10 +193,12 @@ impl<C> ToolContext<C> {
 
     /// `namespace.name` when the tool is namespaced, otherwise the bare tool name.
     /// Port of `ToolContext.qualified_tool_name`.
+    /// A namespace equal to the tool name is the synthetic namespace of a deferred top-level
+    /// tool and is not shown.
     pub fn qualified_tool_name(&self) -> String {
         match &self.tool_namespace {
-            Some(ns) => format!("{ns}.{}", self.tool_name),
-            None => self.tool_name.clone(),
+            Some(ns) if ns != &self.tool_name => format!("{ns}.{}", self.tool_name),
+            _ => self.tool_name.clone(),
         }
     }
 }

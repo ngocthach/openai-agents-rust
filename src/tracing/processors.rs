@@ -7,8 +7,10 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::panic::AssertUnwindSafe;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -20,6 +22,8 @@ use super::spans::{Span, Trace};
 pub const OPENAI_TRACING_INGEST_ENDPOINT: &str = "https://api.openai.com/v1/traces/ingest";
 const MAX_FIELD_BYTES: usize = 100_000;
 const TRUNCATION_SUFFIX: &str = "... [truncated]";
+/// Attempts to make on a status the server marks as transient (in addition to 5xx).
+const RETRYABLE_CLIENT_STATUS_CODES: [u16; 3] = [408, 409, 429];
 
 /// Receives trace and span lifecycle events.
 pub trait TracingProcessor: Send + Sync + fmt::Debug {
@@ -29,6 +33,11 @@ pub trait TracingProcessor: Send + Sync + fmt::Debug {
     fn on_span_end(&self, span: &Span);
     /// Export everything buffered and stop.
     fn shutdown(&self) {}
+    /// Export everything buffered and stop, giving up once `timeout` has elapsed. Mirrors
+    /// `shutdown(timeout=...)`; processors without a background queue ignore the timeout.
+    fn shutdown_with_timeout(&self, _timeout: Duration) {
+        self.shutdown();
+    }
     /// Export everything buffered and wait for completion.
     fn force_flush(&self) {}
 }
@@ -101,24 +110,91 @@ impl ExportItem {
 /// Sends batches of exported items somewhere. Called on the processor's background thread.
 pub trait TracingExporter: Send + Sync + fmt::Debug {
     fn export(&self, items: Vec<ExportItem>);
+
+    /// Export a batch that must finish by `deadline` (set when the processor is shut down with a
+    /// timeout). Exporters without retries can ignore the deadline, as the default does.
+    fn export_with_deadline(&self, items: Vec<ExportItem>, _deadline: Option<Instant>) {
+        self.export(items);
+    }
+
+    /// Ask an in-progress export to stop waiting between retries. Called when a processor is shut
+    /// down with a timeout.
+    fn request_shutdown(&self) {}
 }
 
 /// Prints exported items to stdout.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ConsoleSpanExporter;
 
-impl TracingExporter for ConsoleSpanExporter {
-    fn export(&self, items: Vec<ExportItem>) {
+impl ConsoleSpanExporter {
+    /// Write one line per item to `out`, redacting the data when model or tool data logging is
+    /// turned off. Mirrors `ConsoleSpanExporter.export`, which `export` calls with stdout.
+    pub fn write_items(
+        &self,
+        items: &[ExportItem],
+        out: &mut dyn std::io::Write,
+    ) -> std::io::Result<()> {
+        let redacted = crate::debug::dont_log_model_data() || crate::debug::dont_log_tool_data();
         for item in items {
-            match item.payload.get("object").and_then(Value::as_str) {
-                Some("trace") => println!(
+            let is_trace = item.payload.get("object").and_then(Value::as_str) == Some("trace");
+            match (is_trace, redacted) {
+                (true, true) => writeln!(out, "[Exporter] Export trace. Trace data is redacted.")?,
+                (false, true) => writeln!(out, "[Exporter] Export span. Span data is redacted.")?,
+                (true, false) => writeln!(
+                    out,
                     "[Exporter] Export trace_id={}, name={}",
                     item.payload["id"], item.payload["workflow_name"]
-                ),
-                _ => println!("[Exporter] Export span: {}", item.payload),
+                )?,
+                (false, false) => writeln!(out, "[Exporter] Export span: {}", item.payload)?,
             }
         }
+        Ok(())
     }
+}
+
+impl TracingExporter for ConsoleSpanExporter {
+    fn export(&self, items: Vec<ExportItem>) {
+        let _ = self.write_items(&items, &mut std::io::stdout().lock());
+    }
+}
+
+/// Wakes a backoff sleep when the exporter is asked to shut down.
+#[derive(Debug, Default)]
+struct ShutdownSignal {
+    requested: Mutex<bool>,
+    wake: Condvar,
+}
+
+impl ShutdownSignal {
+    fn request(&self) {
+        *self.requested.lock().expect("shutdown signal poisoned") = true;
+        self.wake.notify_all();
+    }
+
+    /// Sleep for `duration`, returning `true` if shutdown was requested first.
+    fn wait(&self, duration: Duration) -> bool {
+        let guard = self.requested.lock().expect("shutdown signal poisoned");
+        let (guard, _) = self
+            .wake
+            .wait_timeout_while(guard, duration, |requested| !*requested)
+            .expect("shutdown signal poisoned");
+        *guard
+    }
+}
+
+/// The wait before retry `delay`: the backoff plus up to 10% jitter, raised to the server's
+/// `Retry-After` when one was sent, and never above `max_delay`. Mirrors the sleep computation in
+/// `BackendSpanExporter._export_with_deadline`.
+fn retry_wait(delay: Duration, retry_after: Option<f64>, max_delay: Duration) -> Duration {
+    use rand::Rng;
+    let jitter = rand::rng().random_range(0.0..=0.1) * delay.as_secs_f64();
+    let sleep = delay.as_secs_f64() + jitter;
+    let cap = max_delay.as_secs_f64();
+    let wait = match retry_after {
+        Some(secs) => sleep.max(secs).min(cap),
+        None => sleep,
+    };
+    Duration::from_secs_f64(wait.min(cap.max(sleep)))
 }
 
 /// Exports traces and spans to the OpenAI traces backend.
@@ -134,6 +210,7 @@ pub struct BackendSpanExporter {
     max_delay: Duration,
     runtime: Arc<Mutex<Option<tokio::runtime::Runtime>>>,
     http: reqwest::Client,
+    shutdown: Arc<ShutdownSignal>,
 }
 
 impl fmt::Debug for BackendSpanExporter {
@@ -163,6 +240,7 @@ impl BackendSpanExporter {
             max_delay: Duration::from_secs(30),
             runtime: Arc::new(Mutex::new(None)),
             http: crate::util::http_client(),
+            shutdown: Arc::new(ShutdownSignal::default()),
         }
     }
 
@@ -192,6 +270,14 @@ impl BackendSpanExporter {
     /// Use a custom endpoint.
     pub fn with_endpoint(mut self, endpoint: impl Into<String>) -> Self {
         self.endpoint = endpoint.into();
+        self
+    }
+
+    /// Send every request through `http`. The SDK never sets this; tests use it to route the
+    /// official ingest host to a local server, the way Python's tests swap `exporter._client`.
+    #[doc(hidden)]
+    pub fn with_http_client(mut self, http: reqwest::Client) -> Self {
+        self.http = http;
         self
     }
 
@@ -255,7 +341,44 @@ impl BackendSpanExporter {
         self.endpoint.trim_end_matches('/') == OPENAI_TRACING_INGEST_ENDPOINT
     }
 
-    fn send(&self, api_key: &str, data: Vec<Value>) {
+    /// Whether a response with this status and headers may be retried.
+    ///
+    /// Mirrors `BackendSpanExporter._server_allows_retry`: an explicit `x-should-retry: false`
+    /// wins over the status classification, as in the OpenAI client.
+    fn server_allows_retry(headers: &BTreeMap<String, String>) -> bool {
+        headers
+            .get("x-should-retry")
+            .map(|v| !v.trim().eq_ignore_ascii_case("false"))
+            .unwrap_or(true)
+    }
+
+    /// Wait before the next attempt. Returns `false` when the export should stop instead: the
+    /// deadline has passed, or shutdown was requested while no deadline bounds the wait.
+    ///
+    /// Mirrors `BackendSpanExporter._sleep_before_retry`.
+    fn sleep_before_retry(&self, wait: Duration, deadline: Option<Instant>) -> bool {
+        let Some(deadline) = deadline else {
+            if self.shutdown.wait(wait) {
+                log::warn!(target: crate::logger::LOG_TARGET, "[non-fatal] Tracing: shutdown requested during retry backoff, giving up.");
+                return false;
+            }
+            return true;
+        };
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            log::warn!(target: crate::logger::LOG_TARGET, "[non-fatal] Tracing: export deadline reached before retry, giving up.");
+            return false;
+        }
+        // The final drain runs after shutdown is requested, so its deadline bounds the backoff.
+        thread::sleep(wait.min(remaining));
+        if wait >= remaining || Instant::now() >= deadline {
+            log::warn!(target: crate::logger::LOG_TARGET, "[non-fatal] Tracing: export deadline reached during retry backoff, giving up.");
+            return false;
+        }
+        true
+    }
+
+    fn send(&self, api_key: &str, data: Vec<Value>, deadline: Option<Instant>) {
         let body = json!({"data": data});
         let mut guard = self.runtime.lock().expect("exporter runtime poisoned");
         if guard.is_none() {
@@ -271,14 +394,30 @@ impl BackendSpanExporter {
             }
         }
         let rt = guard.as_ref().expect("runtime");
+        let redacted = crate::debug::dont_log_model_data() || crate::debug::dont_log_tool_data();
         let mut delay = self.base_delay;
-        for attempt in 0..=self.max_retries {
+        // `max_retries` bounds the total number of requests, as in Python.
+        let mut attempt: u32 = 0;
+        loop {
+            // A request runs only until the deadline, when one was given.
+            let timeout = match deadline {
+                None => Duration::from_secs(30),
+                Some(deadline) => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        log::warn!(target: crate::logger::LOG_TARGET, "[non-fatal] Tracing: export deadline reached, giving up on this batch.");
+                        return;
+                    }
+                    remaining
+                }
+            };
+            attempt += 1;
             let mut req = self
                 .http
                 .post(&self.endpoint)
                 .bearer_auth(api_key)
                 .header("OpenAI-Beta", "traces=v1")
-                .timeout(Duration::from_secs(30))
+                .timeout(timeout)
                 .json(&body);
             if let Some(o) = &self.organization {
                 req = req.header("OpenAI-Organization", o);
@@ -298,7 +437,12 @@ impl BackendSpanExporter {
                             .map(|v| (k.as_str().to_lowercase(), v.into()))
                     })
                     .collect();
-                let text = resp.text().await.unwrap_or_default();
+                // The body is only read when it will be logged; redacted logging never shows it.
+                let text = if redacted {
+                    String::new()
+                } else {
+                    resp.text().await.unwrap_or_default()
+                };
                 Ok::<_, reqwest::Error>((status, headers, text))
             });
             let mut retry_after = None;
@@ -309,39 +453,41 @@ impl BackendSpanExporter {
                 }
                 Ok((status, headers, text)) => {
                     let code = status.as_u16();
-                    retry_after = crate::retry::parse_retry_after(&headers);
-                    // `x-should-retry: false` overrides the status classification, as in the
-                    // OpenAI client.
-                    let server_allows_retry = headers
-                        .get("x-should-retry")
-                        .map(|v| !v.trim().eq_ignore_ascii_case("false"))
-                        .unwrap_or(true);
-                    let retryable =
-                        server_allows_retry && (code >= 500 || matches!(code, 408 | 409 | 429));
-                    if !retryable {
-                        log::error!(target: crate::logger::LOG_TARGET, "[non-fatal] Tracing client error {code}: {text}");
+                    let allows_retry = Self::server_allows_retry(&headers);
+                    if RETRYABLE_CLIENT_STATUS_CODES.contains(&code) && allows_retry {
+                        // Only the transient client statuses honour the advertised Retry-After.
+                        retry_after = crate::retry::parse_retry_after(&headers)
+                            .filter(|secs| secs.is_finite());
+                        log::warn!(target: crate::logger::LOG_TARGET, "[non-fatal] Tracing: client error {code}, retrying.");
+                    } else if (400..500).contains(&code) {
+                        if redacted {
+                            log::error!(target: crate::logger::LOG_TARGET, "[non-fatal] Tracing client error {code}. Response data is redacted.");
+                        } else {
+                            log::error!(target: crate::logger::LOG_TARGET, "[non-fatal] Tracing client error {code}: {text}");
+                        }
                         return;
+                    } else if !allows_retry {
+                        log::error!(target: crate::logger::LOG_TARGET, "[non-fatal] Tracing: server forbade retry for {code}.");
+                        return;
+                    } else {
+                        // 5xx or another unexpected code: transient.
+                        log::warn!(target: crate::logger::LOG_TARGET, "[non-fatal] Tracing: server error {code}, retrying.");
                     }
-                    log::warn!(target: crate::logger::LOG_TARGET, "[non-fatal] Tracing: server error {code}, retrying.");
                 }
                 Err(e) => {
                     log::warn!(target: crate::logger::LOG_TARGET, "[non-fatal] Tracing: request failed: {e}")
                 }
             }
-            if attempt < self.max_retries {
-                // Honour the server's wait, bounded by max_delay so a large Retry-After
-                // cannot stall the export thread.
-                let wait = match retry_after {
-                    Some(secs) if secs > 0.0 => {
-                        delay.max(Duration::from_secs_f64(secs)).min(self.max_delay)
-                    }
-                    _ => delay,
-                };
-                thread::sleep(wait);
-                delay = (delay * 2).min(self.max_delay);
+            if attempt >= self.max_retries {
+                log::error!(target: crate::logger::LOG_TARGET, "[non-fatal] Tracing: max retries reached, giving up on this batch.");
+                return;
             }
+            let wait = retry_wait(delay, retry_after, self.max_delay);
+            if !self.sleep_before_retry(wait, deadline) {
+                return;
+            }
+            delay = (delay * 2).min(self.max_delay);
         }
-        log::error!(target: crate::logger::LOG_TARGET, "[non-fatal] Tracing: max retries reached, giving up on this batch.");
     }
 }
 
@@ -354,12 +500,33 @@ fn json_size(value: &Value) -> usize {
     value.to_string().len()
 }
 
+/// Serialized size of one character inside a JSON string (escapes included).
+fn json_char_size(c: char) -> usize {
+    match c {
+        '"' | '\\' | '\u{8}' | '\u{c}' | '\n' | '\r' | '\t' => 2,
+        c if (c as u32) < 0x20 => 6,
+        c => c.len_utf8(),
+    }
+}
+
+/// Truncate `s` so its serialized form, quotes and escapes included, fits in `max_bytes`.
+///
+/// Returns an empty string when even the suffix does not fit, as Python does.
 fn truncate_string_for_limit(s: &str, max_bytes: usize) -> Value {
-    // The two quotes of the serialized string count toward the budget.
-    let budget = max_bytes.saturating_sub(TRUNCATION_SUFFIX.len() + 2);
-    let mut cut = budget.min(s.len());
-    while cut > 0 && !s.is_char_boundary(cut) {
-        cut -= 1;
+    let suffix_size = json_size(&Value::String(TRUNCATION_SUFFIX.to_string()));
+    if suffix_size > max_bytes {
+        return Value::String(String::new());
+    }
+    let budget = max_bytes - suffix_size;
+    let mut used = 0usize;
+    let mut cut = 0usize;
+    for (index, c) in s.char_indices() {
+        let size = json_char_size(c);
+        if used + size > budget {
+            break;
+        }
+        used += size;
+        cut = index + c.len_utf8();
     }
     Value::String(format!("{}{}", &s[..cut], TRUNCATION_SUFFIX))
 }
@@ -395,7 +562,7 @@ fn truncate_value_for_limit(value: &Value, max_bytes: usize) -> Value {
                 let pos = sizes
                     .iter()
                     .enumerate()
-                    .max_by_key(|(_, (_, size))| *size)
+                    .max_by(|(ia, (_, sa)), (ib, (_, sb))| sa.cmp(sb).then(ib.cmp(ia)))
                     .map(|(i, _)| i)
                     .expect("non-empty");
                 let (key, child_size) = sizes[pos].clone();
@@ -404,7 +571,8 @@ fn truncate_value_for_limit(value: &Value, max_bytes: usize) -> Value {
                 let new_child = truncate_value_for_limit(&child, budget);
                 let new_size = json_size(&new_child);
                 if new_child == child || new_size >= child_size {
-                    truncated.remove(&key);
+                    // Order-preserving removal: the surviving keys keep their insertion order, as Python's dict does.
+                    truncated.shift_remove(&key);
                     sizes.remove(pos);
                     current = overhead(&truncated) + sizes.iter().map(|(_, s)| *s).sum::<usize>();
                 } else {
@@ -429,7 +597,7 @@ fn truncate_value_for_limit(value: &Value, max_bytes: usize) -> Value {
                 let pos = sizes
                     .iter()
                     .enumerate()
-                    .max_by_key(|(_, (_, size))| *size)
+                    .max_by(|(ia, (_, sa)), (ib, (_, sb))| sa.cmp(sb).then(ib.cmp(ia)))
                     .map(|(i, _)| i)
                     .expect("non-empty");
                 let (index, child_size) = sizes[pos];
@@ -578,7 +746,8 @@ pub fn sanitize_for_openai(mut payload: Value) -> Value {
     }
     if !is_generation {
         span_data.remove("usage");
-    } else if let Some(usage) = span_data.get("usage").cloned() {
+    } else if let Some(usage) = span_data.get("usage").filter(|u| u.is_object()).cloned() {
+        // A usage value that is not an object is left as the span recorded it, as in Python.
         match sanitize_generation_usage(&usage) {
             Some(clean) => {
                 span_data.insert("usage".into(), clean);
@@ -593,6 +762,10 @@ pub fn sanitize_for_openai(mut payload: Value) -> Value {
 
 impl TracingExporter for BackendSpanExporter {
     fn export(&self, items: Vec<ExportItem>) {
+        self.export_with_deadline(items, None);
+    }
+
+    fn export_with_deadline(&self, items: Vec<ExportItem>, deadline: Option<Instant>) {
         let mut grouped: BTreeMap<Option<String>, Vec<Value>> = BTreeMap::new();
         for item in items {
             let payload = if self.is_openai_endpoint() {
@@ -608,9 +781,13 @@ impl TracingExporter for BackendSpanExporter {
                 continue;
             };
             for chunk in data.chunks(100) {
-                self.send(&api_key, chunk.to_vec());
+                self.send(&api_key, chunk.to_vec(), deadline);
             }
         }
+    }
+
+    fn request_shutdown(&self) {
+        self.shutdown.request();
     }
 }
 
@@ -618,7 +795,8 @@ enum Message {
     Item(ExportItem),
     Kick,
     Flush(mpsc::Sender<()>),
-    Shutdown(mpsc::Sender<()>),
+    /// Export what is queued, then stop. The deadline, when set, bounds that final export.
+    Shutdown(Option<Instant>, mpsc::Sender<()>),
 }
 
 /// Buffers traces and spans and exports them in batches from a background thread.
@@ -629,6 +807,9 @@ pub struct BatchTraceProcessor {
     max_batch_size: usize,
     schedule_delay: Duration,
     export_trigger_size: usize,
+    /// Items accepted but not yet handed to the exporter. Bounds the queue at `max_queue_size`,
+    /// as Python's bounded `Queue` does: an item arriving at a full queue is dropped.
+    pending: Arc<AtomicUsize>,
 }
 
 impl fmt::Debug for BatchTraceProcessor {
@@ -661,7 +842,23 @@ impl BatchTraceProcessor {
             max_batch_size: max_batch_size.max(1),
             schedule_delay,
             export_trigger_size: ((max_queue_size as f64 * export_trigger_ratio) as usize).max(1),
+            pending: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    /// Queue an item, or drop it with a warning when the queue is full.
+    fn enqueue(&self, item: ExportItem) {
+        let accepted = self
+            .pending
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                (n < self.max_queue_size).then_some(n + 1)
+            })
+            .is_ok();
+        if !accepted {
+            log::warn!(target: crate::logger::LOG_TARGET, "Queue is full, dropping trace item.");
+            return;
+        }
+        self.send(Message::Item(item));
     }
 
     fn send(&self, msg: Message) -> bool {
@@ -669,13 +866,13 @@ impl BatchTraceProcessor {
         if guard.is_none() {
             let (tx, rx) = mpsc::channel::<Message>();
             let exporter = self.exporter.clone();
-            let max_queue = self.max_queue_size;
             let max_batch = self.max_batch_size;
             let delay = self.schedule_delay;
             let trigger = self.export_trigger_size;
+            let pending = self.pending.clone();
             let spawned = thread::Builder::new()
                 .name("agents-trace-exporter".into())
-                .spawn(move || worker(rx, exporter, max_queue, max_batch, delay, trigger));
+                .spawn(move || worker(rx, exporter, pending, max_batch, delay, trigger));
             if spawned.is_err() {
                 log::error!(target: crate::logger::LOG_TARGET, "[non-fatal] Tracing: failed to spawn exporter thread");
                 return false;
@@ -688,13 +885,72 @@ impl BatchTraceProcessor {
             .unwrap_or(false)
     }
 
-    fn wait(&self, make: impl FnOnce(mpsc::Sender<()>) -> Message) {
+    /// Send a control message and wait for the worker to acknowledge it. Returns `false` only when
+    /// `timeout` elapsed first. With no worker running there is nothing to wait for.
+    fn wait(
+        &self,
+        make: impl FnOnce(mpsc::Sender<()>) -> Message,
+        timeout: Option<Duration>,
+    ) -> bool {
         if self.sender.lock().expect("processor poisoned").is_none() {
-            return;
+            return true;
         }
         let (ack_tx, ack_rx) = mpsc::channel();
-        if self.send(make(ack_tx)) {
-            let _ = ack_rx.recv_timeout(Duration::from_secs(60));
+        if !self.send(make(ack_tx)) {
+            return true;
+        }
+        match timeout {
+            None => {
+                let _ = ack_rx.recv();
+                true
+            }
+            Some(timeout) => {
+                !matches!(ack_rx.recv_timeout(timeout), Err(RecvTimeoutError::Timeout))
+            }
+        }
+    }
+
+    fn shutdown_with_limit(&self, timeout: Option<Duration>) {
+        if timeout.is_some() {
+            // Stop any retry backoff that has no deadline, so the final export can finish in time.
+            self.exporter.request_shutdown();
+        }
+        let deadline = timeout.map(|t| Instant::now() + t);
+        if !self.wait(|ack| Message::Shutdown(deadline, ack), timeout) {
+            log::warn!(target: crate::logger::LOG_TARGET, "[non-fatal] Tracing: shutdown timeout reached; dropping queued traces.");
+        }
+        *self.sender.lock().expect("processor poisoned") = None;
+    }
+}
+
+/// Hand the queued items to the exporter in batches of at most `max_batch`.
+///
+/// A panicking exporter drops only its own batch: the worker keeps running, so later spans are
+/// still exported. Mirrors `BatchTraceProcessor._export_batches`. Once `deadline` has passed the
+/// remaining items are dropped instead of exported.
+fn export_queued(
+    queue: &mut Vec<ExportItem>,
+    exporter: &Arc<dyn TracingExporter>,
+    pending: &AtomicUsize,
+    max_batch: usize,
+    deadline: Option<Instant>,
+) {
+    while !queue.is_empty() {
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            log::warn!(target: crate::logger::LOG_TARGET, "[non-fatal] Tracing: export deadline reached; dropping queued traces.");
+            pending.fetch_sub(queue.len(), Ordering::SeqCst);
+            queue.clear();
+            return;
+        }
+        let n = queue.len().min(max_batch);
+        let batch: Vec<ExportItem> = queue.drain(..n).collect();
+        pending.fetch_sub(batch.len(), Ordering::SeqCst);
+        let count = batch.len();
+        let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            exporter.export_with_deadline(batch, deadline)
+        }));
+        if outcome.is_err() {
+            log::error!(target: crate::logger::LOG_TARGET, "[non-fatal] Tracing exporter failed; dropping batch of {count} items");
         }
     }
 }
@@ -702,53 +958,42 @@ impl BatchTraceProcessor {
 fn worker(
     rx: mpsc::Receiver<Message>,
     exporter: Arc<dyn TracingExporter>,
-    max_queue: usize,
+    pending: Arc<AtomicUsize>,
     max_batch: usize,
     delay: Duration,
     trigger: usize,
 ) {
     let mut queue: Vec<ExportItem> = Vec::new();
-    let export_all = |queue: &mut Vec<ExportItem>| {
-        while !queue.is_empty() {
-            let n = queue.len().min(max_batch);
-            let batch: Vec<ExportItem> = queue.drain(..n).collect();
-            exporter.export(batch);
-        }
-    };
     let mut next_export = Instant::now() + delay;
     loop {
         let timeout = next_export.saturating_duration_since(Instant::now());
         match rx.recv_timeout(timeout) {
             Ok(Message::Item(item)) => {
-                if queue.len() < max_queue {
-                    queue.push(item);
-                } else {
-                    log::warn!(target: crate::logger::LOG_TARGET, "Queue is full, dropping trace item.");
-                }
+                queue.push(item);
                 if queue.len() >= trigger {
-                    export_all(&mut queue);
+                    export_queued(&mut queue, &exporter, &pending, max_batch, None);
                     next_export = Instant::now() + delay;
                 }
             }
             Ok(Message::Kick) => {
-                export_all(&mut queue);
+                export_queued(&mut queue, &exporter, &pending, max_batch, None);
                 next_export = Instant::now() + delay;
             }
             Ok(Message::Flush(ack)) => {
-                export_all(&mut queue);
+                export_queued(&mut queue, &exporter, &pending, max_batch, None);
                 let _ = ack.send(());
             }
-            Ok(Message::Shutdown(ack)) => {
-                export_all(&mut queue);
+            Ok(Message::Shutdown(deadline, ack)) => {
+                export_queued(&mut queue, &exporter, &pending, max_batch, deadline);
                 let _ = ack.send(());
                 return;
             }
             Err(RecvTimeoutError::Timeout) => {
-                export_all(&mut queue);
+                export_queued(&mut queue, &exporter, &pending, max_batch, None);
                 next_export = Instant::now() + delay;
             }
             Err(RecvTimeoutError::Disconnected) => {
-                export_all(&mut queue);
+                export_queued(&mut queue, &exporter, &pending, max_batch, None);
                 return;
             }
         }
@@ -758,11 +1003,11 @@ fn worker(
 impl TracingProcessor for BatchTraceProcessor {
     fn on_trace_start(&self, trace: &Trace) {
         if let Some(payload) = trace.export() {
-            self.send(Message::Item(ExportItem {
+            self.enqueue(ExportItem {
                 payload,
                 api_key: trace.tracing_api_key().map(str::to_string),
                 object: Some(ExportedObject::Trace(trace.clone())),
-            }));
+            });
         }
     }
 
@@ -774,21 +1019,24 @@ impl TracingProcessor for BatchTraceProcessor {
 
     fn on_span_end(&self, span: &Span) {
         if let Some(payload) = span.export() {
-            self.send(Message::Item(ExportItem {
+            self.enqueue(ExportItem {
                 payload,
                 api_key: span.tracing_api_key().map(str::to_string),
                 object: Some(ExportedObject::Span(span.clone())),
-            }));
+            });
         }
     }
 
     fn shutdown(&self) {
-        self.wait(Message::Shutdown);
-        *self.sender.lock().expect("processor poisoned") = None;
+        self.shutdown_with_limit(None);
+    }
+
+    fn shutdown_with_timeout(&self, timeout: Duration) {
+        self.shutdown_with_limit(Some(timeout));
     }
 
     fn force_flush(&self) {
-        self.wait(Message::Flush);
+        self.wait(Message::Flush, Some(Duration::from_secs(60)));
     }
 }
 
@@ -942,5 +1190,96 @@ mod tests {
         p.force_flush();
         assert_eq!(exporter.0.lock().unwrap().len(), 1);
         p.shutdown();
+    }
+}
+
+#[cfg(test)]
+mod backoff_and_truncation_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    fn headers(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn retry_after_seconds_raise_the_wait_but_stay_within_the_cap() {
+        let base = Duration::from_millis(100);
+        let cap = Duration::from_secs(5);
+        let honoured = retry_wait(base, Some(3.0), cap);
+        assert!((honoured.as_secs_f64() - 3.0).abs() < 1e-9, "{honoured:?}");
+        let capped = retry_wait(base, Some(600.0), cap);
+        assert!((capped.as_secs_f64() - 5.0).abs() < 1e-9, "{capped:?}");
+    }
+
+    #[test]
+    fn without_retry_after_the_wait_is_the_backoff_plus_up_to_ten_percent() {
+        let base = Duration::from_millis(100);
+        for _ in 0..50 {
+            let wait = retry_wait(base, None, Duration::from_secs(5)).as_secs_f64();
+            assert!((0.1..=0.11 + 1e-9).contains(&wait), "{wait}");
+        }
+    }
+
+    #[test]
+    fn retry_after_headers_parse_milliseconds_seconds_and_reject_bad_values() {
+        assert_eq!(
+            crate::retry::parse_retry_after(&headers(&[("retry-after", "3")])),
+            Some(3.0)
+        );
+        assert_eq!(
+            crate::retry::parse_retry_after(&headers(&[("retry-after-ms", "1500")])),
+            Some(1.5)
+        );
+        assert_eq!(
+            crate::retry::parse_retry_after(&headers(&[("retry-after", "soon")])),
+            None
+        );
+        assert_eq!(
+            crate::retry::parse_retry_after(&headers(&[("retry-after", "-1")])),
+            None
+        );
+    }
+
+    #[test]
+    fn string_truncation_returns_the_suffix_when_the_limit_equals_it() {
+        let suffix_size = json_size(&Value::String(TRUNCATION_SUFFIX.to_string()));
+        assert_eq!(
+            truncate_string_for_limit(&"x".repeat(100), suffix_size),
+            Value::String(TRUNCATION_SUFFIX.to_string())
+        );
+    }
+
+    #[test]
+    fn string_truncation_returns_empty_when_the_suffix_does_not_fit() {
+        let suffix_size = json_size(&Value::String(TRUNCATION_SUFFIX.to_string()));
+        assert_eq!(
+            truncate_string_for_limit(&"x".repeat(100), suffix_size - 1),
+            Value::String(String::new())
+        );
+    }
+
+    #[test]
+    fn string_truncation_counts_escapes_against_the_limit() {
+        let value = format!("{}tail", "\\\"".repeat(40_000));
+        let out = truncate_value_for_limit(&Value::String(value), MAX_FIELD_BYTES);
+        assert!(json_size(&out) <= MAX_FIELD_BYTES, "{}", json_size(&out));
+        assert!(out.as_str().unwrap().ends_with(TRUNCATION_SUFFIX));
+    }
+
+    #[test]
+    fn a_value_within_the_limit_is_returned_unchanged() {
+        let value = Value::String("hello".into());
+        let limit = json_size(&value);
+        assert_eq!(truncate_value_for_limit(&value, limit), value);
+    }
+
+    #[test]
+    fn an_object_under_a_zero_budget_is_reduced_to_an_empty_object() {
+        let value = json!({"preview": "some text"});
+        assert_eq!(truncate_value_for_limit(&value, 0), json!({}));
     }
 }

@@ -43,6 +43,38 @@ fn call_id_of(tool_call: &Value) -> Option<&str> {
         .and_then(Value::as_str)
 }
 
+/// Check a tool's `allowed_callers` list when the tool is put in a request. An absent list is
+/// fine; a present one must be a non-empty list of distinct `direct` / `programmatic` values.
+/// Port of `_normalize_tool_allowed_callers`, which Python runs when the tool is constructed.
+pub(crate) fn validate_allowed_callers(callers: Option<&Value>, tool_name: &str) -> Result<()> {
+    let Some(callers) = callers.filter(|v| !v.is_null()) else {
+        return Ok(());
+    };
+    let Some(list) = callers.as_array().filter(|list| !list.is_empty()) else {
+        return Err(AgentsError::user(format!(
+            "Tool `{tool_name}` allowed_callers must be a non-empty list containing 'direct', \
+             'programmatic', or both."
+        )));
+    };
+    let mut seen: Vec<&str> = Vec::with_capacity(list.len());
+    for caller in list {
+        let text = caller.as_str().unwrap_or_default();
+        if !matches!(text, "direct" | "programmatic") {
+            return Err(AgentsError::user(format!(
+                "Tool `{tool_name}` allowed_callers contains unsupported caller '{text}'. \
+                 Expected 'direct' or 'programmatic'."
+            )));
+        }
+        if seen.contains(&text) {
+            return Err(AgentsError::user(format!(
+                "Tool `{tool_name}` allowed_callers contains duplicate caller '{text}'."
+            )));
+        }
+        seen.push(text);
+    }
+    Ok(())
+}
+
 /// Reject tool calls whose direct or programmatic caller is not allowed.
 /// Port of `ensure_tool_caller_allowed`.
 pub(crate) fn ensure_tool_caller_allowed(
@@ -60,8 +92,13 @@ pub(crate) fn ensure_tool_caller_allowed(
         (Some(_), Some("direct")) => ToolCaller::Direct,
         (Some(_), Some("program")) => ToolCaller::Programmatic,
         (Some(_), other) => {
+            // Python reprs the type (`'unknown'`, or `None` when absent).
+            let shown = match other {
+                Some(s) => format!("'{s}'"),
+                None => "None".to_string(),
+            };
             let message =
-                format!("Model invoked tool {tool_name} with unsupported caller type {other:?}.");
+                format!("Model invoked tool {tool_name} with unsupported caller type {shown}.");
             attach_span_error(
                 &message,
                 serde_json::json!({

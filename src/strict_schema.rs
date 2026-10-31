@@ -236,6 +236,11 @@ fn ensure_strict(
         ));
     }
     let Value::Object(mut obj) = schema else {
+        // `true` is the unconstrained schema schemars emits for `serde_json::Value`; Python's
+        // pydantic emits `{}` for `Any`, which strict conversion also leaves as it is.
+        if schema == Value::Bool(true) {
+            return Ok(schema);
+        }
         return Err(AgentsError::user(format!(
             "Expected a JSON schema object, got {schema}"
         )));
@@ -510,7 +515,10 @@ fn merge_single_all_of(entry: &Value, parent: &Map<String, Value>) -> Result<Map
 
 /// Resolve a local `#/...` JSON pointer against the schema root.
 pub fn resolve_ref(root: &Value, reference: &str) -> Result<Value> {
-    let Some(path) = reference.strip_prefix("#/") else {
+    // The fragment is percent-decoded before it is split into JSON pointer segments, as Python's
+    // `unquote` does; `%2F` therefore separates segments too.
+    let decoded = percent_decode_ref(reference)?;
+    let Some(path) = decoded.strip_prefix("#/") else {
         return Err(AgentsError::user(format!(
             "Unexpected $ref format {reference:?}; does not start with #/"
         )));
@@ -549,6 +557,32 @@ pub fn resolve_ref(root: &Value, reference: &str) -> Result<Value> {
         }
     }
     Ok(current.clone())
+}
+
+/// Percent-decode a `$ref`. A `%` not followed by two hex digits is kept as-is, as `unquote`
+/// does. Bytes that do not form UTF-8 are an error, like Python's `UnicodeDecodeError`.
+fn percent_decode_ref(reference: &str) -> Result<String> {
+    let bytes = reference.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let hex = |b: u8| (b as char).to_digit(16);
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(hi), Some(lo)) = (hex(bytes[i + 1]), hex(bytes[i + 2]))
+        {
+            out.push((hi * 16 + lo) as u8);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).map_err(|_| {
+        AgentsError::user(format!(
+            "$ref {reference:?} does not percent-decode to valid UTF-8"
+        ))
+    })
 }
 
 #[cfg(test)]

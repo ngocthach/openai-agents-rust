@@ -9,6 +9,8 @@ use crate::items::{InputItem, RunItem, RunItemKind};
 
 const PREAMBLE: &str =
     "For context, here is the conversation so far between the user and the previous agent:";
+/// Preamble of summaries written before the preamble named the previous agent.
+const LEGACY_PREAMBLE: &str = "For context, here is the conversation so far:";
 /// Default opening marker of the nested conversation history block.
 pub const DEFAULT_HISTORY_START: &str = "<CONVERSATION HISTORY>";
 /// Default closing marker of the nested conversation history block.
@@ -124,45 +126,224 @@ fn format_item(item: &Value) -> String {
             };
             return format!("{prefix}: {}", stringify(&content));
         }
-        return item.to_string();
+        return python_style_json(&item);
     }
-    item.to_string()
+    python_style_json(&item)
 }
 
-/// Lines of an earlier summary message, if `item` is one.
-fn nested_lines(item: &Value) -> Option<Vec<String>> {
+/// Render a value the way Python's `json.dumps(value, ensure_ascii=False)` does, with `", "` and
+/// `": "` separators, because the summary text the model reads is the Python rendering.
+fn python_style_json(value: &Value) -> String {
+    match value {
+        Value::Object(map) => {
+            let parts: Vec<String> = map
+                .iter()
+                .map(|(k, v)| format!("{}: {}", Value::String(k.clone()), python_style_json(v)))
+                .collect();
+            format!("{{{}}}", parts.join(", "))
+        }
+        Value::Array(items) => {
+            let parts: Vec<String> = items.iter().map(python_style_json).collect();
+            format!("[{}]", parts.join(", "))
+        }
+        other => other.to_string(),
+    }
+}
+
+/// Flatten earlier summary messages back into the transcript items they summarize, keeping
+/// every other item as is. Port of `_flatten_nested_history_messages`.
+pub(crate) fn flatten_nested_history_messages(items: &[InputItem]) -> Vec<InputItem> {
+    let mut flattened = Vec::new();
+    for item in items {
+        match extract_nested_history_transcript(&item.0) {
+            Some(transcript) => flattened.extend(transcript.into_iter().map(InputItem)),
+            None => flattened.push(item.clone()),
+        }
+    }
+    flattened
+}
+
+/// The items recorded in an earlier summary message, or `None` when `item` is not one.
+/// Port of `_extract_nested_history_transcript`.
+fn extract_nested_history_transcript(item: &Value) -> Option<Vec<Value>> {
     if item.get("role").and_then(Value::as_str) != Some("assistant") {
         return None;
     }
     let content = item.get("content")?.as_str()?;
-    let (start_marker, end_marker) = get_conversation_history_wrappers();
-    let start = content.find(&start_marker)?;
-    let end = content.find(&end_marker)?;
-    if end <= start {
+    let (preamble, wrapped) = content.split_once('\n')?;
+    if preamble != PREAMBLE && preamble != LEGACY_PREAMBLE {
         return None;
     }
-    let body = &content[start + start_marker.len()..end];
+    let (start_marker, end_marker) = get_conversation_history_wrappers();
+    let start_wrapper = format!("{start_marker}\n");
+    let end_wrapper = format!("\n{end_marker}");
+    if !wrapped.starts_with(&start_wrapper) || !wrapped.ends_with(&end_wrapper) {
+        return None;
+    }
+    // Python slices `wrapped[len(start):-len(end)]`, which is empty when the two overlap.
+    let body_end = wrapped.len() - end_wrapper.len();
+    let body = if body_end >= start_wrapper.len() {
+        &wrapped[start_wrapper.len()..body_end]
+    } else {
+        ""
+    };
     Some(
-        body.lines()
-            .map(str::trim)
-            .filter(|l| !l.is_empty() && *l != "(no previous turns recorded)")
-            .map(|l| match l.split_once(". ") {
-                Some((n, rest)) if n.chars().all(|c| c.is_ascii_digit()) => rest.to_string(),
-                _ => l.to_string(),
-            })
+        split_summary_records(body)
+            .iter()
+            .filter_map(|record| parse_summary_line(record))
             .collect(),
     )
 }
 
-/// Build the summary message for `transcript`, flattening earlier summaries.
-pub(crate) fn build_summary_message(transcript: &[InputItem]) -> InputItem {
-    let mut lines: Vec<String> = Vec::new();
-    for item in transcript {
-        match nested_lines(&item.0) {
-            Some(nested) => lines.extend(nested),
-            None => lines.push(format_item(&item.0)),
+/// Split the body of a summary into records. A numbered record absorbs the following
+/// unnumbered lines, which are message content that spans lines. Port of
+/// `_split_summary_records`.
+fn split_summary_records(body: &str) -> Vec<String> {
+    let mut records: Vec<String> = Vec::new();
+    let mut current: Vec<String> = Vec::new();
+    let mut current_is_numbered = false;
+    for raw_line in body.split('\n') {
+        if raw_line.trim().is_empty() {
+            continue;
+        }
+        let starts_numbered = starts_numbered_summary_record(raw_line);
+        if current.is_empty() {
+            current = vec![raw_line.trim().to_string()];
+            current_is_numbered = starts_numbered;
+            continue;
+        }
+        if starts_numbered || !current_is_numbered {
+            records.push(current.join("\n"));
+            current = vec![raw_line.trim().to_string()];
+            current_is_numbered = starts_numbered;
+            continue;
+        }
+        current.push(raw_line.trim_end().to_string());
+    }
+    if !current.is_empty() {
+        records.push(current.join("\n"));
+    }
+    records
+}
+
+fn starts_numbered_summary_record(line: &str) -> bool {
+    let stripped = line.trim_start();
+    match stripped.find('.') {
+        Some(dot) => {
+            let number = &stripped[..dot];
+            !number.is_empty() && number.chars().all(|c| c.is_ascii_digit())
+        }
+        None => false,
+    }
+}
+
+/// Parse one summary record back into an input item. Port of `_parse_summary_line`.
+fn parse_summary_line(line: &str) -> Option<Value> {
+    let stripped = line.trim();
+    if stripped.is_empty() {
+        return None;
+    }
+    let stripped = strip_summary_line_number(stripped);
+    if let Some(item) = parse_summary_json_item(stripped) {
+        return Some(item);
+    }
+    let Some((role_part, remainder)) = stripped.split_once(':') else {
+        // Summaries written before the separator was always emitted record an empty turn as a
+        // bare role. Recover those, restricted to a lone role with an optional "(name)".
+        if !is_bare_role_record(stripped) {
+            return None;
+        }
+        let (role, name) = split_role_and_name(stripped);
+        let mut record = json!({"role": role});
+        if let Some(name) = name {
+            record["name"] = json!(name);
+        }
+        record["content"] = json!("");
+        return Some(record);
+    };
+    let role_text = role_part.trim();
+    if role_text.is_empty() {
+        return None;
+    }
+    let (role, name) = split_role_and_name(role_text);
+    let content = remainder.trim();
+    if !content.is_empty()
+        && let Some(item) = parse_legacy_typed_item(&role, content)
+    {
+        return Some(item);
+    }
+    let mut record = json!({"role": role});
+    if let Some(name) = name {
+        record["name"] = json!(name);
+    }
+    // Keep an explicit content even when empty, so the turn stays a replayable message.
+    record["content"] = json!(content);
+    Some(record)
+}
+
+fn strip_summary_line_number(stripped: &str) -> &str {
+    if starts_numbered_summary_record(stripped)
+        && let Some(dot) = stripped.find('.')
+    {
+        return stripped[dot + 1..].trim_start();
+    }
+    stripped
+}
+
+fn parse_summary_json_item(value: &str) -> Option<Value> {
+    let Ok(Value::Object(mut item)) = serde_json::from_str::<Value>(value) else {
+        return None;
+    };
+    item.remove("provider_data");
+    Some(Value::Object(item))
+}
+
+/// `function_call: {...}`-style records written by the Python SDK. Port of
+/// `_parse_legacy_typed_item`.
+fn parse_legacy_typed_item(item_type: &str, content: &str) -> Option<Value> {
+    if matches!(item_type, "assistant" | "user" | "system" | "developer") {
+        return None;
+    }
+    let Ok(Value::Object(mut item)) = serde_json::from_str::<Value>(content) else {
+        return None;
+    };
+    item.remove("provider_data");
+    item.insert("type".to_string(), json!(item_type));
+    Some(Value::Object(item))
+}
+
+fn is_bare_role_record(stripped: &str) -> bool {
+    let candidate = match stripped.rfind('(') {
+        Some(open) if stripped.ends_with(')') => stripped[..open].trim(),
+        _ => stripped,
+    };
+    matches!(candidate, "user" | "assistant" | "system" | "developer")
+}
+
+/// Split `role (name)` into its role and name. Port of `_split_role_and_name`.
+fn split_role_and_name(role_text: &str) -> (String, Option<String>) {
+    if role_text.ends_with(')')
+        && let Some(open) = role_text.rfind('(')
+    {
+        let name = role_text[open + 1..role_text.len() - 1].trim();
+        if !name.is_empty() {
+            let role = role_text[..open].trim();
+            let role = if role.is_empty() { "developer" } else { role };
+            return (role.to_string(), Some(name.to_string()));
         }
     }
+    let role = if role_text.is_empty() {
+        "developer"
+    } else {
+        role_text
+    };
+    (role.to_string(), None)
+}
+
+/// Build the summary message for `transcript`. Earlier summaries are not flattened here; the
+/// caller does that. Port of `_build_summary_message`.
+pub(crate) fn build_summary_message(transcript: &[InputItem]) -> InputItem {
+    let lines: Vec<String> = transcript.iter().map(|i| format_item(&i.0)).collect();
     let (start_marker, end_marker) = get_conversation_history_wrappers();
     let mut content = vec![PREAMBLE.to_string(), start_marker];
     if lines.is_empty() {
@@ -234,25 +415,6 @@ pub(crate) fn normalize_handoff_items(
         .collect()
 }
 
-/// Indexes into `items` of the items [`build_ordered_history`] forwards verbatim (outside the
-/// summary). Port of the provenance half of `_build_ordered_default_history`.
-pub(crate) fn forwarded_item_indexes(items: &[RunItem], pre_count: usize) -> Vec<usize> {
-    items
-        .iter()
-        .enumerate()
-        .filter(|(_, item)| !matches!(item.kind, RunItemKind::ToolApproval { .. }))
-        .filter(|(index, item)| {
-            let plain = item.to_input_item();
-            if *index < pre_count {
-                should_forward_pre_item(&plain.0)
-            } else {
-                should_forward_new_item(&plain.0)
-            }
-        })
-        .map(|(index, _)| index)
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -263,7 +425,8 @@ mod tests {
         let text = first.text_content().unwrap();
         assert!(text.contains("1. user: hi"));
         assert!(text.contains("2. assistant: hello"));
-        let second = build_summary_message(&[first, InputItem::user("more")]);
+        let flattened = flatten_nested_history_messages(&[first, InputItem::user("more")]);
+        let second = build_summary_message(&flattened);
         let text = second.text_content().unwrap();
         assert!(text.contains("3. user: more"));
         assert_eq!(text.matches(DEFAULT_HISTORY_START).count(), 1);

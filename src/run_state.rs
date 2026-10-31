@@ -206,6 +206,22 @@ pub struct RunState {
     /// Mirrors `_context_meta_requires_deserializer`. Read-only; derived on deserialization.
     #[serde(skip)]
     pub context_requires_restoration: bool,
+    /// The snapshot was written before schema `1.21`, so its duplicate-named agents were named by
+    /// ordinal and could not record hook instance state. Set on deserialization from the payload
+    /// version; a resume refuses it when the graph has such duplicates. Mirrors the
+    /// `(schema_major, schema_minor) < (1, 21)` gate in Python's `_deserialize_run_state`.
+    #[serde(skip)]
+    pub legacy_hook_identity_snapshot: bool,
+    /// The graph this snapshot came from has same-named agents that differ only by hook instance
+    /// state. Set when the run builds the snapshot; [`to_json`](Self::to_json) then refuses to
+    /// write it, as Python does. Derived from the graph, so it never travels on the wire.
+    #[serde(skip)]
+    pub hook_identity_ambiguous: bool,
+    /// The parked interruption may end the run once it resolves (its agent stops on the tool
+    /// result), so staged input could never reach a model call. Set when the run builds the
+    /// snapshot; [`add_input`](Self::add_input) refuses such a state, as Python does.
+    #[serde(skip)]
+    pub tool_result_may_end_run: bool,
 }
 
 /// How [`RunState::from_json_with`] treats a snapshot whose context cannot be restored from
@@ -405,15 +421,18 @@ impl RunState {
     /// Stage new user input for the next model call of the resumed run.
     pub fn add_input(&mut self, input: impl Into<StagedInput>) -> Result<()> {
         if self.final_output.is_some() {
-            return Err(AgentsError::user(
-                "Cannot add input to a finished run; start a new run instead.",
-            ));
+            return Err(AgentsError::user("Cannot add input to a terminal RunState"));
         }
         if let Some(max) = self.max_turns
             && self.current_turn >= max
         {
             return Err(AgentsError::user(
-                "Cannot add input: no model turns remain.",
+                "Cannot add input to a RunState with no remaining model turns",
+            ));
+        }
+        if self.tool_result_may_end_run {
+            return Err(AgentsError::user(
+                "Cannot add input to an interrupted RunState whose tool result may end the run",
             ));
         }
         match input.into() {
@@ -469,7 +488,8 @@ impl RunState {
     ///
     /// Reads the Python envelope as well as the flat `"1.0"` snapshots this crate used to
     /// write.
-    pub fn from_json(value: Value) -> Result<Self> {
+    pub fn from_json(mut value: Value) -> Result<Self> {
+        wire::rename_python_async_alias(&mut value);
         let version = wire::validate_schema_version(&value)?;
         let version = version.as_str();
         let is_legacy_rust = wire::is_legacy_rust_envelope(&value);
@@ -506,6 +526,7 @@ impl RunState {
                 wire::context_meta_warning(context_meta.as_ref()),
             );
         }
+        state.legacy_hook_identity_snapshot = version_precedes(version, (1, 21));
         // The in-memory state is always current; the version only describes the payload read.
         state.schema_version = CURRENT_SCHEMA_VERSION.to_string();
         Ok(state)
@@ -656,5 +677,17 @@ impl From<String> for StagedInput {
 impl From<Vec<InputItem>> for StagedInput {
     fn from(value: Vec<InputItem>) -> Self {
         StagedInput::Items(value)
+    }
+}
+
+/// Whether a `major.minor` schema version sorts before `minimum`. A version that does not parse
+/// is not treated as legacy.
+fn version_precedes(version: &str, minimum: (u32, u32)) -> bool {
+    let Some((major, minor)) = version.split_once('.') else {
+        return false;
+    };
+    match (major.parse::<u32>(), minor.parse::<u32>()) {
+        (Ok(major), Ok(minor)) => (major, minor) < minimum,
+        _ => false,
     }
 }

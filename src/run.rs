@@ -315,10 +315,12 @@ fn run_streamed_default<C: Send + Sync + 'static>(
     let scope = ScopeSnapshot::capture();
     let start_agent = agent.clone();
     let max_turns = options.max_turns;
+    let finished_control = control.clone();
     let handle = tokio::spawn(async move {
         let result = scope
             .enter(Box::pin(run_loop(agent, input, options, Some(sink))))
             .await;
+        finished_control.mark_finished();
         let _ = tx.send(StreamMsg::Done(Box::new(result)));
     });
     let mut streaming = RunResultStreaming::new(rx, start_agent, cancel, control, handle);

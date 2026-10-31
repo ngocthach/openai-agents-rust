@@ -297,6 +297,11 @@ impl Span {
     }
 
     /// When the span was started (ISO-8601), if it has been.
+    /// The metadata of the trace this span belongs to, if it has any. Mirrors `Span.trace_metadata`.
+    pub fn trace_metadata(&self) -> Option<&Map<String, Value>> {
+        self.0.trace_metadata.as_ref()
+    }
+
     pub fn started_at(&self) -> Option<String> {
         self.0
             .state
@@ -346,6 +351,10 @@ impl Span {
 
     /// Record an error.
     pub fn set_error(&self, message: impl Into<String>, data: Option<Value>) {
+        // A disabled span is a no-op: it records no error, as Python's `NoOpSpan` does.
+        if self.0.disabled {
+            return;
+        }
         self.0.state.lock().expect("span poisoned").error = Some(SpanError {
             message: message.into(),
             data,
@@ -354,6 +363,10 @@ impl Span {
 
     /// Start the span.
     pub fn start(&self) {
+        // A disabled span keeps no timestamps: Python's `NoOpSpan.started_at` is `None`.
+        if self.0.disabled {
+            return;
+        }
         {
             let mut st = self.0.state.lock().expect("span poisoned");
             if st.started_at.is_some() {
@@ -361,13 +374,14 @@ impl Span {
             }
             st.started_at = Some(time_iso());
         }
-        if !self.0.disabled {
-            provider().on_span_start(self);
-        }
+        provider().on_span_start(self);
     }
 
     /// Finish the span.
     pub fn finish(&self) {
+        if self.0.disabled {
+            return;
+        }
         {
             let mut st = self.0.state.lock().expect("span poisoned");
             if st.ended_at.is_some() {
@@ -375,9 +389,7 @@ impl Span {
             }
             st.ended_at = Some(time_iso());
         }
-        if !self.0.disabled {
-            provider().on_span_end(self);
-        }
+        provider().on_span_end(self);
     }
 
     /// Start the span, run `fut` with it as the current span, then finish it.
@@ -404,14 +416,31 @@ impl Span {
             "span_data": st.data.export(),
             "error": st.error.as_ref().map(|e| json!({"message": e.message, "data": e.data})),
         });
-        if let Some(meta) = &self.0.trace_metadata
-            && let Some(v) = meta.get("agent_harness_id")
-        {
-            payload["metadata"] = json!({"agent_harness_id": v});
+        // Routing keys from the trace metadata come first; the span data's own metadata fills in
+        // the rest without overriding them. Mirrors `SpanImpl.export`.
+        let mut metadata = Map::new();
+        if let Some(meta) = &self.0.trace_metadata {
+            for key in SPAN_METADATA_ROUTING_KEYS {
+                if let Some(v) = meta.get(*key) {
+                    metadata.insert((*key).to_string(), v.clone());
+                }
+            }
+        }
+        if let Some(data_meta) = &st.data_metadata {
+            for (k, v) in data_meta {
+                metadata.entry(k.clone()).or_insert_with(|| v.clone());
+            }
+        }
+        if !metadata.is_empty() {
+            payload["metadata"] = Value::Object(metadata);
         }
         Some(payload)
     }
 }
+
+/// Trace metadata keys that a span exports as its own `metadata`. Mirrors
+/// `_SPAN_METADATA_ROUTING_KEYS`.
+const SPAN_METADATA_ROUTING_KEYS: &[&str] = &["agent_harness_id"];
 
 /// Generate a trace id (`trace_<32 hex>`).
 pub fn gen_trace_id() -> String {

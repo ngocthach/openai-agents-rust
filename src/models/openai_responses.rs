@@ -12,7 +12,7 @@ use super::openai_client::OpenAIClient;
 use crate::error::{AgentsError, Result};
 use crate::items::{InputItem, ModelResponse, OutputItem};
 use crate::model_settings::ToolChoice;
-use crate::tracing::{Span, SpanData, record_model_error_on_span, response_span};
+use crate::tracing::{ModelSpanGuard, Span, SpanData, record_model_error_on_span, response_span};
 use crate::usage::Usage;
 
 use super::response_terminal::{
@@ -816,11 +816,15 @@ pub fn attach_stream_request_id(event: &mut Value, request_id: Option<&str>) {
 ///
 /// Mirrors Python: the usage is always recorded; the response and the request input only when
 /// tracing includes data (neither is part of the exported payload).
+///
+/// The response id is redacted with the rest of the data unless `trusted_response_id` says the
+/// endpoint is the official OpenAI API. Mirrors `redacted_response_id_endpoint_is_trusted`.
 pub(crate) fn finish_response_span(
     span: &Span,
     resp: &ModelResponse,
     include_data: bool,
     input: &[InputItem],
+    trusted_response_id: bool,
 ) {
     span.update_data(|d| {
         if let SpanData::Response {
@@ -830,7 +834,11 @@ pub(crate) fn finish_response_span(
             input: span_input,
         } = d
         {
-            *response_id = resp.response_id.clone();
+            *response_id = if include_data || trusted_response_id {
+                resp.response_id.clone()
+            } else {
+                None
+            };
             *usage = Some(resp.usage.to_span_usage());
             if include_data {
                 *response = serde_json::to_value(resp).ok();
@@ -874,8 +882,10 @@ pub(crate) fn deliver_terminal_failures(
 }
 
 /// Ensures a span is finished when a stream is dropped early.
+#[cfg(feature = "websocket")]
 pub(crate) struct SpanGuard(pub(crate) Span);
 
+#[cfg(feature = "websocket")]
 impl Drop for SpanGuard {
     fn drop(&mut self) {
         self.0.finish();
@@ -892,6 +902,11 @@ impl Model for OpenAIResponsesModel {
         let body = self.build_request_body(&request, false)?;
         let span = response_span(request.tracing.is_disabled());
         span.start();
+        let mut guard = ModelSpanGuard::new(
+            &span,
+            "Error getting response",
+            request.tracing.include_data(),
+        );
         let result = async {
             let (value, request_id) = self
                 .client
@@ -910,13 +925,21 @@ impl Model for OpenAIResponsesModel {
         }
         .await;
         let include_data = request.tracing.include_data();
+        let trusted_response_id = self.client.is_openai_api();
         match &result {
-            Ok(resp) => finish_response_span(&span, resp, include_data, &request.input),
+            Ok(resp) => finish_response_span(
+                &span,
+                resp,
+                include_data,
+                &request.input,
+                trusted_response_id,
+            ),
             Err(e) => {
                 record_model_error_on_span(&span, "Error getting response", e, include_data);
                 crate::logger::log_model_action_error("Error getting response", e);
             }
         }
+        guard.disarm();
         span.finish();
         result
     }
@@ -926,6 +949,7 @@ impl Model for OpenAIResponsesModel {
         let span = response_span(request.tracing.is_disabled());
         span.start();
         let include_data = request.tracing.include_data();
+        let trusted_response_id = self.client.is_openai_api();
         let (stream, request_id) = match self
             .client
             .post_sse(
@@ -945,9 +969,9 @@ impl Model for OpenAIResponsesModel {
             }
         };
         let span_input = request.input.clone();
-        let guard = SpanGuard(span);
+        let guard = ModelSpanGuard::new(&span, "Error streaming response", include_data);
         let mapped = deliver_terminal_failures(stream, move |ev| {
-            let span = &guard.0;
+            let span = guard.span();
             match ev {
                 Ok(mut event) => {
                     attach_stream_request_id(&mut event, request_id.as_deref());
@@ -960,7 +984,13 @@ impl Model for OpenAIResponsesModel {
                         if let Some(r) = event.get("response")
                             && let Ok(parsed) = parse_response(r, None, false)
                         {
-                            finish_response_span(span, &parsed, include_data, &span_input);
+                            finish_response_span(
+                                span,
+                                &parsed,
+                                include_data,
+                                &span_input,
+                                trusted_response_id,
+                            );
                         }
                         return (vec![Ok(event)], true);
                     }

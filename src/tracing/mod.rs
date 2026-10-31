@@ -28,9 +28,10 @@ use std::sync::Arc;
 use serde_json::{Map, Value};
 
 pub use error_tracing::{
-    REDACTED_TOOL_ERROR_MESSAGE, REDACTED_TRACE_ERROR_MESSAGE, attach_error_to_current_span,
-    get_trace_error, get_trace_tool_error, model_error_text, record_model_error_on_span,
-    record_tool_error_on_span,
+    ModelSpanGuard, ModelTimeoutSlot, REDACTED_TOOL_ERROR_MESSAGE, REDACTED_TRACE_ERROR_MESSAGE,
+    attach_error_to_current_span, attach_generic_agent_error, get_trace_error,
+    get_trace_tool_error, model_error_text, record_model_error_on_span, record_tool_error_on_span,
+    scope_model_timeout,
 };
 pub use processors::{
     BackendSpanExporter, BatchTraceProcessor, ConsoleSpanExporter, ExportItem, ExportedObject,
@@ -621,7 +622,8 @@ pub struct TracingShutdownGuard(());
 
 impl Drop for TracingShutdownGuard {
     fn drop(&mut self) {
-        shutdown_tracing();
+        // Bounded, as Python's exit hook is: a stalled exporter must not hold the process open.
+        provider().shutdown_with_timeout(provider::DEFAULT_SHUTDOWN_TIMEOUT);
     }
 }
 

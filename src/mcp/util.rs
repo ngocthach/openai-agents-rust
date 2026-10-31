@@ -338,6 +338,20 @@ pub async fn invoke_mcp_tool(
     meta: Option<Map<String, Value>>,
     tool_display_name: Option<&str>,
 ) -> Result<ToolOutput> {
+    invoke_mcp_tool_with_result_meta(server, tool, input_json, meta, tool_display_name)
+        .await
+        .map(|(output, _)| output)
+}
+
+/// [`invoke_mcp_tool`] that also returns the call result's `_meta`, which the function tool
+/// exposes to its custom-data extractor as `result_meta`.
+pub(crate) async fn invoke_mcp_tool_with_result_meta(
+    server: &Arc<dyn MCPServer>,
+    tool: &MCPTool,
+    input_json: &str,
+    meta: Option<Map<String, Value>>,
+    tool_display_name: Option<&str>,
+) -> Result<(ToolOutput, Option<Value>)> {
     let display = tool_display_name.unwrap_or(&tool.name);
     let arguments: Option<Map<String, Value>> = if input_json.trim().is_empty() {
         None
@@ -408,9 +422,10 @@ pub async fn invoke_mcp_tool(
             )),
         }
     })?;
-    Ok(convert_call_tool_result(
-        &result,
-        server.config().use_structured_content,
+    let result_meta = result.get("_meta").filter(|m| m.is_object()).cloned();
+    Ok((
+        convert_call_tool_result(&result, server.config().use_structured_content),
+        result_meta,
     ))
 }
 
@@ -456,14 +471,23 @@ pub async fn to_function_tool_with_failure<C: Send + Sync + 'static>(
         exposed_name,
         resolve_mcp_tool_description_for_model(tool),
         schema,
-        move |_ctx, args: String| {
+        move |ctx, args: String| {
             let srv = srv.clone();
             let mcp_tool = mcp_tool.clone();
             let display = display.clone();
             async move {
                 // A fresh copy of the static `_meta` per call, as Python's partial passes it.
                 let static_meta = mcp_tool.meta.clone();
-                invoke_mcp_tool(&srv, &mcp_tool, &args, static_meta, Some(&display)).await
+                let (output, result_meta) = invoke_mcp_tool_with_result_meta(
+                    &srv,
+                    &mcp_tool,
+                    &args,
+                    static_meta,
+                    Some(&display),
+                )
+                .await?;
+                ctx.set_result_meta(result_meta);
+                Ok(output)
             }
         },
     );

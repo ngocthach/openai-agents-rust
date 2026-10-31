@@ -176,6 +176,32 @@ fn output_outcome(call: &FunctionCall, output: ToolOutput) -> ToolOutcome {
     ToolOutcome::Output { output, item }
 }
 
+/// An SDK-generated error for a call (a rejection, a guardrail verdict or a default failure
+/// message). A schema-backed tool that a program called answers with `{"error": text}`, so the
+/// program can parse the result; the run item keeps the plain text. Port of
+/// `function_tool_error_output`.
+fn error_outcome(
+    output_json_schema: Option<&Value>,
+    call: &FunctionCall,
+    text: String,
+) -> ToolOutcome {
+    let called_by_program = call
+        .extra
+        .get("caller")
+        .and_then(|c| c.get("type"))
+        .and_then(Value::as_str)
+        == Some("program");
+    let provider_text = if output_json_schema.is_some() && called_by_program {
+        json!({"error": text}).to_string()
+    } else {
+        text.clone()
+    };
+    ToolOutcome::Output {
+        output: ToolOutput::Text(text),
+        item: ItemHelpers::tool_call_output_item(call, &ToolOutput::Text(provider_text)),
+    }
+}
+
 enum InputGuardrailVerdict {
     Allow,
     Reject(String),
@@ -285,7 +311,7 @@ pub(crate) async fn execute_function_tool<C: Send + Sync + 'static>(
             status = status_now();
             if let (None, InputGuardrailVerdict::Reject(msg)) = (status, verdict) {
                 return Ok(finish(
-                    output_outcome(&call, ToolOutput::Text(msg)),
+                    error_outcome(tool.output_json_schema.as_ref(), &call, msg),
                     input_results,
                     output_results,
                 ));
@@ -357,7 +383,7 @@ pub(crate) async fn execute_function_tool<C: Send + Sync + 'static>(
                 );
                 span.finish();
                 return Ok(finish(
-                    output_outcome(&call, ToolOutput::Text(message)),
+                    error_outcome(tool.output_json_schema.as_ref(), &call, message),
                     input_results,
                     output_results,
                 ));
@@ -391,7 +417,7 @@ pub(crate) async fn execute_function_tool<C: Send + Sync + 'static>(
             && let InputGuardrailVerdict::Reject(msg) =
                 run_input_guardrails(env, &tool, &tool_ctx, &mut input_results).await?
         {
-            return Ok(output_outcome(&call, ToolOutput::Text(msg)));
+            return Ok(error_outcome(tool.output_json_schema.as_ref(), &call, msg));
         }
         let tool_enum = Tool::Function(tool.clone());
         // From here on user code runs: a retry must not run it again.
@@ -405,6 +431,12 @@ pub(crate) async fn execute_function_tool<C: Send + Sync + 'static>(
             }
         }
 
+        // A failure or timeout that the tool's error function turned into model text is not the
+        // tool's own output, so the declared output type does not apply to it.
+        let mut formatted_failure = false;
+        let mut output_rejected = false;
+        // The text is the SDK's own (a default failure or timeout message), not the tool's.
+        let mut sdk_generated_text = false;
         let invocation = tool.invoke_body(tool_ctx.clone(), call.arguments.clone());
         let result = match tool.timeout {
             Some(d) => match tokio::time::timeout(d, invocation).await {
@@ -418,13 +450,17 @@ pub(crate) async fn execute_function_tool<C: Send + Sync + 'static>(
                     match tool.timeout_behavior {
                         ToolTimeoutBehavior::RaiseException => return Err(err),
                         ToolTimeoutBehavior::ErrorAsResult => {
+                            formatted_failure = true;
                             let msg = match &tool.timeout_error_function {
                                 Some(f) => f(env.ctx, &err),
-                                None => format!(
-                                    "Tool '{}' timed out after {} seconds.",
-                                    tool.name,
-                                    d.as_secs_f64()
-                                ),
+                                None => {
+                                    sdk_generated_text = true;
+                                    format!(
+                                        "Tool '{}' timed out after {} seconds.",
+                                        tool.name,
+                                        d.as_secs_f64()
+                                    )
+                                }
                             };
                             Ok(ToolOutput::Text(msg))
                         }
@@ -443,6 +479,7 @@ pub(crate) async fn execute_function_tool<C: Send + Sync + 'static>(
         let mut output = match result {
             Ok(o) => o,
             Err(e) => {
+                formatted_failure = true;
                 let propagate = matches!(
                     e,
                     AgentsError::InputGuardrailTripwireTriggered { .. }
@@ -456,6 +493,7 @@ pub(crate) async fn execute_function_tool<C: Send + Sync + 'static>(
                 let propagate = propagate
                     || (tool.uses_default_failure_error_function
                         && tool.output_json_schema.is_some()
+                        && !matches!(e, AgentsError::ToolTimeoutError { .. })
                         && call
                             .extra
                             .get("caller")
@@ -478,6 +516,7 @@ pub(crate) async fn execute_function_tool<C: Send + Sync + 'static>(
                                 msg,
                                 Some(&e),
                             );
+                            sdk_generated_text = true;
                         }
                         // The default policy keeps the error out of traces even when sensitive
                         // data is traced; only an application handler opts the detail in.
@@ -516,7 +555,15 @@ pub(crate) async fn execute_function_tool<C: Send + Sync + 'static>(
 
         // A declared output type is a contract on the tool, not model feedback: a mismatch
         // fails the run rather than reaching `failure_error_function`.
-        tool.validate_output(&tool_ctx.tool_name, &output)?;
+        // The default failure text is model feedback, not a structured result. An application
+        // handler's output is the tool's result, so it must match the declared type too.
+        if !formatted_failure {
+            tool.validate_output(&tool_ctx.tool_name, &output)?;
+        } else if !tool.uses_default_failure_error_function
+            && let ToolOutput::Text(text) = &output
+        {
+            tool.validate_failure_text(&tool_ctx.tool_name, text)?;
+        }
 
         for g in &tool.tool_output_guardrails {
             let out = g
@@ -535,6 +582,7 @@ pub(crate) async fn execute_function_tool<C: Send + Sync + 'static>(
                 ToolGuardrailBehavior::Allow => {}
                 ToolGuardrailBehavior::RejectContent { message } => {
                     output = ToolOutput::Text(message.clone());
+                    output_rejected = true;
                     break;
                 }
                 ToolGuardrailBehavior::RaiseException => {
@@ -554,6 +602,17 @@ pub(crate) async fn execute_function_tool<C: Send + Sync + 'static>(
         if let Some(h) = &env.agent.hooks {
             h.on_tool_end(&tool_ctx, env.agent, &tool_enum, &output)
                 .await;
+        }
+        // The default failure text and a guardrail's rejection are SDK-generated errors, which a
+        // schema-backed tool called by a program answers as a JSON error object.
+        if let ToolOutput::Text(text) = &output
+            && (sdk_generated_text || output_rejected)
+        {
+            return Ok(error_outcome(
+                tool.output_json_schema.as_ref(),
+                &call,
+                text.clone(),
+            ));
         }
         Ok(output_outcome(&call, output))
     };
@@ -598,6 +657,7 @@ pub(crate) async fn execute_function_tool<C: Send + Sync + 'static>(
                 tool: &tool,
                 output,
                 raw_item: item,
+                result_meta: tool_ctx.result_meta(),
             };
             extractor(&ctx).await
         }

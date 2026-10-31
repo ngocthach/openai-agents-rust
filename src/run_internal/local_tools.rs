@@ -30,6 +30,21 @@ fn log_tool_error(label: &str, msg: &str) {
     }
 }
 
+/// Record a failed local tool on `span` with the tool name, as Python's `SpanError` for
+/// shell, apply_patch and custom tools carries it. The error text is redacted unless sensitive
+/// trace data is enabled.
+fn record_local_tool_error(span: &Span, tool_name: &str, message: &str, include_sensitive: bool) {
+    let text = if include_sensitive {
+        message.to_string()
+    } else {
+        crate::tracing::REDACTED_TOOL_ERROR_MESSAGE.to_string()
+    };
+    span.set_error(
+        "Error running tool",
+        Some(json!({"tool_name": tool_name, "error": text})),
+    );
+}
+
 /// A local tool call found in a model response.
 pub(crate) enum LocalCall<C> {
     Computer(Value, Arc<ComputerTool<C>>),
@@ -452,7 +467,7 @@ async fn run_computer<C: Send + Sync + 'static>(
         .with_agent(env.agent.clone())
         .with_run_config(env.config.clone());
     let run = async {
-        let computer = tool.resolve().await?;
+        let computer = tool.resolve(env.ctx).await?;
         start_hooks(env, &tool_ctx, &tool_enum).await;
         let shot = run_computer_actions(computer.as_ref(), &raw).await?;
         let image_url = if shot.is_empty() {
@@ -607,9 +622,9 @@ async fn run_shell<C: Send + Sync + 'static>(
                 status = "failed";
                 let msg = e.to_string();
                 if let Some(s) = scope::current_span() {
-                    crate::tracing::record_tool_error_on_span(
+                    record_local_tool_error(
                         &s,
-                        "Error running tool",
+                        &tool.name,
                         &msg,
                         env.config.trace_include_sensitive_data,
                     );
@@ -797,9 +812,9 @@ async fn run_apply_patch<C: Send + Sync + 'static>(
                 status = ApplyPatchStatus::Failed;
                 let msg = e.to_string();
                 if let Some(s) = scope::current_span() {
-                    crate::tracing::record_tool_error_on_span(
+                    record_local_tool_error(
                         &s,
-                        "Error running tool",
+                        &tool.name,
                         &msg,
                         env.config.trace_include_sensitive_data,
                     );
@@ -910,9 +925,9 @@ async fn run_custom<C: Send + Sync + 'static>(
             Err(e) => {
                 let msg = e.to_string();
                 if let Some(s) = scope::current_span() {
-                    crate::tracing::record_tool_error_on_span(
+                    record_local_tool_error(
                         &s,
-                        "Error running tool",
+                        &tool.name,
                         &msg,
                         env.config.trace_include_sensitive_data,
                     );

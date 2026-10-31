@@ -7,6 +7,7 @@ use std::fmt;
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
+use std::time::Duration;
 
 use super::processors::{BackendSpanExporter, BatchTraceProcessor, TracingProcessor};
 use super::spans::{Span, Trace};
@@ -29,11 +30,20 @@ pub trait TraceProvider: Send + Sync + fmt::Debug {
     fn on_span_start(&self, span: &Span);
     /// A span finished.
     fn on_span_end(&self, span: &Span);
-    /// Flush all processors (blocking).
-    fn force_flush(&self);
-    /// Shut down all processors (blocking).
-    fn shutdown(&self);
+    /// Flush all processors (blocking). The default does nothing, as in Python.
+    fn force_flush(&self) {}
+    /// Shut down all processors (blocking). The default does nothing, as in Python.
+    fn shutdown(&self) {}
+    /// Shut down all processors, giving up once `timeout` has elapsed. Mirrors
+    /// `TraceProvider.shutdown(timeout=...)`; the default ignores the timeout.
+    fn shutdown_with_timeout(&self, _timeout: Duration) {
+        self.shutdown();
+    }
 }
+
+/// How long the process-exit shutdown may wait for queued traces, matching Python's
+/// `_DEFAULT_SHUTDOWN_TIMEOUT`.
+pub const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The built-in provider: holds the registered processors and the global disabled flag.
 pub struct DefaultTraceProvider {
@@ -218,6 +228,12 @@ impl TraceProvider for DefaultTraceProvider {
     fn shutdown(&self) {
         for p in self.processors() {
             isolate("shutdown", &p, || p.shutdown());
+        }
+    }
+
+    fn shutdown_with_timeout(&self, timeout: Duration) {
+        for p in self.processors() {
+            isolate("shutdown", &p, || p.shutdown_with_timeout(timeout));
         }
     }
 }

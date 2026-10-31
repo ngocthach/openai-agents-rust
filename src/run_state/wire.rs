@@ -1178,8 +1178,19 @@ fn interruption_from_wire(value: &Value) -> Result<ToolApprovalItem> {
     let raw = value
         .get("raw_item")
         .ok_or_else(|| AgentsError::user("Run state interruption is missing raw_item"))?;
-    let raw_item = function_call_from_raw(&strip_function_call_type(raw.clone()))
+    let mut raw_item = function_call_from_raw(&strip_function_call_type(raw.clone()))
         .ok_or_else(|| AgentsError::user("Run state interruption has an invalid raw_item"))?;
+    // A hosted MCP request legitimately has no arguments and names its call by `id`. For a
+    // function call, an approval without `arguments` or `call_id` is malformed: keep those empty
+    // so the resume can hold the turn (`reconcile_resumed_approvals`) instead of inventing them.
+    if raw.get("type").and_then(Value::as_str) != Some("mcp_approval_request") {
+        if raw.get("arguments").is_none() {
+            raw_item.arguments.clear();
+        }
+        if raw.get("call_id").and_then(Value::as_str).is_none() {
+            raw_item.call_id.clear();
+        }
+    }
     let tool_name = value
         .get("tool_name")
         .and_then(Value::as_str)
@@ -1704,6 +1715,13 @@ fn trace_payload(state: &RunState, include_tracing_api_key: bool) -> Value {
 
 /// Serialize a run state to Python's schema 1.21 envelope.
 pub(super) fn to_wire(state: &RunState, include_tracing_api_key: bool) -> Result<Value> {
+    // Python refuses to write a snapshot whose same-named agents differ only by hook instance
+    // state, since the saved owner could not be found again.
+    if state.hook_identity_ambiguous {
+        return Err(AgentsError::user(
+            "RunState cannot distinguish same-name agents without hook instance state. Use unique agent names before starting a persistable run.",
+        ));
+    }
     let generated_items: Vec<Value> = state.generated_items.iter().map(run_item_to_wire).collect();
     let model_responses: Vec<Value> = state
         .model_responses
@@ -1887,6 +1905,13 @@ pub(super) fn to_wire(state: &RunState, include_tracing_api_key: bool) -> Result
         && let Value::Object(map) = &mut envelope
     {
         map.insert("terminal_unrecoverable".into(), Value::Bool(true));
+    }
+    // Additive key: Rust-only knowledge that the parked approval may end the run. Python ignores
+    // unknown envelope keys, and a resume re-derives the decision from the agent when it is absent.
+    if state.tool_result_may_end_run
+        && let Value::Object(map) = &mut envelope
+    {
+        map.insert("tool_result_may_end_run".into(), Value::Bool(true));
     }
     if let Some(pending) = &state.pending_session_write
         && let Value::Object(map) = &mut envelope
@@ -2163,6 +2188,13 @@ pub(super) fn from_wire(value: &Value, version: &str) -> Result<RunState> {
         context_requires_restoration: context_meta_requires_restoration(
             context.get("context_meta"),
         ),
+        // Set by `RunState::from_json` from the payload version, which this literal does not see.
+        legacy_hook_identity_snapshot: false,
+        hook_identity_ambiguous: false,
+        tool_result_may_end_run: value
+            .get("tool_result_may_end_run")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
         turn_start_index: rust_usize("turn_start_index", default_turn_start),
         model_input_start: rust_usize("model_input_start", 0),
         tool_use_tracker: tool_use_tracker_from_wire(value.get("tool_use_tracker")),
@@ -2253,3 +2285,31 @@ fn tool_use_tracker_from_wire(value: Option<&Value>) -> ToolUseTrackerSnapshot {
 
 /// A tool-use snapshot keyed by agent name. Mirrors `serialize_tool_use_tracker`.
 pub type ToolUseTrackerSnapshot = BTreeMap<String, Vec<String>>;
+
+/// Rename the Python field name `async_` of a function call to its provider name `async`.
+///
+/// Python's pydantic model stores the provider's `async` field as `async_` and writes that name
+/// into snapshots. The name is only a spelling of the same field, so a snapshot holding it is
+/// restored with the name the model API expects. Only function-call items are rewritten.
+pub(super) fn rename_python_async_alias(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            if map.get("type").and_then(Value::as_str) == Some("function_call")
+                && map.contains_key("async_")
+                && !map.contains_key("async")
+                && let Some(field) = map.remove("async_")
+            {
+                map.insert("async".into(), field);
+            }
+            for child in map.values_mut() {
+                rename_python_async_alias(child);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                rename_python_async_alias(item);
+            }
+        }
+        _ => {}
+    }
+}

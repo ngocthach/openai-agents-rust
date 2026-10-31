@@ -117,6 +117,16 @@ impl ServerConversationTracker {
         self.sent_initial_input = sent;
     }
 
+    /// The id a resumed run chains from: the most recent response that carries one. A response
+    /// without an id (a non-Responses provider) does not break the chain. Port of the
+    /// `latest_response_id` selection in `hydrate_from_state`.
+    pub(crate) fn latest_response_id(model_responses: &[ModelResponse]) -> Option<String> {
+        model_responses
+            .iter()
+            .rev()
+            .find_map(|response| response.response_id.clone())
+    }
+
     /// Seed tracking from a prior run state so a resume does not replay sent content.
     /// Port of `hydrate_from_state`.
     pub(crate) fn hydrate_from_state(
@@ -186,7 +196,11 @@ impl ServerConversationTracker {
                 if is_tool_search_item(&raw) {
                     self.state.server_output_fingerprints.insert(fp.clone());
                 }
-                self.state.sent_item_fingerprints.insert(fp);
+                // An admitted input item is delivered only by a model call that carries it
+                // (`mark_input_as_sent`). One that was admitted but never sent stays unsent.
+                if !matches!(item.kind, RunItemKind::Input { .. }) {
+                    self.state.sent_item_fingerprints.insert(fp);
+                }
             }
             if let Some(fp) = anonymous_tool_search_fingerprint(&raw) {
                 self.restored_anonymous_tool_search_fingerprints.insert(fp);
@@ -213,6 +227,13 @@ impl ServerConversationTracker {
                 self.state.server_output_fingerprints.insert(fp);
             }
         }
+    }
+
+    /// Whether the server already holds this input item, by the same fingerprint that selects
+    /// deltas. Staged input that was never delivered reads as unsent.
+    pub(crate) fn was_sent(&self, item: &InputItem) -> bool {
+        fingerprint(&item.0, false)
+            .is_some_and(|fp| self.state.sent_item_fingerprints.contains(&fp))
     }
 
     /// Record the items a successful model call delivered. Port of `mark_input_as_sent`.
@@ -381,5 +402,26 @@ mod tests {
         );
         let item = InputItem(json!({"type": "function_call", "call_id": "c1", "name": "t"}));
         assert!(!tracker.needs_send(&item));
+    }
+
+    #[test]
+    fn resume_chains_from_the_latest_response_that_has_an_id() {
+        let response = |id: Option<&str>| ModelResponse {
+            output: Vec::new(),
+            usage: Default::default(),
+            response_id: id.map(str::to_string),
+            request_id: None,
+            raw_usage: None,
+        };
+        let responses = vec![
+            response(Some("resp_first")),
+            response(Some("resp_second")),
+            response(None),
+        ];
+        assert_eq!(
+            ServerConversationTracker::latest_response_id(&responses).as_deref(),
+            Some("resp_second")
+        );
+        assert_eq!(ServerConversationTracker::latest_response_id(&[]), None);
     }
 }

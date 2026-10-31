@@ -12,7 +12,9 @@ use std::sync::Arc;
 use serde_json::{Value, json};
 
 use crate::agent::Agent;
-use crate::agent::{AgentModel, Instructions};
+use crate::agent::{AgentModel, Instructions, ToolUseBehavior};
+use crate::items::ToolApprovalItem;
+use crate::run_state::ProcessedResponseSnapshot;
 use crate::tool::Tool;
 
 /// Agents reachable from `start` through handoffs, breadth first, each exactly once.
@@ -169,4 +171,88 @@ pub(crate) fn resolve_identity<C>(start: &Arc<Agent<C>>, identity: &str) -> Opti
     map.into_iter()
         .find(|(_, agent)| agent.name == identity)
         .map(|(_, agent)| agent)
+}
+
+/// Whether same-named agents in the graph have identical configuration signatures while hooks
+/// are present. Port of `_has_ambiguous_hook_identities`: the saved owner of an operation then
+/// depends on traversal order, and the hook instance state that could tell them apart is not
+/// stored.
+pub(crate) fn has_ambiguous_hook_identities<C>(start: &Arc<Agent<C>>) -> bool {
+    let mut groups: HashMap<(String, bool, String), (usize, bool)> = HashMap::new();
+    for agent in iter_agent_graph(start) {
+        let key = (
+            agent.name.clone(),
+            Arc::ptr_eq(&agent, start),
+            agent_signature(&agent),
+        );
+        let entry = groups.entry(key).or_default();
+        entry.0 += 1;
+        entry.1 |= agent.hooks.is_some();
+    }
+    groups
+        .values()
+        .any(|(count, has_hooks)| *count > 1 && *has_hooks)
+}
+
+/// Whether a legacy (pre-`1.21`) snapshot could not name its duplicate owners: two non-root
+/// agents with hooks share a name and every signature field up to `hooks`, so the ordinal the
+/// old format saved depended on hook state it did not record. Port of
+/// `_has_legacy_hook_identity_ambiguity`.
+pub(crate) fn has_legacy_hook_identity_ambiguity<C>(start: &Arc<Agent<C>>) -> bool {
+    let mut seen: HashSet<(String, String)> = HashSet::new();
+    for agent in iter_agent_graph(start) {
+        if Arc::ptr_eq(&agent, start) || agent.hooks.is_none() {
+            continue;
+        }
+        let signature: Value =
+            serde_json::from_str(&agent_signature(&agent)).unwrap_or(Value::Null);
+        let prefix: serde_json::Map<String, Value> = signature
+            .as_object()
+            .into_iter()
+            .flatten()
+            .filter(|(key, _)| key.as_str() <= "hooks")
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        if !seen.insert((agent.name.clone(), Value::Object(prefix).to_string())) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether a parked approval may end the run once it resolves, so staged input has no model call
+/// left to join. Port of the `stops_before_next_model` / callable check in Python's
+/// `RunState.add_input`. The names that count are the parked calls' tool names plus, when the
+/// response carries no handoff, the completed sibling calls' names (bare and qualified).
+pub(crate) fn interruption_may_end_run<C>(
+    agent: &Agent<C>,
+    interruptions: &[ToolApprovalItem],
+    processed: Option<&ProcessedResponseSnapshot>,
+) -> bool {
+    if interruptions.is_empty() {
+        return false;
+    }
+    match &agent.tool_use_behavior {
+        ToolUseBehavior::StopOnFirstTool | ToolUseBehavior::Custom(_) => true,
+        ToolUseBehavior::RunLlmAgain => false,
+        ToolUseBehavior::StopAtTools(stop) => {
+            let mut names: HashSet<String> = interruptions
+                .iter()
+                .map(|item| item.tool_name.clone())
+                .collect();
+            if let Some(processed) = processed.filter(|p| p.handoffs.is_empty()) {
+                for function in &processed.functions {
+                    names.insert(function.tool_name.clone());
+                    if let Some(ns) = function.namespace.as_deref()
+                        && ns != function.tool_name
+                    {
+                        names.insert(format!("{ns}.{}", function.tool_name));
+                    }
+                }
+            }
+            stop.stop_at_tool_names
+                .iter()
+                .any(|name| names.contains(name))
+        }
+    }
 }

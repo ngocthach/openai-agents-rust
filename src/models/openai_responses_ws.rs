@@ -876,8 +876,15 @@ impl Model for OpenAIResponsesWSModel {
         }
         .await;
         let include_data = request.tracing.include_data();
+        let trusted_response_id = self.supports_default_prompt_cache_key();
         match &result {
-            Ok(resp) => finish_response_span(&span, resp, include_data, &request.input),
+            Ok(resp) => finish_response_span(
+                &span,
+                resp,
+                include_data,
+                &request.input,
+                trusted_response_id,
+            ),
             Err(e) => {
                 record_model_error_on_span(&span, "Error getting response", e, include_data);
                 crate::logger::log_model_action_error("Error getting response", e);
@@ -891,6 +898,7 @@ impl Model for OpenAIResponsesWSModel {
         let span = response_span(request.tracing.is_disabled());
         span.start();
         let include_data = request.tracing.include_data();
+        let trusted_response_id = self.supports_default_prompt_cache_key();
         let stream = match self.open_stream(&request).await {
             Ok(s) => s,
             Err(e) => {
@@ -915,7 +923,13 @@ impl Model for OpenAIResponsesWSModel {
                         if let Some(r) = event.get("response")
                             && let Ok(parsed) = parse_response(r, None, false)
                         {
-                            finish_response_span(span, &parsed, include_data, &span_input);
+                            finish_response_span(
+                                span,
+                                &parsed,
+                                include_data,
+                                &span_input,
+                                trusted_response_id,
+                            );
                         }
                         return (vec![Ok(event)], true);
                     }

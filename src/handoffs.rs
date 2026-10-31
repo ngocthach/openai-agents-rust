@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 
 use crate::agent::Agent;
 use crate::error::{AgentsError, Result};
-use crate::items::{InputItem, RunItem};
+use crate::items::{InputItem, RunItem, RunItemKind};
 use crate::models::interface::FunctionToolSpec;
 use crate::run_context::RunContext;
 use crate::strict_schema::ensure_strict_json_schema;
@@ -57,13 +57,28 @@ pub fn nest_handoff_history(
     let mut items = data.pre_handoff_items.clone();
     items.extend(data.new_items.clone());
     let normalized = crate::run_internal::history::normalize_handoff_items(&items, pre_count);
+    if history_mapper.is_none() {
+        // Record which run items the summary forwarded verbatim, so the runner knows they now
+        // live in the input and must not be replayed again. Items not forwarded are summarized.
+        let forwarded = items
+            .iter()
+            .filter(|item| !matches!(item.kind, RunItemKind::ToolApproval { .. }))
+            .zip(normalized.iter())
+            .filter(|(_, (_, forward))| *forward)
+            .filter_map(|(item, (plain, _))| Some((item.occurrence.0?, plain.0.clone())));
+        NESTED_PROVENANCE.with(|p| p.borrow_mut().extend(forwarded));
+    }
+    // Earlier summaries are flattened back into the items they recorded, as Python does, so a
+    // custom mapper receives the transcript itself rather than a summary of a summary.
+    let flattened =
+        crate::run_internal::history::flatten_nested_history_messages(&data.input_history);
     let input_history = match history_mapper {
         Some(m) => {
-            let mut transcript = data.input_history.clone();
+            let mut transcript = flattened;
             transcript.extend(normalized.into_iter().map(|(item, _)| item));
             m(transcript)
         }
-        None => crate::run_internal::history::build_ordered_history(data.input_history, normalized),
+        None => crate::run_internal::history::build_ordered_history(flattened, normalized),
     };
     HandoffInputData {
         input_history,
@@ -73,6 +88,24 @@ pub fn nest_handoff_history(
         new_items: data.new_items,
         input_items: Some(Vec::new()),
     }
+}
+
+thread_local! {
+    /// Occurrence keys and forwarded inputs recorded by [`nest_handoff_history`] on this thread.
+    /// The runner drains it right after a handoff input filter returns, which is what ties a
+    /// filter's output to the run items it kept, as Python's provenance does.
+    static NESTED_PROVENANCE: std::cell::RefCell<Vec<(u64, serde_json::Value)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Start a fresh provenance record for the handoff input filter about to run.
+pub(crate) fn clear_nested_provenance() {
+    NESTED_PROVENANCE.with(|p| p.borrow_mut().clear());
+}
+
+/// The provenance recorded since [`clear_nested_provenance`]: `(occurrence key, forwarded input)`.
+pub(crate) fn take_nested_provenance() -> Vec<(u64, serde_json::Value)> {
+    NESTED_PROVENANCE.with(|p| std::mem::take(&mut *p.borrow_mut()))
 }
 
 type InvokeFn<C> =
@@ -96,6 +129,9 @@ pub struct Handoff<C> {
     pub strict_json_schema: bool,
     /// Enablement check.
     pub is_enabled: IsEnabled<C>,
+    /// The strict-schema error of the input type, if any. The runner raises it before the first
+    /// model call, because the builder cannot return it.
+    pub(crate) schema_error: Option<String>,
     /// Formats the model-visible output when the handoff invocation fails.
     ///
     /// `None` propagates the error and terminates the run. When it is set, a failed
@@ -119,6 +155,7 @@ impl<C> Clone for Handoff<C> {
             nest_handoff_history: self.nest_handoff_history,
             strict_json_schema: self.strict_json_schema,
             is_enabled: self.is_enabled.clone(),
+            schema_error: self.schema_error.clone(),
             failure_error_function: self.failure_error_function.clone(),
             on_invoke_handoff: self.on_invoke_handoff.clone(),
             agent: self.agent.clone(),
@@ -168,6 +205,7 @@ impl<C: Send + Sync + 'static> Handoff<C> {
             nest_handoff_history: None,
             strict_json_schema: true,
             is_enabled: IsEnabled::Static(true),
+            schema_error: None,
             failure_error_function: None,
             on_invoke_handoff: Arc::new(move |_ctx, _args| {
                 let a = target.clone();
@@ -200,6 +238,7 @@ impl<C: Send + Sync + 'static> Handoff<C> {
             nest_handoff_history: None,
             strict_json_schema: true,
             is_enabled: IsEnabled::Static(true),
+            schema_error: None,
             failure_error_function: None,
             on_invoke_handoff: Arc::new(move |c, a| Box::pin(f(c, a))),
             agent: None,
@@ -259,7 +298,11 @@ impl<C: Send + Sync + 'static> Handoff<C> {
                 self.input_json_schema = s;
                 self.strict_json_schema = true;
             }
-            Err(_) => {
+            Err(error) => {
+                self.schema_error = Some(match &error {
+                    AgentsError::UserError { message, .. } => message.clone(),
+                    other => other.to_string(),
+                });
                 self.input_json_schema = schema;
                 self.strict_json_schema = false;
             }

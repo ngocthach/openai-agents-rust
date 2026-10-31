@@ -550,7 +550,9 @@ impl<C: Send + Sync + 'static> ShellTool<C> {
         let ty = environment.get("type").and_then(Value::as_str);
         if matches!(ty, None | Some("local")) {
             return Err(AgentsError::user(
-                "ShellTool::hosted requires a container_auto or container_reference environment.",
+                "ShellTool with local environment requires an executor. Use ShellTool::new for \
+                 local shells; ShellTool::hosted takes a container_auto or container_reference \
+                 environment.",
             ));
         }
         Ok(ShellTool {
@@ -613,6 +615,33 @@ impl<C> ShellTool<C> {
             self.environment.get("type").and_then(Value::as_str),
             None | Some("local")
         )
+    }
+
+    /// Check that the executor, environment and approval settings agree. Python rejects these
+    /// combinations when the tool is constructed; the Rust builders are infallible, so the agent
+    /// runs this check when it resolves its tools.
+    pub fn validate(&self) -> Result<()> {
+        if self.is_local() {
+            if self.executor.is_none() {
+                return Err(AgentsError::user(
+                    "ShellTool with local environment requires an executor.",
+                ));
+            }
+            return Ok(());
+        }
+        if self.executor.is_some() {
+            return Err(AgentsError::user(
+                "ShellTool with hosted environment does not accept an executor.",
+            ));
+        }
+        if !matches!(self.needs_approval, ApprovalPolicy::Static(false))
+            || self.on_approval.is_some()
+        {
+            return Err(AgentsError::user(
+                "ShellTool with hosted environment does not support needs_approval or on_approval.",
+            ));
+        }
+        Ok(())
     }
 
     /// Restrict which callers may invoke the tool (`"direct"`, `"programmatic"`).
@@ -984,8 +1013,28 @@ pub type SafetyCheckFn<C> =
     Arc<dyn Fn(ComputerToolSafetyCheckData<C>) -> BoxFuture<'static, bool> + Send + Sync>;
 
 type ComputerFactory = Arc<dyn Fn() -> BoxFuture<'static, Result<Arc<dyn Computer>>> + Send + Sync>;
-/// Tears down a computer a factory created. Port of `ComputerProvider.dispose`.
-pub type ComputerDisposeFn = Arc<dyn Fn(Arc<dyn Computer>) -> BoxFuture<'static, ()> + Send + Sync>;
+/// What a computer's dispose hook returns: `()`, or a `Result` whose error is logged.
+pub trait ComputerDisposeOutput: Send + 'static {
+    /// The failure to log, if the dispose failed.
+    fn into_dispose_error(self) -> Option<String>;
+}
+
+impl ComputerDisposeOutput for () {
+    fn into_dispose_error(self) -> Option<String> {
+        None
+    }
+}
+
+impl<E: fmt::Display + Send + 'static> ComputerDisposeOutput for std::result::Result<(), E> {
+    fn into_dispose_error(self) -> Option<String> {
+        self.err().map(|e| e.to_string())
+    }
+}
+
+/// Tears down a computer a factory created. Port of `ComputerProvider.dispose`. Returns the
+/// failure message to log, if any.
+pub type ComputerDisposeFn =
+    Arc<dyn Fn(Arc<dyn Computer>) -> BoxFuture<'static, Option<String>> + Send + Sync>;
 
 #[derive(Clone)]
 enum ComputerSource {
@@ -993,8 +1042,21 @@ enum ComputerSource {
     Lazy {
         factory: ComputerFactory,
         dispose: Option<ComputerDisposeFn>,
-        slot: Arc<tokio::sync::Mutex<Option<Arc<dyn Computer>>>>,
+        /// Identifies this tool's computer within a run (see `RunContext`).
+        id: u64,
     },
+}
+
+/// A computer a lazy computer tool created for one run, kept until the run ends.
+pub(crate) struct ResolvedComputer {
+    pub(crate) computer: Arc<dyn Computer>,
+    pub(crate) dispose: Option<ComputerDisposeFn>,
+}
+
+static NEXT_COMPUTER_TOOL_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn next_computer_tool_id() -> u64 {
+    NEXT_COMPUTER_TOOL_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Lets the model control a [`Computer`] through the Responses API computer tool.
@@ -1038,8 +1100,7 @@ impl<C> ComputerTool<C> {
         }
     }
 
-    /// Create the computer lazily, the first time a run needs it. The created computer is
-    /// cached by this tool (and its clones).
+    /// Create the computer lazily, the first time a run needs it. Each run gets its own computer.
     pub fn from_factory<F, Fut>(factory: F) -> Self
     where
         F: Fn() -> Fut + Send + Sync + 'static,
@@ -1049,7 +1110,7 @@ impl<C> ComputerTool<C> {
             source: ComputerSource::Lazy {
                 factory: Arc::new(move || Box::pin(factory())),
                 dispose: None,
-                slot: Arc::new(tokio::sync::Mutex::new(None)),
+                id: next_computer_tool_id(),
             },
             on_safety_check: None,
             custom_data_extractor: None,
@@ -1059,39 +1120,25 @@ impl<C> ComputerTool<C> {
     /// Create the computer lazily and tear it down when the run that created it finishes,
     /// so the next run starts from a fresh computer.
     /// Port of `ComputerProvider { create, dispose }`.
-    pub fn from_provider<F, Fut, D, DFut>(factory: F, dispose: D) -> Self
+    pub fn from_provider<F, Fut, D, DFut, T>(factory: F, dispose: D) -> Self
     where
         F: Fn() -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<Arc<dyn Computer>>> + Send + 'static,
         D: Fn(Arc<dyn Computer>) -> DFut + Send + Sync + 'static,
-        DFut: Future<Output = ()> + Send + 'static,
+        DFut: Future<Output = T> + Send + 'static,
+        T: ComputerDisposeOutput,
     {
         ComputerTool {
             source: ComputerSource::Lazy {
                 factory: Arc::new(move || Box::pin(factory())),
-                dispose: Some(Arc::new(move |c| Box::pin(dispose(c)))),
-                slot: Arc::new(tokio::sync::Mutex::new(None)),
+                dispose: Some(Arc::new(move |c| {
+                    let fut = dispose(c);
+                    Box::pin(async move { fut.await.into_dispose_error() })
+                })),
+                id: next_computer_tool_id(),
             },
             on_safety_check: None,
             custom_data_extractor: None,
-        }
-    }
-
-    /// Tear down a computer this tool created, if any, and forget it.
-    /// Port of `dispose_resolved_computers`.
-    pub async fn dispose(&self) {
-        let ComputerSource::Lazy {
-            dispose: Some(dispose),
-            slot,
-            ..
-        } = &self.source
-        else {
-            // Without a dispose hook the computer stays cached, as `from_factory` promises.
-            return;
-        };
-        let taken = slot.lock().await.take();
-        if let Some(computer) = taken {
-            dispose(computer).await;
         }
     }
 
@@ -1120,26 +1167,35 @@ impl<C> ComputerTool<C> {
         "computer_use_preview"
     }
 
-    /// The computer, creating it on first use.
-    pub async fn resolve(&self) -> Result<Arc<dyn Computer>> {
+    /// The computer for `ctx`'s run, creating it on first use. Lazy computers are per run: two runs
+    /// of the same agent get separate computers (Python's per-run-context `resolve_computer`).
+    pub async fn resolve(&self, ctx: &RunContext<C>) -> Result<Arc<dyn Computer>> {
         match &self.source {
             ComputerSource::Ready(c) => Ok(c.clone()),
-            ComputerSource::Lazy { factory, slot, .. } => {
-                let mut guard = slot.lock().await;
-                if let Some(computer) = guard.as_ref() {
-                    return Ok(computer.clone());
+            ComputerSource::Lazy {
+                factory,
+                dispose,
+                id,
+            } => {
+                if let Some(computer) = ctx.run_computer(*id) {
+                    return Ok(computer);
                 }
                 let computer = factory().await?;
-                *guard = Some(computer.clone());
-                Ok(computer)
+                Ok(ctx.store_run_computer(
+                    *id,
+                    ResolvedComputer {
+                        computer,
+                        dispose: dispose.clone(),
+                    },
+                ))
             }
         }
     }
 
     /// The tool param handed to models. The Responses model picks the GA `computer` or preview
     /// `computer_use_preview` wire shape from the model name.
-    pub async fn to_responses_param(&self) -> Result<Value> {
-        let computer = self.resolve().await?;
+    pub async fn to_responses_param(&self, ctx: &RunContext<C>) -> Result<Value> {
+        let computer = self.resolve(ctx).await?;
         let mut param = json!({"type": "computer"});
         if let Some(env) = computer.environment() {
             param["environment"] = json!(env.as_str());
@@ -1465,8 +1521,10 @@ pub(crate) fn normalize_shell_output_entries(entries: &[Value]) -> Vec<Value> {
                 }
                 Some(Value::Object(mut o)) => {
                     let st = o.remove("status");
+                    // Python's `setdefault` keeps an explicit `exit_code: null` as it is; only a
+                    // missing key is resolved from the status.
                     if o.get("type").and_then(Value::as_str) != Some("timeout")
-                        && o.get("exit_code").is_none_or(Value::is_null)
+                        && !o.contains_key("exit_code")
                     {
                         o.insert(
                             "exit_code".into(),

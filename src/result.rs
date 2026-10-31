@@ -120,10 +120,10 @@ pub struct RunResult<C> {
     pub(crate) model_input_items: Vec<RunItem>,
     /// Whether model history diverged from the public history during this run.
     pub(crate) replay_from_model_input_items: bool,
-    /// Indexes into `new_items` of items a nested handoff already carried into `input`
-    /// verbatim; the full-history view leaves them out so they are not replayed twice. Port of
-    /// `NestedHistoryOwnedItemRef`.
-    pub(crate) nested_history_owned_items: Vec<usize>,
+    /// Items a nested handoff already carried into `input` verbatim, keyed by their occurrence
+    /// so position changes in `new_items` cannot move ownership. The full-history view leaves
+    /// them out so they are not replayed twice. Port of `NestedHistoryOwnedItemRef`.
+    pub(crate) nested_history_owned_items: Vec<NestedOwnedRef>,
     pub(crate) state: Box<RunState>,
 }
 
@@ -164,19 +164,18 @@ impl<C> RunResult<C> {
     /// Input items for the next turn, choosing which history view to replay.
     /// Mirrors `RunResultBase.to_input_list(mode=...)`.
     pub fn to_input_list_with(&self, mode: ToInputListMode) -> Vec<InputItem> {
-        let owned: &[usize] = &self.nested_history_owned_items;
         let source: Vec<&RunItem> = match mode {
             ToInputListMode::Normalized if self.replay_from_model_input_items => {
                 self.model_input_items.iter().collect()
             }
             ToInputListMode::Normalized => self.new_items.iter().collect(),
-            ToInputListMode::PreserveAll => self
-                .new_items
-                .iter()
-                .enumerate()
-                .filter(|(index, _)| !owned.contains(index))
-                .map(|(_, item)| item)
-                .collect(),
+            ToInputListMode::PreserveAll => {
+                let active = self.active_owned_occurrences();
+                self.new_items
+                    .iter()
+                    .filter(|item| !item.occurrence.0.is_some_and(|key| active.contains(&key)))
+                    .collect()
+            }
         };
         // Replay follows the run's reasoning-id policy, as the model input did. Port of
         // `run_items_to_input_items(..., reasoning_item_id_policy)`.
@@ -199,6 +198,25 @@ impl<C> RunResult<C> {
                 }),
         );
         out
+    }
+
+    /// The occurrences whose forwarded copy is still in `input`. Each owned ref claims one equal
+    /// input item, so removing that item from `input` puts the session copy back into the replay.
+    fn active_owned_occurrences(&self) -> Vec<u64> {
+        let mut available: Vec<Value> = self
+            .input
+            .iter()
+            .map(|i| canonical_replay_value(&i.0))
+            .collect();
+        let mut active = Vec::new();
+        for owned in &self.nested_history_owned_items {
+            let wanted = canonical_replay_value(&owned.input);
+            if let Some(position) = available.iter().position(|v| *v == wanted) {
+                available.remove(position);
+                active.push(owned.key);
+            }
+        }
+        active
     }
 
     /// A human-readable summary. Port of `pretty_print_result`.
@@ -276,9 +294,22 @@ pub(crate) struct StreamControl {
     progress: tokio::sync::Notify,
     cancelled: AtomicBool,
     cancel: tokio::sync::Notify,
+    /// Set by the run task once the run has finished, whether or not the consumer has read the
+    /// stream. Mirrors `RunResultStreaming.is_complete`, which the Python run sets in its own task.
+    finished: AtomicBool,
 }
 
 impl StreamControl {
+    /// Record that the run task has finished.
+    pub(crate) fn mark_finished(&self) {
+        self.finished.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether the run task has finished.
+    pub(crate) fn is_finished(&self) -> bool {
+        self.finished.load(Ordering::SeqCst)
+    }
+
     /// Count an event handed to the consumer channel.
     pub(crate) fn record_sent(&self) {
         self.sent.fetch_add(1, Ordering::SeqCst);
@@ -649,7 +680,7 @@ impl<C: Send + Sync + 'static> RunResultStreaming<C> {
 
     /// Whether the run has finished (or was cancelled immediately).
     pub fn is_complete(&self) -> bool {
-        self.complete || self.control.is_cancelled()
+        self.complete || self.control.is_finished() || self.control.is_cancelled()
     }
 
     /// The agent currently running (updates as handoffs happen).
@@ -752,4 +783,25 @@ impl<C: Send + Sync + 'static> fmt::Display for RunResultStreaming<C> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.pretty_print())
     }
+}
+
+/// A nested-history occurrence owned by a run: the item's copy-lineage key and the plain input
+/// the nested history forwarded for it. Port of `NestedHistoryOwnedItemRef`.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct NestedOwnedRef {
+    /// The occurrence key of the run item the forwarded input came from.
+    pub(crate) key: u64,
+    /// The forwarded input item, compared by value against the replayed `input`.
+    pub(crate) input: Value,
+}
+
+/// The form in which a replayed input item is compared with a forwarded one. `status` is not
+/// part of replay identity: a forwarded message without one gains `completed` when it is
+/// restored, as Python's canonical replay normalization treats it.
+fn canonical_replay_value(value: &Value) -> Value {
+    let mut value = value.clone();
+    if let Value::Object(map) = &mut value {
+        map.remove("status");
+    }
+    value
 }
