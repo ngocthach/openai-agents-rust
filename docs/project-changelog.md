@@ -2,6 +2,59 @@
 
 ## Unreleased (0.6.0)
 
+Shell, apply_patch, computer, and partial programmatic and collision-policy parity with Python's `test_shell_tool.py`,
+`test_shell_call_serialization.py`, `test_apply_patch_tool.py`, `test_local_shell_tool.py`,
+`test_computer_tool_lifecycle.py`, `test_strict_schema_oneof.py`, `test_scripted_sandbox.py`,
+`test_tool_name_collision_policy.py` and `test_programmatic_tool_calling.py` (see
+`plans/reports/py-test-parity-core3-shelltools.md`).
+
+Breaking changes (shelltools round):
+
+- Computers are per run context. `ComputerTool::resolve` and `ComputerTool::to_responses_param` take
+  the `RunContext`; each run gets its own computer from a lazy `ComputerTool`, and the run disposes of
+  it. `ComputerTool::dispose()` is removed.
+- `ComputerTool::from_provider`'s dispose hook may return `Result<(), E: Display>`; a failure is logged
+  without the error text unless tool data logging is allowed. Returning `()` still works.
+- `ShellTool` configuration errors (local without an executor, hosted with an executor, hosted with
+  approval) are raised when the agent resolves its tools, not by the builders.
+- `with_output_json_schema` accepts `"type": ["object"]` and stores `"object"`.
+
+Function tools parity with Python's `test_function_tool.py`, `test_tool_identity.py`,
+`test_tool_context.py`, `test_tool_custom_data.py`, `test_tool_use_tracker.py`,
+`test_custom_tool.py`, and the open rows of `test_function_schema.py` and
+`test_function_tool_decorator.py` (see `plans/reports/py-test-parity-core3-functiontools.md`).
+
+Added:
+
+- `FunctionTool::try_new` (typed, fallible) and `FunctionTool::try_new_raw` (raw schema, explicit
+  strictness) return `UserError` when a schema cannot be made strict. `FunctionTool::try_with_timeout`
+  rejects a zero timeout.
+- `ToolContext::result_meta()` and `FunctionToolCustomDataContext::result_meta`: the `_meta` of the
+  MCP call result, read by the custom-data extractor as in Python.
+
+Breaking changes (pre-1.0):
+
+- `FunctionTool::new` panics when the argument type's schema cannot be made strict. Python raises
+  at definition time; the Rust constructor previously fell back to a non-strict tool silently. Use
+  `try_new` to handle the error.
+- `FunctionToolCustomDataContext` gained the public field `result_meta`. Code that builds the struct
+  with a literal must add the field; the SDK is the only constructor.
+- `$ref` fragments are percent-decoded before resolution, as Python's `unquote` does; a `%` escape
+  that was taken literally before now decodes.
+- `FunctionTool::with_strict_json_schema(true)` re-strictifies from the schema as given, and
+  `with_strict_json_schema(false)` restores it, instead of only flipping the flag.
+- A typed tool called with a JSON value that is not an object fails with "Invalid JSON input for tool
+  X: expected a JSON object".
+
+Deliberate differences from Python:
+
+- A docstring argument description and an explicit `#[function_tool]` `#[arg(desc = "...")]` both
+  apply to the same parameter; the explicit `#[arg(desc)]` wins. Python gives the docstring
+  precedence over `Annotated` metadata. The Rust order is kept on purpose.
+- Typed tool arguments are validated by their `Deserialize` impl; pydantic `Field` constraints
+  have no Rust equivalent. Use a validating newtype (`#[serde(try_from = ...)]`) for a bounded value.
+- Synchronous `failure_error_function` closures only; Python also accepts an awaitable return.
+
 `RunState` parity with Python's `test_run_state.py` (see `plans/reports/py-test-parity-core2-runstate.md`).
 
 Added:
