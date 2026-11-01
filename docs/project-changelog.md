@@ -1,5 +1,79 @@
 # Changelog
 
+## 0.17.0 (2026-11-01)
+
+Fallible hooks, Redis Cluster reads, a per-session memory-manager registry and the findings of a case-by-case
+re-read of the remaining Python-only files. 203 more parity cases moved out of the Python-only bucket (130
+ported, 73 covered). Measured state: 12,641 Python test cases, 9,032 ported, 797 covered, 2,812 Python-only, 0
+not ported, 0 unaccounted. Notes by area: `plans/reports/py-test-parity-core14-*.md` and `core15-*.md`. No live
+model call was made.
+
+- Sandbox memory: a sandbox session now has one memory generation manager per layout (`Memory::manager_for_session`).
+  Capabilities with the same layout and an equal `MemoryGenerateConfig` share it; a different config for the same
+  layout, or a layout that reuses another layout's `memories_dir` or `sessions_dir`, fails the run with Python's
+  messages. The registration ends when the manager flushes (session close). `MemoryGenerateConfig` gained
+  `PartialEq` (model instances compare by identity). Agents that share a session and a layout must share one
+  `Memory` configuration.
+- Sandbox manifests: custom environment value types can persist. Implement `EnvValue::to_payload` (default `None`,
+  still unwritable) and register the type with `sandbox::persisted_registry::register_env_value_type(name, parser)`;
+  `Manifest::to_value` then writes the tagged payload (never the resolved value) and `Manifest::from_value` restores
+  the same type. Registering `str`, an empty name or a name twice is refused, as Python refuses a duplicate subclass tag.
+- Realtime: a `session.created`/`session.updated` event naming a GA output format object (`audio/pcm`, `audio/pcmu`,
+  `audio/pcma`) now reaches the playback tracker as `pcm16`, `g711_ulaw`, `g711_alaw`, as Python normalizes it.
+- Hooks: every `RunHooks` and `AgentHooks` callback has a fallible twin (`try_on_llm_start`, `try_on_llm_end`,
+  `try_on_agent_start`, `try_on_agent_end`, `try_on_handoff`, `try_on_tool_start`, `try_on_tool_end`;
+  `try_on_start`/`try_on_end` on `AgentHooks`) returning `Result<()>`. The runner calls the twin and an `Err` fails
+  the run where Python's raising hook does. The twin's default calls the infallible callback, so existing hooks
+  keep compiling and behaving; override the `try_` method to fail a run. The run-level and agent-level hook of one
+  event run together and both always run (run-level failure wins), as Python's `asyncio.gather` does.
+  Failure effects: a failed `on_llm_end` leaves the response accepted (resume processes it with no second model
+  call and no second end hook), a failed `on_tool_start` leaves the call unproven (a retry refuses it), a failed
+  `on_tool_end` keeps the call's output in history and a retry skips the call, and a failed `on_agent_end` withholds
+  the final message but keeps the turn's tool calls and outputs.
+- Hooks and output guardrails: the final-output end hooks (`on_agent_end`, `AgentHooks::on_end`) now run before the
+  output guardrails, as in Python, so a failing end hook means the guardrails never see the output, and a terminal tool
+  output behind output guardrails stays private (out of history and of the failure's run data) when the end hook fails.
+  A failed resumed turn whose approved tool outputs are still guarded keeps them in the checkpoint but not in the
+  error's `run_data.new_items`, so retrying from the checkpoint finishes without running the tool again.
+- Retries: response header names (`Retry-After`, `Retry-After-Ms`, `X-Should-Retry`) match case-insensitively when
+  the normalized retry delay and the provider's retry advice are read.
+- Model settings: deserializing `ModelSettings` rejects a non-positive or non-finite `timeout`, and deserializing
+  `ModelRetryBackoffSettings` rejects a negative or non-finite `initial_delay`, `max_delay` or `multiplier`, as
+  Python's field validation does. Builder-set and struct-literal values are not checked.
+- Sessions: `MongoDBSession` identifies the SDK (`openai-agents`) in the MongoDB connection handshake, both for a
+  client built by `from_uri` and for a client passed to `with_client`.
+- Sessions: `RedisSession` accepts a Redis Cluster connection (`RedisSession::from_cluster_nodes`,
+  `with_cluster_connection`; the `redis` feature now enables the crate's `cluster-async`). As in Python, a cluster
+  session reads and pops history and rejects every write (`add_items` with items, `clear_session`, compaction
+  replacement) with a user error before anything is sent, because the write scripts span three keys.
+- Sandbox state: the persisted provider record also carries the E2B template, metadata, environment and timeouts and
+  the Vercel project id, team id, environment and `interactive` flag (`VercelSandboxClientOptions::with_interactive`
+  is accepted and enables nothing, as in Python). The state stays credential-free: an environment or metadata entry
+  whose name or value looks secret is not recorded, URL values lose userinfo and query, and a template, project or
+  team id that looks like a credential is dropped; the resuming client supplies those values and wins per key. The
+  recorded template, timeouts, project and team belong to the original session. Old states still read.
+
+Breaking changes: `E2BPersistedOptions`, `VercelPersistedOptions` and `VercelSandboxClientOptions` struct
+literals need `..Default::default()`; a resumed session takes the recorded E2B template and timeouts and the
+recorded Vercel project and team over the resuming client's own; the final-output end hooks run before the
+output guardrails; `OpenAIVoiceModelProvider` no longer derives `Default` (use `new()`); agents that share a
+sandbox session and a memory layout must share one `Memory` configuration;
+`RealtimePlaybackTracker::audio_format()` reports normalized format names for GA audio formats.
+
+Known gaps (real differences): the `docker-removal` feature's privileged Linux paths are type-checked but have
+not run against a real container, and the feature is excluded from the docs.rs build; a restored context is
+bound to an agent by name; a function or computer call whose end hook failed is re-executed when the same call
+id returns on a fresh run sharing the context, where Python refuses it; streamed `ToolCalled` arrives after
+`on_llm_end` where Python emits it before; `CallbackSink` does not receive the bound session; the realtime
+interrupt path returns only the first of several failures; `MCPToolCancellationError` has no Rust variant;
+`#[function_tool]` is rejected on methods and associated functions; realtime connect-time overrides cannot carry
+a tool implementation; a speech-to-text transcript received before session setup is dropped; the `apply_patch`
+approval checker cannot stop after a decision lands; Vercel `shutdown` is a single stop request; a dynamic
+approval rule is consulted unless the tool opts in with `with_args_have_validators`; about 100 Python-only files
+were read at name level plus the bodies of portable-looking candidates rather than case by case; docs.rs builds
+without the `mongodb` feature; the websocket crate logs handshake data at TRACE through the `log` crate; the
+Redis atomic replace and the Redis Cluster path have only run against mocks.
+
 ## 0.16.0 (2026-11-01)
 
 Persists provider options in sandbox session state, bounds E2B and Daytona PTY start, ports Python's Docker

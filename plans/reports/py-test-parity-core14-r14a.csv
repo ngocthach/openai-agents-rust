@@ -1,0 +1,6 @@
+path,moved_to_ported,moved_to_covered,remaining_python_only
+tests/extensions/memory/test_redis_session.py,4,0,44
+tests/sandbox/test_docker_removal.py,1,0,1
+tests/sandbox/test_docker_removal_worker.py,0,0,2
+tests/extensions/sandbox/test_e2b.py,0,0,5
+tests/extensions/sandbox/test_vercel.py,0,0,35
