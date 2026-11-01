@@ -1,5 +1,51 @@
 # Changelog
 
+## 0.12.0 (2026-11-01)
+
+Third pass over the parity ledger's Python-only bucket plus the real feature gaps it exposed. The files whose
+Python-only reasons earlier agents had only spot-checked were read case by case, 130 more cases moved out of
+the bucket (122 ported, 8 covered) and five gaps were closed. Measured state: 12,641 Python test cases, 8,585
+ported, 673 covered, 3,383 Python-only, 0 not ported, 0 unaccounted. Notes by area:
+`plans/reports/py-test-parity-core9-*.md`. No live model call was made.
+
+Fixes and additions:
+
+- Approvals are keyed by agent identity, so two agents with the same name no longer share decisions; the
+  serialized form keeps the name and adds the identity, and name-only snapshots written before schema 1.7 still
+  authorize by name. Duplicate agent names are allowed in a sandbox handoff graph (identity keys `name`,
+  `name#2`, ...). A deferred top-level tool's permanent approval no longer authorizes a visible tool with the
+  same bare name.
+- Pre-approval validation is schema-only: the argument type's `Deserialize`, `deserialize_with` and application
+  defaults run only after approval, as Python's validators do. A hosted MCP interruption whose `arguments` were
+  removed is asked again.
+- Sandbox: pre-stop hooks and `aclose` (`register_pre_stop_hook`, `run_pre_stop_hooks`, `aclose_session`); the
+  guard runs the hooks before suspend and close and skips the snapshot after a hook failure.
+- Runner: a streamed run cancelled during a compaction notice waits for it and settles the pending write; the
+  checkpoint is published before a Session append, so a dropped or cancelled run leaves a recoverable state, and
+  a second resume of a checkpoint whose append is running is refused; `memory::rewind_session_items`,
+  `wait_for_session_cleanup` and `fingerprint_input_item` are public.
+- Generic output schemas have readable names (`Vec<String>`, not `String>`); the default handoff name only
+  warns for characters other than whitespace; a hosted MCP approval callback does not run for a request that
+  already has a decision and records its answer; `RunState` exposes `SCHEMA_VERSION_SUMMARIES`.
+
+Breaking changes: `RunState` has two more public fields (`session_write_in_progress`,
+`legacy_name_owner_snapshot`), so struct literals need `..Default::default()`; `RunCheckpoint::take` can return
+a state after a dropped or cancelled run; `ToolApprovalItem.agent` holds the identity key (equal to the name
+except for second and later same-named agents); a persisted "always approve" for a deferred top-level tool
+written by an earlier version is no longer honoured; a dynamic approval rule is not consulted for calls with an
+integer for a float parameter, an absent nested property or a value the schema check cannot confirm (they
+pause for manual approval first); the `name()` text of generic output schemas changed; the existing assertion
+in `py_core3_runstatectx_hook_identity` now expects `sub#2`.
+
+Known gaps (real differences, not Python-only mechanics): the Docker removal service (148 cases) is a root
+host-side helper with no Rust equivalent; Rust cannot detect a custom `Deserialize`, so a dynamic approval rule
+is still consulted for arguments that match the schema; schema 1.12 snapshots without an ownership ledger replay
+once where Python replays twice; restore keeps or refuses an item whose agent is not in the graph where Python
+skips it; a resume whose parked call lost its tool is refused where Python drops it; failure formatters are
+synchronous and infallible; per-agent resume of sandbox sessions is not supported (only the starting agent's
+session state is accepted); in-place writes to `agent.model_settings` are not tracked; the websocket crate logs
+handshake data at TRACE through the `log` crate; the Redis atomic replace has only run against a mock.
+
 ## 0.11.1 (2026-11-01)
 
 Documentation build only; the library code is identical to 0.11.0. The 0.11.0 build on docs.rs failed because
