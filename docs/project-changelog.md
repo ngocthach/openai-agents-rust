@@ -1,5 +1,54 @@
 # Changelog
 
+## 0.11.0 (2026-11-01)
+
+Second audit pass over the parity ledger's Python-only bucket: every file that still had Python-only cases was
+re-read case by case, 441 cases moved out (380 ported, 61 covered), and the divergences they exposed were
+fixed. Measured state: 12,641 Python test cases, 8,463 ported, 665 covered, 3,513 Python-only, 0 not ported,
+0 unaccounted. Notes by area: `plans/reports/py-test-parity-core8-*.md`. No live model call was made.
+
+Fixes:
+
+- MCP: failed requests read like Python (`Failed to list tools from MCP server '<name>': HTTP error 503`);
+  a server-reported 408 earns the isolated-session retry; a zero `max_list_pages`, a negative or non-finite
+  backoff cap and a zero lifecycle timeout fail at connect with Python's messages; a failing `initialized`
+  notification no longer logs the URL's query secret.
+- Sandbox: unix-local `mkdir`, `ls`, `rm`, `mv` and `same_file` pin the validated parent with directory file
+  descriptors, so a swapped parent or leaf cannot redirect them; `read_bounded` reads only the prefix;
+  sandbox session state, event sinks, suspend and teardown no longer log payloads or raw provider errors for
+  credentialed mounts; a failed create reports `WorkspaceArchiveWriteError`; client option payloads accept
+  partial field sets; `Manifest` gains `from_value`, `from_untrusted_value` and `to_value`.
+- Sessions: `Session` has defaulted `*_with_context` methods and the runner passes the run context to them;
+  Redis compaction replaces the history in one atomic script; SQLite write transactions use `BEGIN IMMEDIATE`,
+  table claims are atomic and the first-open WAL race is retried; the compaction session drops its response
+  chain when a delete fails after committing; the OpenAI session constructors use the process default client.
+- Models and realtime: `AnyLLMModel` refuses prompt-managed requests, strips nulls from replayed input and
+  flattens object `reasoning`; an infinite `ModelSettings.timeout` means no timeout; concurrent realtime
+  `close()` callers share one outcome.
+- Tracing and macros: a failing trace processor is logged without data when sensitive-data logging is off;
+  `#[function_tool]` doc parsing stops the description at `Returns:`/`Note:`/`# Examples` and reads NumPy and
+  Sphinx styles; agents that differ only by `tool_use_behavior` get distinct identity keys.
+- E2B `shutdown` never raises and Vercel refuses manifest changes on a stopped session.
+
+Breaking changes: `ModelRetrySettings` and `ModelRetryBackoffSettings` fields are now `Option`, and
+`ModelSettings::resolve` merges retry settings field by field; MCP request and connect errors are `User` errors
+with new text; `from_json_str` errors for sandbox state have new text; the persisted S3 Files `extra_options`
+shape is an ordered object (the array form is still read); realtime and E2B behaviour notes above; the two
+OpenAI session `new()` constructors pick up a previously set default client; duplicate agents that differ only
+by `tool_use_behavior` may get different identity keys than earlier snapshots. Additive: `Session::*_with_context`,
+`SessionRunContext`, `Session::replace_history_atomically`, `SandboxSession::validate_manifest_application`,
+`UnixLocalSandboxSession::with_after_pin_hook`.
+
+Known gaps (real feature differences, not Python-only mechanics): the Docker removal service (148 cases) is a
+root host-side helper with no Rust equivalent; Rust does not rewind session items on a `conversation_locked`
+retry with server-managed conversations; there are no sandbox pre-stop hooks or `aclose`; duplicate agent
+names in a handoff graph are rejected in Rust but allowed in Python; the Rust approval store keys approvals by
+agent name; a hosted MCP interruption with `arguments` removed is still honoured; the websocket crate logs
+handshake data (including the query string) at TRACE through the `log` crate; the Redis atomic replace has only
+run against a mock; the manifest config carriers and custom environment value types are not ported; when a
+history expires during compaction Rust keeps the live items and skips the replacement where Python's test
+drives a failure.
+
 ## 0.10.0 (2026-11-01)
 
 Closes the findings of an independent audit of the Python-only bucket in the parity ledger. The audit sampled

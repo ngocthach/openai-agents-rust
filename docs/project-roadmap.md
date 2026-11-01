@@ -28,6 +28,11 @@ Last updated: 2026-10-29.
 - MCP legacy HTTP+SSE transport
 - Extensions: tool output trimmer, Codex tool, hosted multi-agent (experimental)
 
+## 0.11.0 (released)
+
+- Full re-audit of the Python-only parity bucket: 441 more cases ported or covered (8,463 ported, 665 covered,
+  3,513 Python-only); MCP errors, pinned unix-local file ops, context-aware sessions, retry-settings merge
+
 ## 0.10.0 (released)
 
 - Audit of the Python-only parity bucket: race-safe sandbox local-dir copy, full realtime event validation,

@@ -1,0 +1,8 @@
+path,moved_to_ported,moved_to_covered,remaining_python_only
+tests/model_settings/test_serialization.py,2,0,2
+tests/memory/test_session_context_wrapper.py,8,0,7
+tests/deferred_session_writes/test_resume.py,2,0,1
+tests/mcp/test_mcp_server_manager.py,2,0,48
+tests/sandbox/test_docker_removal.py,0,0,74
+tests/sandbox/test_docker_removal_client.py,0,0,14
+tests/sandbox/test_docker_removal_worker.py,0,0,60
