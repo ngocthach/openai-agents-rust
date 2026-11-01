@@ -321,7 +321,14 @@ impl<C: Send + Sync + 'static> RealtimeSession<C> {
         });
 
         let starting = model_config.initial_model_settings.clone();
-        let resolved = inner.build_settings(&agent, starting.as_ref()).await?;
+        let resolved = build_model_settings_with_initial_overrides(
+            &agent,
+            &inner.context,
+            &inner.base_settings,
+            starting.as_ref(),
+            &inner.run_config,
+        )
+        .await?;
         {
             let mut state = inner.state.lock().expect("realtime session poisoned");
             state.tools = resolved.tools.clone();
@@ -656,6 +663,21 @@ pub(crate) async fn build_model_settings_from_agent<C: Send + Sync + 'static>(
     starting: Option<&RealtimeSessionModelSettings>,
     tracing_disabled: bool,
 ) -> Result<ResolvedSettings<C>> {
+    let resolved =
+        build_model_settings_unvalidated(agent, context, base, starting, tracing_disabled).await?;
+    validate_tool_names(resolved.settings.tools.as_deref().unwrap_or_default())?;
+    Ok(resolved)
+}
+
+/// [`build_model_settings_from_agent`] without the final duplicate-name check, for a caller that
+/// still replaces tools or handoffs afterwards.
+async fn build_model_settings_unvalidated<C: Send + Sync + 'static>(
+    agent: &Arc<RealtimeAgent<C>>,
+    context: &RunContext<C>,
+    base: &RealtimeSessionModelSettings,
+    starting: Option<&RealtimeSessionModelSettings>,
+    tracing_disabled: bool,
+) -> Result<ResolvedSettings<C>> {
     let mut settings = base.clone();
     if let Some(agent_settings) = &agent.model_settings {
         settings.merge(agent_settings);
@@ -675,30 +697,24 @@ pub(crate) async fn build_model_settings_from_agent<C: Send + Sync + 'static>(
         }
     }
 
-    let mut specs: Vec<RealtimeFunctionToolSpec> = tools
-        .iter()
-        .map(|tool| {
-            let mut spec = RealtimeFunctionToolSpec::new(
-                tool.name.clone(),
-                tool.description.clone(),
-                tool.params_json_schema.clone(),
-            )
-            .with_defer_loading(tool.defer_loading);
-            if let Some(namespace) = tool.namespace() {
-                spec = spec.with_namespace(namespace);
-            }
-            spec
-        })
-        .collect();
+    let mut specs: Vec<RealtimeFunctionToolSpec> = tools.iter().map(|t| tool_spec(t)).collect();
     specs.extend(handoffs.iter().map(RealtimeHandoff::to_spec));
     settings.tools = Some(specs);
 
+    let mut tools = tools;
     if let Some(starting) = starting {
         settings.merge(starting);
+        // A tool list given at connect time replaces the agent's: what the model is no longer
+        // offered cannot be called either, as Python builds its dispatch snapshot from the
+        // merged settings. A spec carries no implementation, so only agent tools it still
+        // names stay dispatchable.
+        if let Some(offered) = &starting.tools {
+            let names: std::collections::HashSet<&str> =
+                offered.iter().map(|spec| spec.name.as_str()).collect();
+            tools.retain(|tool| names.contains(tool.name.as_str()));
+            handoffs.retain(|handoff| names.contains(handoff.tool_name.as_str()));
+        }
     }
-    // The names that reach the model are the final ones: a connect-time override that replaces
-    // the agent's tools also replaces the conflict.
-    validate_tool_names(settings.tools.as_deref().unwrap_or_default())?;
     if tracing_disabled {
         settings.tracing = Some(RealtimeModelTracing::Disabled);
     }
@@ -708,6 +724,89 @@ pub(crate) async fn build_model_settings_from_agent<C: Send + Sync + 'static>(
         tools,
         handoffs,
     })
+}
+
+/// [`build_model_settings_from_agent`] followed by the run config's connect-time live tools and
+/// handoffs. The names that reach the model are the final ones: an override that replaces the
+/// agent's tools also replaces a conflict, so the duplicate-name check runs after it.
+pub(crate) async fn build_model_settings_with_initial_overrides<C: Send + Sync + 'static>(
+    agent: &Arc<RealtimeAgent<C>>,
+    context: &RunContext<C>,
+    base: &RealtimeSessionModelSettings,
+    starting: Option<&RealtimeSessionModelSettings>,
+    run_config: &RealtimeRunConfig<C>,
+) -> Result<ResolvedSettings<C>> {
+    let mut resolved = build_model_settings_unvalidated(
+        agent,
+        context,
+        base,
+        starting,
+        run_config.tracing_disabled,
+    )
+    .await?;
+    apply_initial_overrides(
+        &mut resolved,
+        agent,
+        context,
+        run_config.initial_tools.as_ref(),
+        run_config.initial_handoffs.as_ref(),
+    )
+    .await?;
+    Ok(resolved)
+}
+
+/// The wire spec of a function tool.
+fn tool_spec<C>(tool: &FunctionTool<C>) -> RealtimeFunctionToolSpec {
+    let mut spec = RealtimeFunctionToolSpec::new(
+        tool.name.clone(),
+        tool.description.clone(),
+        tool.params_json_schema.clone(),
+    )
+    .with_defer_loading(tool.defer_loading);
+    if let Some(namespace) = tool.namespace() {
+        spec = spec.with_namespace(namespace);
+    }
+    spec
+}
+
+/// Replace the agent's tools and/or handoffs with the live objects given at connect time
+/// (Python's `initial_model_settings["tools"]` / `["handoffs"]`). Overrides are filtered by
+/// enablement, drive both the specs the model sees and the calls the session dispatches, and are
+/// validated for name conflicts like any other final set.
+async fn apply_initial_overrides<C: Send + Sync + 'static>(
+    resolved: &mut ResolvedSettings<C>,
+    agent: &Arc<RealtimeAgent<C>>,
+    context: &RunContext<C>,
+    tools: Option<&Vec<Arc<FunctionTool<C>>>>,
+    handoffs: Option<&Vec<RealtimeHandoff<C>>>,
+) -> Result<()> {
+    if tools.is_none() && handoffs.is_none() {
+        return validate_tool_names(resolved.settings.tools.as_deref().unwrap_or_default());
+    }
+    if let Some(tools) = tools {
+        let mut enabled = Vec::new();
+        for tool in tools {
+            if tool.is_enabled.evaluate(context, &agent.name).await {
+                enabled.push(tool.clone());
+            }
+        }
+        resolved.tools = enabled;
+    }
+    if let Some(handoffs) = handoffs {
+        let mut enabled = Vec::new();
+        for handoff in handoffs {
+            if handoff.is_enabled.evaluate(context, &agent.name).await {
+                enabled.push(handoff.clone());
+            }
+        }
+        resolved.handoffs = enabled;
+    }
+    let mut specs: Vec<RealtimeFunctionToolSpec> =
+        resolved.tools.iter().map(|t| tool_spec(t)).collect();
+    specs.extend(resolved.handoffs.iter().map(RealtimeHandoff::to_spec));
+    validate_tool_names(&specs)?;
+    resolved.settings.tools = Some(specs);
+    Ok(())
 }
 
 impl<C: Send + Sync + 'static> SessionInner<C> {

@@ -613,7 +613,9 @@ pub(crate) async fn execute_function_tool<C: Send + Sync + 'static>(
                 match (&tool.failure_error_function, propagate) {
                     (Some(f), false) => {
                         let mut msg = f(env.ctx, &e).await?;
-                        if tool.uses_default_failure_error_function {
+                        if tool.uses_default_failure_error_function
+                            && !matches!(e, AgentsError::MCPToolCancellationError { .. })
+                        {
                             // Keep the default failure policy identity: approving model
                             // feedback must not opt the original error into handled traces.
                             msg = format_tool_error_for(

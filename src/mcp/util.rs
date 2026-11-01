@@ -406,6 +406,15 @@ pub(crate) async fn invoke_mcp_tool_with_result_meta(
         }
     };
     let result = result.map_err(|e| {
+        // A call the client cancelled itself names the tool and the (credential-free) server
+        // and is reported as is, without an error log, as Python does.
+        if matches!(e, AgentsError::MCPToolCancellationError { .. }) {
+            return AgentsError::mcp_tool_cancelled(format!(
+                "Failed to call tool '{}' on MCP server '{}': tool execution was cancelled.",
+                tool.name,
+                get_mcp_server_log_name(server.name())
+            ));
+        }
         // Redacted mode names neither the tool nor the server, as Python's does.
         let log_message = if crate::debug::dont_log_tool_data() {
             "Error invoking MCP tool".to_string()
@@ -419,7 +428,9 @@ pub(crate) async fn invoke_mcp_tool_with_result_meta(
         // A misconfiguration or a malformed model call is not a transport failure, so it keeps
         // its own kind instead of being flattened into a generic invocation error.
         match e {
-            AgentsError::UserError { .. } | AgentsError::ModelBehaviorError { .. } => e,
+            AgentsError::UserError { .. }
+            | AgentsError::ModelBehaviorError { .. }
+            | AgentsError::MCPToolCancellationError { .. } => e,
             _ => AgentsError::other(format!(
                 "Error invoking MCP tool {display} on server '{}': {e}",
                 get_mcp_server_log_name(server.name())

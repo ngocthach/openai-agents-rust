@@ -1064,9 +1064,13 @@ impl Core {
                     Some(c) => c.clone(),
                     None => {
                         crate::util::ensure_crypto_provider();
+                        // The default client never follows a redirect, as Python's hardened
+                        // `_create_default_streamable_http_client` (`follow_redirects=False`): a
+                        // redirect would carry the caller's credential headers to another origin.
                         reqwest::Client::builder()
                             .connect_timeout(p.timeout)
                             .read_timeout(p.sse_read_timeout)
+                            .redirect(reqwest::redirect::Policy::none())
                             .build()?
                     }
                 };
@@ -1455,6 +1459,12 @@ impl Core {
                 Err(e) if allow_isolated_retry && should_retry_in_isolated_session(&e) => {
                     SharedOutcome::NeedsIsolation
                 }
+                Err(rmcp::ServiceError::Cancelled { .. }) => {
+                    SharedOutcome::Failed(AgentsError::mcp_tool_cancelled(format!(
+                        "{}: tool execution was cancelled.",
+                        self.call_prefix(params)
+                    )))
+                }
                 Err(e) => SharedOutcome::Failed(request_failure(&self.call_prefix(params), e)),
             }
         };
@@ -1485,7 +1495,15 @@ impl Core {
                     .service
                     .call_tool(params.clone())
                     .await
-                    .map_err(|e| request_failure(&self.call_prefix(params), e))
+                    .map_err(|e| match e {
+                        rmcp::ServiceError::Cancelled { .. } => {
+                            AgentsError::mcp_tool_cancelled(format!(
+                                "{}: tool execution was cancelled.",
+                                self.call_prefix(params)
+                            ))
+                        }
+                        e => request_failure(&self.call_prefix(params), e),
+                    })
             })
             .await;
         connection.close().await;

@@ -1109,18 +1109,17 @@ impl Session for OpenAIResponsesCompactionSession {
     async fn pop_item(&self) -> Result<Option<InputItem>> {
         self.ensure_wrappable()?;
         let _guard = self.mutation_lock.lock().await;
+        // The stored response chain is dropped before the deletion starts: a caller that is
+        // dropped while it is in flight (cancelled in Python) may leave the deletion committed,
+        // and the chain can no longer be trusted then. Only an empty pop gives it back.
+        let saved = std::mem::take(&mut *self.state.lock().await);
         let popped = match self.underlying.pop_item().await {
             Ok(popped) => popped,
-            Err(error) => {
-                // The deletion may have committed before the acknowledgement failed, so the
-                // stored response chain can no longer be trusted.
-                *self.state.lock().await = CompactionState::default();
-                return Err(error);
-            }
+            // The deletion may have committed before the acknowledgement failed.
+            Err(error) => return Err(error),
         };
-        if popped.is_some() {
-            let mut state = self.state.lock().await;
-            *state = CompactionState::default();
+        if popped.is_none() {
+            *self.state.lock().await = saved;
         }
         Ok(popped)
     }
@@ -1128,11 +1127,10 @@ impl Session for OpenAIResponsesCompactionSession {
     async fn clear_session(&self) -> Result<()> {
         self.ensure_wrappable()?;
         let _guard = self.mutation_lock.lock().await;
-        let cleared = self.underlying.clear_session().await;
-        // A failed clear may have committed before the acknowledgement failed, so the stored
-        // response chain is dropped either way.
+        // A failed or abandoned clear may have committed, so the stored response chain is dropped
+        // before it starts, whatever its outcome.
         *self.state.lock().await = CompactionState::default();
-        cleared
+        self.underlying.clear_session().await
     }
 
     async fn on_run_completed(&self, info: &SessionRunCompletion) -> Result<Usage> {

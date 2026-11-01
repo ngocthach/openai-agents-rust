@@ -609,7 +609,7 @@ impl SandboxRunner {
                 // that is driving the same workspace across several runs never has its
                 // workspace re-applied underneath it. Mirrors Python's `ensure_session`.
                 if !session.running().await? {
-                    session.start().await?;
+                    start_protected(session.as_ref()).await?;
                 }
                 apply_live_session_manifest(session.as_ref(), &processed).await?;
                 session.set_archive_limits(config.archive_limits);
@@ -648,9 +648,12 @@ impl SandboxRunner {
                 };
                 session.set_archive_limits(config.archive_limits);
                 session.set_concurrency_limits(config.concurrency_limits.unwrap_or_default());
-                if let Err(error) =
-                    sandbox_span_result("sandbox.start", serde_json::json!({}), session.start())
-                        .await
+                if let Err(error) = sandbox_span_result(
+                    "sandbox.start",
+                    serde_json::json!({}),
+                    start_protected(session.as_ref()),
+                )
+                .await
                 {
                     // Release the backend resources the failed start may already hold.
                     let _ = client.delete(session.clone()).await;
@@ -855,7 +858,7 @@ impl SandboxRunner {
         };
         session.set_archive_limits(config.archive_limits);
         session.set_concurrency_limits(config.concurrency_limits.unwrap_or_default());
-        if let Err(error) = session.start().await {
+        if let Err(error) = start_protected(session.as_ref()).await {
             let _ = client.delete(session.clone()).await;
             return Err(error.into());
         }
@@ -1957,6 +1960,15 @@ fn install_per_turn_preparation<C: Send + Sync + 'static>(
         })
     }));
     options
+}
+
+/// Start a session, replacing a failure with the fixed protected-mount sentence when the
+/// session's manifest carries credentialed mounts: a provider's error can repeat the mount's
+/// configuration. Mirrors Python's `redact_mount_error_data` on `BaseSandboxSession.start`.
+async fn start_protected(session: &dyn SandboxSession) -> crate::sandbox::SandboxResult<()> {
+    session.start().await.map_err(|error| {
+        crate::sandbox::sandboxes::docker::redact_for_protected_mounts(session.manifest(), error)
+    })
 }
 
 /// Confirm the configured working directory exists and is traversable for the sandbox user.

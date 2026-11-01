@@ -127,6 +127,12 @@ pub type CustomToolCustomDataExtractor<C> = Arc<
 pub type ApprovalPolicyFn<C, T> =
     Arc<dyn Fn(RunContext<C>, T, String) -> BoxFuture<'static, bool> + Send + Sync>;
 
+/// [`ApprovalPolicyFn`] that also receives the name of the agent running the call:
+/// `(context, agent name, payload, call id) -> needs approval`. A rule that consults the run's
+/// recorded decisions (see [`RunContext::is_tool_approved`]) needs the agent they are filed under.
+pub type ApprovalPolicyForAgentFn<C, T> =
+    Arc<dyn Fn(RunContext<C>, String, T, String) -> BoxFuture<'static, bool> + Send + Sync>;
+
 /// Whether a local tool call needs human approval. `T` is the payload the rule inspects
 /// (the shell action, the patch operation or the custom tool input).
 pub enum ApprovalPolicy<C, T> {
@@ -134,6 +140,8 @@ pub enum ApprovalPolicy<C, T> {
     Static(bool),
     /// Decided per call.
     Dynamic(ApprovalPolicyFn<C, T>),
+    /// Decided per call by a rule that also learns which agent runs it.
+    DynamicForAgent(ApprovalPolicyForAgentFn<C, T>),
 }
 
 impl<C, T> Clone for ApprovalPolicy<C, T> {
@@ -141,6 +149,7 @@ impl<C, T> Clone for ApprovalPolicy<C, T> {
         match self {
             ApprovalPolicy::Static(b) => ApprovalPolicy::Static(*b),
             ApprovalPolicy::Dynamic(f) => ApprovalPolicy::Dynamic(f.clone()),
+            ApprovalPolicy::DynamicForAgent(f) => ApprovalPolicy::DynamicForAgent(f.clone()),
         }
     }
 }
@@ -150,6 +159,7 @@ impl<C, T> fmt::Debug for ApprovalPolicy<C, T> {
         match self {
             ApprovalPolicy::Static(b) => write!(f, "ApprovalPolicy::Static({b})"),
             ApprovalPolicy::Dynamic(_) => write!(f, "ApprovalPolicy::Dynamic(..)"),
+            ApprovalPolicy::DynamicForAgent(_) => write!(f, "ApprovalPolicy::DynamicForAgent(..)"),
         }
     }
 }
@@ -161,11 +171,26 @@ impl<C, T> From<bool> for ApprovalPolicy<C, T> {
 }
 
 impl<C, T> ApprovalPolicy<C, T> {
-    /// Evaluate the rule for one call.
+    /// Evaluate the rule for one call. A [`DynamicForAgent`](Self::DynamicForAgent) rule sees an
+    /// empty agent name here; use [`evaluate_for_agent`](Self::evaluate_for_agent) to name it.
     pub async fn evaluate(&self, ctx: &RunContext<C>, payload: T, call_id: &str) -> bool {
+        self.evaluate_for_agent(ctx, "", payload, call_id).await
+    }
+
+    /// Evaluate the rule for one call run by the agent named `agent`.
+    pub async fn evaluate_for_agent(
+        &self,
+        ctx: &RunContext<C>,
+        agent: &str,
+        payload: T,
+        call_id: &str,
+    ) -> bool {
         match self {
             ApprovalPolicy::Static(b) => *b,
             ApprovalPolicy::Dynamic(f) => f(ctx.clone(), payload, call_id.to_string()).await,
+            ApprovalPolicy::DynamicForAgent(f) => {
+                f(ctx.clone(), agent.to_string(), payload, call_id.to_string()).await
+            }
         }
     }
 

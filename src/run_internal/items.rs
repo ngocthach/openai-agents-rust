@@ -632,4 +632,65 @@ mod tests {
         assert_eq!(items[0].tool_output().unwrap(), &json!("1"));
         assert_eq!(items[1].tool_output().unwrap(), &json!("2"));
     }
+    fn settle(items: Vec<Value>, pending: &[&str]) -> Vec<Value> {
+        let pending: HashSet<String> = pending.iter().map(|id| id.to_string()).collect();
+        crate::run_internal::settle_safe_items(items.into_iter().map(item).collect(), &pending)
+            .into_iter()
+            .map(|item| item.0)
+            .collect()
+    }
+
+    #[test]
+    fn a_held_batch_settles_only_requests_that_can_pair() {
+        let unpaired_mcp = json!({"type": "mcp_approval_request", "id": "mcpr_1",
+            "name": "do_it", "server_label": "srv", "arguments": "{}"});
+        let paired_mcp = json!({"type": "mcp_approval_request", "id": "mcpr_2",
+            "name": "do_it", "server_label": "srv", "arguments": "{}"});
+        let mcp_response = json!({"type": "mcp_approval_response",
+            "approval_request_id": "mcpr_2", "approve": true});
+        let unpaired_custom = json!({"type": "custom_tool_call", "call_id": "cust_1",
+            "name": "custom", "input": ""});
+        let preamble = json!({"role": "assistant", "content": "hi", "type": "message"});
+        let batch = vec![
+            unpaired_mcp.clone(),
+            paired_mcp.clone(),
+            mcp_response.clone(),
+            unpaired_custom,
+            preamble.clone(),
+        ];
+        assert_eq!(settle(batch, &[]), vec![paired_mcp, mcp_response, preamble]);
+        // A request whose approval is still open settles now and pairs up at a later exit.
+        assert_eq!(
+            settle(vec![unpaired_mcp.clone()], &["mcpr_1"]),
+            vec![unpaired_mcp]
+        );
+    }
+
+    #[test]
+    fn a_held_batch_prunes_with_the_canonical_rule() {
+        let reasoning = json!({"type": "reasoning", "id": "rs_1", "summary": []});
+        let unpaired_shell = json!({"type": "shell_call", "call_id": "sh_1", "id": "sh_item_1",
+            "status": "completed", "action": {"type": "exec", "command": "ls"}});
+        let paired_call = json!({"type": "function_call", "call_id": "fn_1",
+            "name": "write_thing", "arguments": "{}"});
+        let paired_output = json!({"type": "function_call_output", "call_id": "fn_1",
+            "output": "ok"});
+        // The reasoning item riding before a dropped call goes with it.
+        assert_eq!(
+            settle(
+                vec![
+                    reasoning.clone(),
+                    unpaired_shell.clone(),
+                    paired_call.clone(),
+                    paired_output.clone()
+                ],
+                &[]
+            ),
+            vec![paired_call, paired_output]
+        );
+        assert_eq!(
+            settle(vec![reasoning.clone(), unpaired_shell.clone()], &["sh_1"]),
+            vec![reasoning, unpaired_shell]
+        );
+    }
 }

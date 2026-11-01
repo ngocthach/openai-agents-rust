@@ -301,6 +301,21 @@ pub trait SandboxSession: Send + Sync + fmt::Debug {
         contents: &[u8],
         user: Option<&User>,
     ) -> SandboxResult<()> {
+        self.write_file_as_with(path, contents, user, false).await
+    }
+
+    /// [`write_file_as`](Self::write_file_as) that can refuse to replace what is already there.
+    ///
+    /// With `exclusive`, the staged file is hard-linked into place instead of moved over the
+    /// destination, so a name that exists by then (a regular file, a directory, or a symlink,
+    /// dangling ones included) makes the write fail with `already exists` and is never touched.
+    async fn write_file_as_with(
+        &self,
+        path: &str,
+        contents: &[u8],
+        user: Option<&User>,
+        exclusive: bool,
+    ) -> SandboxResult<()> {
         /// Bytes of base64 per command, comfortably inside the single-argument limit.
         const CHUNK_BYTES: usize = 48 * 1024;
 
@@ -370,6 +385,25 @@ pub trait SandboxSession: Send + Sync + fmt::Debug {
                 let _ = run(format!("rm -f -- {quoted_staging}")).await;
                 return Err(failed("write", &appended));
             }
+        }
+
+        if exclusive {
+            let linked = run(format!(
+                "ln -- {quoted_staging} {quoted_path} && rm -f -- {quoted_staging}"
+            ))
+            .await?;
+            if !linked.ok() {
+                let occupied = run(format!("[ -e {quoted_path} ] || [ -L {quoted_path} ]")).await?;
+                let _ = run(format!("rm -f -- {quoted_staging}")).await;
+                if occupied.ok() {
+                    return Err(SandboxError::new(
+                        ErrorCode::ApplyPatchInvalidPath,
+                        format!("`{path}` already exists"),
+                    ));
+                }
+                return Err(failed("write", &linked));
+            }
+            return Ok(());
         }
 
         let moved = run(format!("mv -- {quoted_staging} {quoted_path}")).await?;

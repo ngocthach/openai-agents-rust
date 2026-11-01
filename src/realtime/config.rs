@@ -729,6 +729,29 @@ pub struct RealtimeRunConfig<C> {
     pub tool_error_formatter: Option<RealtimeToolErrorFormatter<C>>,
     /// Lifecycle callbacks for the whole run, in addition to each agent's own.
     pub hooks: Option<std::sync::Arc<dyn crate::realtime::agent::RealtimeHooks<C>>>,
+    /// Function tools that replace the agent's for the session's first configuration (Python's
+    /// `initial_model_settings["tools"]`). They are advertised to the model and dispatched.
+    pub initial_tools: Option<Vec<std::sync::Arc<crate::tool::FunctionTool<C>>>>,
+    /// Handoffs that replace the agent's for the session's first configuration (Python's
+    /// `initial_model_settings["handoffs"]`). An empty list removes every handoff.
+    pub initial_handoffs: Option<Vec<crate::realtime::handoffs::RealtimeHandoff<C>>>,
+}
+
+impl<C> RealtimeRunConfig<C> {
+    /// Replace the agent's function tools at connect time with live tools.
+    pub fn with_initial_tools(mut self, tools: Vec<crate::tool::FunctionTool<C>>) -> Self {
+        self.initial_tools = Some(tools.into_iter().map(std::sync::Arc::new).collect());
+        self
+    }
+
+    /// Replace the agent's handoffs at connect time with live handoffs.
+    pub fn with_initial_handoffs(
+        mut self,
+        handoffs: Vec<crate::realtime::handoffs::RealtimeHandoff<C>>,
+    ) -> Self {
+        self.initial_handoffs = Some(handoffs);
+        self
+    }
 }
 
 impl<C> Default for RealtimeRunConfig<C> {
@@ -743,6 +766,8 @@ impl<C> Default for RealtimeRunConfig<C> {
             history_audio_storage: RealtimeAudioStorage::default(),
             tool_error_formatter: None,
             hooks: None,
+            initial_tools: None,
+            initial_handoffs: None,
         }
     }
 }
@@ -759,6 +784,8 @@ impl<C> Clone for RealtimeRunConfig<C> {
             history_audio_storage: self.history_audio_storage,
             tool_error_formatter: self.tool_error_formatter.clone(),
             hooks: self.hooks.clone(),
+            initial_tools: self.initial_tools.clone(),
+            initial_handoffs: self.initial_handoffs.clone(),
         }
     }
 }
@@ -778,6 +805,11 @@ impl<C> fmt::Debug for RealtimeRunConfig<C> {
                 &self.tool_error_formatter.as_ref().map(|_| "..."),
             )
             .field("hooks", &self.hooks)
+            .field("initial_tools", &self.initial_tools.as_ref().map(Vec::len))
+            .field(
+                "initial_handoffs",
+                &self.initial_handoffs.as_ref().map(Vec::len),
+            )
             .finish()
     }
 }

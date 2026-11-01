@@ -68,7 +68,7 @@ pub fn scoped_tool_key(tool_name: &str, invocation_type: Option<&str>) -> String
 
 /// Prefix of the key a deferred top-level function tool's decisions are recorded under. Mirrors
 /// Python's `deferred_top_level:<name>` approval key.
-const DEFERRED_TOP_LEVEL_PREFIX: &str = "deferred_top_level:";
+pub(crate) const DEFERRED_TOP_LEVEL_PREFIX: &str = "deferred_top_level:";
 
 /// [`scoped_tool_key`] for the tool call an approval item stands for.
 ///

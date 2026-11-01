@@ -2733,6 +2733,7 @@ pub(super) fn from_wire(value: &Value, version: &str) -> Result<RunState> {
         hook_identity_ambiguous: false,
         agent_owner_names: owner_names_from_wire(value),
         ambiguous_agent_owners: Default::default(),
+        restored_function_approval_keys: Default::default(),
         session_write_in_progress: Default::default(),
         tool_result_may_end_run: value
             .get("tool_result_may_end_run")

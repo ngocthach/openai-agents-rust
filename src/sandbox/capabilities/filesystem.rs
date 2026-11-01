@@ -38,6 +38,7 @@ pub struct ViewImageArgs {
 #[derive(Debug, Clone)]
 pub struct Filesystem {
     apply_patch_needs_approval: bool,
+    view_image_needs_approval: bool,
     include_view_image: bool,
     custom_apply_patch: bool,
 }
@@ -53,6 +54,7 @@ impl Filesystem {
     pub fn new() -> Self {
         Filesystem {
             apply_patch_needs_approval: false,
+            view_image_needs_approval: false,
             include_view_image: true,
             custom_apply_patch: true,
         }
@@ -78,6 +80,12 @@ impl Filesystem {
     /// Require human approval for every `apply_patch` call.
     pub fn with_apply_patch_needs_approval(mut self, needs_approval: bool) -> Self {
         self.apply_patch_needs_approval = needs_approval;
+        self
+    }
+
+    /// Require human approval for every `view_image` call.
+    pub fn with_view_image_needs_approval(mut self, needs_approval: bool) -> Self {
+        self.view_image_needs_approval = needs_approval;
         self
     }
 
@@ -188,7 +196,8 @@ impl<C: Send + Sync + 'static> Capability<C> for Filesystem {
                     }
                 },
             )
-            .with_strict_json_schema(false);
+            .with_strict_json_schema(false)
+            .with_needs_approval(self.view_image_needs_approval);
             tools.push(Tool::Function(Arc::new(view_image)));
         }
         tools.push(apply_patch_tool);

@@ -107,6 +107,15 @@ pub enum AgentsError {
         run_data: Option<Box<RunErrorDetails>>,
     },
 
+    /// An MCP tool call was cancelled inside the client before it produced a result (Python's
+    /// `MCPToolCancellationError`). The function-tool failure pipeline reports it to the model
+    /// like any other tool failure; it is never routed to the run's `tool_error_formatter`.
+    #[error("{message}")]
+    MCPToolCancellationError {
+        message: String,
+        run_data: Option<Box<RunErrorDetails>>,
+    },
+
     /// An input guardrail tripwire was triggered.
     #[error("Guardrail {} triggered tripwire", guardrail_result.guardrail_name)]
     InputGuardrailTripwireTriggered {
@@ -196,6 +205,14 @@ impl AgentsError {
         }
     }
 
+    /// Create a [`AgentsError::MCPToolCancellationError`].
+    pub fn mcp_tool_cancelled(message: impl Into<String>) -> Self {
+        AgentsError::MCPToolCancellationError {
+            message: message.into(),
+            run_data: None,
+        }
+    }
+
     /// Create a [`AgentsError::Other`].
     pub fn other(message: impl Into<String>) -> Self {
         AgentsError::Other(message.into())
@@ -276,6 +293,7 @@ impl AgentsError {
             | AgentsError::ModelTimeoutError { run_data, .. }
             | AgentsError::UserError { run_data, .. }
             | AgentsError::ToolTimeoutError { run_data, .. }
+            | AgentsError::MCPToolCancellationError { run_data, .. }
             | AgentsError::InputGuardrailTripwireTriggered { run_data, .. }
             | AgentsError::OutputGuardrailTripwireTriggered { run_data, .. }
             | AgentsError::ToolInputGuardrailTripwireTriggered { run_data, .. }
@@ -298,6 +316,7 @@ impl AgentsError {
             | AgentsError::ModelTimeoutError { run_data, .. }
             | AgentsError::UserError { run_data, .. }
             | AgentsError::ToolTimeoutError { run_data, .. }
+            | AgentsError::MCPToolCancellationError { run_data, .. }
             | AgentsError::InputGuardrailTripwireTriggered { run_data, .. }
             | AgentsError::OutputGuardrailTripwireTriggered { run_data, .. }
             | AgentsError::ToolInputGuardrailTripwireTriggered { run_data, .. }

@@ -132,9 +132,12 @@ pub(crate) async fn connect(
         Some(c) => c.clone(),
         None => {
             crate::util::ensure_crypto_provider();
+            // Python's hardened default factory sets `follow_redirects=False`: a redirect would
+            // carry the caller's credential headers to another origin.
             reqwest::Client::builder()
                 .connect_timeout(timeout)
                 .read_timeout(params.sse_read_timeout)
+                .redirect(reqwest::redirect::Policy::none())
                 .build()?
         }
     };

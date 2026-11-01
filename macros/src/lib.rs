@@ -7,8 +7,8 @@ use quote::{format_ident, quote};
 use syn::parse::{Parse, ParseStream};
 use syn::punctuated::Punctuated;
 use syn::{
-    Attribute, Expr, ExprLit, FnArg, GenericArgument, ItemFn, Lit, Meta, Pat, PathArguments,
-    ReturnType, Token, Type, parse_macro_input,
+    Attribute, Expr, ExprLit, FnArg, GenericArgument, ImplItemFn, ItemFn, Lit, Meta, Pat,
+    PathArguments, ReturnType, Token, Type, parse_macro_input,
 };
 
 /// Options of `#[function_tool(...)]`.
@@ -17,6 +17,9 @@ struct ToolOptions {
     name: Option<String>,
     description: Option<String>,
     strict: Option<bool>,
+    /// Marks an associated function (no `self`) inside an `impl` block, which the attribute
+    /// cannot tell apart from a free function.
+    associated: bool,
 }
 
 impl Parse for ToolOptions {
@@ -24,6 +27,12 @@ impl Parse for ToolOptions {
         let mut opts = ToolOptions::default();
         let metas = Punctuated::<Meta, Token![,]>::parse_terminated(input)?;
         for meta in metas {
+            if let Meta::Path(path) = &meta
+                && path.is_ident("associated")
+            {
+                opts.associated = true;
+                continue;
+            }
             let Meta::NameValue(nv) = &meta else {
                 return Err(syn::Error::new_spanned(meta, "expected `key = value`"));
             };
@@ -284,34 +293,81 @@ fn pascal_case(s: &str) -> String {
 /// `AgentsError`.
 ///
 /// Options: `#[function_tool(name = "...", description = "...", strict = false)]`.
+///
+/// Inside an `impl` block, a function with a `self` receiver gets `<fn>_tool(&self)`, which binds
+/// a clone of the receiver (the type must be `Clone + Send + Sync + 'static`; `&mut self` is not
+/// supported). An associated function without a receiver is marked
+/// `#[function_tool(associated)]` and gets `<fn>_tool()`; the attribute cannot see that it sits
+/// in an `impl` block. The parameter struct is local to the constructor.
 #[proc_macro_attribute]
 pub fn function_tool(attr: TokenStream, item: TokenStream) -> TokenStream {
     let opts = parse_macro_input!(attr as ToolOptions);
-    let mut func = parse_macro_input!(item as ItemFn);
-    match expand(opts, &mut func) {
+    let tokens = TokenStream2::from(item);
+    // A free function, or a function inside an `impl` block: one with a `self` receiver, or
+    // marked `associated`, is the latter (the two read the same to an attribute macro).
+    let in_impl = opts.associated
+        || syn::parse2::<ImplItemFn>(tokens.clone()).is_ok_and(|f| f.sig.receiver().is_some());
+    let expanded = if in_impl {
+        syn::parse2::<ImplItemFn>(tokens).and_then(|mut method| expand_in_impl(opts, &mut method))
+    } else {
+        syn::parse2::<ItemFn>(tokens).and_then(|mut func| expand(opts, &mut func))
+    };
+    match expanded {
         Ok(t) => t.into(),
         Err(e) => e.to_compile_error().into(),
     }
 }
 
-fn expand(opts: ToolOptions, func: &mut ItemFn) -> syn::Result<TokenStream2> {
-    let sdk = quote!(::openai_agents_sdk);
-    let fn_ident = func.sig.ident.clone();
-    let vis = func.vis.clone();
-    let (doc_description, doc_args) = parse_docs(&doc_lines(&func.attrs));
+/// What one function parameter list contributes to a tool.
+struct Analysis {
+    tool_name: String,
+    description: String,
+    context_type: Option<Type>,
+    fields: Vec<TokenStream2>,
+    call_args: Vec<TokenStream2>,
+    /// A `self` receiver, which only a function inside an `impl` block has.
+    receiver: bool,
+}
+
+fn analyze(
+    opts: ToolOptions,
+    sig: &mut syn::Signature,
+    attrs: &[Attribute],
+    allow_receiver: bool,
+) -> syn::Result<Analysis> {
+    let fn_ident = sig.ident.clone();
+    let (doc_description, doc_args) = parse_docs(&doc_lines(attrs));
     let tool_name = opts.name.unwrap_or_else(|| fn_ident.to_string());
     let description = opts.description.unwrap_or(doc_description);
 
     let mut context_type: Option<Type> = None;
     let mut fields = Vec::new();
     let mut call_args = Vec::new();
-    for (i, input) in func.sig.inputs.iter_mut().enumerate() {
-        let FnArg::Typed(pt) = input else {
-            return Err(syn::Error::new_spanned(
-                input,
-                "#[function_tool] does not support methods",
-            ));
+    let mut receiver = false;
+    let mut typed_index = 0usize;
+    for input in sig.inputs.iter_mut() {
+        let pt = match input {
+            FnArg::Receiver(r) if allow_receiver => {
+                if r.reference.is_some() && r.mutability.is_some() {
+                    return Err(syn::Error::new_spanned(
+                        r,
+                        "#[function_tool] cannot bind a `&mut self` receiver; use `&self` and \
+                         interior mutability",
+                    ));
+                }
+                receiver = true;
+                continue;
+            }
+            FnArg::Receiver(r) => {
+                return Err(syn::Error::new_spanned(
+                    r,
+                    "#[function_tool] on a free function cannot take `self`",
+                ));
+            }
+            FnArg::Typed(pt) => pt,
         };
+        let i = typed_index;
+        typed_index += 1;
         if i == 0
             && let Some(c) = tool_context_type(&pt.ty)
         {
@@ -358,14 +414,138 @@ fn expand(opts: ToolOptions, func: &mut ItemFn) -> syn::Result<TokenStream2> {
         fields.push(quote! { #doc pub #ident: #ty });
         call_args.push(quote!(__args.#ident));
     }
+    Ok(Analysis {
+        tool_name,
+        description,
+        context_type,
+        fields,
+        call_args,
+        receiver,
+    })
+}
+
+/// A function inside an `impl` block. The function keeps working as written, and a sibling
+/// constructor `<fn>_tool` is generated in the same block: for an associated function it takes
+/// no arguments; for a method it takes `&self` and calls the method on a clone of the receiver,
+/// so the type must be `Clone + Send + Sync + 'static`. The parameter struct is local to the
+/// constructor, so it cannot name the impl's generic parameters.
+fn expand_in_impl(opts: ToolOptions, func: &mut ImplItemFn) -> syn::Result<TokenStream2> {
+    let sdk = quote!(::openai_agents_sdk);
+    let fn_ident = func.sig.ident.clone();
+    let vis = func.vis.clone();
+    let strict = opts.strict;
+    let a = analyze(opts, &mut func.sig, &func.attrs, true)?;
+    let args_ident = format_ident!("__{}Args", pascal_case(&fn_ident.to_string()));
+    let ctor_ident = format_ident!("{}_tool", fn_ident);
+    let (tool_name, description) = (&a.tool_name, &a.description);
+    let fields = &a.fields;
+    let call_args = &a.call_args;
+    let callee = if a.receiver {
+        quote!(__this.#fn_ident)
+    } else {
+        quote!(Self::#fn_ident)
+    };
+    let is_async = func.sig.asyncness.is_some();
+    let call = if is_async {
+        quote!(#callee(#(#call_args),*).await)
+    } else if a.receiver {
+        quote!(#sdk::__private::run_blocking(move || __this.#fn_ident(#(#call_args),*)).await)
+    } else {
+        quote!(#sdk::__private::run_blocking(move || Self::#fn_ident(#(#call_args),*)).await)
+    };
+    let result = if returns_result(&func.sig.output) {
+        quote!(#call.map_err(::core::convert::Into::<#sdk::AgentsError>::into))
+    } else {
+        quote!(::core::result::Result::<_, #sdk::AgentsError>::Ok(#call))
+    };
+    let ctx_pat = if a.context_type.is_some() {
+        quote!(__ctx)
+    } else {
+        quote!(_)
+    };
+    let (generics, ctx_ty, ctx_bound) = match &a.context_type {
+        Some(c) => (quote!(), quote!(#c), quote!()),
+        None => (
+            quote!(<__C>),
+            quote!(__C),
+            quote!(__C: ::core::marker::Send + ::core::marker::Sync + 'static,),
+        ),
+    };
+    let receiver_param = if a.receiver { quote!(&self) } else { quote!() };
+    let receiver_bound = if a.receiver {
+        quote!(Self: ::core::clone::Clone + ::core::marker::Send + ::core::marker::Sync + 'static,)
+    } else {
+        quote!(Self: 'static,)
+    };
+    let bind = if a.receiver {
+        quote!(let __this = ::core::clone::Clone::clone(self);)
+    } else {
+        quote!()
+    };
+    let per_call = if a.receiver {
+        quote!(let __this = ::core::clone::Clone::clone(&__this);)
+    } else {
+        quote!()
+    };
+    let strict = strict
+        .map(|s| quote!(.with_strict_json_schema(#s)))
+        .unwrap_or_default();
+    let ctor_doc = format!("Build the `{tool_name}` function tool from [`Self::{fn_ident}`].");
+    let schemars_path = format!("{sdk}::__private::schemars").replace(' ', "");
+    let serde_path = format!("{sdk}::__private::serde").replace(' ', "");
+    Ok(quote! {
+        #func
+
+        #[doc = #ctor_doc]
+        #vis fn #ctor_ident #generics (#receiver_param) -> #sdk::FunctionTool<#ctx_ty>
+        where #ctx_bound #receiver_bound
+        {
+            #[allow(non_camel_case_types, dead_code)]
+            #[derive(#sdk::__private::serde::Deserialize, #sdk::__private::schemars::JsonSchema)]
+            #[serde(crate = #serde_path)]
+            #[schemars(crate = #schemars_path)]
+            struct #args_ident {
+                #(#fields,)*
+            }
+            #bind
+            #sdk::FunctionTool::<#ctx_ty>::new(
+                #tool_name,
+                #description,
+                move |#ctx_pat: #sdk::tool_context::ToolContext<#ctx_ty>, __args: #args_ident| {
+                    #per_call
+                    async move {
+                        #result
+                    }
+                },
+            )
+            #strict
+        }
+    })
+}
+
+fn expand(opts: ToolOptions, func: &mut ItemFn) -> syn::Result<TokenStream2> {
+    let sdk = quote!(::openai_agents_sdk);
+    let fn_ident = func.sig.ident.clone();
+    let vis = func.vis.clone();
+    let strict_opt = opts.strict;
+    let Analysis {
+        tool_name,
+        description,
+        context_type,
+        fields,
+        call_args,
+        ..
+    } = analyze(opts, &mut func.sig, &func.attrs, false)?;
 
     let args_ident = format_ident!("__{}Args", pascal_case(&fn_ident.to_string()));
     let ctor_ident = format_ident!("{}_tool", fn_ident);
     let is_async = func.sig.asyncness.is_some();
+    // A synchronous function runs on the blocking pool, as Python runs it in a worker thread,
+    // so it does not stall the runtime while it blocks.
     let call = if is_async {
         quote!(#fn_ident(#(#call_args),*).await)
     } else {
-        quote!(#fn_ident(#(#call_args),*))
+        quote!(#sdk::__private::run_blocking(move || #fn_ident(#(#call_args),*)).await)
     };
     let result = if returns_result(&func.sig.output) {
         quote!(#call.map_err(::core::convert::Into::<#sdk::AgentsError>::into))
@@ -385,8 +565,7 @@ fn expand(opts: ToolOptions, func: &mut ItemFn) -> syn::Result<TokenStream2> {
             quote!(where __C: ::core::marker::Send + ::core::marker::Sync + 'static),
         ),
     };
-    let strict = opts
-        .strict
+    let strict = strict_opt
         .map(|s| quote!(.with_strict_json_schema(#s)))
         .unwrap_or_default();
     let ctor_doc = format!("Build the `{tool_name}` function tool from [`{fn_ident}`].");

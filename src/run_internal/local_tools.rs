@@ -669,8 +669,12 @@ async fn run_shell<C: Send + Sync + 'static>(
         "shell",
         &tool.name,
         fc.clone(),
-        tool.needs_approval
-            .evaluate(env.ctx, data.action.clone(), &call_id),
+        tool.needs_approval.evaluate_for_agent(
+            env.ctx,
+            &env.agent.name,
+            data.action.clone(),
+            &call_id,
+        ),
         tool.on_approval.as_ref(),
     )
     .await?;
@@ -874,7 +878,7 @@ async fn run_apply_patch<C: Send + Sync + 'static>(
         for op in &operations {
             if tool
                 .needs_approval
-                .evaluate(env.ctx, op.clone(), &call_id)
+                .evaluate_for_agent(env.ctx, &env.agent.name, op.clone(), &call_id)
                 .await
             {
                 return true;
@@ -1065,7 +1069,7 @@ async fn run_custom<C: Send + Sync + 'static>(
         &tool.name,
         fc.clone(),
         tool.needs_approval
-            .evaluate(env.ctx, input.clone(), &call_id),
+            .evaluate_for_agent(env.ctx, &env.agent.name, input.clone(), &call_id),
         tool.on_approval.as_ref(),
     )
     .await?;

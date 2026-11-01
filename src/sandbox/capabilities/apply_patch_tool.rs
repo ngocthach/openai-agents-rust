@@ -456,29 +456,38 @@ impl<C: Send + Sync + 'static> SandboxApplyPatchTool<C> {
         tool.needs_approval = match self.needs_approval {
             OperationApproval::Static(value) => ApprovalPolicy::Static(value),
             OperationApproval::Dynamic(check) => {
-                ApprovalPolicy::Dynamic(Arc::new(move |ctx, raw_input: String, call_id| {
-                    let editor = editor.clone();
-                    let check = check.clone();
-                    Box::pin(async move {
-                        let operations = match parse_custom_input(&raw_input).and_then(|ops| {
-                            ops.iter()
-                                .map(|operation| editor.normalize_operation(operation))
-                                .collect::<Result<Vec<_>>>()
-                        }) {
-                            Ok(operations) => operations,
-                            // A malformed patch or an invalid path flows through normal tool
-                            // execution so the model gets a recoverable tool error instead of
-                            // the run aborting during the approval pre-check.
-                            Err(_) => return false,
-                        };
-                        for operation in operations {
-                            if check(ctx.clone(), operation, call_id.clone()).await {
-                                return true;
+                ApprovalPolicy::DynamicForAgent(Arc::new(
+                    move |ctx, agent, raw_input: String, call_id| {
+                        let editor = editor.clone();
+                        let check = check.clone();
+                        Box::pin(async move {
+                            let operations = match parse_custom_input(&raw_input).and_then(|ops| {
+                                ops.iter()
+                                    .map(|operation| editor.normalize_operation(operation))
+                                    .collect::<Result<Vec<_>>>()
+                            }) {
+                                Ok(operations) => operations,
+                                // A malformed patch or an invalid path flows through normal tool
+                                // execution so the model gets a recoverable tool error instead of
+                                // the run aborting during the approval pre-check.
+                                Err(_) => return false,
+                            };
+                            // Once a decision lands for the call, the remaining operations are
+                            // not checked: the decision governs the whole call.
+                            let key = crate::run_context::scoped_tool_key(
+                                "apply_patch",
+                                Some("custom_tool_call"),
+                            );
+                            for operation in operations {
+                                let needs = check(ctx.clone(), operation, call_id.clone()).await;
+                                if needs || ctx.is_tool_approved(&agent, &key, &call_id).is_some() {
+                                    return needs;
+                                }
                             }
-                        }
-                        false
-                    })
-                }))
+                            false
+                        })
+                    },
+                ))
             }
         };
         tool

@@ -410,9 +410,32 @@ fn settle_safe_items(items: Vec<InputItem>, pending: &HashSet<String>) -> Vec<In
         })
         .collect();
     working.extend(placeholders);
+    // Hosted MCP approvals pair outside the canonical map: a request settles only with its
+    // response present or its approval still open (the response names the request's `id`).
+    let answered: HashSet<String> = working
+        .iter()
+        .filter(|item| item.item_type() == Some("mcp_approval_response"))
+        .filter_map(|item| item.0.get("approval_request_id").and_then(Value::as_str))
+        .map(str::to_string)
+        .chain(pending.iter().cloned())
+        .collect();
     items::drop_orphan_function_calls(working)
         .into_iter()
         .filter(|item| item.0.get(PLACEHOLDER).is_none())
+        .filter(|item| {
+            if item.item_type() != Some("mcp_approval_request") {
+                return true;
+            }
+            match item
+                .0
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+            {
+                Some(id) => answered.contains(id),
+                None => true,
+            }
+        })
         .collect()
 }
 
@@ -1829,7 +1852,20 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
                  the current response boundary cannot be proven. Start a new run from safe input.",
             ));
         }
-        self.ctx.import_approvals(&state.approvals);
+        // A decision read from a snapshot cannot authorize an owner that this graph only tells
+        // from a same-named sibling by traversal order (Python skips them when it restores).
+        let mut approvals = state.approvals.clone();
+        if !state.restored_function_approval_keys.is_empty() {
+            let ambiguous = agent_identity::ambiguous_identity_keys(&self.starting_agent);
+            for key in &state.restored_function_approval_keys {
+                if let Some((owner, _)) = key.split_once('\u{1}')
+                    && ambiguous.contains(owner)
+                {
+                    approvals.0.remove(key);
+                }
+            }
+        }
+        self.ctx.import_approvals(&approvals);
         self.legacy_name_owner_fallback = state.legacy_name_owner_snapshot;
         self.ctx
             .import_nested_states(&state.nested_agent_tool_states);
@@ -3067,6 +3103,7 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
             approvals: self.ctx.export_approvals(),
             agent_owner_names: agent_identity::names_by_identity_key(&self.starting_agent),
             ambiguous_agent_owners: agent_identity::ambiguous_identity_keys(&self.starting_agent),
+            restored_function_approval_keys: Default::default(),
             nested_agent_tool_states: self.ctx.nested_states_for_checkpoint(),
             input_guardrail_results: self.input_guardrail_results.clone(),
             output_guardrail_results: self.output_guardrail_results.clone(),
@@ -3793,7 +3830,36 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
         .await
     }
 
+    /// [`run_turn_inner`](Self::run_turn_inner), keeping the ledger honest when the turn fails.
+    ///
+    /// Python marks a tool call completed only once its output is part of the history a later
+    /// turn is built from. A turn that fails after its tools ran (an end hook, a guardrail)
+    /// never gets there, so the calls it committed stay "executed, not completed" and a fresh
+    /// run sharing the context refuses to run them again.
     async fn run_turn(
+        &mut self,
+        tools: Vec<Tool<C>>,
+        handoffs: Vec<Handoff<C>>,
+    ) -> Result<NextStep<C>> {
+        self.turn_start = self.generated_items.len();
+        let outcome = self.run_turn_inner(tools, handoffs).await;
+        if outcome.is_err() {
+            let start = self.turn_start.min(self.generated_items.len());
+            for item in &self.generated_items[start..] {
+                let output = match &item.kind {
+                    RunItemKind::ToolCallOutput { raw_item, .. } => Some(raw_item),
+                    RunItemKind::HandoffOutput { raw_item, .. } => Some(&raw_item.0),
+                    _ => None,
+                };
+                if let Some((_, call_id)) = output.and_then(tool_invocation::tool_output_identity) {
+                    self.ctx.mark_invocation_executed(&call_id);
+                }
+            }
+        }
+        outcome
+    }
+
+    async fn run_turn_inner(
         &mut self,
         tools: Vec<Tool<C>>,
         handoffs: Vec<Handoff<C>>,
@@ -4097,6 +4163,18 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
             // The response was delivered before its end hooks ran, so the failed run checkpoints
             // as a turn that resumes by processing it, without another model call or end hooks.
             self.model_responses.push(response.clone());
+            if self.sink.is_some() {
+                // A streamed run shows the validated items of the response before its end
+                // hooks run, as Python does; the items themselves stay out of the checkpoint,
+                // which resumes by processing the response.
+                let generated = self.generated_items.len();
+                let model = self.model_items.len();
+                let _ = self
+                    .process_response(&agent, &tools, &handoffs, &response, true, &HashSet::new())
+                    .await;
+                self.generated_items.truncate(generated);
+                self.model_items.truncate(model);
+            }
             if self.server_managed() {
                 self.accept_server_response(&response, &sent_input);
             }

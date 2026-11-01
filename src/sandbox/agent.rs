@@ -525,7 +525,22 @@ impl<C: Send + Sync + 'static> SandboxAgent<C> {
         }
 
         for capability in &self.capabilities {
-            capability.check_manifest(binding.session.manifest())?;
+            if let Err(error) = capability.check_manifest(binding.session.manifest()) {
+                // A capability's message can repeat the manifest it rejected, credentials of
+                // its mounts included, so a protected manifest surfaces only the fixed
+                // sentence.
+                return Err(
+                    if crate::sandbox::sandboxes::docker::manifest_has_protected_mounts(
+                        binding.session.manifest(),
+                    ) {
+                        AgentsError::other(
+                            crate::sandbox::sandboxes::docker::PROTECTED_MOUNT_ERROR_MESSAGE,
+                        )
+                    } else {
+                        error
+                    },
+                );
+            }
         }
 
         let mut capability_tools = Vec::new();

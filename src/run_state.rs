@@ -223,6 +223,12 @@ pub struct RunState {
     /// `_get_ambiguous_agent_ids`. Derived from the graph by the run that builds the state.
     #[serde(skip)]
     pub ambiguous_agent_owners: BTreeSet<String>,
+    /// Keys (`owner`, tool) of the agent-owned function decisions read from a snapshot and not
+    /// replaced by a fresh decision since. The resumed run drops those whose owner cannot be told
+    /// apart from a same-named sibling in the graph it is given, the way Python's
+    /// `_deserialize_run_state` skips them against the restored graph. Read-derived.
+    #[serde(skip)]
+    pub restored_function_approval_keys: BTreeSet<String>,
     /// The snapshot's `context_meta` says its context cannot be rebuilt from the payload
     /// alone: it was written from a type the JSON does not describe, or omitted outright.
     /// Mirrors `_context_meta_requires_deserializer`. Read-only; derived on deserialization.
@@ -545,7 +551,19 @@ impl RunState {
         self.approvals.try_approve(item, always_approve)?;
         self.restored_unbound_approval_call_ids
             .remove(item.call_id());
+        self.forget_restored_function_decision(item);
         Ok(())
+    }
+
+    /// A fresh decision on `item` replaces what the snapshot said about its owner and tool.
+    fn forget_restored_function_decision(&mut self, item: &ToolApprovalItem) {
+        let key = crate::run_context::approval_tool_key(&item.tool_name, &item.raw_item);
+        self.restored_function_approval_keys
+            .remove(&format!("{}\u{1}{key}", item.agent));
+        if let Some(bare) = key.strip_prefix(crate::run_context::DEFERRED_TOP_LEVEL_PREFIX) {
+            self.restored_function_approval_keys
+                .remove(&format!("{}\u{1}{bare}", item.agent));
+        }
     }
 
     /// Refuse a decision for an invocation identity that more than one pending approval of
@@ -584,6 +602,7 @@ impl RunState {
             .try_reject(item, always_reject, rejection_message)?;
         self.restored_unbound_approval_call_ids
             .remove(item.call_id());
+        self.forget_restored_function_decision(item);
         Ok(())
     }
 
@@ -706,6 +725,20 @@ impl RunState {
                 "{}",
                 wire::context_meta_warning(context_meta.as_ref()),
             );
+        }
+        if !is_legacy_rust {
+            state.restored_function_approval_keys = state
+                .approvals
+                .0
+                .keys()
+                .filter(|key| {
+                    crate::run_context::parse_hosted_key(key).is_none()
+                        && key
+                            .split_once('\u{1}')
+                            .is_some_and(|(owner, _)| !owner.is_empty())
+                })
+                .cloned()
+                .collect();
         }
         state.legacy_hook_identity_snapshot = version_precedes(version, (1, 21));
         state.legacy_name_owner_snapshot = version_precedes(version, (1, 7));

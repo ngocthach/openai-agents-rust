@@ -298,6 +298,10 @@ pub trait EventSink: Send + Sync + fmt::Debug {
     /// Flush anything buffered. The default does nothing.
     async fn flush(&self) {}
 
+    /// Hand the sink the session whose events it receives. Mirrors Python's
+    /// `EventSink.bind`; [`InstrumentedSession::new`] calls it once. The default ignores it.
+    fn bind(&self, _session: Arc<dyn crate::sandbox::session::SandboxSession>) {}
+
     /// The payload policy this sink wants, overriding the instrumentation's own.
     ///
     /// Mirrors Python's per-sink `payload_policy`: a sink that ships events off the machine may
@@ -327,31 +331,45 @@ pub trait EventSink: Send + Sync + fmt::Debug {
     }
 }
 
-/// The closure a [`CallbackSink`] runs for each event.
-type EventCallback = dyn Fn(&SandboxSessionEvent) -> SandboxResult<()> + Send + Sync;
+/// The closure a [`CallbackSink`] runs for each event, with the bound session when there is one.
+type EventCallback = dyn Fn(
+        &SandboxSessionEvent,
+        Option<&Arc<dyn crate::sandbox::session::SandboxSession>>,
+    ) -> SandboxResult<()>
+    + Send
+    + Sync;
 
 /// Hands each event to a closure. Mirrors Python's `CallbackSink`.
 pub struct CallbackSink {
     callback: Arc<EventCallback>,
     raises: bool,
     policy: Option<EventPayloadPolicy>,
+    session: std::sync::Mutex<Option<Arc<dyn crate::sandbox::session::SandboxSession>>>,
 }
 
 impl CallbackSink {
+    fn build(callback: Arc<EventCallback>, raises: bool) -> Self {
+        CallbackSink {
+            callback,
+            raises,
+            policy: None,
+            session: std::sync::Mutex::new(None),
+        }
+    }
+
     /// A sink calling `callback` for every event. A failure in `callback` cannot fail the
     /// operation; use [`raising`](Self::raising) for that.
     pub fn new<F>(callback: F) -> Self
     where
         F: Fn(&SandboxSessionEvent) + Send + Sync + 'static,
     {
-        CallbackSink {
-            callback: Arc::new(move |event| {
+        Self::build(
+            Arc::new(move |event, _| {
                 callback(event);
                 Ok(())
             }),
-            raises: false,
-            policy: None,
-        }
+            false,
+        )
     }
 
     /// A sink whose callback may fail. A failure fails the operation that produced the event,
@@ -360,11 +378,62 @@ impl CallbackSink {
     where
         F: Fn(&SandboxSessionEvent) -> SandboxResult<()> + Send + Sync + 'static,
     {
-        CallbackSink {
-            callback: Arc::new(callback),
-            raises: true,
-            policy: None,
-        }
+        Self::build(Arc::new(move |event, _| callback(event)), true)
+    }
+
+    /// Like [`new`](Self::new), for a callback that also receives the session the event came
+    /// from, as Python's `CallbackSink` callback does. The session is bound when the sink is
+    /// handed to an [`InstrumentedSession`]; an event delivered before that fails with
+    /// `CallbackSink requires a bound session`, which a non-raising sink only logs.
+    pub fn with_session<F>(callback: F) -> Self
+    where
+        F: Fn(&SandboxSessionEvent, &Arc<dyn crate::sandbox::session::SandboxSession>)
+            + Send
+            + Sync
+            + 'static,
+    {
+        Self::build(
+            Arc::new(move |event, session| {
+                callback(event, Self::require_session(session)?);
+                Ok(())
+            }),
+            false,
+        )
+    }
+
+    /// [`raising`](Self::raising) for a callback that also receives the bound session. See
+    /// [`with_session`](Self::with_session).
+    pub fn raising_with_session<F>(callback: F) -> Self
+    where
+        F: Fn(
+                &SandboxSessionEvent,
+                &Arc<dyn crate::sandbox::session::SandboxSession>,
+            ) -> SandboxResult<()>
+            + Send
+            + Sync
+            + 'static,
+    {
+        Self::build(
+            Arc::new(move |event, session| callback(event, Self::require_session(session)?)),
+            true,
+        )
+    }
+
+    fn require_session(
+        session: Option<&Arc<dyn crate::sandbox::session::SandboxSession>>,
+    ) -> SandboxResult<&Arc<dyn crate::sandbox::session::SandboxSession>> {
+        session.ok_or_else(|| {
+            SandboxError::new(
+                ErrorCode::EventSinkFailed,
+                "CallbackSink requires a bound session; wrap the session in an \
+                 InstrumentedSession (or call bind)",
+            )
+        })
+    }
+
+    fn call(&self, event: &SandboxSessionEvent) -> SandboxResult<()> {
+        let session = self.session.lock().expect("poisoned").clone();
+        (self.callback)(event, session.as_ref())
     }
 
     /// Give this sink its own payload policy.
@@ -383,7 +452,7 @@ impl fmt::Debug for CallbackSink {
 #[async_trait]
 impl EventSink for CallbackSink {
     async fn emit(&self, event: &SandboxSessionEvent) {
-        if let Err(error) = (self.callback)(event) {
+        if let Err(error) = self.call(event) {
             // The failure's own text may repeat what the event described, so it is logged only
             // when tool data may be logged; the sink and the event stay out of the message.
             crate::logger::log_tool_action_error("Sandbox event sink failed (ignored)", &error);
@@ -391,7 +460,11 @@ impl EventSink for CallbackSink {
     }
 
     async fn try_emit(&self, event: &SandboxSessionEvent) -> SandboxResult<()> {
-        (self.callback)(event)
+        self.call(event)
+    }
+
+    fn bind(&self, session: Arc<dyn crate::sandbox::session::SandboxSession>) {
+        *self.session.lock().expect("poisoned") = Some(session);
     }
 
     fn raises_on_error(&self) -> bool {
@@ -822,6 +895,12 @@ impl EventSink for ChainedSink {
             sink.flush().await;
         }
     }
+
+    fn bind(&self, session: Arc<dyn crate::sandbox::session::SandboxSession>) {
+        for sink in &self.sinks {
+            sink.bind(session.clone());
+        }
+    }
 }
 
 /// Issues the start and finish events for a session's operations. Mirrors Python's
@@ -1072,6 +1151,7 @@ impl InstrumentedSession {
         inner: Arc<dyn crate::sandbox::session::SandboxSession>,
         sink: Arc<dyn EventSink>,
     ) -> Self {
+        sink.bind(inner.clone());
         let instrumentation = Instrumentation::new(sink, inner.id(), inner.backend_id());
         InstrumentedSession {
             inner,

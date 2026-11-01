@@ -1,6 +1,6 @@
 //! The OpenAI speech-to-text model. Mirrors `agents.voice.models.openai_stt`.
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -430,12 +430,14 @@ impl OpenAISTTTranscriptionSession {
         .await
         .map_err(|e| websocket_error(format!("Could not open the STT websocket: {e}")))?;
         let (sink, mut stream) = ws.split();
+        let mut backlog: VecDeque<Message> = VecDeque::new();
 
         wait_for_event(
             &mut stream,
             &["session.created", "transcription_session.created"],
             seconds(options.session_creation_timeout),
             "Timeout waiting for transcription_session.created event",
+            &mut backlog,
         )
         .await?;
 
@@ -463,6 +465,7 @@ impl OpenAISTTTranscriptionSession {
             &["session.updated", "transcription_session.updated"],
             seconds(options.session_update_timeout),
             "Timeout waiting for transcription_session.updated event",
+            &mut backlog,
         )
         .await?;
 
@@ -517,6 +520,7 @@ impl OpenAISTTTranscriptionSession {
                         turns_tx,
                         final_commit_id,
                         closing,
+                        backlog,
                     ))
                     .await;
             })
@@ -670,6 +674,7 @@ async fn wait_for_event(
     expected: &[&str],
     timeout: Duration,
     timeout_message: &str,
+    backlog: &mut VecDeque<Message>,
 ) -> Result<Value> {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
@@ -690,14 +695,17 @@ async fn wait_for_event(
             .get("type")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        if expected.contains(&event_type) {
-            return Ok(event);
-        }
         if event_type == "error" {
             return Err(websocket_error(format!(
                 "Error event: {}",
                 event.get("error").unwrap_or(&Value::Null)
             )));
+        }
+        // Every event reaches the turn handler once setup is done, as Python's event queue
+        // holds them: a transcript that arrives during setup is not lost.
+        backlog.push_back(message);
+        if expected.contains(&event_type) {
+            return Ok(event);
         }
     }
 }
@@ -831,37 +839,42 @@ async fn handle_events(
     turns: mpsc::UnboundedSender<Result<String>>,
     final_commit_id: Arc<Mutex<Option<String>>>,
     closing: Arc<AtomicBool>,
+    mut backlog: VecDeque<Message>,
 ) {
     let mut pending_transcripts: HashSet<String> = HashSet::new();
     let mut input_cleared = false;
     loop {
-        let message = match next_event(&mut stream, &sink, &options).await {
-            NextEvent::Inactive => {
-                if final_commit_id.lock().expect("poisoned").is_some() {
-                    let _ = turns.send(Err(websocket_error(
-                        "Timeout waiting for final transcription",
-                    )));
+        let message = if let Some(buffered) = backlog.pop_front() {
+            buffered
+        } else {
+            match next_event(&mut stream, &sink, &options).await {
+                NextEvent::Inactive => {
+                    if final_commit_id.lock().expect("poisoned").is_some() {
+                        let _ = turns.send(Err(websocket_error(
+                            "Timeout waiting for final transcription",
+                        )));
+                    }
+                    // No new events for a while: assume the session is done.
+                    break;
                 }
-                // No new events for a while: assume the session is done.
-                break;
-            }
-            NextEvent::Closed => {
-                let committed = final_commit_id.lock().expect("poisoned").is_some();
-                if !closing.load(Ordering::SeqCst)
-                    && committed
-                    && (!input_cleared || !pending_transcripts.is_empty())
-                {
-                    let _ = turns.send(Err(websocket_error(
-                        "Websocket closed before final transcription completed",
-                    )));
+                NextEvent::Closed => {
+                    let committed = final_commit_id.lock().expect("poisoned").is_some();
+                    if !closing.load(Ordering::SeqCst)
+                        && committed
+                        && (!input_cleared || !pending_transcripts.is_empty())
+                    {
+                        let _ = turns.send(Err(websocket_error(
+                            "Websocket closed before final transcription completed",
+                        )));
+                    }
+                    break;
                 }
-                break;
+                NextEvent::Failed(message) => {
+                    let _ = turns.send(Err(websocket_error(message)));
+                    break;
+                }
+                NextEvent::Message(message) => message,
             }
-            NextEvent::Failed(message) => {
-                let _ = turns.send(Err(websocket_error(message)));
-                break;
-            }
-            NextEvent::Message(message) => message,
         };
         if matches!(message, Message::Close(_)) {
             break;

@@ -65,6 +65,8 @@ pub struct OpenAIClient {
     default_headers: HashMap<String, String>,
     /// Header names removed after every other source was applied. Python's `Omit`.
     omitted_headers: Vec<String>,
+    /// Query parameter names removed after every other source was applied. Python's `Omit`.
+    omitted_query: Vec<String>,
     /// Query parameters added to every request. Mirrors `AsyncOpenAI.default_query`.
     default_query: HashMap<String, String>,
     auth: Option<std::sync::Arc<dyn RequestAuth>>,
@@ -128,6 +130,7 @@ impl OpenAIClient {
             project: env("OPENAI_PROJECT_ID"),
             default_headers: HashMap::new(),
             omitted_headers: Vec::new(),
+            omitted_query: Vec::new(),
             default_query: HashMap::new(),
             auth: None,
             send_bearer_auth: true,
@@ -180,6 +183,19 @@ impl OpenAIClient {
     pub fn without_header(mut self, name: impl Into<String>) -> Self {
         self.omitted_headers.push(name.into());
         self
+    }
+
+    /// Remove a query parameter that would otherwise be sent (a default query parameter, one in
+    /// the websocket base URL or a per-request `extra_query` entry). The equivalent of passing
+    /// OpenAI's `Omit` for that key.
+    pub fn without_query(mut self, name: impl Into<String>) -> Self {
+        self.omitted_query.push(name.into());
+        self
+    }
+
+    /// Whether `name` was removed with [`without_query`](Self::without_query).
+    pub fn is_query_omitted(&self, name: &str) -> bool {
+        self.omitted_query.iter().any(|omitted| omitted == name)
     }
 
     /// Add a query parameter sent on every request. Mirrors `AsyncOpenAI.default_query`.
@@ -248,14 +264,15 @@ impl OpenAIClient {
             base.trim_end_matches('/'),
             path.trim_start_matches('/')
         );
-        if self.default_query.is_empty() {
-            return url;
-        }
         let mut params: Vec<(&str, &str)> = self
             .default_query
             .iter()
+            .filter(|(k, _)| !self.is_query_omitted(k))
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
+        if params.is_empty() {
+            return url;
+        }
         params.sort_unstable();
         let separator = if url.contains('?') { '&' } else { '?' };
         let query = params
@@ -357,6 +374,7 @@ impl OpenAIClient {
                 .flatten()
                 .map(|(k, v)| (k.as_str(), v.as_str())),
         );
+        params.retain(|(k, _)| !self.is_query_omitted(k));
         let url = self.url(path);
         if params.is_empty() {
             return url;

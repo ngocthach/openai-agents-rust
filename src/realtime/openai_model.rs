@@ -42,7 +42,7 @@ use crate::realtime::model_events::{
     RealtimeModelToolCallEvent,
 };
 use crate::realtime::model_inputs::{RealtimeInterrupt, RealtimeModelSendEvent};
-use crate::realtime::session::build_model_settings_from_agent;
+use crate::realtime::session::build_model_settings_with_initial_overrides;
 use crate::run_context::RunContext;
 use crate::usage::Usage;
 
@@ -713,7 +713,18 @@ impl RealtimeModel for OpenAIRealtimeWebSocketModel {
             ));
         }
         let _slot = ConnectSlot(&self.inner.connecting);
-        self.connect_inner(config).await
+        let previous_model = self.model_name();
+        let result = self.connect_inner(config).await;
+        if result.is_err() {
+            // A failed attempt must not leave the model name it was asked to use behind: the
+            // next connect without an explicit name would otherwise open that model.
+            self.inner
+                .state
+                .lock()
+                .expect("realtime model poisoned")
+                .model = previous_model;
+        }
+        result
     }
 
     async fn send_event(&self, event: RealtimeModelSendEvent) -> Result<()> {
@@ -967,12 +978,13 @@ impl OpenAIRealtimeSIPModel {
         }
 
         let run_context = RunContext::new(context);
-        let mut resolved = build_model_settings_from_agent(
+        let default_run_config = RealtimeRunConfig::<C>::default();
+        let mut resolved = build_model_settings_with_initial_overrides(
             agent,
             &run_context,
             &base,
             starting.as_ref(),
-            run_config.is_some_and(|config| config.tracing_disabled),
+            run_config.unwrap_or(&default_run_config),
         )
         .await?;
         if let Some(overrides) = overrides {
@@ -1511,10 +1523,16 @@ impl WsInner {
                     .cancel_response(interrupt.response_id.as_deref())
                     .await
                     .err();
-                if let Some(error) = playback_error.or(cancel_error) {
-                    return Err(error);
-                }
-                return Ok(());
+                // Several failed steps are reported together, as Python's
+                // `_RealtimeInterruptError` does; a single failure is returned as it is.
+                return match (playback_error, cancel_error) {
+                    (None, None) => Ok(()),
+                    (Some(error), None) | (None, Some(error)) => Err(error),
+                    (Some(playback), Some(cancel)) => Err(AgentsError::other(format!(
+                        "Multiple Realtime interrupt operations failed: \
+                         truncate_audio={playback}; cancel_response={cancel}"
+                    ))),
+                };
             }
         }
 

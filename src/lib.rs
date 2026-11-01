@@ -153,4 +153,24 @@ pub mod __private {
     pub use schemars;
     pub use serde;
     pub use serde_json;
+
+    /// Run a synchronous tool body off the async worker, like Python's `asyncio.to_thread`, so
+    /// a slow blocking function does not stall other tasks. Outside a tokio runtime the body
+    /// runs inline. A panic in the body propagates to the caller as it would inline.
+    pub async fn run_blocking<T, F>(f: F) -> T
+    where
+        T: Send + 'static,
+        F: FnOnce() -> T + Send + 'static,
+    {
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => match handle.spawn_blocking(f).await {
+                Ok(value) => value,
+                Err(error) => match error.try_into_panic() {
+                    Ok(payload) => std::panic::resume_unwind(payload),
+                    Err(error) => panic!("a blocking tool body was cancelled: {error}"),
+                },
+            },
+            Err(_) => f(),
+        }
+    }
 }

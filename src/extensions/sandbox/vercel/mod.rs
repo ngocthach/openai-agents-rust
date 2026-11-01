@@ -1261,6 +1261,9 @@ pub struct VercelSandboxSession {
     terminated: tokio::sync::Mutex<bool>,
     /// Set once a session that held S3 mounts was shut down: it is never used again.
     s3_mount_session_closed: AtomicBool,
+    /// Set once a mount transition failed and the sandbox was stopped: the session refuses
+    /// further commands and its shutdown does not try to unmount again.
+    s3_mount_failed: AtomicBool,
     /// Set while a snapshot has the S3 mounts detached, so model-facing tools refuse to read an
     /// empty mount directory as if it were the bucket.
     mount_transition: crate::sandbox::mounts::MountTransition,
@@ -1337,6 +1340,7 @@ impl VercelSandboxSession {
             started: AtomicBool::new(false),
             terminated: tokio::sync::Mutex::new(false),
             s3_mount_session_closed: AtomicBool::new(false),
+            s3_mount_failed: AtomicBool::new(false),
             mount_transition: crate::sandbox::mounts::MountTransition::new(),
             snapshot,
             resuming: false,
@@ -1456,8 +1460,59 @@ impl VercelSandboxSession {
     /// failed part way leaves the sandbox in a state no later step can reason about, so the
     /// sandbox does not survive it.
     pub(crate) async fn fail_s3_mount_transition(&self, error: SandboxError) -> SandboxError {
-        let _ = self.terminate().await;
-        error
+        self.s3_mount_failed.store(true, Ordering::SeqCst);
+        // A stop that fails replaces the mount error, as it does in Python where the stop
+        // raises from inside the handler of the mount failure.
+        match self.terminate().await {
+            Ok(()) => error,
+            Err(stop_error) => stop_error,
+        }
+    }
+
+    /// Port of `_shutdown_with_s3_mounts`: detach every attached mount (a failed unmount stops
+    /// the sandbox through [`fail_s3_mount_transition`](Self::fail_s3_mount_transition)), then
+    /// stop it. A failed stop after a failed detach is retried once by that second stop, and the
+    /// first failure is the one reported.
+    async fn shutdown_with_s3_mounts(&self) -> SandboxResult<()> {
+        if self.s3_mount_session_closed.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        let mut first_error: Option<SandboxError> = None;
+        if self.has_s3_mounts() && !self.s3_mount_failed.load(Ordering::SeqCst) {
+            for (mount, path) in self.manifest.mount_targets() {
+                if let Err(error) = mount
+                    .strategy
+                    .teardown_for_snapshot(mount, self, &path)
+                    .await
+                {
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        match self.terminate().await {
+            Ok(()) => {
+                self.active_s3_mounts.lock().expect("poisoned").clear();
+                self.detached_s3_mounts.lock().expect("poisoned").clear();
+                match first_error {
+                    Some(error) => Err(error),
+                    None => Ok(()),
+                }
+            }
+            Err(stop_error) => {
+                let detached = !self.detached_s3_mounts.lock().expect("poisoned").is_empty();
+                if detached {
+                    // Unmounted but not stopped: the sandbox must not survive, so it is
+                    // stopped again; a second failure only matters when nothing failed before.
+                    self.s3_mount_failed.store(true, Ordering::SeqCst);
+                    if let Err(second) = self.terminate().await
+                        && first_error.is_none()
+                    {
+                        return Err(second);
+                    }
+                }
+                Err(first_error.unwrap_or(stop_error))
+            }
+        }
     }
 
     fn with_session_key(mut self, session_key: String) -> Self {
@@ -1623,6 +1678,19 @@ impl VercelSandboxSession {
             )
             .with_context("backend", BACKEND_ID)
             .with_context("reason", "mounted_session_closed"));
+        }
+        // A start that failed before any mount attached left nothing to protect and may be
+        // retried (the next `start` clears the flag); once mounts attached, the stopped session
+        // stays unusable.
+        if self.s3_mount_failed.load(Ordering::SeqCst)
+            && self.s3_mounts_started.load(Ordering::SeqCst)
+        {
+            return Err(SandboxError::new(
+                ErrorCode::WorkspaceStartError,
+                "a Vercel S3 mount transition failed and the session was stopped",
+            )
+            .with_context("backend", BACKEND_ID)
+            .with_context("reason", "mount_transition_failed"));
         }
         Ok(())
     }
@@ -2036,6 +2104,9 @@ impl SandboxSession for VercelSandboxSession {
             .with_context("backend", BACKEND_ID)
             .with_retryable(false));
         }
+        if has_s3_mounts {
+            self.s3_mount_failed.store(false, Ordering::SeqCst);
+        }
         let root = self.manifest.root().to_string();
         let prepared = self
             .run_command(
@@ -2088,7 +2159,7 @@ impl SandboxSession for VercelSandboxSession {
     }
 
     async fn shutdown(&self) -> SandboxResult<()> {
-        self.redacted(self.terminate().await)
+        self.redacted(self.shutdown_with_s3_mounts().await)
     }
 
     async fn running(&self) -> SandboxResult<bool> {

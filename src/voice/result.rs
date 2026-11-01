@@ -112,8 +112,35 @@ impl StreamedAudioResult {
             ) {
                 this.done = true;
             }
+            if matches!(event, VoiceStreamEvent::Error(_)) {
+                // A failed session leaves nothing running: sibling segments and the producer are
+                // stopped and awaited before the failure is handed to the consumer.
+                this.cancel_background_tasks().await;
+            }
             Some((event, this))
         })
+    }
+
+    /// Abort the producer, the dispatcher and every segment task, then wait until they are gone.
+    async fn cancel_background_tasks(&mut self) {
+        // The producer goes first: cancelling it hands the segment tasks it was awaiting back to
+        // the writer, which is where the rest are collected from.
+        let mut first: Vec<JoinHandle<()>> = Vec::new();
+        first.extend(self.producer.take());
+        first.extend(self.dispatcher.take());
+        for handle in &first {
+            handle.abort();
+        }
+        for handle in first {
+            let _ = handle.await;
+        }
+        let segments = self.writer.take_tasks();
+        for handle in &segments {
+            handle.abort();
+        }
+        for handle in segments {
+            let _ = handle.await;
+        }
     }
 
     /// Whether the terminal event has been delivered.
@@ -444,21 +471,50 @@ impl AudioResultWriter {
 
     async fn join_tasks(&self) {
         loop {
-            let tasks: Vec<JoinHandle<()>> =
-                std::mem::take(&mut *self.tasks.lock().expect("poisoned"));
+            let tasks = self.take_tasks();
             if tasks.is_empty() {
                 return;
             }
-            for task in tasks {
-                let _ = task.await;
+            let mut joining = Joining {
+                writer: self,
+                tasks,
+                next: 0,
+            };
+            while joining.next < joining.tasks.len() {
+                let _ = (&mut joining.tasks[joining.next]).await;
+                joining.next += 1;
             }
         }
     }
 
     fn abort_tasks(&self) {
-        for task in std::mem::take(&mut *self.tasks.lock().expect("poisoned")) {
+        for task in self.take_tasks() {
             task.abort();
         }
+    }
+
+    fn take_tasks(&self) -> Vec<JoinHandle<()>> {
+        std::mem::take(&mut *self.tasks.lock().expect("poisoned"))
+    }
+}
+
+/// Segment tasks being awaited. If the awaiting future is dropped (the producer is cancelled),
+/// the tasks that were not finished go back to the writer, so whoever cancels the session can
+/// still stop and await them instead of leaving them detached.
+struct Joining<'a> {
+    writer: &'a AudioResultWriter,
+    tasks: Vec<JoinHandle<()>>,
+    next: usize,
+}
+
+impl Drop for Joining<'_> {
+    fn drop(&mut self) {
+        let unfinished: Vec<JoinHandle<()>> = self.tasks.drain(self.next..).collect();
+        self.writer
+            .tasks
+            .lock()
+            .expect("poisoned")
+            .extend(unfinished);
     }
 }
 

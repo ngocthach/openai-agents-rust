@@ -408,6 +408,7 @@ impl OpenAIResponsesWSModel {
         for (k, v) in extra_query.into_iter().flatten() {
             put(k.clone(), v.clone());
         }
+        pairs.retain(|(k, _)| !self.client.is_query_omitted(k));
         let mut url = format!("{}/responses", origin_and_path.trim_end_matches('/'));
         if !pairs.is_empty() {
             pairs.sort();

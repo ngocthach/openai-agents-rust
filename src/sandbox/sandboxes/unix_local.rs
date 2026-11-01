@@ -2212,7 +2212,8 @@ impl SandboxSession for UnixLocalSandboxSession {
         user: Option<&crate::sandbox::types::User>,
     ) -> SandboxResult<()> {
         if user.is_some() {
-            // A run-as user goes through `exec`, which has no exclusive create.
+            // A run-as user goes through `exec`: the contents are staged and then hard-linked
+            // into place, which fails for any name that exists by then.
             if self.read_file_as(path, user).await.is_ok() {
                 return Err(SandboxError::new(
                     ErrorCode::ApplyPatchInvalidPath,
@@ -2222,7 +2223,9 @@ impl SandboxSession for UnixLocalSandboxSession {
             let target = self.normalize_path_for_write(path)?;
             let parent = target.rsplit_once('/').map_or("/", |(parent, _)| parent);
             self.mkdir_as(parent, true, user).await?;
-            return self.write_file_as(path, contents, user).await;
+            let host = self.host_path_for(path, true).await?;
+            self.run_after_validate(&host);
+            return self.write_file_as_with(path, contents, user, true).await;
         }
         use tokio::io::AsyncWriteExt as _;
         let host = self.host_path_for(path, true).await?;
@@ -2415,6 +2418,49 @@ impl SandboxSession for UnixLocalSandboxSession {
         }
         listing.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(listing)
+    }
+
+    /// Create a directory for `user`: their permission is probed with the access-check script
+    /// under `sudo -u`, and the directory is then created natively.
+    ///
+    /// Mirrors Python's `UnixLocalSandboxSession.mkdir(user=...)`, which checks with
+    /// `_check_mkdir_with_exec` and then uses the local filesystem, so nothing is created by
+    /// (or owned by) the impersonated account.
+    async fn mkdir_as(
+        &self,
+        path: &str,
+        parents: bool,
+        user: Option<&crate::sandbox::types::User>,
+    ) -> SandboxResult<()> {
+        let Some(user) = user else {
+            return self.mkdir(path, parents).await;
+        };
+        let host = self.host_path_for(path, true).await?;
+        self.check_mkdir_access(&host.to_string_lossy(), parents, Some(user))
+            .await?;
+        self.mkdir(path, parents).await
+    }
+
+    /// Remove a path for `user`: their permission is probed under `sudo -u`, then the removal
+    /// itself is native. Mirrors Python's `UnixLocalSandboxSession.rm(user=...)`.
+    async fn rm_as(
+        &self,
+        path: &str,
+        recursive: bool,
+        user: Option<&crate::sandbox::types::User>,
+    ) -> SandboxResult<()> {
+        let Some(user) = user else {
+            return self.rm(path, recursive).await;
+        };
+        if recursive {
+            self.workspace_path_policy()?
+                .validate_recursive_remove(path)?;
+        }
+        self.host_path_for(path, true).await?;
+        let normalized = self.normalize_path_for_write(path)?;
+        self.check_rm_access(&normalized, recursive, Some(user))
+            .await?;
+        self.rm(path, recursive).await
     }
 
     /// Remove a file or directory natively.
