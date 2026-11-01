@@ -1,5 +1,44 @@
 # Changelog
 
+## 0.14.0 (2026-11-01)
+
+Closes the last documented synchronous-API divergences and adds an independent measurement of the Python-only
+bucket. 32 more parity cases moved out of it. Measured state: 12,641 Python test cases, 8,659 ported, 682
+covered, 3,300 Python-only, 0 not ported, 0 unaccounted. A seeded random sample of 364 Python-only cases found
+94.2% with a valid reason and 3.3% portable (95% interval 1.9-5.7%), which extrapolates to about 100 portable
+cases still unported (under 1% of the suite); see `plans/reports/py-test-parity-core11-r11b.md`. No live model
+call was made.
+
+Fixes and additions:
+
+- `HandoffInputFilter`, `RunConfig::handoff_input_filter` and `RunConfig::tool_error_formatter` are async and
+  fallible. A failing handoff input filter ends the run with its error; a failing run-level formatter logs and
+  keeps the default message, as Python does. New builders: `handoff_input_filter`, `try_handoff_input_filter`,
+  `async_handoff_input_filter`, `tool_error_formatter_fn`, `try_tool_error_formatter_fn`,
+  `async_tool_error_formatter_fn`, `with_input_filter_handler`, `with_handoff_input_filter_handler`,
+  `with_tool_error_formatter_handler`; the closure builders keep their shape. The handoff ownership record is a
+  `tokio::task_local`, so an async filter that resumes on another thread still works.
+- A completed sandbox run writes the `sandbox` section into its `RunState` (not when teardown failed or the
+  session is caller-owned); `StreamCompletion` gains `last_agent_id`, so a streamed run that stopped at the second
+  of two same-named agents resumes it.
+- `FunctionTool::with_args_have_validators(true)` marks a tool whose argument type validates: a dynamic
+  `needs_approval` rule is then never consulted and every call pauses first, as in Python.
+- E2B `running()` is false until `start` has prepared the workspace root, and `exec` omits the cwd before that,
+  so the runner starts a fresh caller-supplied session.
+
+Breaking changes: `HandoffInputFilter`, `RunConfig::handoff_input_filter`, `RunConfig::tool_error_formatter` and
+`realtime::RealtimeToolErrorFormatter` are boxed-future types (code that built one with `Arc::new(closure)` must
+use the constructors); `StreamCompletion` has a new public field; a completed sandbox run's `RunState` carries a
+`sandbox` section; an unstarted E2B session no longer reports `running()`.
+
+Known gaps (real differences): the Docker removal service (about 190 cases) is a root host-side helper that is
+deliberately not part of this library; Rust cannot detect a custom `Deserialize`, so a dynamic approval rule is
+still consulted unless the tool opts in with `with_args_have_validators`; assigning a field of the public
+`agent.model_settings` directly is untracked; E2B `clear_workspace_root_on_resume` preserving nested mounts and
+the agent-as-tool resume after a cancelled nested commit are portable but unported; `last_agent_id` is a raw
+`Arc` address; docs.rs builds without the `mongodb` feature; the websocket crate logs handshake data at TRACE
+through the `log` crate; the Redis atomic replace has only run against a mock.
+
 ## 0.13.0 (2026-11-01)
 
 Closes the documented divergences from Python's run-state restore, failure formatters and sandbox resume. 51
