@@ -20,6 +20,12 @@
 //!   still looks like an SDK-created temporary directory, so an edited state cannot turn
 //!   teardown into `rm -rf` on an arbitrary directory.
 //!
+//! One provider-specific record is the exception to "carries only identity": the provider
+//! options a resume rebuilds a replacement sandbox from (see
+//! [`SandboxSessionState::with_provider_options`]). They are limits and settings such as the
+//! Vercel runtime and network policy or the Modal resources, and the non-secret shape of the
+//! E2B MCP config. Secret values stay out: the resuming client supplies them.
+//!
 //! This mirrors Python's `sanitize_manifest_mount_authority` /
 //! `rebind_manifest_mount_authority` pair without serializing the manifest itself.
 
@@ -41,6 +47,9 @@ fn default_true() -> bool {
 
 /// Prefix of the temporary workspace directories the SDK creates and may delete.
 pub const OWNED_WORKSPACE_PREFIX: &str = "openai-agents-sandbox-";
+
+/// The `provider_metadata` key that holds the persisted provider options.
+pub const PROVIDER_OPTIONS_KEY: &str = "provider_options";
 
 /// Version of the session-state payload format.
 pub const SESSION_STATE_SCHEMA_VERSION: &str = "openai-agents-sandbox-state-v1";
@@ -244,6 +253,26 @@ impl SandboxSessionState {
     /// Read a backend-specific value.
     pub fn provider_metadata(&self, key: &str) -> Option<&serde_json::Value> {
         self.provider_metadata.get(key)
+    }
+
+    /// Record the provider options a resume needs under [`PROVIDER_OPTIONS_KEY`].
+    ///
+    /// Mirrors the provider fields Python's `SandboxSessionState` subclasses carry (the Vercel
+    /// runtime and network policy, the Modal builder version and resources, the E2B MCP
+    /// config): a resumed session is built from the state, not from the options of whichever
+    /// client resumes it. Rust keeps them in one `provider_metadata` entry so a payload written
+    /// before the entry existed still reads, with the client's options standing in.
+    pub fn with_provider_options<T: Serialize>(self, options: &T) -> Self {
+        match serde_json::to_value(options) {
+            Ok(value) => self.with_provider_metadata(PROVIDER_OPTIONS_KEY, value),
+            Err(_) => self,
+        }
+    }
+
+    /// The provider options [`with_provider_options`](Self::with_provider_options) recorded, or
+    /// `None` for a state written without them or with an entry of another shape.
+    pub fn provider_options<T: serde::de::DeserializeOwned>(&self) -> Option<T> {
+        serde_json::from_value(self.provider_metadata.get(PROVIDER_OPTIONS_KEY)?.clone()).ok()
     }
 
     /// Rebind the persisted grants and mount authority to the current trusted manifest.

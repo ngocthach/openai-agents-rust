@@ -1763,6 +1763,34 @@ impl DaytonaSandboxSession {
     ///
     /// The command's output is read back from the session log endpoint, which is how a
     /// non-writable interactive process works in Python too.
+    /// Bound one step of starting a PTY process by the request's timeout.
+    ///
+    /// Python wraps each provider call of `pty_exec_start` in `asyncio.wait_for(...,
+    /// timeout=exec_timeout)`: without a timeout the step is unbounded, a zero timeout is the
+    /// smallest bound, and an elapsed one is an `ExecTimeout`.
+    async fn within_start_timeout<T>(
+        &self,
+        request: &PtyExecRequest,
+        argv: &[String],
+        step: impl std::future::Future<Output = SandboxResult<T>>,
+    ) -> SandboxResult<T> {
+        let Some(timeout) = request.timeout else {
+            return step.await;
+        };
+        let budget = if timeout.is_zero() {
+            Duration::from_millis(1)
+        } else {
+            timeout
+        };
+        match tokio::time::timeout(budget, step).await {
+            Ok(result) => result,
+            Err(_) => Err(SandboxError::new(
+                ErrorCode::ExecTimeout,
+                format!("Command `{}` timed out after {budget:?}", argv.join(" ")),
+            )),
+        }
+    }
+
     async fn start_logged_command(
         &self,
         argv: &[String],
@@ -1771,23 +1799,38 @@ impl DaytonaSandboxSession {
     ) -> SandboxResult<PtyExecUpdate> {
         let command = self.session_command(argv, cwd, &self.command_envs());
         let toolbox_session = format!("pty-{}", uuid::Uuid::new_v4().simple());
-        self.create_toolbox_session(&toolbox_session).await?;
         let what = "start an interactive process in the Daytona sandbox";
-        let response = self
-            .authorize(
-                self.http
-                    .post(self.toolbox(&format!("/process/session/{toolbox_session}/exec"))),
-            )
-            .json(&json!({ "command": command, "runAsync": true }))
-            .send()
-            .await
-            .map_err(|e| transport(what, e))?;
         #[derive(Deserialize)]
         struct Started {
             #[serde(rename = "cmdId")]
             cmd_id: String,
         }
-        let started: Started = match parse_json(response, what).await {
+        // Each step of the start is bounded by the call's timeout, as Python bounds each
+        // awaited provider call of `pty_exec_start`.
+        if let Err(error) = self
+            .within_start_timeout(request, argv, self.create_toolbox_session(&toolbox_session))
+            .await
+        {
+            // A step that timed out may still have created the session.
+            self.delete_toolbox_session(&toolbox_session).await;
+            return Err(error);
+        }
+        let started: Result<Started, SandboxError> = self
+            .within_start_timeout(request, argv, async {
+                let response = self
+                    .authorize(
+                        self.http.post(
+                            self.toolbox(&format!("/process/session/{toolbox_session}/exec")),
+                        ),
+                    )
+                    .json(&json!({ "command": command, "runAsync": true }))
+                    .send()
+                    .await
+                    .map_err(|e| transport(what, e))?;
+                parse_json(response, what).await
+            })
+            .await;
+        let started = match started {
             Ok(started) => started,
             Err(error) => {
                 self.delete_toolbox_session(&toolbox_session).await;
@@ -1892,7 +1935,11 @@ impl DaytonaSandboxSession {
         let (process, pruned) = self.ptys.register(true)?;
         self.release_pruned(&pruned).await;
         let connected = match self
-            .connect_terminal(&process, &requested_session, cwd)
+            .within_start_timeout(
+                request,
+                argv,
+                self.connect_terminal(&process, &requested_session, cwd),
+            )
             .await
         {
             Ok(connected) => connected,

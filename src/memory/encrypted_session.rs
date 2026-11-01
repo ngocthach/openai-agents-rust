@@ -421,14 +421,20 @@ impl EncryptedSession {
         }
         let encrypted = self.encrypt_items(&items)?;
         let underlying = Arc::clone(&self.underlying);
-        match ctx {
-            // The context only borrows from the caller, so the write stays on this task.
-            Some(ctx) => underlying.add_items_with_context(ctx, encrypted).await,
-            None => {
-                super::await_session_mutation(async move { underlying.add_items(encrypted).await })
-                    .await
+        // The context is detached into an owned copy so the write can move to its own task:
+        // a dropped caller cannot leave the store holding part of a batch.
+        let ctx = ctx.map(|ctx| ctx.detach());
+        super::await_session_mutation(async move {
+            match &ctx {
+                Some(ctx) => {
+                    underlying
+                        .add_items_with_context(ctx.as_context(), encrypted)
+                        .await
+                }
+                None => underlying.add_items(encrypted).await,
             }
-        }
+        })
+        .await
     }
 
     /// Remove and return the most recent readable item, skipping expired or plaintext records.

@@ -12,10 +12,11 @@ use std::sync::Arc;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use super::{RunLoop, strip_item_id};
+use super::{DetachedTurnWrite, RunLoop, strip_item_id};
 use crate::error::{AgentsError, Result};
 use crate::items::InputItem;
 use crate::memory::{Session, SessionRunContext, compaction_item_digest};
+use crate::run::RunCheckpoint;
 
 /// Whether a pending write record is the withheld batch of an interruption.
 pub(super) fn is_held(record: &Value) -> bool {
@@ -266,5 +267,66 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
         }
         self.pending_write = None;
         Ok(())
+    }
+}
+
+impl<C: Send + Sync + 'static> DetachedTurnWrite<C> {
+    /// Start the write on its own task.
+    ///
+    /// A failure cannot reach the dropped caller, so it is logged and recorded as the pending
+    /// session write of `checkpoint`. The record carries the digests of the history tail read
+    /// before the append, so a resume can tell an append that never landed (repeat it) from one
+    /// whose acknowledgement was lost (accept it) and refuses anything ambiguous. When that
+    /// pre-read itself fails the record has no tail, and the resume reads it first.
+    pub(super) fn spawn(self, checkpoint: Option<RunCheckpoint>) {
+        let DetachedTurnWrite {
+            handle,
+            session,
+            ctx,
+            items,
+            persisted_count,
+            response_id,
+            store,
+        } = self;
+        handle.spawn(async move {
+            let before = match session
+                .get_items_with_context(SessionRunContext::new(&ctx), Some(items.len() + 1))
+                .await
+            {
+                Ok(tail) => Some(digests(&session, &tail)),
+                Err(_) => None,
+            };
+            let batch = items.clone();
+            let target = session.clone();
+            let result = crate::memory::await_session_mutation(async move {
+                target
+                    .add_items_with_context(SessionRunContext::new(&ctx), batch)
+                    .await
+            })
+            .await;
+            let Err(error) = result else {
+                return;
+            };
+            crate::logger::log_model_and_tool_action_error(
+                "Failed to save the turn of a run that was dropped during its output guardrails \
+                 to the session",
+                &error,
+            );
+            let has_local_tool_outputs = items.iter().any(|i| {
+                i.item_type()
+                    .is_some_and(|t| t.ends_with("_output") || t == "mcp_approval_response")
+            });
+            if let Some(checkpoint) = checkpoint {
+                checkpoint.record_pending_write(json!({
+                    "session_id": session.session_id(),
+                    "items": items.into_iter().map(|i| i.0).collect::<Vec<_>>(),
+                    "before": before.map_or(Value::Null, |b| json!(b)),
+                    "persisted_count": persisted_count,
+                    "response_id": response_id,
+                    "store": store,
+                    "has_local_tool_outputs": has_local_tool_outputs,
+                }));
+            }
+        });
     }
 }

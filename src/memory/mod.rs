@@ -259,7 +259,25 @@ pub struct CompactionSnapshot {
 /// was started with.
 #[derive(Clone, Copy)]
 pub struct SessionRunContext<'a> {
-    inner: &'a (dyn std::any::Any + Send + Sync),
+    inner: &'a dyn ErasedRunContext,
+}
+
+/// The run context behind a [`SessionRunContext`], with the one capability the wrapper needs
+/// beyond a downcast: making an owned copy that can outlive the borrow.
+trait ErasedRunContext: Send + Sync {
+    fn as_any(&self) -> &(dyn std::any::Any + Send + Sync);
+    fn detach(&self) -> std::sync::Arc<dyn ErasedRunContext>;
+}
+
+impl<C: Send + Sync + 'static> ErasedRunContext for crate::run_context::RunContext<C> {
+    fn as_any(&self) -> &(dyn std::any::Any + Send + Sync) {
+        self
+    }
+
+    fn detach(&self) -> std::sync::Arc<dyn ErasedRunContext> {
+        // A `RunContext` clone shares the context, usage and approvals of the original.
+        std::sync::Arc::new(self.clone())
+    }
 }
 
 impl<'a> SessionRunContext<'a> {
@@ -272,12 +290,45 @@ impl<'a> SessionRunContext<'a> {
     pub fn run_context<C: Send + Sync + 'static>(
         &self,
     ) -> Option<&'a crate::run_context::RunContext<C>> {
-        self.inner.downcast_ref()
+        self.inner.as_any().downcast_ref()
     }
 
     /// The app-defined context object, when the run was started with a context of type `C`.
     pub fn context<C: Send + Sync + 'static>(&self) -> Option<&'a C> {
         self.run_context::<C>().map(|c| c.context())
+    }
+
+    /// An owned copy of this context that does not borrow from the caller.
+    ///
+    /// It shares the run's context, usage and approvals, so a store that must finish a write
+    /// after its caller was dropped (see [`await_session_mutation`]) can still hand the store
+    /// the context the write belongs to.
+    pub fn detach(&self) -> OwnedSessionRunContext {
+        OwnedSessionRunContext {
+            inner: self.inner.detach(),
+        }
+    }
+}
+
+/// A [`SessionRunContext`] that owns its context, from [`SessionRunContext::detach`].
+#[derive(Clone)]
+pub struct OwnedSessionRunContext {
+    inner: std::sync::Arc<dyn ErasedRunContext>,
+}
+
+impl OwnedSessionRunContext {
+    /// Borrow it as the context the `*_with_context` methods take.
+    pub fn as_context(&self) -> SessionRunContext<'_> {
+        SessionRunContext {
+            inner: self.inner.as_ref(),
+        }
+    }
+}
+
+impl fmt::Debug for OwnedSessionRunContext {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OwnedSessionRunContext")
+            .finish_non_exhaustive()
     }
 }
 

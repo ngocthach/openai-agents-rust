@@ -847,11 +847,39 @@ fn http_status_in(text: &str) -> Option<u16> {
     digits.parse().ok().filter(|code| (100..600).contains(code))
 }
 
+/// The `reqwest` error behind a failed HTTP transport call, when there is one.
+///
+/// `rmcp` wraps the HTTP client's error in a transport error whose text is all a caller sees;
+/// the class of the failure (a refused connection, a timeout) lives in the wrapped error.
+fn transport_http_cause(error: &rmcp::transport::DynamicTransportError) -> Option<&reqwest::Error> {
+    use rmcp::transport::streamable_http_client::StreamableHttpError;
+    if let Some(StreamableHttpError::Client(cause)) = error
+        .error
+        .downcast_ref::<StreamableHttpError<reqwest::Error>>()
+    {
+        return Some(cause);
+    }
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(&*error.error);
+    while let Some(err) = current {
+        if let Some(cause) = err.downcast_ref::<reqwest::Error>() {
+            return Some(cause);
+        }
+        current = err.source();
+    }
+    None
+}
+
 /// Turn a failed HTTP or SSE connect into the credential-free message Python raises for it.
 ///
 /// A failure that is not a transport failure keeps its (redacted) text.
-fn connect_failure(name: &str, e: impl fmt::Display) -> AgentsError {
+fn connect_failure(name: &str, e: rmcp::service::ClientInitializeError) -> AgentsError {
     let text = e.to_string();
+    let cause = match &e {
+        rmcp::service::ClientInitializeError::TransportError { error, .. } => {
+            transport_http_cause(error)
+        }
+        _ => None,
+    };
     let reason = if let Some(code) = http_status_in(&text) {
         match reqwest::StatusCode::from_u16(code)
             .ok()
@@ -859,6 +887,14 @@ fn connect_failure(name: &str, e: impl fmt::Display) -> AgentsError {
         {
             Some(phrase) => format!("HTTP error {code} ({phrase})"),
             None => format!("HTTP error {code}"),
+        }
+    } else if let Some(cause) = cause {
+        if cause.is_connect() {
+            "Could not reach the server.".to_string()
+        } else if cause.is_timeout() {
+            "Connection timeout.".to_string()
+        } else {
+            "Request failed.".to_string()
         }
     } else if text.contains("error sending request") || text.to_lowercase().contains("connect") {
         "Could not reach the server.".to_string()
@@ -887,8 +923,19 @@ fn request_failure(prefix: &str, e: rmcp::ServiceError) -> AgentsError {
         }
         other => {
             let text = other.to_string();
+            let cause = match other {
+                rmcp::ServiceError::TransportSend(error) => transport_http_cause(error),
+                _ => None,
+            };
             match http_status_in(&text) {
                 Some(code) => format!("HTTP error {code}"),
+                None if cause.is_some_and(reqwest::Error::is_connect) => {
+                    "Connection lost. The server may have disconnected.".to_string()
+                }
+                None if cause.is_some_and(reqwest::Error::is_timeout) => {
+                    "Connection timeout.".to_string()
+                }
+                None if cause.is_some() => "Request failed.".to_string(),
                 None if text.to_lowercase().contains("connect") => {
                     "Connection lost. The server may have disconnected.".to_string()
                 }

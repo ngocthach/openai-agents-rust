@@ -664,6 +664,11 @@ fn write_transaction(conn: &Connection) -> Result<rusqlite::Transaction<'_>> {
 pub struct AdvancedSqliteSession {
     base: SqliteSession,
     branch: Arc<Mutex<BranchState>>,
+    /// Orders appends, pops, usage writes and branch deletions in call order. The wait queue of
+    /// a `tokio` mutex is first-in-first-out, so concurrent callers (`join!`, several tasks)
+    /// see their operations run in the order the calls were first polled, as Python's ordered
+    /// turn operations do.
+    turn_gate: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl AdvancedSqliteSession {
@@ -722,6 +727,7 @@ impl AdvancedSqliteSession {
                     branch: MAIN_BRANCH.to_string(),
                     generation: 0,
                 })),
+                turn_gate: Arc::default(),
             };
             session.init_all_tables_atomically()?;
             return Ok(session);
@@ -749,6 +755,7 @@ impl AdvancedSqliteSession {
                 branch: MAIN_BRANCH.to_string(),
                 generation: 0,
             })),
+            turn_gate: Arc::default(),
         };
         session.init_structure_tables(create_tables)?;
         Ok(session)
@@ -758,6 +765,12 @@ impl AdvancedSqliteSession {
     pub fn with_settings(mut self, settings: SessionSettings) -> Self {
         self.base = self.base.with_settings(settings);
         self
+    }
+
+    /// The branch and clear generation as of this call.
+    fn branch_snapshot(&self) -> (String, i64) {
+        let state = self.branch.lock().expect("branch poisoned");
+        (state.branch.clone(), state.generation)
     }
 
     fn ctx(&self) -> Ctx {
@@ -1019,7 +1032,7 @@ impl AdvancedSqliteSession {
             return Err(AgentsError::user("Branch name cannot be empty"));
         }
         let requested = branch_name.map(str::to_string);
-        let branch_id = self
+        let (branch_id, source, turn_content) = self
             .blocking(move |conn, ctx| {
                 // Take SQLite's write reservation before claiming the branch id, so a session
                 // in another process cannot pass the same check concurrently.
@@ -1049,6 +1062,23 @@ impl AdvancedSqliteSession {
                 // The reservation is the claim: it outlives the branch's rows, so a cleared
                 // id is never reused and two processes cannot both take the same name.
                 let branch_id = reserve_branch_id(&tx, ctx, requested, turn_number)?;
+                let turn_content = tx
+                    .query_row(
+                        &format!(
+                            "SELECT m.message_data FROM message_structure s
+                             JOIN {m} m ON m.id = s.message_id
+                             WHERE s.session_id = ? AND s.branch_id = ?
+                               AND s.branch_turn_number = ? AND s.message_type = 'user'
+                             ORDER BY s.sequence_number LIMIT 1",
+                            m = ctx.messages_table
+                        ),
+                        params![ctx.session_id, source, turn_number],
+                        |r| r.get::<_, String>(0),
+                    )
+                    .ok()
+                    .and_then(|data| serde_json::from_str::<Value>(&data).ok())
+                    .and_then(|value| InputItem(value).text_content())
+                    .unwrap_or_default();
                 let seq_start: i64 = tx
                     .query_row(
                         "SELECT COALESCE(MAX(sequence_number), 0) FROM message_structure
@@ -1071,9 +1101,20 @@ impl AdvancedSqliteSession {
                 .map_err(sql_err)?;
                 tx.commit().map_err(sql_err)?;
                 commit_branch_pointer(conn, ctx, branch_id.clone(), generation)?;
-                Ok(branch_id)
+                Ok((branch_id, source, turn_content))
             })
             .await?;
+        if crate::debug::dont_log_model_data() {
+            log::debug!(
+                target: crate::logger::LOG_TARGET,
+                "Created branch '{branch_id}' from turn {turn_number} in '{source}'"
+            );
+        } else {
+            log::debug!(
+                target: crate::logger::LOG_TARGET,
+                "Created branch '{branch_id}' from turn {turn_number} ('{turn_content}') in '{source}'"
+            );
+        }
         Ok(branch_id)
     }
 
@@ -1112,6 +1153,9 @@ impl AdvancedSqliteSession {
             )));
         }
         let target = branch_id.to_string();
+        // Appends queued earlier settle first, so one of them cannot recreate rows after the
+        // deletion commits.
+        let _turn = self.turn_gate.lock().await;
         self.blocking(move |conn, ctx| {
             let tx = write_transaction(conn)?;
             // Back-fill the reservations before the branch's rows, their only durable evidence
@@ -1352,11 +1396,32 @@ impl AdvancedSqliteSession {
     /// Record a run's usage against the current turn of the current branch.
     ///
     /// Call this with [`RunResult::usage`](crate::result::RunResult::usage) after a run. Usage
-    /// of several runs in the same turn is summed.
+    /// of several runs in the same turn is summed. A write failure is logged, not returned.
     pub async fn store_run_usage(&self, usage: &Usage) -> Result<()> {
+        // Usage bookkeeping never breaks the run that produced it: a failure is logged under
+        // the model-data policy and swallowed, as in Python. The turn is the one current at
+        // call time, in call order with appends and pops.
+        let snapshot = self.branch_snapshot();
+        let _turn = self.turn_gate.lock().await;
+        if let Err(error) = self.store_run_usage_inner(usage, snapshot).await {
+            crate::logger::log_model_action_error("Failed to store session usage", &error);
+        }
+        Ok(())
+    }
+
+    async fn store_run_usage_inner(
+        &self,
+        usage: &Usage,
+        (snapshot_branch, snapshot_generation): (String, i64),
+    ) -> Result<()> {
         let usage = usage.clone();
         self.blocking(move |conn, ctx| {
-            let branch = ctx.branch_id();
+            refresh_branch_after_external_clear(conn, ctx, false)?;
+            // A clear since the call invalidates usage that belonged to the earlier history.
+            if ctx.generation() != snapshot_generation {
+                return Ok(());
+            }
+            let branch = snapshot_branch;
             let turn: i64 = conn
                 .query_row(
                     "SELECT COALESCE(MAX(user_turn_number), 0) FROM message_structure
@@ -1475,9 +1540,14 @@ impl AdvancedSqliteSession {
     }
 
     /// Insert items and their structure metadata in one transaction.
-    fn insert_with_structure(conn: &Connection, ctx: &Ctx, items: &[InputItem]) -> Result<()> {
+    fn insert_with_structure(
+        conn: &Connection,
+        ctx: &Ctx,
+        items: &[InputItem],
+        branch: &str,
+    ) -> Result<()> {
         let tx = write_transaction(conn)?;
-        Self::insert_with_structure_in(&tx, ctx, items)?;
+        Self::insert_with_structure_in(&tx, ctx, items, branch)?;
         tx.commit().map_err(sql_err)
     }
 
@@ -1486,8 +1556,8 @@ impl AdvancedSqliteSession {
         tx: &rusqlite::Transaction<'_>,
         ctx: &Ctx,
         items: &[InputItem],
+        branch: &str,
     ) -> Result<()> {
-        let branch = ctx.branch_id();
         tx.execute(
             &format!(
                 "INSERT OR IGNORE INTO {s} (session_id) VALUES (?)",
@@ -1576,12 +1646,25 @@ impl Session for AdvancedSqliteSession {
         if items.is_empty() {
             return Ok(());
         }
+        // The branch is the one selected when the call was made, however the operations
+        // queued behind earlier ones; a clear in between moves the append to the post-clear
+        // branch.
+        let (snapshot_branch, snapshot_generation) = self.branch_snapshot();
+        let _turn = self.turn_gate.lock().await;
         self.blocking(move |conn, ctx| {
             // Another instance may have cleared the session since this one picked its branch.
             refresh_branch_after_external_clear(conn, ctx, true)?;
-            Self::insert_with_structure(conn, ctx, &items)
+            let branch = if ctx.generation() == snapshot_generation {
+                snapshot_branch
+            } else {
+                ctx.branch_id()
+            };
+            Self::insert_with_structure(conn, ctx, &items, &branch)
         })
         .await
+        .inspect_err(|error| {
+            crate::logger::log_model_and_tool_action_error("Failed to add session items", error);
+        })
     }
 
     /// Remove the most recent item of the current branch.
@@ -1589,9 +1672,17 @@ impl Session for AdvancedSqliteSession {
     /// The structure row is always removed; the stored message is removed only when no other
     /// branch still references it. A `turn_usage` row is removed when the pop empties its turn.
     async fn pop_item(&self) -> Result<Option<InputItem>> {
+        // The branch is the one selected at call time: a switch that lands while this pop waits
+        // for its turn cannot redirect it.
+        let (snapshot_branch, snapshot_generation) = self.branch_snapshot();
+        let _turn = self.turn_gate.lock().await;
         self.blocking(move |conn, ctx| {
             refresh_branch_after_external_clear(conn, ctx, true)?;
-            let branch = ctx.branch_id();
+            let branch = if ctx.generation() == snapshot_generation {
+                snapshot_branch
+            } else {
+                ctx.branch_id()
+            };
             let tx = write_transaction(conn)?;
             // Back-fill the reservations before deleting the rows that are their only durable
             // evidence in a database written before reservations existed.
@@ -1742,7 +1833,7 @@ impl Session for AdvancedSqliteSession {
                     .map_err(sql_err)?;
                 }
             }
-            Self::insert_with_structure_in(&tx, ctx, &items)?;
+            Self::insert_with_structure_in(&tx, ctx, &items, &ctx.branch_id())?;
             tx.commit().map_err(sql_err)?;
             Ok(true)
         })

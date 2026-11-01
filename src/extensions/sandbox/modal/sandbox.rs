@@ -193,6 +193,72 @@ pub struct ModalSandboxClientOptions {
     pub python: Option<String>,
 }
 
+/// The Modal options a resumed session is rebuilt from.
+///
+/// Mirrors the `image_builder_version`, `idle_timeout`, `cpu` and `memory` fields of Python's
+/// `ModalSandboxSessionState`. A replacement sandbox created on resume keeps the builder
+/// version and resources of the original. Every field has a serde default: a missing builder
+/// version reads as the SDK default (`2025.06`), as in Python, and missing resources read as
+/// unset.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
+#[serde(default)]
+pub struct ModalPersistedOptions {
+    /// The Modal image builder version; `None` leaves the account configuration in place.
+    pub image_builder_version: Option<String>,
+    /// The idle timeout in seconds.
+    pub idle_timeout_secs: Option<u32>,
+    /// The CPU reservation.
+    pub cpu: Option<f64>,
+    /// The CPU limit.
+    pub cpu_limit: Option<f64>,
+    /// The memory reservation in MiB.
+    pub memory_mb: Option<u32>,
+    /// The memory limit in MiB.
+    pub memory_limit_mb: Option<u32>,
+}
+
+impl Default for ModalPersistedOptions {
+    fn default() -> Self {
+        ModalPersistedOptions {
+            image_builder_version: default_image_builder_version(),
+            idle_timeout_secs: None,
+            cpu: None,
+            cpu_limit: None,
+            memory_mb: None,
+            memory_limit_mb: None,
+        }
+    }
+}
+
+impl ModalPersistedOptions {
+    /// The persisted subset of `options`.
+    pub fn from_options(options: &ModalSandboxClientOptions) -> Self {
+        ModalPersistedOptions {
+            image_builder_version: options.image_builder_version.clone(),
+            idle_timeout_secs: options.idle_timeout_secs,
+            cpu: options.cpu,
+            cpu_limit: options.cpu_limit,
+            memory_mb: options.memory_mb,
+            memory_limit_mb: options.memory_limit_mb,
+        }
+    }
+
+    /// Replace the corresponding fields of `options`.
+    pub fn apply_to(self, options: &mut ModalSandboxClientOptions) {
+        options.image_builder_version = self.image_builder_version;
+        options.idle_timeout_secs = self.idle_timeout_secs;
+        options.cpu = self.cpu;
+        options.cpu_limit = self.cpu_limit;
+        options.memory_mb = self.memory_mb;
+        options.memory_limit_mb = self.memory_limit_mb;
+    }
+
+    /// The options persisted in `state`, when it carries any.
+    pub fn from_state(state: &SandboxSessionState) -> Option<Self> {
+        state.provider_options()
+    }
+}
+
 fn default_timeout_secs() -> u32 {
     300
 }
@@ -632,6 +698,17 @@ pub struct ModalSandboxClient {
 }
 
 impl ModalSandboxClient {
+    /// This client with the options `state` recorded layered over its own.
+    ///
+    /// A state written before options were recorded leaves the client's options in place.
+    fn with_persisted_options(&self, state: &SandboxSessionState) -> Self {
+        let mut client = self.clone();
+        if let Some(persisted) = ModalPersistedOptions::from_state(state) {
+            persisted.apply_to(&mut client.options);
+        }
+        client
+    }
+
     /// A client for a Modal app.
     pub fn new(options: ModalSandboxClientOptions) -> Self {
         ModalSandboxClient {
@@ -877,6 +954,9 @@ impl SandboxClient for ModalSandboxClient {
         state: &SandboxSessionState,
         manifest: Manifest,
     ) -> SandboxResult<Arc<dyn SandboxSession>> {
+        // A replacement sandbox is built from what the state recorded, not from the options
+        // of the client that happens to resume it.
+        let this = &self.with_persisted_options(state);
         if state.backend != "modal" {
             return Err(SandboxError::new(
                 ErrorCode::SessionStateMismatch,
@@ -888,7 +968,7 @@ impl SandboxClient for ModalSandboxClient {
         }
         state.verify_manifest(&manifest)?;
         let manifest = manifest.with_root(state.workspace_root.clone());
-        let helper = ModalHelper::new(self.options.resolve_helper_command()?);
+        let helper = ModalHelper::new(this.options.resolve_helper_command()?);
         // A state whose mount authority was re-supplied by the caller must not reattach the
         // sandbox that holds the old authority: a fresh one is created from the current manifest.
         let reattachable = !state.mount_authority_rebound;
@@ -913,7 +993,7 @@ impl SandboxClient for ModalSandboxClient {
                         version,
                     });
                 return Ok(Arc::new(
-                    ModalSandboxSession::new(helper, sandbox_id, manifest, self.options.clone())
+                    ModalSandboxSession::new(helper, sandbox_id, manifest, this.options.clone())
                         .with_snapshot(Some(state.snapshot.clone()))
                         .with_snapshot_id(state.snapshot_id.clone())
                         .with_state_preserved(true)
@@ -924,7 +1004,7 @@ impl SandboxClient for ModalSandboxClient {
         }
         // The recorded sandbox is gone: a replacement starts from the recorded snapshot.
         Ok(Arc::new(
-            self.create_session(manifest, None)
+            this.create_session(manifest, None)
                 .await?
                 .with_snapshot(Some(state.snapshot.clone()))
                 .with_snapshot_id(state.snapshot_id.clone())
@@ -1989,6 +2069,8 @@ impl SandboxSession for ModalSandboxSession {
         .with_snapshot(self.snapshot.clone().unwrap_or_default());
         state.snapshot_id = self.snapshot_id.clone();
         state.exposed_ports = self.options.exposed_ports.clone();
+        let state =
+            state.with_provider_options(&ModalPersistedOptions::from_options(&self.options));
         state.with_snapshot_fingerprint(self.snapshot_fingerprint.lock().expect("poisoned").clone())
     }
 

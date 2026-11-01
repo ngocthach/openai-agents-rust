@@ -88,6 +88,15 @@ impl RunCheckpoint {
         self.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
+    /// Record a session write that failed after the run that owned it was dropped, so a resume
+    /// from this checkpoint settles it. A checkpoint that was already taken has nothing to
+    /// attach it to.
+    pub(crate) fn record_pending_write(&self, record: serde_json::Value) {
+        if let Some(state) = self.0.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            state.pending_session_write = Some(record);
+        }
+    }
+
     pub(crate) fn set(&self, state: RunState) {
         *self.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(state);
     }

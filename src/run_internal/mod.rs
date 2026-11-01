@@ -1688,13 +1688,38 @@ impl<C: Send + Sync + 'static> Drop for RunLoop<C> {
         if !self.in_flight || std::thread::panicking() {
             return;
         }
-        if self.guardrail_persist {
-            self.persist_turn_after_cancelled_guardrail();
-        }
+        // The write starts after the checkpoint is published: its failure handler edits that
+        // checkpoint, so the checkpoint has to exist first.
+        let write = if self.guardrail_persist {
+            self.persist_turn_after_cancelled_guardrail()
+        } else {
+            None
+        };
         if let Some(slot) = &self.checkpoint {
             slot.set(self.failure_checkpoint());
         }
+        if let Some(write) = write {
+            write.spawn(self.checkpoint.clone());
+        }
     }
+}
+
+/// The session write of a turn whose run was dropped while its output guardrails ran.
+///
+/// Python's cancelled-guardrail path awaits the write in a shielded `finally`, so a failure
+/// reaches the caller. A dropped Rust future has no caller left to tell, so the failure is
+/// instead logged (under the model and tool data redaction policy) and, when the run was given a
+/// [`RunCheckpoint`](crate::RunCheckpoint), recorded in it as a pending session write: a resume
+/// from that checkpoint reconciles the append (repeating it when it never landed) before doing
+/// anything else.
+struct DetachedTurnWrite<C> {
+    handle: tokio::runtime::Handle,
+    session: Arc<dyn Session>,
+    ctx: RunContext<C>,
+    items: Vec<InputItem>,
+    persisted_count: usize,
+    response_id: Option<String>,
+    store: Option<bool>,
 }
 
 impl<C: Send + Sync + 'static> RunLoop<C> {
@@ -2674,13 +2699,11 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
     /// The run was dropped while its final output guardrails were running: no guardrail
     /// rejected the turn, so it is written to the session from a detached task (the append
     /// cannot be awaited from `Drop`, and a half-written append must not be aborted).
-    fn persist_turn_after_cancelled_guardrail(&mut self) {
-        let Some(session) = self.session.clone() else {
-            return;
-        };
-        let Ok(handle) = tokio::runtime::Handle::try_current() else {
-            return;
-        };
+    ///
+    /// Returns the write for the caller to start once the checkpoint is published.
+    fn persist_turn_after_cancelled_guardrail(&mut self) -> Option<DetachedTurnWrite<C>> {
+        let session = self.session.clone()?;
+        let handle = tokio::runtime::Handle::try_current().ok()?;
         let mut items = Vec::new();
         if !self.input_saved_to_session {
             items.extend(self.session_input.clone());
@@ -2699,14 +2722,20 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
         self.input_saved_to_session = true;
         self.session_saved_items = self.generated_items.len();
         if items.is_empty() {
-            return;
+            return None;
         }
-        let ctx = self.ctx.clone();
-        handle.spawn(crate::memory::await_session_mutation(async move {
-            session
-                .add_items_with_context(SessionRunContext::new(&ctx), items)
-                .await
-        }));
+        Some(DetachedTurnWrite {
+            handle,
+            session,
+            ctx: self.ctx.clone(),
+            items,
+            persisted_count: self.generated_items.len(),
+            response_id: self
+                .model_responses
+                .last()
+                .and_then(|r| r.response_id.clone()),
+            store: self.last_store,
+        })
     }
 
     /// Run the agent's and the run's output guardrails over `output`, recording each result.

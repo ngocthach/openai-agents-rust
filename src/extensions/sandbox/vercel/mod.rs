@@ -308,6 +308,159 @@ impl NetworkPolicy {
     }
 }
 
+impl NetworkPolicyRule {
+    /// Read a rule from the `{"transform": [{"headers": {...}}]}` shape `to_api` writes.
+    fn from_state_json(rule: &Value) -> NetworkPolicyRule {
+        let transform = rule
+            .get("transform")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .map(|row| NetworkTransformer {
+                headers: row
+                    .get("headers")
+                    .and_then(Value::as_object)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|(name, value)| Some((name.clone(), value.as_str()?.to_string())))
+                    .collect(),
+            })
+            .collect();
+        NetworkPolicyRule { transform }
+    }
+}
+
+impl NetworkPolicy {
+    /// The policy in the JSON shape Python's `VercelSandboxSessionState.network_policy` has:
+    /// `"allow-all"`, `"deny-all"`, or `{"allow": [...] | {domain: [rule]}, "subnets":
+    /// {"allow": [...] | null, "deny": [...] | null} | null}`.
+    pub fn to_state_json(&self) -> Value {
+        let (allow, allow_subnets, deny_subnets) = match self {
+            NetworkPolicy::AllowAll => return json!("allow-all"),
+            NetworkPolicy::DenyAll => return json!("deny-all"),
+            NetworkPolicy::Custom {
+                allow,
+                allow_subnets,
+                deny_subnets,
+            } => (json!(allow), allow_subnets, deny_subnets),
+            NetworkPolicy::CustomRules {
+                allow,
+                allow_subnets,
+                deny_subnets,
+            } => (
+                Value::Object(
+                    allow
+                        .iter()
+                        .map(|(domain, rules)| {
+                            (
+                                domain.clone(),
+                                Value::Array(rules.iter().map(NetworkPolicyRule::to_api).collect()),
+                            )
+                        })
+                        .collect(),
+                ),
+                allow_subnets,
+                deny_subnets,
+            ),
+        };
+        let list = |subnets: &Vec<String>| {
+            if subnets.is_empty() {
+                Value::Null
+            } else {
+                json!(subnets)
+            }
+        };
+        let subnets = if allow_subnets.is_empty() && deny_subnets.is_empty() {
+            Value::Null
+        } else {
+            json!({ "allow": list(allow_subnets), "deny": list(deny_subnets) })
+        };
+        json!({ "allow": allow, "subnets": subnets })
+    }
+
+    /// Read a policy written by [`to_state_json`](Self::to_state_json) (or by Python's state
+    /// payload). `None` for a value of another shape.
+    pub fn from_state_json(value: &Value) -> Option<NetworkPolicy> {
+        match value {
+            Value::String(mode) if mode == "allow-all" => return Some(NetworkPolicy::AllowAll),
+            Value::String(mode) if mode == "deny-all" => return Some(NetworkPolicy::DenyAll),
+            _ => {}
+        }
+        let object = value.as_object()?;
+        let strings = |value: Option<&Value>| -> Option<Vec<String>> {
+            match value {
+                None | Some(Value::Null) => Some(Vec::new()),
+                Some(Value::Array(rows)) => rows
+                    .iter()
+                    .map(|row| row.as_str().map(str::to_string))
+                    .collect(),
+                Some(_) => None,
+            }
+        };
+        let (allow_subnets, deny_subnets) = match object.get("subnets") {
+            None | Some(Value::Null) => (Vec::new(), Vec::new()),
+            Some(Value::Object(subnets)) => (
+                strings(subnets.get("allow"))?,
+                strings(subnets.get("deny"))?,
+            ),
+            Some(_) => return None,
+        };
+        match object.get("allow")? {
+            Value::Array(_) => Some(NetworkPolicy::Custom {
+                allow: strings(object.get("allow"))?,
+                allow_subnets,
+                deny_subnets,
+            }),
+            Value::Object(domains) => {
+                let mut allow = BTreeMap::new();
+                for (domain, rules) in domains {
+                    let rules = rules
+                        .as_array()?
+                        .iter()
+                        .map(NetworkPolicyRule::from_state_json)
+                        .collect();
+                    allow.insert(domain.clone(), rules);
+                }
+                Some(NetworkPolicy::CustomRules {
+                    allow,
+                    allow_subnets,
+                    deny_subnets,
+                })
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Serde adapter that stores an optional [`NetworkPolicy`] in Python's state-payload shape.
+mod network_policy_state {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use serde_json::Value;
+
+    use super::NetworkPolicy;
+
+    pub(super) fn serialize<S: Serializer>(
+        policy: &Option<NetworkPolicy>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        policy
+            .as_ref()
+            .map(NetworkPolicy::to_state_json)
+            .serialize(serializer)
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<NetworkPolicy>, D::Error> {
+        match Option::<Value>::deserialize(deserializer)? {
+            None | Some(Value::Null) => Ok(None),
+            Some(value) => NetworkPolicy::from_state_json(&value)
+                .map(Some)
+                .ok_or_else(|| serde::de::Error::custom("unrecognised Vercel network policy")),
+        }
+    }
+}
+
 /// Resource limits for a Vercel sandbox.
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Default, PartialEq, Eq)]
 pub struct VercelSandboxResources {
@@ -325,6 +478,56 @@ impl VercelSandboxResources {
     pub fn with_vcpus(mut self, vcpus: u32) -> Self {
         self.vcpus = Some(vcpus);
         self
+    }
+}
+
+/// The Vercel options a resumed session is rebuilt from.
+///
+/// Mirrors the `runtime`, `resources`, `timeout_ms`, `snapshot_expiration_ms` and
+/// `network_policy` fields of Python's `VercelSandboxSessionState`. It travels in the session
+/// state's provider options, so a replacement sandbox created on resume keeps the runtime,
+/// limits and network policy of the original instead of the resuming client's. Every field has
+/// a serde default, so a payload that predates a field still reads.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct VercelPersistedOptions {
+    /// The runtime image alias.
+    pub runtime: Option<String>,
+    /// Resource limits.
+    pub resources: VercelSandboxResources,
+    /// Execution time limit in milliseconds.
+    pub timeout_ms: Option<u64>,
+    /// Snapshot expiration in milliseconds.
+    pub snapshot_expiration_ms: Option<u64>,
+    /// Network policy applied to the sandbox, in the shape Python's state payload uses.
+    #[serde(with = "network_policy_state")]
+    pub network_policy: Option<NetworkPolicy>,
+}
+
+impl VercelPersistedOptions {
+    /// The persisted subset of `options`.
+    pub fn from_options(options: &VercelSandboxClientOptions) -> Self {
+        VercelPersistedOptions {
+            runtime: options.runtime.clone(),
+            resources: options.resources.clone(),
+            timeout_ms: options.timeout_ms,
+            snapshot_expiration_ms: options.snapshot_expiration_ms,
+            network_policy: options.network_policy.clone(),
+        }
+    }
+
+    /// Replace the corresponding fields of `options`.
+    pub fn apply_to(self, options: &mut VercelSandboxClientOptions) {
+        options.runtime = self.runtime;
+        options.resources = self.resources;
+        options.timeout_ms = self.timeout_ms;
+        options.snapshot_expiration_ms = self.snapshot_expiration_ms;
+        options.network_policy = self.network_policy;
+    }
+
+    /// The options persisted in `state`, when it carries any.
+    pub fn from_state(state: &SandboxSessionState) -> Option<Self> {
+        state.provider_options()
     }
 }
 
@@ -621,6 +824,17 @@ impl Default for VercelSandboxClient {
 }
 
 impl VercelSandboxClient {
+    /// This client with the options `state` recorded layered over its own.
+    ///
+    /// A state written before options were recorded leaves the client's options in place.
+    fn with_persisted_options(&self, state: &SandboxSessionState) -> Self {
+        let mut client = self.clone();
+        if let Some(persisted) = VercelPersistedOptions::from_state(state) {
+            persisted.apply_to(&mut client.options);
+        }
+        client
+    }
+
     /// A client reading its credentials from the environment.
     pub fn new() -> Self {
         VercelSandboxClient::default()
@@ -759,6 +973,9 @@ impl SandboxClient for VercelSandboxClient {
         state: &SandboxSessionState,
         manifest: Manifest,
     ) -> SandboxResult<Arc<dyn SandboxSession>> {
+        // A replacement sandbox is built from what the state recorded, not from the options
+        // of the client that happens to resume it.
+        let this = &self.with_persisted_options(state);
         if state.backend != BACKEND_ID {
             return Err(SandboxError::new(
                 ErrorCode::SessionStateMismatch,
@@ -779,17 +996,17 @@ impl SandboxClient for VercelSandboxClient {
             )
         })?;
         let (sandbox_name, session_id) = split_provider_id(&provider_id)?;
-        let token = self.options.resolved_token()?;
-        let mut envs = self.options.env.clone();
+        let token = this.options.resolved_token()?;
+        let mut envs = this.options.env.clone();
         for (key, value) in manifest.environment() {
             envs.insert(key.clone(), value.clone());
         }
 
         let existing = self
             .request(
-                self.http.get(format!(
+                this.http.get(format!(
                     "{}/v2/sandboxes/sessions/{session_id}",
-                    self.options.api_base()
+                    this.options.api_base()
                 )),
                 &token,
             )
@@ -826,9 +1043,9 @@ impl SandboxClient for VercelSandboxClient {
         };
         let build = |created: SandboxAndSession, manifest: Manifest| {
             VercelSandboxSession::new(
-                self.options.clone(),
+                this.options.clone(),
                 token.clone(),
-                self.http.clone(),
+                this.http.clone(),
                 created,
                 manifest,
                 Some(state.snapshot.clone()),
@@ -855,7 +1072,7 @@ impl SandboxClient for VercelSandboxClient {
             }
         }
         // The original session is gone: create a replacement and hydrate it from the snapshot.
-        let created = self.create_sandbox(&token, &envs, None).await?;
+        let created = this.create_sandbox(&token, &envs, None).await?;
         let session = build(created, manifest);
         session.wait_until_running().await?;
         Ok(Arc::new(session))
@@ -1880,6 +2097,7 @@ impl SandboxSession for VercelSandboxSession {
         )))
         .with_snapshot(self.snapshot.clone().unwrap_or_default())
         .with_snapshot_fingerprint(self.snapshot_fingerprint.lock().expect("poisoned").clone())
+        .with_provider_options(&VercelPersistedOptions::from_options(&self.options))
     }
 
     fn snapshot(&self) -> Arc<dyn Snapshot> {

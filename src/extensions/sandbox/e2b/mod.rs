@@ -494,6 +494,98 @@ fn missing_api_key() -> SandboxError {
     )
 }
 
+/// The E2B options a resumed session is rebuilt from.
+///
+/// Mirrors the `mcp` field of Python's `E2BSandboxSessionState`, with one deliberate
+/// difference: the persisted state stays credential-free, so only the non-secret shape of the
+/// MCP config is recorded. Server names are kept; an option whose name looks secret (`apiKey`,
+/// `token`, `secret`, `password`, `authorization`, ...) is dropped, and a URL loses its userinfo,
+/// query and fragment. The resuming client supplies the secrets from its own options: its
+/// config for a server wins key by key over the recorded shape. A payload without the field
+/// reads as no MCP servers.
+#[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct E2BPersistedOptions {
+    /// The non-secret shape of the MCP servers E2B starts inside the sandbox, by server name.
+    pub mcp: BTreeMap<String, BTreeMap<String, String>>,
+}
+
+impl std::fmt::Debug for E2BPersistedOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("E2BPersistedOptions")
+            .field("mcp", &self.mcp.keys().collect::<Vec<_>>())
+            .finish()
+    }
+}
+
+/// Whether an MCP option name is likely to hold a secret.
+fn is_secret_option_name(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    [
+        "key",
+        "token",
+        "secret",
+        "password",
+        "passwd",
+        "auth",
+        "credential",
+        "cookie",
+        "bearer",
+        "signature",
+        "session",
+    ]
+    .iter()
+    .any(|needle| name.contains(needle))
+}
+
+/// A URL without userinfo, query or fragment; any other value is returned as it is.
+fn strip_url_secrets(value: &str) -> String {
+    let Some((scheme, rest)) = value.split_once("://") else {
+        return value.to_string();
+    };
+    let end = rest.find(['?', '#']).unwrap_or(rest.len());
+    let rest = &rest[..end];
+    let authority_end = rest.find('/').unwrap_or(rest.len());
+    let (authority, path) = rest.split_at(authority_end);
+    let host = authority.rsplit('@').next().unwrap_or(authority);
+    format!("{scheme}://{host}{path}")
+}
+
+impl E2BPersistedOptions {
+    /// The persisted, credential-free subset of `options`.
+    pub fn from_options(options: &E2BSandboxClientOptions) -> Self {
+        E2BPersistedOptions {
+            mcp: options
+                .mcp
+                .iter()
+                .map(|(server, config)| {
+                    let shape = config
+                        .iter()
+                        .filter(|(name, _)| !is_secret_option_name(name))
+                        .map(|(name, value)| (name.clone(), strip_url_secrets(value)))
+                        .collect();
+                    (server.clone(), shape)
+                })
+                .collect(),
+        }
+    }
+
+    /// Layer the recorded shape under the client's own MCP config: the client's value wins for
+    /// every key it sets, and a server only the client knows is kept.
+    pub fn apply_to(self, options: &mut E2BSandboxClientOptions) {
+        let mut merged = self.mcp;
+        for (server, config) in std::mem::take(&mut options.mcp) {
+            merged.entry(server).or_default().extend(config);
+        }
+        options.mcp = merged;
+    }
+
+    /// The options persisted in `state`, when it carries any.
+    pub fn from_state(state: &SandboxSessionState) -> Option<Self> {
+        state.provider_options()
+    }
+}
+
 /// Creates [`E2BSandboxSession`]s against the E2B HTTP API.
 #[derive(Debug, Clone)]
 pub struct E2BSandboxClient {
@@ -522,6 +614,17 @@ fn default_http_client() -> reqwest::Client {
 }
 
 impl E2BSandboxClient {
+    /// This client with the options `state` recorded layered over its own.
+    ///
+    /// A state written before options were recorded leaves the client's options in place.
+    fn with_persisted_options(&self, state: &SandboxSessionState) -> Self {
+        let mut client = self.clone();
+        if let Some(persisted) = E2BPersistedOptions::from_state(state) {
+            persisted.apply_to(&mut client.options);
+        }
+        client
+    }
+
     /// A client reading its credentials from the environment.
     pub fn new() -> Self {
         E2BSandboxClient::default()
@@ -643,6 +746,9 @@ impl SandboxClient for E2BSandboxClient {
         state: &SandboxSessionState,
         manifest: Manifest,
     ) -> SandboxResult<Arc<dyn SandboxSession>> {
+        // A replacement sandbox is built from what the state recorded, not from the options
+        // of the client that happens to resume it.
+        let this = &self.with_persisted_options(state);
         if state.backend != BACKEND_ID {
             return Err(SandboxError::new(
                 ErrorCode::SessionStateMismatch,
@@ -660,8 +766,8 @@ impl SandboxClient for E2BSandboxClient {
                 "E2B sandbox session state is missing its sandbox id",
             )
         })?;
-        let api_key = self.options.resolved_api_key()?;
-        let mut envs = self.options.envs.clone();
+        let api_key = this.options.resolved_api_key()?;
+        let mut envs = this.options.envs.clone();
         for (key, value) in manifest.environment() {
             envs.insert(key.clone(), value.clone());
         }
@@ -671,12 +777,12 @@ impl SandboxClient for E2BSandboxClient {
             .http
             .post(format!(
                 "{}/v2/sandboxes/{sandbox_id}/connect",
-                self.options.api_base()
+                this.options.api_base()
             ))
             .header("X-API-Key", &api_key)
             // Reconnecting restarts the sandbox's lifetime clock, so the configured timeout
             // goes with it.
-            .json(&match self.options.timeout_secs {
+            .json(&match this.options.timeout_secs {
                 Some(timeout) => json!({ "timeout": timeout }),
                 None => json!({}),
             })
@@ -693,15 +799,15 @@ impl SandboxClient for E2BSandboxClient {
             Some(created) => (created, true),
             // The original sandbox is gone: create a replacement and hydrate it from the snapshot.
             None => (
-                self.create_sandbox(&api_key, &self.options.resolved_template(), &envs)
+                this.create_sandbox(&api_key, &this.options.resolved_template(), &envs)
                     .await?,
                 true,
             ),
         };
         let session = E2BSandboxSession::new(
-            self.options.clone(),
+            this.options.clone(),
             api_key,
-            self.http.clone(),
+            this.http.clone(),
             created,
             manifest,
             Some(state.snapshot.clone()),
@@ -1703,14 +1809,25 @@ impl SandboxSession for E2BSandboxSession {
         }
         .resolved_argv();
         let start = self.start_request(&argv, Some(cwd), &env, Some((24, 80)), request.tty);
-        let response = self
-            .open_process_stream(
-                start,
-                user.as_deref(),
-                self.options.timeouts.exec_unbounded,
-                "start a PTY process in the E2B sandbox",
-            )
-            .await?;
+        // The per-call timeout is the process lifetime envd enforces, and it also bounds how
+        // long the start request may stall, as Python passes it to `pty.create`.
+        let what = "start a PTY process in the E2B sandbox";
+        let envd_timeout = self.envd_timeout(request.timeout);
+        let opened = self.open_process_stream(start, user.as_deref(), envd_timeout, what);
+        let response = match request.timeout {
+            None => opened.await?,
+            Some(_) => tokio::time::timeout(envd_timeout, opened)
+                .await
+                .map_err(|_| {
+                    SandboxError::new(
+                        ErrorCode::ExecTimeout,
+                        format!(
+                            "Command `{}` timed out after {envd_timeout:?}",
+                            argv.join(" ")
+                        ),
+                    )
+                })??,
+        };
         let (process, pruned) = self.ptys.register(request.tty)?;
         // A pruned session keeps running inside the sandbox until it is signalled.
         self.release_pty_processes(&pruned).await;
@@ -1782,6 +1899,7 @@ impl SandboxSession for E2BSandboxSession {
         .with_provider_id(Some(self.sandbox_id()))
         .with_snapshot(self.snapshot.clone().unwrap_or_default())
         .with_snapshot_fingerprint(self.snapshot_fingerprint.lock().expect("poisoned").clone())
+        .with_provider_options(&E2BPersistedOptions::from_options(&self.options))
     }
 
     fn resume_snapshot_fingerprint(&self) -> Option<SnapshotFingerprint> {

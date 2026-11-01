@@ -98,6 +98,14 @@ pub struct PtyExecRequest {
     pub yield_time_ms: u64,
     /// Maximum number of tokens of output to return.
     pub max_output_tokens: Option<usize>,
+    /// How long starting the process may take, and (for backends whose provider enforces it) how
+    /// long the process may live. `None` is unbounded; a zero timeout is treated as the
+    /// smallest the provider accepts. Mirrors the `timeout` argument of Python's
+    /// `pty_exec_start`.
+    ///
+    /// Only the E2B and Daytona backends honour it; the others start the process without a
+    /// bound of their own.
+    pub timeout: Option<Duration>,
 }
 
 impl PtyExecRequest {
@@ -111,7 +119,14 @@ impl PtyExecRequest {
             cwd: None,
             yield_time_ms: DEFAULT_EXEC_YIELD_TIME_MS,
             max_output_tokens: None,
+            timeout: None,
         }
+    }
+
+    /// Bound how long starting the process may take.
+    pub fn with_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.timeout = timeout;
+        self
     }
 
     /// Allow the model to write to the process.

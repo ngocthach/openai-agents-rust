@@ -172,12 +172,36 @@ impl DockerRunner for DockerCliRunner {
     }
 }
 
+/// The host-side authority that removes trees from a paused container, which the opt-in
+/// `docker-removal` feature provides. The Docker client only talks to this seam, so it has no
+/// feature-gated code paths of its own.
+#[async_trait]
+pub(crate) trait RemovalAuthority: std::fmt::Debug + Send + Sync {
+    /// The daemon connection the authority uses; the client must use the same one.
+    fn runner(&self) -> Arc<dyn DockerRunner>;
+    /// Create the workspace in a freshly started container, then bind it.
+    async fn bind_new(&self, container_id: &str, manifest: &Manifest) -> SandboxResult<()>;
+    /// Check that the live binding still matches `manifest`.
+    async fn assert_bound(&self, container_id: &str, manifest: &Manifest) -> SandboxResult<()>;
+    /// Remove `path` recursively from the paused container.
+    async fn remove(
+        &self,
+        container_id: &str,
+        manifest: &Manifest,
+        path: &str,
+        user: Option<&str>,
+    ) -> SandboxResult<()>;
+    /// Release the binding of a container that has been deleted.
+    async fn release(&self, container_id: &str) -> SandboxResult<()>;
+}
+
 /// Creates [`DockerSandboxSession`]s with the `docker` CLI.
 #[derive(Debug, Clone)]
 pub struct DockerSandboxClient {
     options: DockerSandboxClientOptions,
     snapshot: Option<SnapshotSpec>,
     runner: Arc<dyn DockerRunner>,
+    removal: Option<Arc<dyn RemovalAuthority>>,
 }
 
 impl Default for DockerSandboxClient {
@@ -186,6 +210,7 @@ impl Default for DockerSandboxClient {
             options: DockerSandboxClientOptions::default(),
             snapshot: None,
             runner: Arc::new(DockerCliRunner),
+            removal: None,
         }
     }
 }
@@ -216,6 +241,37 @@ impl DockerSandboxClient {
         self
     }
 
+    /// Route recursive removals through the opt-in host-side removal service.
+    ///
+    /// The client adopts the service's daemon connection, and new containers are started and
+    /// bound before the session is returned. Without this call the client removes inside the
+    /// container with `docker exec rm`. See [`DockerRemovalService`] for what the caller must
+    /// supply: the service only works in a process the caller runs as root on the Docker host.
+    ///
+    /// [`DockerRemovalService`]: super::docker_removal::DockerRemovalService
+    #[cfg(all(feature = "docker-removal", unix))]
+    pub fn with_removal_service(
+        mut self,
+        service: super::docker_removal::DockerRemovalService,
+    ) -> Self {
+        self.runner = service.runner();
+        self.removal = Some(Arc::new(service));
+        self
+    }
+
+    /// The removal authority, after checking it uses this client's daemon connection.
+    fn removal_authority(&self) -> SandboxResult<Option<Arc<dyn RemovalAuthority>>> {
+        match &self.removal {
+            Some(authority) if !Arc::ptr_eq(&authority.runner(), &self.runner) => {
+                Err(SandboxError::new(
+                    ErrorCode::SandboxConfigInvalid,
+                    "Use the Docker client's live removal service connection",
+                ))
+            }
+            other => Ok(other.clone()),
+        }
+    }
+
     /// Whether a usable Docker daemon is reachable (`docker info`).
     pub async fn is_available() -> bool {
         run_docker(
@@ -238,6 +294,7 @@ impl DockerSandboxClient {
         session_id: Option<String>,
     ) -> SandboxResult<DockerSandboxSession> {
         self.options.validate()?;
+        self.removal_authority()?;
         validate_docker_path_grants(&manifest)?;
         let protected = manifest.clone();
         // The volume names are derived from the session id, so it has to exist before the
@@ -285,9 +342,13 @@ impl DockerSandboxClient {
             "create".to_string(),
             "--label".to_string(),
             "openai-agents-sandbox=1".to_string(),
-            "-w".to_string(),
-            manifest.root().to_string(),
         ];
+        // The daemon creates a missing working directory as root. With a removal service the
+        // workspace is created with the image's default user instead (before the binding), so
+        // the container gets no default working directory; every exec names its own.
+        if self.removal.is_none() {
+            argv.extend(["-w".to_string(), manifest.root().to_string()]);
+        }
         for (key, value) in &self.options.labels {
             argv.push("--label".to_string());
             argv.push(format!("{key}={value}"));
@@ -358,11 +419,55 @@ impl DockerSandboxClient {
                 "`docker create` returned no container id",
             ));
         }
-        Ok(DockerSandboxSession::new(container_id, manifest)
+        let removal = self.removal_authority()?;
+        if let Some(authority) = &removal
+            && let Err(error) = self
+                .start_and_bind(authority.as_ref(), &container_id, &manifest)
+                .await
+        {
+            // The container never reached a session, so nothing else will remove it.
+            let _ = self
+                .runner
+                .run(
+                    &["rm".to_string(), "-f".to_string(), container_id.clone()],
+                    None,
+                )
+                .await;
+            let _ = authority.release(&container_id).await;
+            return Err(error);
+        }
+        let session = DockerSandboxSession::new(container_id, manifest)
             .with_session_id(session_id)
             .with_client_options(&self.options)
             .with_runner(self.runner.clone())
-            .with_snapshot(self.snapshot.clone()))
+            .with_snapshot(self.snapshot.clone());
+        Ok(match removal {
+            Some(authority) => session.with_removal(authority),
+            None => session,
+        })
+    }
+
+    /// Start a new container and bind its removal authority before any workload runs.
+    async fn start_and_bind(
+        &self,
+        authority: &dyn RemovalAuthority,
+        container_id: &str,
+        manifest: &Manifest,
+    ) -> SandboxResult<()> {
+        let output = self
+            .runner
+            .run(&["start".to_string(), container_id.to_string()], None)
+            .await?;
+        if output.exit_code != 0 {
+            return Err(SandboxError::new(
+                ErrorCode::WorkspaceStartError,
+                format!(
+                    "`docker start` failed for `{container_id}`: {}",
+                    output.stderr_text().trim()
+                ),
+            ));
+        }
+        authority.bind_new(container_id, manifest).await
     }
 
     /// Whether `image` is already present locally (`docker image inspect`).
@@ -433,6 +538,7 @@ impl SandboxClient for DockerSandboxClient {
         let state = state.rebind_path_grants(&manifest)?;
         let manifest = manifest.with_root(state.workspace_root.clone());
         validate_docker_path_grants(&manifest)?;
+        let removal = self.removal_authority()?;
         let network_disabled = state
             .provider_metadata(DOCKER_NETWORK_DISABLED_KEY)
             .and_then(serde_json::Value::as_bool)
@@ -474,14 +580,23 @@ impl SandboxClient for DockerSandboxClient {
             inspect_container(self.runner.as_ref(), &container_id).await
         };
         if let Some(attrs) = attrs {
+            // Reattaching a running container needs the same live removal binding.
+            if let Some(authority) = &removal {
+                authority.assert_bound(&container_id, &manifest).await?;
+            }
             // The container has been reachable to anything that could run `docker` since the
             // pause, so its configuration is re-checked against the trusted manifest rather than
             // trusted because the id matched.
             assert_container_path_grants_match(&attrs, &manifest)?;
             assert_container_network_matches(&attrs, network_disabled)?;
             assert_container_labels_match(&attrs, &labels)?;
+            let reattached = DockerSandboxSession::new(container_id, manifest);
+            let reattached = match removal {
+                Some(authority) => reattached.with_removal(authority),
+                None => reattached,
+            };
             return Ok(Arc::new(
-                DockerSandboxSession::new(container_id, manifest)
+                reattached
                     .with_session_id(session_id)
                     .with_runner(self.runner.clone())
                     .with_resume_identity(network_disabled, labels, state.exposed_ports.clone())
@@ -511,6 +626,7 @@ impl SandboxClient for DockerSandboxClient {
             options,
             snapshot: self.snapshot.clone(),
             runner: self.runner.clone(),
+            removal: self.removal.clone(),
         };
         let replacement = replacement_client
             .create_session(manifest, replacement_session_id)
@@ -580,6 +696,10 @@ pub struct DockerSandboxSession {
     /// Whether this session reattached to an existing container, whose accounts and system state
     /// survived the pause.
     reused_container: bool,
+    /// The host-side removal authority, when the client was configured with one.
+    removal: Option<Arc<dyn RemovalAuthority>>,
+    /// Serializes removals with stop and shutdown, which would otherwise race a paused container.
+    removal_lock: Mutex<()>,
 }
 
 impl DockerSandboxSession {
@@ -607,7 +727,42 @@ impl DockerSandboxSession {
             runner: Arc::new(DockerCliRunner),
             path_helper_ready: AtomicBool::new(false),
             reused_container: false,
+            removal: None,
+            removal_lock: Mutex::new(()),
         }
+    }
+
+    fn with_removal(mut self, authority: Arc<dyn RemovalAuthority>) -> Self {
+        self.removal = Some(authority);
+        self
+    }
+
+    /// Attach a session to an existing container whose recursive removals go through the
+    /// host-side removal `service`, reaching the daemon through the service's connection.
+    ///
+    /// [`DockerSandboxClient::with_removal_service`] does this for the sessions it creates; this
+    /// is for a session built by hand around a container the service already bound.
+    #[cfg(all(feature = "docker-removal", unix))]
+    pub fn with_removal_service(
+        mut self,
+        service: super::docker_removal::DockerRemovalService,
+    ) -> Self {
+        self.runner = service.runner();
+        self.removal = Some(Arc::new(service));
+        self
+    }
+
+    /// Recursive removal through the host-side authority, serialized with stop and shutdown.
+    async fn removal_rm(
+        &self,
+        authority: &dyn RemovalAuthority,
+        path: &str,
+        user: Option<&str>,
+    ) -> SandboxResult<()> {
+        let _serialized = self.removal_lock.lock().await;
+        authority
+            .remove(&self.container_id, &self.manifest, path, user)
+            .await
     }
 
     /// Reach the daemon through `runner` instead of spawning the `docker` executable.
@@ -994,6 +1149,11 @@ impl SandboxSession for DockerSandboxSession {
     }
 
     async fn start(&self) -> SandboxResult<()> {
+        if let Some(authority) = &self.removal {
+            authority
+                .assert_bound(&self.container_id, &self.manifest)
+                .await?;
+        }
         let output = self
             .runner
             .run(&["start".to_string(), self.container_id.clone()], None)
@@ -1053,6 +1213,7 @@ impl SandboxSession for DockerSandboxSession {
             "sandbox.stop",
             self.span_data("stop"),
             async {
+                let _serialized = self.removal_lock.lock().await;
                 self.terminate_pty_sessions().await;
                 self.manifest.unmount_all(self).await?;
                 let output = self
@@ -1086,6 +1247,7 @@ impl SandboxSession for DockerSandboxSession {
 
     async fn shutdown(&self) -> SandboxResult<()> {
         crate::sandbox::runtime::sandbox_span_result("sandbox.shutdown", self.span_data("shutdown"), async {
+        let _serialized = self.removal_lock.lock().await;
         self.terminate_pty_sessions().await;
         // The staged secrets must not outlive the container that used them.
         self.remove_resolved_environment_file().await;
@@ -1137,6 +1299,13 @@ impl SandboxSession for DockerSandboxSession {
                 ));
             }
             Err(error) => first_error = Some(error),
+        }
+        // Authority is released only once the container is confirmed gone.
+        if *removed
+            && let Some(authority) = &self.removal
+            && let Err(error) = authority.release(&self.container_id).await
+        {
+            first_error.get_or_insert(error);
         }
         // A named volume outlives its container, so the storage a mount attached would leak.
         for volume in docker_volume_names_for_manifest(&self.manifest, Some(&self.session_id)) {
@@ -1452,7 +1621,63 @@ impl SandboxSession for DockerSandboxSession {
         Ok(())
     }
 
+    async fn validate_manifest_application(
+        &self,
+        manifest: &Manifest,
+        _session_running: Option<bool>,
+    ) -> SandboxResult<()> {
+        match &self.removal {
+            Some(authority) => authority.assert_bound(&self.container_id, manifest).await,
+            None => Ok(()),
+        }
+    }
+
+    async fn rm_as(
+        &self,
+        path: &str,
+        recursive: bool,
+        user: Option<&crate::sandbox::types::User>,
+    ) -> SandboxResult<()> {
+        if recursive && let Some(authority) = &self.removal {
+            return self
+                .removal_rm(
+                    authority.as_ref(),
+                    path,
+                    user.map(|user| user.name.as_str()),
+                )
+                .await;
+        }
+        let Some(user) = user else {
+            return self.rm(path, recursive).await;
+        };
+        // The trait's default, which this override replaces for the non-service case.
+        let policy = self.workspace_path_policy()?;
+        if recursive {
+            policy.validate_recursive_remove(path)?;
+        }
+        if self.has_read_only_grant() || self.resolves_paths_remotely() {
+            self.validate_remote_path_access(path, true, recursive)
+                .await?;
+        }
+        let path = policy.normalize_sandbox_path(path, true)?;
+        let mut argv = vec!["rm".to_string()];
+        if recursive {
+            argv.push("-r".to_string());
+        }
+        argv.extend(["-f".to_string(), "--".to_string(), path.clone()]);
+        let result = self
+            .exec(ExecRequest::argv(argv.clone()).with_user(Some(user.clone())))
+            .await?;
+        if !result.ok() {
+            return Err(SandboxError::exec_nonzero(&argv, &result));
+        }
+        Ok(())
+    }
+
     async fn rm(&self, path: &str, recursive: bool) -> SandboxResult<()> {
+        if recursive && let Some(authority) = &self.removal {
+            return self.removal_rm(authority.as_ref(), path, None).await;
+        }
         if recursive {
             // A recursive removal of an ancestor is a write to every grant under it.
             self.workspace_path_policy()?
