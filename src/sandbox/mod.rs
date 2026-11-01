@@ -71,6 +71,7 @@ pub mod mounts;
 pub mod persisted_registry;
 pub mod pty;
 pub mod remote_mount_policy;
+mod resume_payload;
 pub mod retry;
 pub mod runtime;
 pub mod runtime_helpers;

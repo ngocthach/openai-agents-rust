@@ -238,6 +238,12 @@ pub struct RunState {
     /// only: a decision recorded under a bare name applies to any same-named agent. Read-derived.
     #[serde(skip)]
     pub legacy_name_owner_snapshot: bool,
+    /// The snapshot was written before schema `1.13`, which introduced the nested-history
+    /// ownership ledger: which of its items an earlier nested handoff already forwarded is
+    /// unknown. A nested handoff after the resume therefore replays the earlier items both in
+    /// its summary and as history, as Python does for such a snapshot. Read-derived.
+    #[serde(skip)]
+    pub nested_history_lineage_unknown: bool,
     /// The graph this snapshot came from has same-named agents that differ only by hook instance
     /// state. Set when the run builds the snapshot; [`to_json`](Self::to_json) then refuses to
     /// write it, as Python does. Derived from the graph, so it never travels on the wire.
@@ -413,6 +419,80 @@ pub struct ServerConversationState {
 }
 
 impl RunState {
+    /// Drop the generated items `keep` marks `false`, moving every recorded position (turn
+    /// start, model-input start, saved and sent counts, owned items) onto the surviving list.
+    /// `keep` is indexed like `generated_items`; positions past its end count as kept.
+    pub(crate) fn remove_generated_items(&mut self, keep: &[bool]) {
+        if keep.iter().all(|k| *k) {
+            return;
+        }
+        let kept_before = |n: usize| -> usize {
+            (0..n.min(self.generated_items.len()))
+                .filter(|i| keep.get(*i).copied().unwrap_or(true))
+                .count()
+                + n.saturating_sub(self.generated_items.len())
+        };
+        let turn_start_index = kept_before(self.turn_start_index);
+        let model_input_start = kept_before(self.model_input_start);
+        let session_saved_items = kept_before(self.session_saved_items);
+        let server_sent_items = kept_before(self.server_sent_items);
+        let owned: Vec<usize> = self
+            .nested_history_owned_items
+            .iter()
+            .filter(|i| keep.get(**i).copied().unwrap_or(true))
+            .map(|i| kept_before(*i))
+            .collect();
+        let mut index = 0;
+        self.generated_items.retain(|_| {
+            let kept = keep.get(index).copied().unwrap_or(true);
+            index += 1;
+            kept
+        });
+        self.turn_start_index = turn_start_index;
+        self.model_input_start = model_input_start;
+        self.session_saved_items = session_saved_items;
+        self.server_sent_items = server_sent_items;
+        self.nested_history_owned_items = owned;
+    }
+
+    /// Skip the items of agents the graph rooted at `names` does not contain, as Python's
+    /// `_deserialize_items` does when it cannot resolve an item's agent in the agent map: the item
+    /// is dropped with a warning that names the agent only when the data policies allow it. A
+    /// handoff output needs both its source and its target in the graph.
+    pub(crate) fn drop_items_of_unknown_agents(&mut self, known: &BTreeSet<String>) {
+        let unknown = |item: &RunItem| -> Option<String> {
+            let named = |name: &str| !name.is_empty() && !known.contains(name);
+            if let crate::items::RunItemKind::HandoffOutput {
+                source_agent,
+                target_agent,
+                ..
+            } = &item.kind
+            {
+                return (named(source_agent) || named(target_agent))
+                    .then(|| format!("{source_agent}, {target_agent}"));
+            }
+            named(&item.agent).then(|| item.agent.clone())
+        };
+        let keep: Vec<bool> = self
+            .generated_items
+            .iter()
+            .map(|item| match unknown(item) {
+                Some(name) => {
+                    crate::logger::log_model_and_tool_data_warning(
+                        "Agent not found, skipping item",
+                        || format!("Agent {name} not found, skipping item"),
+                    );
+                    false
+                }
+                None => true,
+            })
+            .collect();
+        self.remove_generated_items(&keep);
+        if let Some(processed) = &mut self.last_processed_response {
+            processed.new_items.retain(|item| unknown(item).is_none());
+        }
+    }
+
     /// Pending approvals.
     pub fn get_interruptions(&self) -> Vec<ToolApprovalItem> {
         self.interruptions.clone()
@@ -605,6 +685,8 @@ impl RunState {
         }
         state.legacy_hook_identity_snapshot = version_precedes(version, (1, 21));
         state.legacy_name_owner_snapshot = version_precedes(version, (1, 7));
+        state.nested_history_lineage_unknown =
+            !is_legacy_rust && version_precedes(version, (1, 13));
         // The in-memory state is always current; the version only describes the payload read.
         state.schema_version = CURRENT_SCHEMA_VERSION.to_string();
         Ok(state)

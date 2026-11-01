@@ -214,7 +214,11 @@ fn warn_invalid_indexes() {
 /// the restored generated items. Port of the ownership pass of `_deserialize_run_state`: every
 /// malformed or mismatched reference is an error, never a silent skip, because a wrong
 /// reference would drop a real item from the replayed history.
-pub(super) fn ownership_from_wire(wire: &Value, state: &RunState) -> Result<Vec<usize>> {
+pub(super) fn ownership_from_wire(
+    wire: &Value,
+    state: &RunState,
+    keep: &[bool],
+) -> Result<Vec<usize>> {
     let refs = match wire.get("nested_history_owned_session_item_refs") {
         None | Some(Value::Null) => return Ok(Vec::new()),
         Some(Value::Array(refs)) => refs,
@@ -266,7 +270,30 @@ pub(super) fn ownership_from_wire(wire: &Value, state: &RunState) -> Result<Vec<
                 "Run state nested history ownership references a missing session item",
             ));
         }
-        let Some(generated_index) = generated_for_session(session_index) else {
+        // A session item the reader skips (no type or no agent) owns nothing.
+        let session_item_readable = wire
+            .get("session_items")
+            .and_then(Value::as_array)
+            .and_then(|items| items.get(session_index))
+            .is_none_or(|item| {
+                item.get("type")
+                    .and_then(Value::as_str)
+                    .is_some_and(|t| !t.is_empty())
+                    && ["agent", "source_agent", "target_agent"].iter().any(|key| {
+                        match item.get(*key) {
+                            Some(Value::String(name)) => !name.is_empty(),
+                            Some(Value::Object(agent)) => agent
+                                .get("name")
+                                .and_then(Value::as_str)
+                                .is_some_and(|name| !name.is_empty()),
+                            _ => false,
+                        }
+                    })
+            });
+        let Some(generated_index) = generated_for_session(session_index)
+            .filter(|_| session_item_readable)
+            .filter(|i| keep.get(*i).copied().unwrap_or(true))
+        else {
             log::warn!(
                 target: crate::logger::LOG_TARGET,
                 "Ignoring nested history ownership for skipped session item at index {session_index}"

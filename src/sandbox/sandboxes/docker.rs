@@ -1116,6 +1116,16 @@ impl SandboxSession for DockerSandboxSession {
         self.started.store(false, Ordering::SeqCst);
         match removal {
             Ok(output) if output.exit_code == 0 => *removed = true,
+            // A container that is already gone is released, as Python's `delete` treats
+            // `docker.errors.NotFound`.
+            Ok(output)
+                if output
+                    .stderr_text()
+                    .to_ascii_lowercase()
+                    .contains("no such container") =>
+            {
+                *removed = true;
+            }
             Ok(output) => {
                 first_error = Some(SandboxError::new(
                     ErrorCode::WorkspaceStopError,

@@ -1460,7 +1460,7 @@ impl<C: Send + Sync + 'static> SessionInner<C> {
                         ToolTimeoutBehavior::RaiseException => return Err(error),
                         ToolTimeoutBehavior::ErrorAsResult => {
                             let message = match &tool.timeout_error_function {
-                                Some(f) => f(&self.context, &error),
+                                Some(f) => f(&self.context, &error).await?,
                                 None => format!(
                                     "Tool '{}' timed out after {} seconds.",
                                     tool.name,
@@ -1480,7 +1480,7 @@ impl<C: Send + Sync + 'static> SessionInner<C> {
             Err(error) => match &tool.failure_error_function {
                 Some(f) => {
                     log_tool_action_error(&format!("Realtime tool {} failed", tool.name), &error);
-                    ToolOutput::Text(f(&self.context, &error))
+                    ToolOutput::Text(f(&self.context, &error).await?)
                 }
                 None => return Err(error),
             },

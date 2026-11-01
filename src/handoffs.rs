@@ -369,7 +369,15 @@ impl<C: Send + Sync + 'static> Handoff<C> {
     where
         F: Fn(&RunContext<C>, &AgentsError) -> String + Send + Sync + 'static,
     {
-        self.failure_error_function = Some(Arc::new(f));
+        self.failure_error_function = Some(crate::tool::tool_error_fn(f));
+        self
+    }
+
+    /// Like [`Self::with_failure_error_function`] with a handler that may await or fail
+    /// (see [`crate::tool::ToolErrorFn`]). An `Err` from the handler ends the run with that
+    /// error, as a Python formatter that re-raises does.
+    pub fn with_failure_error_handler(mut self, f: ToolErrorFn<C>) -> Self {
+        self.failure_error_function = Some(f);
         self
     }
 

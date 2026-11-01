@@ -20,6 +20,7 @@ use crate::sandbox::memory::SandboxMemoryGenerationManager;
 use crate::sandbox::memory::rollouts::{
     RolloutTerminalMetadata, TerminalState, build_rollout_payload,
 };
+use crate::sandbox::resume_payload::{ResumeSource, SuspendedSession};
 use crate::sandbox::session::{
     ExecRequest, SandboxClient, SandboxSession, persist_session_snapshot,
 };
@@ -439,6 +440,8 @@ pub struct PreparedSandboxRun<C> {
     /// [`SandboxSessionState::rollout_id`], and generated otherwise, so the two halves of a
     /// paused run form one rollout.
     pub rollout_id: String,
+    /// The per-agent sandbox section the run was resumed from.
+    pub(crate) resume: ResumeSource,
 }
 
 impl<C> fmt::Debug for PreparedSandboxRun<C> {
@@ -524,10 +527,32 @@ impl SandboxRunner {
         agent: &SandboxAgent<C>,
         config: &SandboxRunConfig,
     ) -> Result<PreparedSandboxRun<C>> {
+        Self::prepare_with(agent, config, ResumeSource::default()).await
+    }
+
+    /// [`prepare`](Self::prepare) for a run resumed from `state`.
+    ///
+    /// When `state` carries a sandbox section (see [`RunState::sandbox`](crate::RunState)),
+    /// every agent of the graph resumes the session the section files under its identity key,
+    /// ahead of [`SandboxRunConfig::session_state`]. The section must have been written for the
+    /// configured client's backend. A caller-supplied live session ignores it.
+    pub async fn prepare_from_state<C: Send + Sync + 'static>(
+        agent: &SandboxAgent<C>,
+        config: &SandboxRunConfig,
+        state: &crate::run_state::RunState,
+    ) -> Result<PreparedSandboxRun<C>> {
+        Self::prepare_with(agent, config, resume_source_for(state)).await
+    }
+
+    async fn prepare_with<C: Send + Sync + 'static>(
+        agent: &SandboxAgent<C>,
+        config: &SandboxRunConfig,
+        resume: ResumeSource,
+    ) -> Result<PreparedSandboxRun<C>> {
         sandbox_span(
             "sandbox.prepare_agent",
             serde_json::json!({"agent_name": agent.name()}),
-            Self::prepare_untraced(agent, config),
+            Self::prepare_untraced(agent, config, resume),
         )
         .await
     }
@@ -535,6 +560,7 @@ impl SandboxRunner {
     async fn prepare_untraced<C: Send + Sync + 'static>(
         agent: &SandboxAgent<C>,
         config: &SandboxRunConfig,
+        mut resume: ResumeSource,
     ) -> Result<PreparedSandboxRun<C>> {
         let scope = SandboxWorkspaceScope::from_cwd(config.cwd.as_deref())?;
         if let Some(limits) = &config.concurrency_limits {
@@ -543,6 +569,9 @@ impl SandboxRunner {
         if let Some(limits) = &config.archive_limits {
             limits.validate()?;
         }
+        // The state the starting agent's session resumes from: the run state's section, else the
+        // explicit one.
+        let mut start_state = config.session_state.clone();
         let (session, client) = match (&config.session, &config.client) {
             (Some(session), _) => {
                 if config.session_mode == SandboxSessionMode::PerAgent {
@@ -581,7 +610,12 @@ impl SandboxRunner {
                     "agent_name": agent.name(),
                     "backend_id": client.backend_id(),
                 });
-                let session = match &config.session_state {
+                if let Some(saved) =
+                    resume.state_for(client.backend_id(), agent.name(), agent.name())?
+                {
+                    start_state = Some(saved);
+                }
+                let session = match &start_state {
                     None => {
                         let snapshot = Self::snapshot_spec(config, client.as_ref()).await?;
                         sandbox_span_result(
@@ -645,8 +679,7 @@ impl SandboxRunner {
             .rollout_id
             .clone()
             .or_else(|| {
-                config
-                    .session_state
+                start_state
                     .as_ref()
                     .and_then(|state| state.rollout_id.clone())
             })
@@ -672,7 +705,21 @@ impl SandboxRunner {
                 if name == agent.name() {
                     continue;
                 }
-                match Self::create_agent_session(&client, agent, &name, config).await {
+                let saved = match agent.graph_agent(&name) {
+                    Some(node) => resume.state_for(client.backend_id(), &name, node.name()),
+                    None => Ok(None),
+                };
+                let saved = match saved {
+                    Ok(saved) => saved,
+                    Err(error) => {
+                        for (_, extra) in agent_guards {
+                            let _ = extra.close().await;
+                        }
+                        let _ = guard.close().await;
+                        return Err(error);
+                    }
+                };
+                match Self::create_agent_session(&client, agent, &name, config, saved).await {
                     Ok(agent_session) => {
                         bindings.insert(
                             name.clone(),
@@ -699,6 +746,7 @@ impl SandboxRunner {
                 agent_guards,
                 memory_manager,
                 rollout_id,
+                resume,
             }),
             Err(error) => {
                 for (_, extra) in agent_guards {
@@ -762,6 +810,7 @@ impl SandboxRunner {
         root: &SandboxAgent<C>,
         name: &str,
         config: &SandboxRunConfig,
+        saved: Option<SandboxSessionState>,
     ) -> Result<SandboxSessionGuard> {
         let node = root
             .graph_agent(name)
@@ -769,10 +818,26 @@ impl SandboxRunner {
         // Each agent brings its own manifest and its own `run_as` user; only the explicit
         // `SandboxRunConfig::manifest` override is shared, as it is in Python.
         let manifest = Self::effective_manifest(node.as_ref(), config)?;
-        let snapshot = Self::snapshot_spec(config, client.as_ref()).await?;
-        let session = client
-            .create_with_snapshot(Some(manifest), snapshot)
-            .await?;
+        let session = match saved {
+            Some(state) => {
+                let span_data = serde_json::json!({
+                    "agent_name": node.name(),
+                    "backend_id": client.backend_id(),
+                });
+                sandbox_span_result(
+                    "sandbox.resume_session",
+                    span_data,
+                    client.resume(&state, manifest),
+                )
+                .await?
+            }
+            None => {
+                let snapshot = Self::snapshot_spec(config, client.as_ref()).await?;
+                client
+                    .create_with_snapshot(Some(manifest), snapshot)
+                    .await?
+            }
+        };
         session.set_archive_limits(config.archive_limits);
         session.set_concurrency_limits(config.concurrency_limits.unwrap_or_default());
         if let Err(error) = session.start().await {
@@ -824,17 +889,26 @@ impl SandboxRunner {
         options: RunOptions<C>,
     ) -> Result<SandboxRunOutcome<C>> {
         let tracing_disabled = options.run_config.tracing_disabled;
-        let rollout_override = Self::grouping_rollout_id(config, &options);
         let model_provider = options.run_config.model_provider.clone();
         let input = input.into();
-        let resuming = matches!(input, RunInput::State(_));
+        let resume = match &input {
+            RunInput::State(state) => Some(resume_source_for(state)),
+            _ => None,
+        };
+        let rollout_override = Self::grouping_rollout_id(
+            config,
+            &options,
+            resume
+                .as_ref()
+                .is_some_and(|saved| saved.has_rollout_id(agent.name())),
+        );
         let (options, starting_agent, deferred) = begin_preparation(
             options,
             agent,
             config,
             tracing_disabled,
             rollout_override,
-            resuming,
+            resume,
         )
         .await?;
         let result = Runner::run_with_options(starting_agent, input, options).await;
@@ -842,7 +916,7 @@ impl SandboxRunner {
         // no session to release and no result to carry.
         let rest = deferred.rest.lock().expect("poisoned").take();
         let guard = deferred.guard.lock().expect("poisoned").take();
-        let (Some(prepared), Some(guard)) = (rest, guard) else {
+        let (Some(mut prepared), Some(guard)) = (rest, guard) else {
             return match result {
                 Err(error) => Err(error),
                 Ok(_) => Err(AgentsError::user(
@@ -891,6 +965,14 @@ impl SandboxRunner {
         let sandbox_states_by_agent =
             release_agent_guards(prepared.agent_guards, suspend, &rollout_id).await;
         let protected = session_protects_mounts(guard.session());
+        let current_key = match &result {
+            Ok(result) => prepared
+                .graph
+                .key_for_prepared(&result.last_agent)
+                .map(str::to_string)
+                .unwrap_or_else(|| key_for_agent_name(&prepared.graph, &result.last_agent.name)),
+            Err(_) => agent.name().to_string(),
+        };
         let sandbox_state = if suspend {
             match guard.suspend().await {
                 // Carry the rollout id across the suspend so the resumed half appends to the
@@ -907,8 +989,28 @@ impl SandboxRunner {
             }
             None
         };
+        // The run state carries the sandbox section of the sessions this run suspended. A run
+        // that finished leaves what it was resumed from untouched; a caller-owned session has no
+        // state to resume from, and a suspend that failed leaves nothing to resume.
+        let mut result = result?;
+        if config.session.is_some() {
+            result.state.sandbox = None;
+        } else if suspend {
+            result.state.sandbox = match (&sandbox_state, &config.client) {
+                (Some(state), Some(client)) => suspended_section(
+                    &mut prepared.resume,
+                    &prepared.graph,
+                    client.backend_id(),
+                    agent.name(),
+                    state,
+                    &sandbox_states_by_agent,
+                    &current_key,
+                ),
+                _ => None,
+            };
+        }
         Ok(SandboxRunOutcome {
-            result: result?,
+            result,
             sandbox_state,
             sandbox_states_by_agent,
             // The manager is handed back only when this run did not flush it.
@@ -922,8 +1024,10 @@ impl SandboxRunner {
     fn grouping_rollout_id<C>(
         config: &SandboxRunConfig,
         options: &RunOptions<C>,
+        saved_rollout: bool,
     ) -> Option<String> {
         if config.rollout_id.is_some()
+            || saved_rollout
             || config
                 .session_state
                 .as_ref()
@@ -958,22 +1062,38 @@ impl SandboxRunner {
         options: RunOptions<C>,
     ) -> Result<SandboxStreamedRun<C>> {
         let tracing_disabled = options.run_config.tracing_disabled;
-        let rollout_override = Self::grouping_rollout_id(config, &options);
         let model_provider = options.run_config.model_provider.clone();
         let input = input.into();
-        let resuming = matches!(input, RunInput::State(_));
+        let resume = match &input {
+            RunInput::State(state) => Some(resume_source_for(state)),
+            _ => None,
+        };
+        let rollout_override = Self::grouping_rollout_id(
+            config,
+            &options,
+            resume
+                .as_ref()
+                .is_some_and(|saved| saved.has_rollout_id(agent.name())),
+        );
         let (options, starting_agent, mut deferred) = begin_preparation(
             options,
             agent,
             config,
             tracing_disabled,
             rollout_override,
-            resuming,
+            resume,
         )
         .await?;
         let mut streaming = Runner::run_streamed_with_options(starting_agent, input, options);
 
         let sandbox_state = Arc::new(Mutex::new(None));
+        let resume_section: Arc<Mutex<Option<serde_json::Value>>> = Arc::new(Mutex::new(None));
+        let hook_section = resume_section.clone();
+        // A caller-owned session has no state to resume from.
+        let backend_id = match (&config.session, &config.client) {
+            (None, Some(client)) => Some(client.backend_id().to_string()),
+            _ => None,
+        };
         let starting_name = agent.name().to_string();
         let guard = deferred.guard.clone();
         let hook_state = sandbox_state.clone();
@@ -981,6 +1101,8 @@ impl SandboxRunner {
         let prepared_slot = deferred.rest.clone();
         streaming.set_on_complete(Arc::new(move |completion| {
             let hook_state = hook_state.clone();
+            let hook_section = hook_section.clone();
+            let backend_id = backend_id.clone();
             let hook_guard = hook_guard.clone();
             let prepared_slot = prepared_slot.clone();
             let model_provider = model_provider.clone();
@@ -997,8 +1119,10 @@ impl SandboxRunner {
                     None,
                 );
                 let PreparedRest {
+                    graph,
                     agent_guards,
                     rollout_id,
+                    mut resume,
                     ..
                 } = prepared;
                 // The caller may have taken the guard over; then the lifecycle is theirs.
@@ -1037,7 +1161,9 @@ impl SandboxRunner {
                         );
                     }
                 }
-                release_agent_guards(agent_guards, completion.is_suspended(), &rollout_id).await;
+                let by_agent =
+                    release_agent_guards(agent_guards, completion.is_suspended(), &rollout_id)
+                        .await;
                 let state = finish_sandbox_run(
                     guard,
                     completion.is_suspended(),
@@ -1046,6 +1172,22 @@ impl SandboxRunner {
                     rollout_id,
                 )
                 .await;
+                // The streamed completion names the last agent but carries no handle to it, so
+                // two agents sharing a name resolve to the first of them.
+                if completion.is_suspended()
+                    && let (Some(state), Some(backend_id)) = (&state, &backend_id)
+                {
+                    let current_key = key_for_agent_name(&graph, &completion.last_agent_name);
+                    *hook_section.lock().expect("poisoned") = suspended_section(
+                        &mut resume,
+                        &graph,
+                        backend_id,
+                        &starting_name,
+                        state,
+                        &by_agent,
+                        &current_key,
+                    );
+                }
                 *hook_state.lock().expect("poisoned") = state;
             })
         }));
@@ -1059,6 +1201,7 @@ impl SandboxRunner {
             streaming,
             guard,
             sandbox_state,
+            resume_section,
         })
     }
 }
@@ -1074,6 +1217,7 @@ pub struct SandboxStreamedRun<C> {
     pub streaming: RunResultStreaming<C>,
     guard: Arc<Mutex<Option<SandboxSessionGuard>>>,
     sandbox_state: Arc<Mutex<Option<SandboxSessionState>>>,
+    resume_section: Arc<Mutex<Option<serde_json::Value>>>,
 }
 
 impl<C> fmt::Debug for SandboxStreamedRun<C> {
@@ -1104,6 +1248,26 @@ impl<C: Send + Sync + 'static> SandboxStreamedRun<C> {
     /// The session state to persist, once the stream has finished and the run was suspended.
     pub fn sandbox_state(&self) -> Option<SandboxSessionState> {
         self.sandbox_state.lock().expect("poisoned").clone()
+    }
+
+    /// The sandbox section of the suspended sessions (see
+    /// [`RunState::sandbox`](crate::RunState)), once the stream has finished with the run paused.
+    ///
+    /// One entry per agent session, so [`SandboxSessionMode::PerAgent`] runs resume every agent.
+    pub fn sandbox_resume_state(&self) -> Option<serde_json::Value> {
+        self.resume_section.lock().expect("poisoned").clone()
+    }
+
+    /// A resumable snapshot of the run, carrying the sandbox section when the run paused.
+    ///
+    /// [`RunResultStreaming::to_state`] plus [`sandbox_resume_state`](Self::sandbox_resume_state),
+    /// so a run resumed from it restores the agents' sessions.
+    pub fn to_state(&self) -> Option<crate::run_state::RunState> {
+        let mut state = self.streaming.to_state()?;
+        if let Some(section) = self.sandbox_resume_state() {
+            state.sandbox = Some(section);
+        }
+        Some(state)
     }
 
     /// Take over the session lifecycle, disarming the automatic teardown.
@@ -1158,6 +1322,74 @@ async fn release_agent_guards(
         }
     }
     states
+}
+
+/// The identity key of the first agent of `graph` called `name`: the key `name` itself when an
+/// agent holds it, else the first same-named agent in key order.
+fn key_for_agent_name<C: Send + Sync + 'static>(
+    graph: &PreparedSandboxGraph<C>,
+    name: &str,
+) -> String {
+    if graph.agents_by_name().contains_key(name) {
+        return name.to_string();
+    }
+    let mut keys: Vec<&String> = graph
+        .agents_by_name()
+        .iter()
+        .filter(|(_, agent)| agent.name() == name)
+        .map(|(key, _)| key)
+        .collect();
+    keys.sort();
+    keys.first()
+        .map_or_else(|| name.to_string(), |key| (*key).clone())
+}
+
+/// The sandbox section for sessions a run suspended, or `None` (logged) when it cannot be built.
+///
+/// `current_key` is the agent the run stopped at; its session state is the section's top-level
+/// one, falling back to the starting agent's when the whole graph shares one session.
+fn suspended_section<C: Send + Sync + 'static>(
+    resume: &mut ResumeSource,
+    graph: &PreparedSandboxGraph<C>,
+    backend_id: &str,
+    start_key: &str,
+    start_state: &SandboxSessionState,
+    by_agent: &std::collections::BTreeMap<String, SandboxSessionState>,
+    current_key: &str,
+) -> Option<serde_json::Value> {
+    let name_of = |key: &str| -> String {
+        graph
+            .agents_by_name()
+            .get(key)
+            .map_or_else(|| key.to_string(), |agent| agent.name().to_string())
+    };
+    let start_name = name_of(start_key);
+    let mut sessions = vec![SuspendedSession {
+        key: start_key,
+        name: &start_name,
+        state: start_state,
+    }];
+    let names: Vec<String> = by_agent.keys().map(|key| name_of(key)).collect();
+    for ((key, state), name) in by_agent.iter().zip(&names) {
+        sessions.push(SuspendedSession { key, name, state });
+    }
+    let current_name = name_of(current_key);
+    let current_state = by_agent.get(current_key).unwrap_or(start_state);
+    match resume.serialize(
+        backend_id,
+        (current_key, &current_name),
+        current_state,
+        &sessions,
+    ) {
+        Ok(section) => Some(section),
+        Err(error) => {
+            log::warn!(
+                target: crate::logger::LOG_TARGET,
+                "Failed to serialize the sandbox resume state: {error}"
+            );
+            None
+        }
+    }
 }
 
 async fn finish_sandbox_run(
@@ -1465,19 +1697,35 @@ struct PreparedRest<C> {
     agent_guards: Vec<(String, SandboxSessionGuard)>,
     memory_manager: Option<Arc<SandboxMemoryGenerationManager>>,
     rollout_id: String,
+    resume: ResumeSource,
+}
+
+/// The saved sandbox section of a run state, with the agent the saved run stopped at.
+fn resume_source_for(state: &crate::run_state::RunState) -> ResumeSource {
+    ResumeSource::new(
+        state.sandbox.as_ref(),
+        state.current_agent_identity.as_deref(),
+        Some(state.current_agent_name.as_str()),
+    )
 }
 
 /// Prepare the sandbox into `slots`, returning the agent the run should start from.
+#[allow(clippy::too_many_arguments)]
 async fn prepare_into<C: Send + Sync + 'static>(
     agent: &SandboxAgent<C>,
     config: &SandboxRunConfig,
     tracing_disabled: bool,
     rollout_override: Option<String>,
+    resume: ResumeSource,
     graph_cell: &std::sync::OnceLock<PreparedSandboxGraph<C>>,
     rest_slot: &Mutex<Option<PreparedRest<C>>>,
     guard_slot: &Mutex<Option<SandboxSessionGuard>>,
 ) -> Result<Arc<Agent<C>>> {
-    let mut prepared = masked(tracing_disabled, SandboxRunner::prepare(agent, config)).await?;
+    let mut prepared = masked(
+        tracing_disabled,
+        SandboxRunner::prepare_with(agent, config, resume),
+    )
+    .await?;
     prepared.guard.tracing_disabled = tracing_disabled;
     for (_, extra) in prepared.agent_guards.iter_mut() {
         extra.tracing_disabled = tracing_disabled;
@@ -1493,6 +1741,7 @@ async fn prepare_into<C: Send + Sync + 'static>(
         agent_guards,
         memory_manager,
         rollout_id,
+        resume,
     } = prepared;
     *guard_slot.lock().expect("poisoned") = Some(guard);
     *rest_slot.lock().expect("poisoned") = Some(PreparedRest {
@@ -1500,6 +1749,7 @@ async fn prepare_into<C: Send + Sync + 'static>(
         agent_guards,
         memory_manager,
         rollout_id,
+        resume,
     });
     Ok(starting)
 }
@@ -1519,7 +1769,7 @@ async fn begin_preparation<C: Send + Sync + 'static>(
     config: &SandboxRunConfig,
     tracing_disabled: bool,
     rollout_override: Option<String>,
-    resuming: bool,
+    resume: Option<ResumeSource>,
 ) -> Result<(RunOptions<C>, Arc<Agent<C>>, DeferredPreparation<C>)> {
     let slot: Arc<Mutex<Option<PreparedRest<C>>>> = Arc::new(Mutex::new(None));
     let guard_slot: Arc<Mutex<Option<SandboxSessionGuard>>> = Arc::new(Mutex::new(None));
@@ -1532,7 +1782,7 @@ async fn begin_preparation<C: Send + Sync + 'static>(
         guard: guard_slot.clone(),
         ready,
     };
-    if resuming {
+    if let Some(resume) = resume {
         let _signal = ReadySignal(ready_tx);
         // Boxed so the rarely used eager path does not widen this function's own future.
         let starting = Box::pin(prepare_into(
@@ -1540,6 +1790,7 @@ async fn begin_preparation<C: Send + Sync + 'static>(
             config,
             tracing_disabled,
             rollout_override,
+            resume,
             &graph,
             &slot,
             &guard_slot,
@@ -1571,6 +1822,7 @@ async fn begin_preparation<C: Send + Sync + 'static>(
                     &config,
                     tracing_disabled,
                     rollout,
+                    ResumeSource::default(),
                     &graph,
                     &slot,
                     &guard_slot,

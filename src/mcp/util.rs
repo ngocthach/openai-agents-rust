@@ -528,7 +528,7 @@ pub async fn to_function_tool_with_failure<C: Send + Sync + 'static>(
         Some(handler) => {
             // The default policy keeps the error detail out of traces.
             let is_default = crate::tool::is_shared_default_tool_error_function(&handler);
-            let mut f = f.with_failure_error_function(move |ctx, e| handler(ctx, e));
+            let mut f = f.with_failure_error_handler(handler);
             f.default_failure_error_function = is_default;
             f
         }

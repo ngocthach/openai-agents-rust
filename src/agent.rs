@@ -231,7 +231,14 @@ impl<C: Send + Sync + 'static> MCPConfig<C> {
             + Sync
             + 'static,
     {
-        self.failure_error_function = Some(Arc::new(f));
+        self.failure_error_function = Some(crate::tool::tool_error_fn(f));
+        self
+    }
+
+    /// Like [`Self::with_failure_error_function`] with a handler that may await or fail
+    /// (see [`crate::tool::ToolErrorFn`]).
+    pub fn with_failure_error_handler(mut self, f: crate::tool::ToolErrorFn<C>) -> Self {
+        self.failure_error_function = Some(f);
         self
     }
 
@@ -422,6 +429,23 @@ impl<C: Send + Sync + 'static> Agent<C> {
         self.model_settings = settings;
         self.model_settings_explicit = true;
         self
+    }
+
+    /// Edit the agent's model settings in place.
+    ///
+    /// Port of Python's tracked in-place write (`agent.model_settings.verbosity = "low"`): the
+    /// first call makes the settings explicit even if the value written equals the default.
+    /// The defaults captured when the agent was created are kept, with the edit on top, instead
+    /// of being recomputed from whichever model the run selects. Assigning a field of the public
+    /// `model_settings` directly is not tracked: unset fields still follow the selected model.
+    pub fn model_settings_mut(&mut self) -> &mut ModelSettings {
+        if !self.model_settings_explicit {
+            self.model_settings = self
+                .implicit_model_settings
+                .resolve(Some(&self.model_settings));
+            self.model_settings_explicit = true;
+        }
+        &mut self.model_settings
     }
 
     /// Add a tool.
@@ -1095,7 +1119,14 @@ impl<C: Send + Sync + 'static> AgentAsToolOptions<C> {
             + Sync
             + 'static,
     {
-        self.failure_error_function = Some(Arc::new(f));
+        self.failure_error_function = Some(crate::tool::tool_error_fn(f));
+        self
+    }
+
+    /// Like [`Self::failure_error_function`] with a handler that may await or fail
+    /// (see [`crate::tool::ToolErrorFn`]). An `Err` from the handler fails the outer run.
+    pub fn failure_error_handler(mut self, f: crate::tool::ToolErrorFn<C>) -> Self {
+        self.failure_error_function = Some(f);
         self
     }
 }
@@ -1259,7 +1290,7 @@ impl<C: Send + Sync + 'static> Agent<C> {
                         Err(e) => match &opts.failure_error_function {
                             // Report the failure to the calling model instead of failing the
                             // outer run. Port of `as_tool(failure_error_function=...)`.
-                            Some(f) => return Ok(ToolOutput::Text(f(&parent, &e))),
+                            Some(f) => return Ok(ToolOutput::Text(f(&parent, &e).await?)),
                             None => return Err(e),
                         },
                     };

@@ -359,6 +359,9 @@ struct RunLoop<C> {
     resumed_pre_count: Option<usize>,
     /// Source of [`RunItem`] lineage keys.
     next_occurrence: u64,
+    /// Generated items before this index came from a snapshot that recorded no nested-history
+    /// ownership; a nested handoff never claims them as forwarded.
+    unclaimable_prefix: usize,
     /// The response id of a held batch that has already been reported to the session.
     settle_notified: Option<String>,
     /// The `store` setting the latest model call ran under, after the run config merge.
@@ -1120,6 +1123,7 @@ pub(crate) async fn run_loop<C: Send + Sync + 'static>(
         resumed_from_failure: false,
         resumed_pre_count: None,
         next_occurrence: 0,
+        unclaimable_prefix: 0,
         settle_notified: None,
         last_store: None,
         server_conversation: Default::default(),
@@ -1639,7 +1643,7 @@ fn resolve_trace_settings<C>(
 }
 
 impl<C: Send + Sync + 'static> RunLoop<C> {
-    fn restore(&mut self, state: RunState, restore_usage: bool) -> Result<()> {
+    fn restore(&mut self, mut state: RunState, restore_usage: bool) -> Result<()> {
         if state.schema_version != CURRENT_SCHEMA_VERSION {
             return Err(AgentsError::user(format!(
                 "Unsupported run state schema version {}",
@@ -1706,6 +1710,17 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
         let agent = agent_identity::resolve_identity(&self.starting_agent, identity)
             .ok_or_else(|| AgentsError::user(not_found))?;
         self.current_agent = agent;
+        // Items of an agent this graph does not contain are skipped with a warning, as Python's
+        // `_deserialize_items` does with its agent map.
+        let known: std::collections::BTreeSet<String> =
+            agent_identity::iter_agent_graph(&self.starting_agent)
+                .iter()
+                .flat_map(|agent| {
+                    std::iter::once(agent.name.clone())
+                        .chain(agent.handoffs.iter().map(|h| h.agent_name.clone()))
+                })
+                .collect();
+        state.drop_items_of_unknown_agents(&known);
         // Python refuses staged input behind a parked approval that may end the run. A state
         // restored from JSON has lost its build-time flag, so the check is repeated here.
         if !state.pending_input.is_empty()
@@ -1752,6 +1767,9 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
             .collect();
         // After a nested handoff the earlier items are summarized in the input.
         let model_start = state.model_input_start.min(self.generated_items.len());
+        if state.nested_history_lineage_unknown {
+            self.unclaimable_prefix = self.generated_items.len();
+        }
         self.model_items = self.generated_items[model_start..].to_vec();
         if model_start > 0 {
             self.nested_model_start = Some(model_start);
@@ -1959,13 +1977,15 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
     /// history is still recognized.
     fn claim_forwarded(&mut self, values: &[serde_json::Value]) {
         for value in values.iter().rev() {
-            let candidate = (0..self.generated_items.len()).rev().find(|&index| {
-                let item = &self.generated_items[index];
-                item.to_input_item().0 == *value
-                    && !item.occurrence.0.is_some_and(|key| {
-                        self.nested_history_owned_items.iter().any(|o| o.key == key)
-                    })
-            });
+            let candidate = (self.unclaimable_prefix..self.generated_items.len())
+                .rev()
+                .find(|&index| {
+                    let item = &self.generated_items[index];
+                    item.to_input_item().0 == *value
+                        && !item.occurrence.0.is_some_and(|key| {
+                            self.nested_history_owned_items.iter().any(|o| o.key == key)
+                        })
+                });
             if let Some(index) = candidate {
                 let key = self.occurrence_of(index);
                 self.nested_history_owned_items
@@ -2902,6 +2922,7 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
             // A snapshot this loop builds is written at the current schema, with keyed identities.
             legacy_hook_identity_snapshot: false,
             legacy_name_owner_snapshot: false,
+            nested_history_lineage_unknown: false,
             hook_identity_ambiguous: agent_identity::has_ambiguous_hook_identities(
                 &self.starting_agent,
             ),
@@ -4766,6 +4787,64 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
                             processed.local_calls.push(local);
                         }
                     } else {
+                        // A parked call whose tool is gone (disabled or removed) does not stop
+                        // the resume, as Python's restored response drops such a function: a
+                        // call nothing is waiting on is skipped, an undecided approval stays
+                        // pending and a rejected one still answers the model. Only an approved
+                        // call needs the tool and takes the not-found outcome below.
+                        if !append {
+                            let pending = self
+                                .resumed_interruptions
+                                .iter()
+                                .find(|i| i.call_id() == fc.call_id)
+                                .cloned();
+                            match pending {
+                                _ if skip.contains(&fc.call_id) => continue,
+                                // A call whose nested agent run is paused still needs its
+                                // tool; losing it is refused below.
+                                None if !self.ctx.nested_states().contains_key(&fc.call_id) => {
+                                    continue;
+                                }
+                                None => {}
+                                Some(pending) if pending.raw_item.name != fc.name => {}
+                                Some(pending) => {
+                                    match self
+                                        .ctx
+                                        .approval_status_for_item(&pending, &fc.call_id)
+                                        .approved
+                                    {
+                                        Some(true) => {}
+                                        None => {
+                                            processed.unmatched_pending.push(pending);
+                                            continue;
+                                        }
+                                        Some(false) => {
+                                            let mut stand_in = FunctionTool::<C>::new_raw(
+                                                fc.name.clone(),
+                                                "",
+                                                json!({"type": "object", "properties": {}}),
+                                                |_ctx, _args: String| async {
+                                                    Err::<String, _>(AgentsError::model_behavior(
+                                                        "The tool this call was made to is not \
+                                                         available.",
+                                                    ))
+                                                },
+                                            );
+                                            stand_in.needs_approval =
+                                                crate::tool::NeedsApproval::Static(true);
+                                            let next = processed.call_positions.len();
+                                            processed
+                                                .call_positions
+                                                .insert(fc.call_id.clone(), next);
+                                            processed
+                                                .functions
+                                                .push((fc.clone(), Arc::new(stand_in)));
+                                            continue;
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         // A resumed approval whose name no longer matches the queued call is
                         // refused before the not-found outcome is chosen.
                         if !append
@@ -6037,7 +6116,7 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
                 };
                 span.set_error("Handoff invocation failed", Some(json!({})));
                 span.finish();
-                let text = format_error(&self.ctx, &e);
+                let text = format_error(&self.ctx, &e).await?;
                 let item = RunItem::new(
                     agent.name.clone(),
                     RunItemKind::ToolCallOutput {

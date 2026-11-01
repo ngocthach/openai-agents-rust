@@ -538,7 +538,7 @@ pub(crate) async fn execute_function_tool<C: Send + Sync + 'static>(
                         ToolTimeoutBehavior::ErrorAsResult => {
                             formatted_failure = true;
                             let msg = match &tool.timeout_error_function {
-                                Some(f) => f(env.ctx, &err),
+                                Some(f) => f(env.ctx, &err).await?,
                                 None => {
                                     sdk_generated_text = true;
                                     format!(
@@ -589,7 +589,7 @@ pub(crate) async fn execute_function_tool<C: Send + Sync + 'static>(
                             == Some("program"));
                 match (&tool.failure_error_function, propagate) {
                     (Some(f), false) => {
-                        let mut msg = f(env.ctx, &e);
+                        let mut msg = f(env.ctx, &e).await?;
                         if tool.uses_default_failure_error_function {
                             // Keep the default failure policy identity: approving model
                             // feedback must not opt the original error into handled traces.

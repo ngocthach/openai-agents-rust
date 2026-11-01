@@ -1424,9 +1424,64 @@ fn is_invalid_local_shell_output_item(item: &Value) -> bool {
             })
 }
 
-fn run_item_from_wire(value: &Value) -> Result<RunItem> {
+/// Read one serialized run item. `Ok(None)` is an item Python's `_deserialize_items` skips with a
+/// warning instead of failing the restore: no `type`, no agent to attribute it to, a handoff
+/// output that names no source or target, a tool output whose raw item has no `type`, or a
+/// payload its typed model rejects. The warnings follow the model/tool data policy and never
+/// echo payload values unless both policies allow it.
+fn run_item_from_wire(value: &Value) -> Result<Option<RunItem>> {
     let mut value = value.clone();
+    let item_type = value
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if item_type.is_empty() {
+        log::warn!(target: crate::logger::LOG_TARGET, "Item missing type field, skipping");
+        return Ok(None);
+    }
+    let item_type = item_type.to_string();
     if let Value::Object(m) = &mut value {
+        if item_type == "tool_call_output_item"
+            && m.get("raw_item").is_some_and(|raw| {
+                raw.is_object() && !raw.get("type").is_some_and(Value::is_string)
+            })
+        {
+            log_skipped_item("Failed to deserialize item", &item_type);
+            return Ok(None);
+        }
+        // Python builds the message through its typed model, which needs an id, a role and
+        // content (a bare string is accepted from an assistant, as a legacy shape).
+        if item_type == "message_output_item"
+            && let Some(raw) = m.get("raw_item").and_then(Value::as_object)
+        {
+            let text_shape = raw.get("role").and_then(Value::as_str) == Some("assistant")
+                && raw.get("content").is_some_and(Value::is_string);
+            if !text_shape
+                && !["id", "role", "content"]
+                    .iter()
+                    .all(|key| raw.get(*key).is_some_and(|v| !v.is_null()))
+            {
+                log_skipped_item("Failed to deserialize item", &item_type);
+                return Ok(None);
+            }
+        }
+        if item_type == "handoff_output_item"
+            && ["source_agent", "target_agent"]
+                .iter()
+                .any(|key| agent_name_of(m.get(*key)).is_empty())
+        {
+            crate::logger::log_model_and_tool_data_warning(
+                "Skipping handoff output item: could not resolve agents",
+                || {
+                    format!(
+                        "Skipping handoff_output_item: could not resolve agents (source={}, target={}).",
+                        agent_name_of(m.get("source_agent")),
+                        agent_name_of(m.get("target_agent")),
+                    )
+                },
+            );
+            return Ok(None);
+        }
         // Python splits tool search into its own item types; Rust merges them into the
         // generic tool-call items with the right stream event names.
         match m.get("type").and_then(Value::as_str) {
@@ -1444,15 +1499,14 @@ fn run_item_from_wire(value: &Value) -> Result<RunItem> {
         let agent = ["agent", "source_agent", "target_agent"]
             .iter()
             .map(|key| agent_name_of(m.get(*key)))
-            .find(|name| !name.is_empty())
-            .ok_or_else(|| {
-                // Python skips such an item; keeping a snapshot that silently lost history is
-                // worse than refusing it.
-                AgentsError::user(format!(
-                    "Run state has an item of type {} without an agent",
-                    m.get("type").and_then(Value::as_str).unwrap_or("<missing>")
-                ))
-            })?;
+            .find(|name| !name.is_empty());
+        let Some(agent) = agent else {
+            crate::logger::log_model_and_tool_data_warning(
+                "Item missing agent field, skipping",
+                || format!("Item missing agent field, skipping: {item_type}"),
+            );
+            return Ok(None);
+        };
         m.insert("agent".into(), Value::String(agent));
         for key in ["source_agent", "target_agent"] {
             if let Some(entry) = m.get(key).cloned()
@@ -1551,15 +1605,21 @@ fn run_item_from_wire(value: &Value) -> Result<RunItem> {
             }
         }
     }
-    serde_json::from_value(value.clone()).map_err(|e| {
-        AgentsError::user(format!(
-            "Run state has an unreadable item of type {}: {e}",
-            value
-                .get("type")
-                .and_then(Value::as_str)
-                .unwrap_or("<missing>")
-        ))
+    Ok(match serde_json::from_value(value) {
+        Ok(item) => Some(item),
+        Err(_) => {
+            log_skipped_item("Failed to deserialize item", &item_type);
+            None
+        }
     })
+}
+
+/// Warn about a skipped item. The item type is payload data, so it appears only when the model
+/// and tool data policies both allow it.
+fn log_skipped_item(redacted: &str, item_type: &str) {
+    crate::logger::log_model_and_tool_data_warning(redacted, || {
+        format!("{redacted}: item_type={item_type}")
+    });
 }
 
 fn interruption_to_wire(item: &ToolApprovalItem) -> Value {
@@ -1863,6 +1923,7 @@ fn processed_response_from_wire(value: &Value) -> Result<ProcessedResponseSnapsh
                     .iter()
                     .map(run_item_from_wire)
                     .collect::<Result<Vec<_>>>()
+                    .map(|items| items.into_iter().flatten().collect::<Vec<_>>())
             })
             .transpose()?
             .unwrap_or_default(),
@@ -2437,20 +2498,32 @@ pub(super) fn from_wire(value: &Value, version: &str) -> Result<RunState> {
             .get("tool_invocations")
             .and_then(Value::as_object)
             .is_some_and(|ledger| !ledger.is_empty());
-    let generated_items = value
+    // An item Python's reader skips keeps a placeholder here, so every index the snapshot
+    // records (turn start, ownership, saved counts) still lines up while the rest is read; the
+    // placeholders are removed, and those indexes remapped, once the state is built.
+    let mut keep_generated: Vec<bool> = Vec::new();
+    let mut generated_items: Vec<RunItem> = Vec::new();
+    for item in value
         .get("generated_items")
         .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter(|item| {
-                    !(drops_invalid_shell_output && is_invalid_local_shell_output_item(item))
-                })
-                .map(run_item_from_wire)
-                .collect::<Result<Vec<_>>>()
-        })
-        .transpose()?
-        .unwrap_or_default();
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+    {
+        let read = if drops_invalid_shell_output && is_invalid_local_shell_output_item(item) {
+            None
+        } else {
+            run_item_from_wire(item)?
+        };
+        keep_generated.push(read.is_some());
+        generated_items.push(read.unwrap_or_else(|| {
+            RunItem::new(
+                "",
+                crate::items::RunItemKind::Compaction {
+                    raw_item: Value::Null,
+                },
+            )
+        }));
+    }
 
     let interruptions: Vec<ToolApprovalItem> = value
         .get("current_step")
@@ -2656,6 +2729,7 @@ pub(super) fn from_wire(value: &Value, version: &str) -> Result<RunState> {
         // Set by `RunState::from_json` from the payload version, which this literal does not see.
         legacy_hook_identity_snapshot: false,
         legacy_name_owner_snapshot: false,
+        nested_history_lineage_unknown: false,
         hook_identity_ambiguous: false,
         agent_owner_names: owner_names_from_wire(value),
         ambiguous_agent_owners: Default::default(),
@@ -2705,7 +2779,9 @@ pub(super) fn from_wire(value: &Value, version: &str) -> Result<RunState> {
         current_response_boundary_unproven: !current_response_boundary_proven(value, version),
     };
     super::nested_history::check_generated_session_indexes(value);
-    state.nested_history_owned_items = super::nested_history::ownership_from_wire(value, &state)?;
+    state.nested_history_owned_items =
+        super::nested_history::ownership_from_wire(value, &state, &keep_generated)?;
+    state.remove_generated_items(&keep_generated);
     Ok(state)
 }
 

@@ -453,7 +453,45 @@ impl<C> From<bool> for NeedsApproval<C> {
 }
 
 /// Function converting a tool failure into a model-visible message.
-pub type ToolErrorFn<C> = Arc<dyn Fn(&RunContext<C>, &AgentsError) -> String + Send + Sync>;
+///
+/// Port of Python's `ToolErrorFunction`: the handler may await, and it may return an error,
+/// which aborts the run in place of the original failure (Python lets a formatter re-raise).
+/// Build one with [`tool_error_fn`] (plain closure), [`try_tool_error_fn`] (plain closure that
+/// may fail) or [`async_tool_error_fn`] (async).
+pub type ToolErrorFn<C> = Arc<
+    dyn for<'a> Fn(&'a RunContext<C>, &'a AgentsError) -> BoxFuture<'a, Result<String>>
+        + Send
+        + Sync,
+>;
+
+/// Wrap a synchronous closure that returns the message as a [`ToolErrorFn`].
+pub fn tool_error_fn<C, F>(f: F) -> ToolErrorFn<C>
+where
+    F: Fn(&RunContext<C>, &AgentsError) -> String + Send + Sync + 'static,
+{
+    async_tool_error_fn(move |ctx, error| Box::pin(std::future::ready(Ok(f(ctx, error)))))
+}
+
+/// Wrap a synchronous closure that may fail as a [`ToolErrorFn`]. An `Err` aborts the run with
+/// that error, as a Python formatter that re-raises does.
+pub fn try_tool_error_fn<C, F>(f: F) -> ToolErrorFn<C>
+where
+    F: Fn(&RunContext<C>, &AgentsError) -> Result<String> + Send + Sync + 'static,
+{
+    async_tool_error_fn(move |ctx, error| Box::pin(std::future::ready(f(ctx, error))))
+}
+
+/// Wrap an async closure as a [`ToolErrorFn`]. The closure returns a boxed future, usually
+/// `Box::pin(async move { ... })`; an `Err` aborts the run with that error.
+pub fn async_tool_error_fn<C, F>(f: F) -> ToolErrorFn<C>
+where
+    F: for<'a> Fn(&'a RunContext<C>, &'a AgentsError) -> BoxFuture<'a, Result<String>>
+        + Send
+        + Sync
+        + 'static,
+{
+    Arc::new(f)
+}
 
 /// What a function-tool custom-data extractor receives.
 /// Mirrors `agents.tool.FunctionToolCustomDataContext`.
@@ -570,7 +608,7 @@ pub(crate) fn shared_default_tool_error_function<C: 'static>() -> ToolErrorFn<C>
     cache
         .entry(TypeId::of::<C>())
         .or_insert_with(|| {
-            let f: ToolErrorFn<C> = Arc::new(default_tool_error_function::<C>);
+            let f: ToolErrorFn<C> = tool_error_fn(default_tool_error_function::<C>);
             Box::new(f)
         })
         .downcast_ref::<ToolErrorFn<C>>()
@@ -1104,7 +1142,7 @@ impl<C: Send + Sync + 'static> FunctionTool<C> {
             tool_input_guardrails: Vec::new(),
             tool_output_guardrails: Vec::new(),
             defer_loading: false,
-            failure_error_function: Some(Arc::new(default_tool_error_function::<C>)),
+            failure_error_function: Some(tool_error_fn(default_tool_error_function::<C>)),
             uses_default_failure_error_function: true,
             default_failure_error_function: true,
             timeout_error_function: None,
@@ -1233,7 +1271,14 @@ impl<C: Send + Sync + 'static> FunctionTool<C> {
     where
         F: Fn(&RunContext<C>, &AgentsError) -> String + Send + Sync + 'static,
     {
-        self.timeout_error_function = Some(Arc::new(f));
+        self.timeout_error_function = Some(tool_error_fn(f));
+        self
+    }
+
+    /// Customize the timeout message with a handler that may await or fail
+    /// (see [`ToolErrorFn`]).
+    pub fn with_timeout_error_handler(mut self, f: ToolErrorFn<C>) -> Self {
+        self.timeout_error_function = Some(f);
         self
     }
 
@@ -1246,7 +1291,16 @@ impl<C: Send + Sync + 'static> FunctionTool<C> {
         // (Python compares the handler's identity with `default_tool_error_function`).
         self.default_failure_error_function =
             std::any::TypeId::of::<F>() == type_id_of_val(&default_tool_error_function::<C>);
-        self.failure_error_function = Some(Arc::new(f));
+        self.failure_error_function = Some(tool_error_fn(f));
+        self.uses_default_failure_error_function = false;
+        self
+    }
+
+    /// Customize the model-visible message with a handler that may await or fail
+    /// (see [`ToolErrorFn`]). An `Err` from the handler aborts the run.
+    pub fn with_failure_error_handler(mut self, f: ToolErrorFn<C>) -> Self {
+        self.default_failure_error_function = false;
+        self.failure_error_function = Some(f);
         self.uses_default_failure_error_function = false;
         self
     }
@@ -1429,7 +1483,7 @@ impl<C> FunctionTool<C> {
             Err(error) if !self.uses_default_failure_error_function => {
                 match &self.failure_error_function {
                     Some(handler) => {
-                        let text = handler(&run_context, &error);
+                        let text = handler(&run_context, &error).await?;
                         self.validate_failure_text(&name, &text)?;
                         Ok(ToolOutput::Text(text))
                     }
