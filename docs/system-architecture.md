@@ -19,7 +19,7 @@ Last updated: 2026-10-29. Port of `openai-agents` (Python) 0.24.0.
 | MCP | `mcp` (feature `mcp`) | stdio, Streamable HTTP and legacy HTTP+SSE servers on `rmcp`, tool conversion |
 | Realtime | `realtime` (feature `realtime`) | Realtime agents, sessions, OpenAI realtime WebSocket model |
 | Voice | `voice` (feature `voice`) | Voice pipeline, OpenAI STT/TTS, single-agent workflow |
-| Sandbox | `sandbox` (feature `sandbox`) | Sandbox agents, manifests, capabilities, unix-local and Docker clients |
+| Sandbox | `sandbox` (feature `sandbox`) | Sandbox agents, manifests, capabilities, unix-local and Docker clients; opt-in host-side Docker removal service and `docker-removal-worker` binary (feature `docker-removal`, caller supplies root, never default) |
 | Macros | `openai-agents-sdk-macros` crate (feature `macros`) | `#[function_tool]` |
 | Extensions | `extensions`, `repl`, `testing` | Handoff filters and prompts, DOT visualization, tool output trimmer, Codex tool, LiteLLM/any-llm style providers, cloud sandbox providers (feature `sandbox`), hosted multi-agent (feature `websocket`), REPL, scripted `FakeModel` |
 

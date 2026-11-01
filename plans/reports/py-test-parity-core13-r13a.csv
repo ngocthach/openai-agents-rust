@@ -1,0 +1,8 @@
+path,moved_to_ported,moved_to_covered,remaining_python_only
+tests/extensions/sandbox/test_daytona.py,1,0,3
+tests/extensions/sandbox/test_e2b.py,1,0,5
+tests/extensions/sandbox/test_modal.py,0,0,24
+tests/extensions/sandbox/test_vercel.py,0,0,35
+tests/extensions/sandbox/test_vercel_provider_contract.py,1,0,3
+tests/extensions/memory/test_encrypt_session.py,0,0,14
+tests/test_agent_runner.py,0,0,20

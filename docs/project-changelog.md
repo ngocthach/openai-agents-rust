@@ -1,5 +1,60 @@
 # Changelog
 
+## 0.16.0 (2026-11-01)
+
+Persists provider options in sandbox session state, bounds E2B and Daytona PTY start, ports Python's Docker
+removal service behind an opt-in feature and re-reads the Python-only groups earlier rounds had carried over.
+187 more parity cases are ported. Measured state: 12,641 Python test cases, 8,902 ported, 724 covered, 3,015
+Python-only, 0 not ported, 0 unaccounted. Notes by area: `plans/reports/py-test-parity-core13-*.md`. No live
+model call was made.
+
+- Sessions: `AdvancedSqliteSession` runs appends, pops, usage writes and branch deletions in call order and each
+  keeps the branch (and clear generation) selected when it was called, so a concurrent `switch_to_branch` cannot
+  redirect an operation already queued. `store_run_usage` logs a failed write (`Failed to store session usage`,
+  error text only when model data may be logged) and returns `Ok`, as Python does; a failed `add_items` is
+  logged and still returned; creating a branch debug-logs its turn content only when model data may be logged.
+- MCP: a request or handshake that outlives the HTTP read timeout reports `Connection timeout.`, and a
+  connection refused mid-session reports `Connection lost.`, instead of a bare `Request failed.`; the class is
+  read from the `reqwest` error behind the transport failure.
+- Sandbox: opt-in feature `docker-removal` ports Python's `DockerRemovalService`. A trusted host process pauses a
+  private rootful Linux container, pins the workspace and read-only grant roots through a worker that enters the
+  container's mount namespace, authorizes the target against the live bindings and removes it as the requested
+  user, with the same request shapes and `docker_removal_*` error reasons. Configure it with
+  `DockerSandboxClient::with_removal_service`. The library never escalates: the caller runs the process as root on
+  the Docker host and points the service at the `docker-removal-worker` executable (feature-gated binary, one
+  worker process per container and a sibling child per removal, since the crate forbids `fork`). With the
+  service, `docker create` omits `-w` so the daemon does not create a root-owned workspace. Without the feature
+  nothing changes.
+- Sandbox state: Vercel runtime, resources, timeouts and network policy, Modal builder version, idle timeout and
+  resources, and the E2B MCP shape are stored under `provider_metadata.provider_options` with serde defaults, and
+  each client's `resume` layers the record under its own options; old states still read. The persisted E2B MCP
+  shape is credential-free on purpose (server names and non-secret options only, URLs without userinfo, query or
+  fragment; options whose name looks secret are dropped), so the resuming client supplies secrets; Python
+  persists the full config.
+- `PtyExecRequest` has `timeout` and `with_timeout`; E2B sends it as the process lifetime and bounds a stalled
+  start, and Daytona bounds each start step (an elapsed step is `ExecTimeout` and deletes the half-created
+  session). Other providers ignore it.
+- A detached session write that fails after a dropped output-guardrail run is logged under the redaction policy
+  and, when the run has a `RunCheckpoint`, recorded there as a pending session write so a resume settles it;
+  `SessionRunContext::detach()` owns a copy so a context-scoped `EncryptedSession` append is shielded from a
+  dropped caller.
+
+Breaking changes: `PtyExecRequest` has a new public field; persisted sandbox states carry a new
+`provider_options` entry; `AdvancedSqliteSession::store_run_usage` returns `Ok` after logging a failed write;
+MCP failure messages changed (`Connection timeout.`, `Connection lost.`).
+
+Known gaps (real differences): the `docker-removal` feature's privileged Linux paths (entering the container's
+mount namespace, dropping to the requested user) are type-checked for Linux but have never run against a real
+container and need a smoke test on a Linux Docker 26+ host as root, and the feature is excluded from the docs.rs
+build for the same reason; four Docker removal cases (`BaseException` cancellation, broken-pipe `close()` on mock
+streams, `ExitStack` registration failure, `KeyboardInterrupt`) stay Python-only; Redis Cluster is not supported
+(Python accepts `RedisCluster` for reads and pops); persisted state omits `interactive`, `env`, `metadata`, E2B
+`timeouts` and `template`, and Vercel `project_id` and `team_id`; the detached guardrail write never reports to
+the dropped caller, and a run without a checkpoint leaves only a log line; Rust cannot detect a custom
+`Deserialize`, so a dynamic approval rule is consulted unless the tool opts in with
+`with_args_have_validators`; docs.rs builds without the `mongodb` feature; the websocket crate logs handshake
+data at TRACE through the `log` crate; the Redis atomic replace has only run against a mock.
+
 ## 0.15.0 (2026-11-01)
 
 Reads in full the groups where the round-11 random audit found invalid Python-only reasons (provider and model
