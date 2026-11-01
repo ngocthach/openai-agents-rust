@@ -923,9 +923,9 @@ async fn sandbox_handoff_targets_get_their_own_capability_tools() {
 }
 
 #[tokio::test]
-async fn rejects_duplicate_agent_names_in_the_handoff_graph() {
-    // Two distinct agents sharing a name: a resumed run identifies the current agent by name,
-    // so it could not tell them apart.
+async fn duplicate_agent_names_get_identity_keys_in_the_handoff_graph() {
+    // Two distinct agents sharing a name are told apart by identity: the first keeps the name,
+    // the second is keyed `Twin#2`.
     let model = setup();
     let first = Arc::new(
         SandboxAgent::<()>::new("Twin")
@@ -941,9 +941,9 @@ async fn rejects_duplicate_agent_names_in_the_handoff_graph() {
         .with_model_instance(model)
         .with_sandbox_handoff(first)
         .with_sandbox_handoff(second);
-    let config = SandboxRunConfig::with_client(Arc::new(UnixLocalSandboxClient::new()));
-    let err = SandboxRunner::run(&agent, "hi", &config).await.unwrap_err();
-    assert!(err.to_string().contains("two agents named `Twin`"), "{err}");
+    let mut names = agent.graph_agent_names().unwrap();
+    names.sort();
+    assert_eq!(names, ["Coordinator", "Twin", "Twin#2"]);
 }
 
 #[tokio::test]

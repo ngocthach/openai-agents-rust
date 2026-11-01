@@ -369,7 +369,8 @@ async fn legacy_root_priority_does_not_depend_on_hook_state() {
     let graph = build_graph(&effects, &layout);
     let mut restored = RunState::from_json(payload).unwrap();
     let pending = restored.get_interruptions()[0].clone();
-    assert_eq!(pending.agent, "sub");
+    // The parked approval belongs to the non-root `sub`, named by its identity key.
+    assert_eq!(pending.agent, "sub#2");
     restored.approve(&pending, true);
     let resumed = run_graph(&graph.root, restored, false).await.unwrap();
     assert!(Arc::ptr_eq(&resumed.last_agent, &graph.y));
