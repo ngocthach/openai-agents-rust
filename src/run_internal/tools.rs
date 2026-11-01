@@ -144,6 +144,10 @@ pub(crate) enum ToolOutcome {
 pub(crate) struct ToolFailure {
     pub error: AgentsError,
     pub committed: Option<ToolExecResult>,
+    /// The committed output is part of the public history even though the call failed: set when
+    /// an end hook failed after the output passed its guardrails, as in Python. Otherwise a
+    /// failure after the output (a custom data merge) keeps it out of the public view.
+    pub output_is_public: bool,
 }
 
 impl From<AgentsError> for ToolFailure {
@@ -151,6 +155,7 @@ impl From<AgentsError> for ToolFailure {
         ToolFailure {
             error,
             committed: None,
+            output_is_public: false,
         }
     }
 }
@@ -517,12 +522,22 @@ pub(crate) async fn execute_function_tool<C: Send + Sync + 'static>(
         // retry of the outer call resumes it instead of repeating anything.
         if !continues_nested_run {
             env.ctx.mark_invocation_executed(&call.call_id);
-            if let Some(h) = env.hooks {
-                h.on_tool_start(&tool_ctx, env.agent, &tool_enum).await;
-            }
-            if let Some(h) = &env.agent.hooks {
-                h.on_tool_start(&tool_ctx, env.agent, &tool_enum).await;
-            }
+            let run_hook = async {
+                match env.hooks {
+                    Some(h) => h.try_on_tool_start(&tool_ctx, env.agent, &tool_enum).await,
+                    None => Ok(()),
+                }
+            };
+            let agent_hook = async {
+                match &env.agent.hooks {
+                    Some(h) => h.try_on_tool_start(&tool_ctx, env.agent, &tool_enum).await,
+                    None => Ok(()),
+                }
+            };
+            // Both hook sets run, and the first failure (run hooks first) fails the call.
+            let (run_hook, agent_hook) = futures::join!(run_hook, agent_hook);
+            run_hook?;
+            agent_hook?;
         }
 
         // A failure or timeout that the tool's error function turned into model text is not the
@@ -706,14 +721,27 @@ pub(crate) async fn execute_function_tool<C: Send + Sync + 'static>(
             input_results.clone(),
             output_results.clone(),
         ));
-        if let Some(h) = env.hooks {
-            h.on_tool_end(&tool_ctx, env.agent, &tool_enum, &output)
-                .await;
-        }
-        if let Some(h) = &env.agent.hooks {
-            h.on_tool_end(&tool_ctx, env.agent, &tool_enum, &output)
-                .await;
-        }
+        let run_hook = async {
+            match env.hooks {
+                Some(h) => {
+                    h.try_on_tool_end(&tool_ctx, env.agent, &tool_enum, &output)
+                        .await
+                }
+                None => Ok(()),
+            }
+        };
+        let agent_hook = async {
+            match &env.agent.hooks {
+                Some(h) => {
+                    h.try_on_tool_end(&tool_ctx, env.agent, &tool_enum, &output)
+                        .await
+                }
+                None => Ok(()),
+            }
+        };
+        let (run_hook, agent_hook) = futures::join!(run_hook, agent_hook);
+        run_hook?;
+        agent_hook?;
         Ok(make_outcome(output))
     };
     let outcome = scope::with_span(span.clone(), Box::pin(run)).await;
@@ -741,11 +769,21 @@ pub(crate) async fn execute_function_tool<C: Send + Sync + 'static>(
     span.finish();
     // A failure that is not an SDK error surfaces as a `UserError` naming the tool, like
     // Python's `UserError(f"Error running tool {name}: {e}")`.
-    let outcome = outcome.map_err(|e| match e {
-        AgentsError::Other(_) | AgentsError::Json(_) | AgentsError::Io(_) => {
-            AgentsError::user(format!("Error running tool {}: {e}", tool.name))
+    // An end hook that fails after the output was committed still hands the output back, so a
+    // retry skips the completed invocation.
+    let outcome = outcome.map_err(|e| {
+        let error = match e {
+            AgentsError::Other(_) | AgentsError::Json(_) | AgentsError::Io(_) => {
+                AgentsError::user(format!("Error running tool {}: {e}", tool.name))
+            }
+            other => other,
+        };
+        let committed = ctl.take_committed();
+        ToolFailure {
+            output_is_public: committed.is_some(),
+            error,
+            committed,
         }
-        other => other,
     })?;
     // SDK-only data the tool body attached plus whatever the extractor produces; the
     // extractor wins on conflicting keys. Port of `maybe_extract_custom_data` +
@@ -770,6 +808,7 @@ pub(crate) async fn execute_function_tool<C: Send + Sync + 'static>(
             return Err(ToolFailure {
                 error,
                 committed: Some(finish(outcome, input_results, output_results)),
+                output_is_public: false,
             });
         }
     };
@@ -894,7 +933,7 @@ pub(crate) async fn execute_function_tools<C: Send + Sync + 'static>(
                 }
             }
             TaskEnd::Done(Err(failure)) => {
-                let committed = failure.committed.is_some();
+                let committed = failure.committed.is_some() && !failure.output_is_public;
                 results.extend(failure.committed.map(|c| (order, c)));
                 chosen = Some((order, failure.error, committed));
                 break;
@@ -928,7 +967,7 @@ pub(crate) async fn execute_function_tools<C: Send + Sync + 'static>(
         match end {
             TaskEnd::Done(Ok(result)) => results.push((order, result)),
             TaskEnd::Done(Err(other)) => {
-                let committed = other.committed.is_some();
+                let committed = other.committed.is_some() && !other.output_is_public;
                 results.extend(other.committed.map(|c| (order, c)));
                 if chosen.as_ref().is_none_or(|c| order < c.0) {
                     chosen = Some((order, other.error, committed));

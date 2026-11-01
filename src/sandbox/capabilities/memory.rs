@@ -16,6 +16,17 @@ use crate::sandbox::util::truncate_text_by_tokens;
 /// Token budget of the memory summary injected into the agent instructions.
 pub const MEMORY_SUMMARY_MAX_TOKENS: usize = 15_000;
 
+struct ManagerEntry {
+    session_key: usize,
+    session: std::sync::Weak<dyn crate::sandbox::session::SandboxSession>,
+    layout: MemoryLayoutConfig,
+    generate: MemoryGenerateConfig,
+    manager: Arc<SandboxMemoryGenerationManager>,
+}
+
+/// The managers of live sessions, one per (session, layout).
+static MEMORY_MANAGERS: std::sync::Mutex<Vec<ManagerEntry>> = std::sync::Mutex::new(Vec::new());
+
 /// Reads and generates sandbox memory artifacts for an agent.
 ///
 /// [`Shell`](crate::sandbox::Shell) is required for memory reads, and
@@ -106,6 +117,86 @@ impl Memory {
                 generate.clone(),
             )?))),
         }
+    }
+
+    /// The memory generation manager scoped to `session` and this layout, created when absent.
+    ///
+    /// A session can host several generating `Memory` capabilities when they use different
+    /// layouts; capabilities that share a layout (and the same generate config) share one
+    /// manager. A second capability with a different generate config for the same layout, or
+    /// reusing another layout's `memories_dir` or `sessions_dir`, is refused. Returns `None`
+    /// when generation is disabled. Mirrors `get_or_create_memory_generation_manager`.
+    pub fn manager_for_session(
+        &self,
+        session: &Arc<dyn crate::sandbox::session::SandboxSession>,
+    ) -> Result<Option<Arc<SandboxMemoryGenerationManager>>> {
+        self.validate()?;
+        let Some(generate) = &self.generate else {
+            return Ok(None);
+        };
+        let mut registry = MEMORY_MANAGERS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        registry.retain(|entry| entry.session.strong_count() > 0);
+        let key = Arc::as_ptr(session) as *const () as usize;
+        let mine =
+            |entry: &ManagerEntry| entry.session_key == key && entry.session.strong_count() > 0;
+        if let Some(existing) = registry
+            .iter()
+            .find(|entry| mine(entry) && entry.layout == self.layout)
+        {
+            if existing.generate != *generate {
+                return Err(crate::error::AgentsError::user(
+                    "Sandbox session already has a different Memory generation config attached \
+                     for this memory layout.",
+                ));
+            }
+            return Ok(Some(existing.manager.clone()));
+        }
+        for existing in registry.iter().filter(|entry| mine(entry)) {
+            if existing.layout.memories_dir == self.layout.memories_dir {
+                return Err(crate::error::AgentsError::user(format!(
+                    "Sandbox session already has a Memory generation capability for \
+                     memories_dir={:?}. Use a different memories_dir for isolated memories, or \
+                     the same layout to share memory.",
+                    self.layout.memories_dir
+                )));
+            }
+            if existing.layout.sessions_dir == self.layout.sessions_dir {
+                return Err(crate::error::AgentsError::user(format!(
+                    "Sandbox session already has a Memory generation capability for \
+                     sessions_dir={:?}. Use a different sessions_dir for isolated memories, or \
+                     the same layout to share memory.",
+                    self.layout.sessions_dir
+                )));
+            }
+        }
+        let manager = Arc::new(SandboxMemoryGenerationManager::new(
+            self.layout.clone(),
+            generate.clone(),
+        )?);
+        registry.push(ManagerEntry {
+            session_key: key,
+            session: Arc::downgrade(session),
+            layout: self.layout.clone(),
+            generate: generate.clone(),
+            manager: manager.clone(),
+        });
+        Ok(Some(manager))
+    }
+
+    /// Forget `manager` for `session`, as the session closes. Other layouts stay registered.
+    pub fn unregister_manager(
+        session: &Arc<dyn crate::sandbox::session::SandboxSession>,
+        manager: &SandboxMemoryGenerationManager,
+    ) {
+        let key = Arc::as_ptr(session) as *const () as usize;
+        MEMORY_MANAGERS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .retain(|entry| {
+                !(entry.session_key == key && std::ptr::eq(Arc::as_ptr(&entry.manager), manager))
+            });
     }
 
     /// The memory file layout.

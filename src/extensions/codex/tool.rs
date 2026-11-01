@@ -865,7 +865,14 @@ async fn process_events<C: Send + Sync + 'static>(
             });
         }
         match event {
-            ThreadEvent::ThreadStarted { thread_id } => state.thread_id = Some(thread_id),
+            ThreadEvent::ThreadStarted { thread_id } => {
+                // Persist right away: a sibling tool call that fails drops this future, and the
+                // turn must still be resumable from the thread it started.
+                if let Some(store) = &config.thread_id_store {
+                    (store.set)(ctx.context(), &thread_id);
+                }
+                state.thread_id = Some(thread_id);
+            }
             ThreadEvent::ItemStarted { item } => start_item_span(config, policy, spans, &item),
             ThreadEvent::ItemUpdated { item } => update_item_span(config, policy, spans, &item),
             ThreadEvent::ItemCompleted { item } => {

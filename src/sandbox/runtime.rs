@@ -674,12 +674,15 @@ impl SandboxRunner {
             let _ = guard.close().await;
             return Err(error);
         }
-        let binding = CapabilityBinding::new(session)
+        let binding = CapabilityBinding::new(session.clone())
             .with_run_as(agent.run_as.clone())
             .with_scope(scope.clone());
         // One manager per session, so reusing an agent across sessions or concurrent runs never
         // shares rollout state or latches generation off.
-        let memory_manager = match agent.memory_capability().map(|m| m.build_manager()) {
+        let memory_manager = match agent
+            .memory_capability()
+            .map(|m| m.manager_for_session(&session))
+        {
             None => None,
             Some(Ok(manager)) => manager,
             Some(Err(error)) => {

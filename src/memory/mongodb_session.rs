@@ -6,7 +6,9 @@ use std::fmt;
 use async_trait::async_trait;
 use futures::TryStreamExt;
 use mongodb::bson::{Bson, DateTime, Document, doc};
-use mongodb::options::{IndexOptions, ReadPreference, ReturnDocument, SelectionCriteria};
+use mongodb::options::{
+    ClientOptions, DriverInfo, IndexOptions, ReadPreference, ReturnDocument, SelectionCriteria,
+};
 use mongodb::{Client, Collection, IndexModel};
 use tokio::sync::OnceCell;
 
@@ -21,6 +23,15 @@ pub const DEFAULT_MESSAGES_COLLECTION: &str = "agent_messages";
 
 fn mongo_err(e: mongodb::error::Error) -> AgentsError {
     AgentsError::other(format!("MongoDB error: {e}"))
+}
+
+/// The wrapping-library identity sent in the connection handshake, as the Python session does
+/// (`DriverInfo(name="openai-agents", ...)`).
+fn driver_info() -> DriverInfo {
+    DriverInfo::builder()
+        .name("openai-agents")
+        .version(env!("CARGO_PKG_VERSION").to_string())
+        .build()
 }
 
 /// The filter matching the active history generation.
@@ -82,12 +93,21 @@ impl MongoDBSession {
         uri: &str,
         database: &str,
     ) -> Result<Self> {
-        let client = Client::with_uri_str(uri).await.map_err(mongo_err)?;
+        let mut options = ClientOptions::parse(uri).await.map_err(mongo_err)?;
+        // A caller-supplied driver identity in the URI options is kept, not replaced.
+        if options.driver_info.is_none() {
+            options.driver_info = Some(driver_info());
+        }
+        let client = Client::with_options(options).map_err(mongo_err)?;
         Ok(Self::with_client(session_id, &client, database))
     }
 
     /// Use a client the application already manages.
     pub fn with_client(session_id: impl Into<String>, client: &Client, database: &str) -> Self {
+        // Identify this library in the handshake of a caller-supplied client. Appending is
+        // idempotent, and a client that already handshook keeps its metadata, so a failure here
+        // is not an error.
+        let _ = client.append_metadata(driver_info());
         let db = client.database(database);
         MongoDBSession {
             session_id: session_id.into(),

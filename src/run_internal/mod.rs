@@ -1209,6 +1209,8 @@ pub(crate) async fn run_loop<C: Send + Sync + 'static>(
         turn_tool_output_guardrail_start: 0,
     };
     lp.reasoning_item_id_policy = lp.config.reasoning_item_id_policy;
+    lp.server_conversation
+        .set_omit_reasoning_item_ids(lp.reasoning_item_id_policy == ReasoningItemIdPolicy::Omit);
 
     // Python validates these when the `RunConfig` is built; Rust's config is a plain struct,
     // so the run rejects them before anything else happens.
@@ -1959,6 +1961,9 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
         {
             self.reasoning_item_id_policy = policy;
         }
+        self.server_conversation.set_omit_reasoning_item_ids(
+            self.reasoning_item_id_policy == ReasoningItemIdPolicy::Omit,
+        );
         self.resume_pending_tools = state.pending_tool_processing;
         // Carried so a snapshot taken before the resumed turn re-executes still names the
         // tools the parked response asked for; `process_response` replaces it.
@@ -2101,9 +2106,23 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
         if self.failed_after_output {
             tool_output_results.truncate(self.turn_tool_output_guardrail_start);
         }
+        // Outputs a failed resumed turn committed stay in the checkpoint but are not public while
+        // the output guardrails could still reject them as the run's final output.
+        let mut new_items = self.generated_items.clone();
+        if self.turn_in_flight && self.output_guardrails_gate_applies() {
+            let from = self.exec_outputs_start.min(new_items.len());
+            let mut index = from;
+            while index < new_items.len() {
+                if matches!(new_items[index].kind, RunItemKind::ToolCallOutput { .. }) {
+                    new_items.remove(index);
+                } else {
+                    index += 1;
+                }
+            }
+        }
         RunErrorDetails {
             input: self.original_input.clone(),
-            new_items: self.generated_items.clone(),
+            new_items,
             raw_responses: self.model_responses.clone(),
             last_agent: self.current_agent.name.clone(),
             usage: self.ctx.usage(),
@@ -2425,7 +2444,7 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
                 self.current_turn += 1;
                 // Python's turn order: agent-start hooks, tools, prompt, then handoffs, so an
                 // `is_enabled` check sees what the hooks and a dynamic prompt set up.
-                self.run_agent_start_hooks().await;
+                self.run_agent_start_hooks().await?;
                 let tools = self.current_agent.get_all_tools(&self.ctx).await?;
                 // Instructions and prompt resolve concurrently; a failure cancels the other.
                 let (prompt, system_prompt) = futures::try_join!(
@@ -2610,12 +2629,21 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
                 self.save_session().await?;
                 let (output, item) = self.synthesize_handler_output(&res)?;
                 let agent = self.current_agent.clone();
-                if let Some(h) = &self.hooks {
-                    h.on_agent_end(&self.ctx, &agent, &output).await;
-                }
-                if let Some(h) = &agent.hooks {
-                    h.on_end(&self.ctx, &agent, &output).await;
-                }
+                join_hook_results(
+                    async {
+                        match &self.hooks {
+                            Some(h) => h.try_on_agent_end(&self.ctx, &agent, &output).await,
+                            None => Ok(()),
+                        }
+                    },
+                    async {
+                        match &agent.hooks {
+                            Some(h) => h.try_on_end(&self.ctx, &agent, &output).await,
+                            None => Ok(()),
+                        }
+                    },
+                )
+                .await?;
                 match self.run_final_output_guardrails(&agent, &output).await {
                     Ok(None) => {}
                     Ok(Some((tripped, _))) => {
@@ -2779,6 +2807,56 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
 
     async fn finish_with_output(&mut self, output: Value) -> Result<RunResult<C>> {
         let agent = self.current_agent.clone();
+        let agent_end = join_hook_results(
+            async {
+                match &self.hooks {
+                    Some(h) => h.try_on_agent_end(&self.ctx, &agent, &output).await,
+                    None => Ok(()),
+                }
+            },
+            async {
+                match &agent.hooks {
+                    Some(h) => h.try_on_end(&self.ctx, &agent, &output).await,
+                    None => Ok(()),
+                }
+            },
+        )
+        .await;
+        if let Err(e) = agent_end {
+            // The final message was never delivered: it is withheld from the history and the
+            // failure's run data, while the turn's tool calls and outputs stay, as in Python.
+            let turn_start = self.turn_start.min(self.generated_items.len());
+            let guarded_terminal = self.output_guardrails_gate_applies()
+                && !self.recovered_tool_outputs
+                && self.generated_items[turn_start..]
+                    .iter()
+                    .any(|i| matches!(i.kind, RunItemKind::ToolCallOutput { .. }));
+            if guarded_terminal {
+                // The terminal tool output never reached its output guardrails: the whole turn
+                // stays out of history and of the failure's run data.
+                self.generated_items.truncate(turn_start);
+                self.session_saved_items = self.session_saved_items.min(turn_start);
+                self.deferred_tool_events.clear();
+            } else {
+                // The outputs stay in history, so their announcements are not held back.
+                self.release_tool_events();
+            }
+            let mut index = turn_start;
+            while index < self.generated_items.len() {
+                if matches!(
+                    self.generated_items[index].kind,
+                    RunItemKind::MessageOutput { .. }
+                ) {
+                    self.generated_items.remove(index);
+                } else {
+                    index += 1;
+                }
+            }
+            if let Err(save) = self.save_session().await {
+                return Err(e.redact_follow_up(save));
+            }
+            return Err(e);
+        }
         let results_before = self.output_guardrail_results.len();
         match self.run_final_output_guardrails(&agent, &output).await {
             Ok(None) => self.release_tool_events(),
@@ -2802,12 +2880,6 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
                 }
                 return Err(e);
             }
-        }
-        if let Some(h) = &self.hooks {
-            h.on_agent_end(&self.ctx, &agent, &output).await;
-        }
-        if let Some(h) = &agent.hooks {
-            h.on_end(&self.ctx, &agent, &output).await;
         }
         self.terminal_marker = true;
         self.save_session().await?;
@@ -3695,21 +3767,30 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
 
     /// Run the agent-start hooks once per agent activation. Port of the
     /// `should_run_agent_start_hooks` block of `run_single_turn`.
-    async fn run_agent_start_hooks(&mut self) {
+    async fn run_agent_start_hooks(&mut self) -> Result<()> {
         if !self.should_run_agent_start_hooks {
-            return;
+            return Ok(());
         }
         self.should_run_agent_start_hooks = false;
         let agent = self.current_agent.clone();
         // The agent-start hooks see the run input, as `context_wrapper.turn_input` does in
         // Python; the model input replaces it once it has been built.
         self.ctx.set_turn_input(self.original_input.clone());
-        if let Some(h) = &self.hooks {
-            h.on_agent_start(&self.ctx, &agent).await;
-        }
-        if let Some(h) = &agent.hooks {
-            h.on_start(&self.ctx, &agent).await;
-        }
+        join_hook_results(
+            async {
+                match &self.hooks {
+                    Some(h) => h.try_on_agent_start(&self.ctx, &agent).await,
+                    None => Ok(()),
+                }
+            },
+            async {
+                match &agent.hooks {
+                    Some(h) => h.try_on_start(&self.ctx, &agent).await,
+                    None => Ok(()),
+                }
+            },
+        )
+        .await
     }
 
     async fn run_turn(
@@ -3718,7 +3799,7 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
         handoffs: Vec<Handoff<C>>,
     ) -> Result<NextStep<C>> {
         let agent = self.current_agent.clone();
-        self.run_agent_start_hooks().await;
+        self.run_agent_start_hooks().await?;
 
         self.turn_start = self.generated_items.len();
         self.turn_tool_input_guardrail_start = self.tool_input_guardrail_results.len();
@@ -3881,14 +3962,27 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
             prompt,
         };
 
-        if let Some(h) = &self.hooks {
-            h.on_llm_start(&self.ctx, &agent, instructions.as_deref(), &input)
-                .await;
-        }
-        if let Some(h) = &agent.hooks {
-            h.on_llm_start(&self.ctx, &agent, instructions.as_deref(), &input)
-                .await;
-        }
+        join_hook_results(
+            async {
+                match &self.hooks {
+                    Some(h) => {
+                        h.try_on_llm_start(&self.ctx, &agent, instructions.as_deref(), &input)
+                            .await
+                    }
+                    None => Ok(()),
+                }
+            },
+            async {
+                match &agent.hooks {
+                    Some(h) => {
+                        h.try_on_llm_start(&self.ctx, &agent, instructions.as_deref(), &input)
+                            .await
+                    }
+                    None => Ok(()),
+                }
+            },
+        )
+        .await?;
 
         // Every model call of this run runs under the run's owner id, so a model that keeps
         // per-run state can tell this run's calls from another's. Port of
@@ -3984,11 +4078,30 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
             }
             return Err(e);
         }
-        if let Some(h) = &self.hooks {
-            h.on_llm_end(&self.ctx, &agent, &response).await;
-        }
-        if let Some(h) = &agent.hooks {
-            h.on_llm_end(&self.ctx, &agent, &response).await;
+        let llm_end = join_hook_results(
+            async {
+                match &self.hooks {
+                    Some(h) => h.try_on_llm_end(&self.ctx, &agent, &response).await,
+                    None => Ok(()),
+                }
+            },
+            async {
+                match &agent.hooks {
+                    Some(h) => h.try_on_llm_end(&self.ctx, &agent, &response).await,
+                    None => Ok(()),
+                }
+            },
+        )
+        .await;
+        if let Err(e) = llm_end {
+            // The response was delivered before its end hooks ran, so the failed run checkpoints
+            // as a turn that resumes by processing it, without another model call or end hooks.
+            self.model_responses.push(response.clone());
+            if self.server_managed() {
+                self.accept_server_response(&response, &sent_input);
+            }
+            self.turn_in_flight = true;
+            return Err(e);
         }
         self.model_responses.push(response.clone());
         self.compaction_exchange = Some((
@@ -4013,17 +4126,23 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
             }
         };
         if self.server_managed() {
-            self.server_input_sent = true;
-            if (self.auto_previous_response_id || self.previous_response_id.is_some())
-                && let Some(id) = &response.response_id
-            {
-                self.previous_response_id = Some(id.clone());
-            }
-            self.server_conversation.mark_input_as_sent(&sent_input);
-            self.server_conversation.track_server_items(&response);
-            self.server_sent_items = self.model_items.len();
+            self.accept_server_response(&response, &sent_input);
         }
         Box::pin(self.execute_side_effects(&agent, processed)).await
+    }
+
+    /// Record that a server-managed response was accepted: the input it answered counts as sent
+    /// and the conversation continues from its id.
+    fn accept_server_response(&mut self, response: &ModelResponse, sent_input: &[InputItem]) {
+        self.server_input_sent = true;
+        if (self.auto_previous_response_id || self.previous_response_id.is_some())
+            && let Some(id) = &response.response_id
+        {
+            self.previous_response_id = Some(id.clone());
+        }
+        self.server_conversation.mark_input_as_sent(sent_input);
+        self.server_conversation.track_server_items(response);
+        self.server_sent_items = self.model_items.len();
     }
 
     /// Check each resumed approval against the call the re-processed response queues for the same
@@ -5489,9 +5608,10 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
                 RunItemKind::ToolCall { .. } | RunItemKind::HandoffCall { .. }
             )
         });
-        let resumed = turn
-            .iter()
-            .any(|i| matches!(i.kind, RunItemKind::ToolApproval { .. }));
+        let resumed = !self.resumed_interruptions.is_empty()
+            || turn
+                .iter()
+                .any(|i| matches!(i.kind, RunItemKind::ToolApproval { .. }));
         if !called_tools || resumed || self.server_managed() {
             return;
         }
@@ -6293,13 +6413,22 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
         );
         self.push_item(output_item, Some(RunItemStreamEventName::HandoffOccured));
 
-        if let Some(h) = &self.hooks {
-            h.on_handoff(&self.ctx, agent, &new_agent).await;
-        }
         // Python calls the source agent's own hooks with `agent=new_agent, source=agent`.
-        if let Some(h) = &agent.hooks {
-            h.on_handoff(&self.ctx, &new_agent, agent).await;
-        }
+        join_hook_results(
+            async {
+                match &self.hooks {
+                    Some(h) => h.try_on_handoff(&self.ctx, agent, &new_agent).await,
+                    None => Ok(()),
+                }
+            },
+            async {
+                match &agent.hooks {
+                    Some(h) => h.try_on_handoff(&self.ctx, &new_agent, agent).await,
+                    None => Ok(()),
+                }
+            },
+        )
+        .await?;
 
         let filter = handoff
             .input_filter
@@ -6571,4 +6700,14 @@ pub(crate) async fn race_output_guardrails<C: Send + Sync + 'static>(
         }
     }
     (completed, Ok(()))
+}
+
+/// Run the run-level and the agent-level hook of one lifecycle event together, as Python's
+/// `asyncio.gather` does: both always run, and the run-level failure wins over the agent's.
+async fn join_hook_results(
+    run_hook: impl std::future::Future<Output = Result<()>>,
+    agent_hook: impl std::future::Future<Output = Result<()>>,
+) -> Result<()> {
+    let (run_hook, agent_hook) = futures::join!(run_hook, agent_hook);
+    run_hook.and(agent_hook)
 }

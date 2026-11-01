@@ -112,16 +112,27 @@ pub async fn aclose_session(session: &Arc<dyn SandboxSession>) -> SandboxResult<
     if let Err(error) = run_pre_stop_hooks(session).await {
         first = Some(error);
     }
-    // A failed capture or stop skips the shutdown, as Python's single `try` does; a failed
+    // A failed capture or stop skips the shutdown, as Python's single `try` does, unless the
+    // backend asks for it (credentialed mounts must not outlive a failed close); a failed
     // pre-stop hook skips only the capture and the stop.
-    let torn_down = async {
-        if first.is_none() && !lifecycle.failed.load(Ordering::SeqCst) {
+    let torn_down = if first.is_none() && !lifecycle.failed.load(Ordering::SeqCst) {
+        let stopped = async {
             persist_session_snapshot(session.as_ref()).await?;
-            session.stop().await?;
+            session.stop().await
         }
+        .await;
+        match stopped {
+            Ok(()) => session.shutdown().await,
+            Err(error) => {
+                if session.shutdown_after_failed_close() {
+                    let _ = session.shutdown().await;
+                }
+                Err(error)
+            }
+        }
+    } else {
         session.shutdown().await
-    }
-    .await;
+    };
     if let Err(error) = torn_down
         && first.is_none()
     {

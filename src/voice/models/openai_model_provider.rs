@@ -13,17 +13,76 @@ pub const DEFAULT_STT_MODEL: &str = "gpt-transcribe";
 /// The text-to-speech model used when none is given.
 pub const DEFAULT_TTS_MODEL: &str = "gpt-4o-mini-tts";
 
-/// A voice model provider backed by the OpenAI API.
+/// The options that build the provider's own client, as Python's constructor stores them.
 #[derive(Debug, Clone, Default)]
+struct ClientOptions {
+    api_key: Option<String>,
+    base_url: Option<String>,
+    organization: Option<String>,
+    project: Option<String>,
+}
+
+impl ClientOptions {
+    /// Python's `_get_client`: with no explicit option the process default client wins;
+    /// otherwise a client is built from the environment and the explicit options.
+    fn resolve(&self) -> OpenAIClient {
+        let explicit = self.api_key.is_some()
+            || self.base_url.is_some()
+            || self.organization.is_some()
+            || self.project.is_some();
+        if !explicit && let Some(client) = crate::models::get_default_openai_client() {
+            return client;
+        }
+        let mut client = OpenAIClient::from_env();
+        // A missing key falls back to the process default key when the client is used.
+        if let Some(key) = &self.api_key {
+            client = client.with_api_key(key.clone());
+        }
+        if let Some(base_url) = &self.base_url {
+            client = client.with_base_url(base_url.clone());
+        }
+        if let Some(organization) = &self.organization {
+            client = client.with_organization(organization.clone());
+        }
+        if let Some(project) = &self.project {
+            client = client.with_project(project.clone());
+        }
+        client
+    }
+}
+
+/// A voice model provider backed by the OpenAI API.
+///
+/// Without an explicit client the provider uses the default client set with
+/// `set_default_openai_client`, or builds one from the environment, the explicit options and the
+/// default key. Python resolves this lazily on first use; Rust resolves it when the provider is
+/// built, so set the defaults first.
+#[derive(Debug, Clone)]
 pub struct OpenAIVoiceModelProvider {
     client: OpenAIClient,
+    explicit_client: bool,
+    options: ClientOptions,
     http: Option<reqwest::Client>,
     agent_harness_id: Option<String>,
     websocket: VoiceWebSocketOptions,
 }
 
+impl Default for OpenAIVoiceModelProvider {
+    fn default() -> Self {
+        let options = ClientOptions::default();
+        OpenAIVoiceModelProvider {
+            client: options.resolve(),
+            explicit_client: false,
+            options,
+            http: None,
+            agent_harness_id: None,
+            websocket: VoiceWebSocketOptions::default(),
+        }
+    }
+}
+
 impl OpenAIVoiceModelProvider {
-    /// A provider using a client configured from the environment.
+    /// A provider using the default client, or one configured from the environment.
     pub fn new() -> Self {
         Self::default()
     }
@@ -31,18 +90,51 @@ impl OpenAIVoiceModelProvider {
     /// Use this OpenAI client for both models.
     pub fn with_client(mut self, client: OpenAIClient) -> Self {
         self.client = client;
+        self.explicit_client = true;
         self
     }
 
     /// Use an explicit API key.
     pub fn with_api_key(mut self, api_key: impl Into<String>) -> Self {
-        self.client = self.client.with_api_key(api_key);
+        if self.explicit_client {
+            self.client = self.client.with_api_key(api_key);
+        } else {
+            self.options.api_key = Some(api_key.into());
+            self.client = self.options.resolve();
+        }
         self
     }
 
     /// Use an explicit base URL.
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
-        self.client = self.client.with_base_url(base_url);
+        if self.explicit_client {
+            self.client = self.client.with_base_url(base_url);
+        } else {
+            self.options.base_url = Some(base_url.into());
+            self.client = self.options.resolve();
+        }
+        self
+    }
+
+    /// Use an explicit organization.
+    pub fn with_organization(mut self, organization: impl Into<String>) -> Self {
+        if self.explicit_client {
+            self.client = self.client.with_organization(organization);
+        } else {
+            self.options.organization = Some(organization.into());
+            self.client = self.options.resolve();
+        }
+        self
+    }
+
+    /// Use an explicit project.
+    pub fn with_project(mut self, project: impl Into<String>) -> Self {
+        if self.explicit_client {
+            self.client = self.client.with_project(project);
+        } else {
+            self.options.project = Some(project.into());
+            self.client = self.options.resolve();
+        }
         self
     }
 

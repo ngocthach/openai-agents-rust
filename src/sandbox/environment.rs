@@ -30,6 +30,16 @@ pub trait EnvValue: Send + Sync + fmt::Debug {
         None
     }
 
+    /// The persisted payload of this value, an object carrying `"type": env_value_type()`.
+    ///
+    /// Only a type registered with
+    /// [`register_env_value_type`](crate::sandbox::persisted_registry::register_env_value_type)
+    /// can be written; the default `None` keeps a lookup unwritable, so a secret reference is
+    /// never flattened into the manifest.
+    fn to_payload(&self) -> Option<serde_json::Value> {
+        None
+    }
+
     /// Produce the value. Called once per session start.
     async fn resolve(&self) -> SandboxResult<String>;
 }

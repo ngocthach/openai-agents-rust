@@ -1971,14 +1971,25 @@ pub async fn get_api_key(explicit: Option<&RealtimeApiKey>) -> Result<String> {
 
 /// The format name of a GA `audio.format` value, in either its object or string spelling.
 fn read_format_type(format: &Value) -> Option<String> {
-    match format {
+    let name = match format {
         Value::String(name) => Some(name.clone()),
         Value::Object(_) => format
             .get("type")
             .and_then(Value::as_str)
             .map(str::to_string),
         _ => None,
-    }
+    }?;
+    // The GA object spellings name the same formats as the legacy strings; the trackers use the
+    // legacy names, as Python's `_normalize_audio_format` does for its typed formats.
+    Some(match format {
+        Value::Object(_) => match name.as_str() {
+            "audio/pcm" => "pcm16".to_string(),
+            "audio/pcmu" => "g711_ulaw".to_string(),
+            "audio/pcma" => "g711_alaw".to_string(),
+            _ => name,
+        },
+        _ => name,
+    })
 }
 
 fn string_field(event: &Value, key: &str) -> String {

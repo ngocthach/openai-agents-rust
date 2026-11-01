@@ -127,6 +127,26 @@ fn medium_reasoning() -> ModelSettings {
     }
 }
 
+impl PartialEq for MemoryGenerateConfig {
+    /// Value equality; model instances compare by identity, as Python's `==` on model objects.
+    fn eq(&self, other: &Self) -> bool {
+        fn same_model(a: &AgentModel, b: &AgentModel) -> bool {
+            match (a, b) {
+                (AgentModel::Name(a), AgentModel::Name(b)) => a == b,
+                (AgentModel::Instance(a), AgentModel::Instance(b)) => std::sync::Arc::ptr_eq(a, b),
+                _ => false,
+            }
+        }
+        self.max_raw_memories_for_consolidation == other.max_raw_memories_for_consolidation
+            && same_model(&self.phase_one_model, &other.phase_one_model)
+            && self.phase_one_model_settings == other.phase_one_model_settings
+            && same_model(&self.phase_two_model, &other.phase_two_model)
+            && self.phase_two_model_settings == other.phase_two_model_settings
+            && self.extra_prompt == other.extra_prompt
+            && self.phase_two_max_turns == other.phase_two_max_turns
+    }
+}
+
 impl Default for MemoryGenerateConfig {
     fn default() -> Self {
         MemoryGenerateConfig {

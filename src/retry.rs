@@ -113,6 +113,18 @@ impl ModelRetryNormalizedError {
     }
 }
 
+/// A response header by name, matched case-insensitively as HTTP header names are.
+fn header_value<'a>(
+    headers: &'a std::collections::BTreeMap<String, String>,
+    name: &str,
+) -> Option<&'a String> {
+    headers.get(name).or_else(|| {
+        headers
+            .iter()
+            .find_map(|(k, v)| k.eq_ignore_ascii_case(name).then_some(v))
+    })
+}
+
 /// Parse `retry-after-ms` / `retry-after` (seconds or an HTTP date) into seconds.
 ///
 /// Mirrors `parse_retry_after_ms` / `parse_retry_after_value`: the millisecond header wins, a
@@ -122,15 +134,14 @@ impl ModelRetryNormalizedError {
 pub(crate) fn parse_retry_after(
     headers: &std::collections::BTreeMap<String, String>,
 ) -> Option<f64> {
-    if let Some(ms) = headers
-        .get("retry-after-ms")
+    if let Some(ms) = header_value(headers, "retry-after-ms")
         .and_then(|v| v.trim().parse::<f64>().ok())
         .map(|ms| ms / 1000.0)
         .filter(|d| *d >= 0.0)
     {
         return Some(ms);
     }
-    let value = headers.get("retry-after")?.trim();
+    let value = header_value(headers, "retry-after")?.trim();
     if let Ok(seconds) = value.parse::<f64>() {
         return (seconds >= 0.0).then_some(seconds);
     }
@@ -559,13 +570,13 @@ pub fn get_openai_retry_advice(request: &ModelRetryAdviceRequest<'_>) -> Option<
     if let AgentsError::ApiError {
         headers: Some(h), ..
     } = error
-        && let Some(h) =
-            h.get("x-should-retry")
-                .and_then(|v| match v.trim().to_ascii_lowercase().as_str() {
-                    "true" => Some(true),
-                    "false" => Some(false),
-                    _ => None,
-                })
+        && let Some(h) = header_value(h, "x-should-retry").and_then(|v| {
+            match v.trim().to_ascii_lowercase().as_str() {
+                "true" => Some(true),
+                "false" => Some(false),
+                _ => None,
+            }
+        })
     {
         return Some(ModelRetryAdvice {
             suggested: Some(h),

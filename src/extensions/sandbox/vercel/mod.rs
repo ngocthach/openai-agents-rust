@@ -75,6 +75,7 @@ use super::ports::{
     ExposedPortEndpoint, ExposedPortUnavailable, assert_exposed_port_configured, endpoint_from_url,
     exposed_port_unavailable,
 };
+use super::{persistable_identifier, redact_string_map};
 use crate::sandbox::http::{
     as_archive_read, bounded_read_zero, expect_success, http_error, parse_json, read_body_prefix,
     read_status_error, status_is_retryable, transport,
@@ -483,8 +484,12 @@ impl VercelSandboxResources {
 
 /// The Vercel options a resumed session is rebuilt from.
 ///
-/// Mirrors the `runtime`, `resources`, `timeout_ms`, `snapshot_expiration_ms` and
-/// `network_policy` fields of Python's `VercelSandboxSessionState`. It travels in the session
+/// Mirrors the `runtime`, `resources`, `timeout_ms`, `snapshot_expiration_ms`,
+/// `network_policy`, `project_id`, `team_id`, `env` and `interactive` fields of Python's
+/// `VercelSandboxSessionState`. The state stays credential-free: the project and team ids are
+/// recorded only when they do not look like a credential, and `env` is redacted (entries whose
+/// name or value looks secret are not recorded, URL values lose userinfo and query), so the
+/// resuming client supplies those from its own options. It travels in the session
 /// state's provider options, so a replacement sandbox created on resume keeps the runtime,
 /// limits and network policy of the original instead of the resuming client's. Every field has
 /// a serde default, so a payload that predates a field still reads.
@@ -502,6 +507,14 @@ pub struct VercelPersistedOptions {
     /// Network policy applied to the sandbox, in the shape Python's state payload uses.
     #[serde(with = "network_policy_state")]
     pub network_policy: Option<NetworkPolicy>,
+    /// The project the sandbox was created in.
+    pub project_id: Option<String>,
+    /// The team the sandbox was created in.
+    pub team_id: Option<String>,
+    /// Environment variables set at creation, redacted.
+    pub env: BTreeMap<String, String>,
+    /// Accepted for parity with Python's saved state; it enables nothing.
+    pub interactive: bool,
 }
 
 impl VercelPersistedOptions {
@@ -513,16 +526,37 @@ impl VercelPersistedOptions {
             timeout_ms: options.timeout_ms,
             snapshot_expiration_ms: options.snapshot_expiration_ms,
             network_policy: options.network_policy.clone(),
+            project_id: options
+                .resolved_project_id()
+                .and_then(|id| persistable_identifier(&id)),
+            team_id: options
+                .resolved_team_id()
+                .and_then(|id| persistable_identifier(&id)),
+            env: redact_string_map(&options.env),
+            interactive: options.interactive,
         }
     }
 
     /// Replace the corresponding fields of `options`.
+    ///
+    /// The environment merges with the client's value winning per key (the client holds the
+    /// values the record left out); a project or team id the record lacks stays the client's.
     pub fn apply_to(self, options: &mut VercelSandboxClientOptions) {
         options.runtime = self.runtime;
         options.resources = self.resources;
         options.timeout_ms = self.timeout_ms;
         options.snapshot_expiration_ms = self.snapshot_expiration_ms;
         options.network_policy = self.network_policy;
+        if self.project_id.is_some() {
+            options.project_id = self.project_id;
+        }
+        if self.team_id.is_some() {
+            options.team_id = self.team_id;
+        }
+        let mut env = self.env;
+        env.extend(std::mem::take(&mut options.env));
+        options.env = env;
+        options.interactive = self.interactive;
     }
 
     /// The options persisted in `state`, when it carries any.
@@ -543,6 +577,9 @@ pub struct VercelSandboxClientOptions {
     pub project_id: Option<String>,
     /// Team the sandbox belongs to. Falls back to `VERCEL_TEAM_ID`.
     pub team_id: Option<String>,
+    /// Accepted for existing callers and saved state, as in Python: Vercel manages interactive
+    /// shells independently of sandbox creation, so this does not enable PTY support.
+    pub interactive: bool,
     /// Execution time limit in milliseconds.
     pub timeout_ms: Option<u64>,
     /// Runtime image alias, such as `node24`; `None` uses [`DEFAULT_VERCEL_RUNTIME`].
@@ -577,6 +614,7 @@ impl Default for VercelSandboxClientOptions {
             resources: VercelSandboxResources::default(),
             env: BTreeMap::new(),
             exposed_ports: Vec::new(),
+            interactive: false,
             workspace_persistence: WorkspacePersistence::default(),
             snapshot_expiration_ms: None,
             network_policy: None,
@@ -599,6 +637,7 @@ impl std::fmt::Debug for VercelSandboxClientOptions {
             .field("resources", &self.resources)
             .field("env", &self.env.keys().collect::<Vec<_>>())
             .field("exposed_ports", &self.exposed_ports)
+            .field("interactive", &self.interactive)
             .field("workspace_persistence", &self.workspace_persistence)
             .field("snapshot_expiration_ms", &self.snapshot_expiration_ms)
             .field("network_policy", &self.network_policy)
@@ -665,6 +704,12 @@ impl VercelSandboxClientOptions {
     /// Expose a port.
     pub fn with_exposed_port(mut self, port: u16) -> Self {
         self.exposed_ports.push(port);
+        self
+    }
+
+    /// Record the `interactive` flag Python's options accept; it enables nothing.
+    pub fn with_interactive(mut self, interactive: bool) -> Self {
+        self.interactive = interactive;
         self
     }
 
@@ -1214,6 +1259,11 @@ pub struct VercelSandboxSession {
     remote: std::sync::RwLock<RemoteHandle>,
     started: AtomicBool,
     terminated: tokio::sync::Mutex<bool>,
+    /// Set once a session that held S3 mounts was shut down: it is never used again.
+    s3_mount_session_closed: AtomicBool,
+    /// Set while a snapshot has the S3 mounts detached, so model-facing tools refuse to read an
+    /// empty mount directory as if it were the bucket.
+    mount_transition: crate::sandbox::mounts::MountTransition,
     snapshot: Option<SnapshotSpec>,
     snapshot_id: String,
     resuming: bool,
@@ -1286,6 +1336,8 @@ impl VercelSandboxSession {
             session_key,
             started: AtomicBool::new(false),
             terminated: tokio::sync::Mutex::new(false),
+            s3_mount_session_closed: AtomicBool::new(false),
+            mount_transition: crate::sandbox::mounts::MountTransition::new(),
             snapshot,
             resuming: false,
             state_preserved: false,
@@ -1559,6 +1611,22 @@ impl VercelSandboxSession {
         }
     }
 
+    /// Refuse to talk to a mounted sandbox this session already shut down.
+    ///
+    /// Mirrors Python's `mounted_session_closed` check in `_ensure_sandbox`: the credentials a
+    /// mounted session carries must not be presented to a sandbox it no longer owns.
+    fn ensure_not_closed(&self) -> SandboxResult<()> {
+        if self.s3_mount_session_closed.load(Ordering::SeqCst) {
+            return Err(SandboxError::new(
+                ErrorCode::WorkspaceStartError,
+                "the mounted Vercel session was closed and cannot be used again",
+            )
+            .with_context("backend", BACKEND_ID)
+            .with_context("reason", "mounted_session_closed"));
+        }
+        Ok(())
+    }
+
     /// Run one command and collect its output from the NDJSON stream.
     async fn run_command(
         &self,
@@ -1568,6 +1636,7 @@ impl VercelSandboxSession {
         timeout: Option<Duration>,
         sudo: bool,
     ) -> SandboxResult<ExecResult> {
+        self.ensure_not_closed()?;
         let what = "run a command in the Vercel sandbox";
         let (command, args) = argv
             .split_first()
@@ -1625,6 +1694,7 @@ impl VercelSandboxSession {
     /// path first; this is for the paths the session itself owns, such as a temporary archive
     /// under `/tmp`.
     async fn download_at(&self, path: &str, limit: Option<usize>) -> SandboxResult<Vec<u8>> {
+        self.ensure_not_closed()?;
         let what = "read a file from the Vercel sandbox";
         let response = self
             .request(self.http.post(self.session_url("/fs/read")))
@@ -1653,6 +1723,7 @@ impl VercelSandboxSession {
     ///
     /// Retried on a transient transport failure, as Python's `_write_files_with_retry` is.
     async fn write_archive(&self, extract_dir: &str, archive: Vec<u8>) -> SandboxResult<()> {
+        self.ensure_not_closed()?;
         let what = "write files to the Vercel sandbox";
         retry_async(
             RetryPolicy::new(),
@@ -1851,6 +1922,11 @@ impl VercelSandboxSession {
         // second `shutdown` tries again instead of reporting a sandbox that still runs as closed.
         if stopped.is_ok() {
             self.started.store(false, Ordering::SeqCst);
+            // Only a session whose mounts attached carried credentials into the sandbox; a start
+            // that failed before any mount attached stays retryable.
+            if self.has_s3_mounts() && self.s3_mounts_started.load(Ordering::SeqCst) {
+                self.s3_mount_session_closed.store(true, Ordering::SeqCst);
+            }
             *terminated = true;
         }
         stopped
@@ -1918,6 +1994,16 @@ impl SandboxSession for VercelSandboxSession {
 
     fn system_state_preserved_on_start(&self) -> bool {
         self.state_preserved
+    }
+
+    fn mount_transition(&self) -> Option<&crate::sandbox::mounts::MountTransition> {
+        Some(&self.mount_transition)
+    }
+
+    fn shutdown_after_failed_close(&self) -> bool {
+        // Python's wrapper `_aclose_impl`: a mounted sandbox is shut down even when the close
+        // failed before reaching `shutdown`.
+        self.has_s3_mounts()
     }
 
     fn resume_snapshot_fingerprint(&self) -> Option<SnapshotFingerprint> {

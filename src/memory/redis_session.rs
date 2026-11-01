@@ -4,6 +4,7 @@ use std::fmt;
 
 use async_trait::async_trait;
 use redis::aio::MultiplexedConnection;
+use redis::cluster_async::ClusterConnection;
 use tokio::sync::Mutex;
 
 use super::{CompactionSnapshot, Session, SessionSettings, SnapshotHandle};
@@ -163,6 +164,22 @@ fn serialize_item(item: &InputItem) -> Result<String> {
     Ok(serde_json::to_string(item.as_value())?)
 }
 
+/// The connection a session talks through: one server or a Redis Cluster.
+enum Connection {
+    Single(MultiplexedConnection),
+    Cluster(ClusterConnection),
+}
+
+impl Connection {
+    async fn run<T: redis::FromRedisValue>(&mut self, cmd: &redis::Cmd) -> Result<T> {
+        match self {
+            Connection::Single(c) => cmd.query_async(c).await,
+            Connection::Cluster(c) => cmd.query_async(c).await,
+        }
+        .map_err(redis_err)
+    }
+}
+
 fn redis_err(e: redis::RedisError) -> AgentsError {
     AgentsError::other(format!("Redis error: {e}"))
 }
@@ -181,16 +198,21 @@ fn redis_err(e: redis::RedisError) -> AgentsError {
 /// in the round trip before the write rather than inside the transaction: a key whose type is
 /// changed in the instant between the check and the write is not caught, whereas Python's
 /// `WATCH` would abort. Expiry uses a relative `PEXPIRE` instead of Python's `PEXPIREAT`
-/// computed from server `TIME`, which makes it independent of clock skew. Redis Cluster is not
-/// supported.
+/// computed from server `TIME`, which makes it independent of clock skew.
+///
+/// A Redis Cluster connection ([`RedisSession::with_cluster_connection`]) supports reading and
+/// popping history; every write (`add_items` with items, `clear_session`, compaction
+/// replacement) fails with a user error before reaching the network, as Python's `TypeError`
+/// does, because the write scripts span three keys that may live on different slots.
 pub struct RedisSession {
     session_id: String,
-    connection: Mutex<MultiplexedConnection>,
+    connection: Mutex<Connection>,
     session_key: String,
     messages_key: String,
     counter_key: String,
     ttl: Option<u64>,
     settings: Option<SessionSettings>,
+    cluster: bool,
 }
 
 impl fmt::Debug for RedisSession {
@@ -214,12 +236,38 @@ impl RedisSession {
         Ok(Self::with_connection(session_id, connection))
     }
 
+    /// Connect to a Redis Cluster through its `nodes` (for example `redis://host:7000`).
+    ///
+    /// The session can read and pop history; writes are rejected (see the type docs).
+    pub async fn from_cluster_nodes(
+        session_id: impl Into<String>,
+        nodes: Vec<String>,
+    ) -> Result<Self> {
+        let client = redis::cluster::ClusterClient::new(nodes).map_err(redis_err)?;
+        let connection = client.get_async_connection().await.map_err(redis_err)?;
+        Ok(Self::with_cluster_connection(session_id, connection))
+    }
+
     /// Use a connection the application already manages.
     pub fn with_connection(
         session_id: impl Into<String>,
         connection: MultiplexedConnection,
     ) -> Self {
-        let session_id = session_id.into();
+        Self::from_connection(session_id.into(), Connection::Single(connection))
+    }
+
+    /// Use a Redis Cluster connection the application already manages (reads and pops only).
+    pub fn with_cluster_connection(
+        session_id: impl Into<String>,
+        connection: ClusterConnection,
+    ) -> Self {
+        Self {
+            cluster: true,
+            ..Self::from_connection(session_id.into(), Connection::Cluster(connection))
+        }
+    }
+
+    fn from_connection(session_id: String, connection: Connection) -> Self {
         let (session_key, messages_key, counter_key) =
             redis_session_keys(DEFAULT_KEY_PREFIX, &session_id);
         RedisSession {
@@ -230,6 +278,7 @@ impl RedisSession {
             counter_key,
             ttl: None,
             settings: None,
+            cluster: false,
         }
     }
 
@@ -268,10 +317,7 @@ impl RedisSession {
     /// True when Redis answers `PING`.
     pub async fn ping(&self) -> bool {
         let mut conn = self.connection.lock().await;
-        redis::cmd("PING")
-            .query_async::<String>(&mut *conn)
-            .await
-            .is_ok()
+        conn.run::<String>(&redis::cmd("PING")).await.is_ok()
     }
 
     /// An `EVAL` of `body` with this session's three keys and the shared guard prelude.
@@ -288,6 +334,18 @@ impl RedisSession {
             .arg(&self.session_key)
             .arg(&self.counter_key);
         cmd
+    }
+
+    /// Fail a write on a cluster connection before anything is sent.
+    fn ensure_writable(&self) -> Result<()> {
+        if self.cluster {
+            return Err(AgentsError::user(
+                "RedisSession does not support transactions with Redis Cluster connections. \
+                 Use a standalone connection (redis::aio::MultiplexedConnection), \
+                 or implement a custom Session backend for Redis Cluster.",
+            ));
+        }
+        Ok(())
     }
 
     /// The TTL in milliseconds, or 0 when the session does not expire.
@@ -322,13 +380,9 @@ impl Session for RedisSession {
         let limit = super::resolve_session_limit(limit, self.session_settings().as_ref());
         let mut conn = self.connection.lock().await;
         let Some(limit) = limit else {
-            let raw: Vec<String> = redis::cmd("LRANGE")
-                .arg(&self.messages_key)
-                .arg(0)
-                .arg(-1)
-                .query_async(&mut *conn)
-                .await
-                .map_err(redis_err)?;
+            let mut cmd = redis::cmd("LRANGE");
+            cmd.arg(&self.messages_key).arg(0).arg(-1);
+            let raw: Vec<String> = conn.run(&cmd).await?;
             return Ok(Self::decode(&raw));
         };
         if limit == 0 {
@@ -338,13 +392,9 @@ impl Session for RedisSession {
         // `limit` valid items are found or the list is exhausted.
         let mut window = limit;
         loop {
-            let raw: Vec<String> = redis::cmd("LRANGE")
-                .arg(&self.messages_key)
-                .arg(-(window as i64))
-                .arg(-1)
-                .query_async(&mut *conn)
-                .await
-                .map_err(redis_err)?;
+            let mut cmd = redis::cmd("LRANGE");
+            cmd.arg(&self.messages_key).arg(-(window as i64)).arg(-1);
+            let raw: Vec<String> = conn.run(&cmd).await?;
             let items = Self::decode(&raw);
             if items.len() >= limit {
                 return Ok(items[items.len() - limit..].to_vec());
@@ -360,6 +410,7 @@ impl Session for RedisSession {
         if items.is_empty() {
             return Ok(());
         }
+        self.ensure_writable()?;
         let serialized = items
             .iter()
             .map(serialize_item)
@@ -371,20 +422,15 @@ impl Session for RedisSession {
         for entry in &serialized {
             cmd.arg(entry);
         }
-        cmd.query_async::<i64>(&mut *conn)
-            .await
-            .map(|_| ())
-            .map_err(redis_err)
+        conn.run::<i64>(&cmd).await.map(|_| ())
     }
 
     async fn pop_item(&self) -> Result<Option<InputItem>> {
         let mut conn = self.connection.lock().await;
         loop {
-            let raw: Option<String> = redis::cmd("RPOP")
-                .arg(&self.messages_key)
-                .query_async(&mut *conn)
-                .await
-                .map_err(redis_err)?;
+            let mut cmd = redis::cmd("RPOP");
+            cmd.arg(&self.messages_key);
+            let raw: Option<String> = conn.run(&cmd).await?;
             let Some(raw) = raw else { return Ok(None) };
             if let Ok(v) = serde_json::from_str(&raw) {
                 return Ok(Some(InputItem(v)));
@@ -407,13 +453,9 @@ impl Session for RedisSession {
             .unwrap_or(i64::MAX)
             .saturating_add(1)
             .saturating_neg();
-        let raw: Vec<String> = redis::cmd("LRANGE")
-            .arg(&self.messages_key)
-            .arg(window)
-            .arg(-1)
-            .query_async(&mut *conn)
-            .await
-            .map_err(redis_err)?;
+        let mut cmd = redis::cmd("LRANGE");
+        cmd.arg(&self.messages_key).arg(window).arg(-1);
+        let raw: Vec<String> = conn.run(&cmd).await?;
         let complete = raw.len() <= limit;
         let window = &raw[raw.len() - raw.len().min(limit)..];
 
@@ -447,6 +489,7 @@ impl Session for RedisSession {
         handles: &[SnapshotHandle],
         items: Vec<InputItem>,
     ) -> Result<bool> {
+        self.ensure_writable()?;
         let replacement = items
             .iter()
             .map(serialize_item)
@@ -462,11 +505,12 @@ impl Session for RedisSession {
         for entry in &replacement {
             cmd.arg(entry);
         }
-        let replaced: i64 = cmd.query_async(&mut *conn).await.map_err(redis_err)?;
+        let replaced: i64 = conn.run(&cmd).await?;
         Ok(replaced == 1)
     }
 
     async fn replace_history_atomically(&self, items: Vec<InputItem>) -> Result<bool> {
+        self.ensure_writable()?;
         let replacement = items
             .iter()
             .map(serialize_item)
@@ -478,19 +522,15 @@ impl Session for RedisSession {
         for entry in &replacement {
             cmd.arg(entry);
         }
-        cmd.query_async::<i64>(&mut *conn)
-            .await
-            .map(|_| true)
-            .map_err(redis_err)
+        conn.run::<i64>(&cmd).await.map(|_| true)
     }
 
     async fn clear_session(&self) -> Result<()> {
+        self.ensure_writable()?;
         let mut conn = self.connection.lock().await;
-        self.script(CLEAR_SESSION_SCRIPT)
-            .query_async::<i64>(&mut *conn)
+        conn.run::<i64>(&self.script(CLEAR_SESSION_SCRIPT))
             .await
             .map(|_| ())
-            .map_err(redis_err)
     }
 }
 
@@ -581,15 +621,12 @@ mod tests {
         // A key occupied by another type is reported instead of being overwritten.
         {
             let mut conn = s.connection.lock().await;
-            let _: () = redis::cmd("DEL")
-                .arg(s.messages_key())
-                .query_async(&mut *conn)
+            let _: () = conn
+                .run(redis::cmd("DEL").arg(s.messages_key()))
                 .await
                 .unwrap();
-            let _: () = redis::cmd("SADD")
-                .arg(s.messages_key())
-                .arg("x")
-                .query_async(&mut *conn)
+            let _: () = conn
+                .run(redis::cmd("SADD").arg(s.messages_key()).arg("x"))
                 .await
                 .unwrap();
         }
@@ -598,9 +635,8 @@ mod tests {
         assert!(s.clear_session().await.is_err());
         {
             let mut conn = s.connection.lock().await;
-            let _: () = redis::cmd("DEL")
-                .arg(s.messages_key())
-                .query_async(&mut *conn)
+            let _: () = conn
+                .run(redis::cmd("DEL").arg(s.messages_key()))
                 .await
                 .unwrap();
         }
@@ -653,11 +689,7 @@ mod tests {
         {
             let mut conn = s.connection.lock().await;
             for key in [s.messages_key(), s.session_key()] {
-                let ttl: i64 = redis::cmd("PTTL")
-                    .arg(key)
-                    .query_async(&mut *conn)
-                    .await
-                    .unwrap();
+                let ttl: i64 = conn.run(redis::cmd("PTTL").arg(key)).await.unwrap();
                 assert!(ttl > 0, "{key} lost its expiry: PTTL = {ttl}");
             }
         }

@@ -1,6 +1,6 @@
 [package]
 name = "openai-agents-sdk"
-version = "0.16.0"
+version = "0.17.0"
 edition = "2024"
 rust-version = "1.89"
 description = "Unofficial Rust port of the OpenAI Agents SDK: agents, tools, handoffs, guardrails, sessions, tracing, MCP"
@@ -43,7 +43,7 @@ sqlx = ["dep:sqlx"]
 provider-auth = ["dep:hmac", "dep:base64", "dep:aws-lc-rs"]
 
 [dependencies]
-openai-agents-sdk-macros = { version = "0.16.0", path = "macros", optional = true }
+openai-agents-sdk-macros = { version = "0.17.0", path = "macros", optional = true }
 async-trait = "0.1"
 bytes = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
@@ -87,7 +87,7 @@ tar = { version = "0.4", default-features = false, optional = true }
 flate2 = { version = "1", optional = true }
 zip = { version = "9", default-features = false, features = ["deflate-flate2"], optional = true }
 # Optional dependency for RedisSession (feature `redis`).
-redis = { version = "1", default-features = false, features = ["tokio-comp", "aio"], optional = true }
+redis = { version = "1", default-features = false, features = ["tokio-comp", "aio", "cluster-async"], optional = true }
 # SHA-1 for MCP tool-name disambiguation hashes (parity with Python).
 sha1 = { version = "0.11", optional = true }
 # Optional dependency for MongoDBSession (feature `mongodb`).

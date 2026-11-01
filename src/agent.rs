@@ -679,6 +679,16 @@ type InputItemsBuilder =
     Arc<dyn Fn(&StructuredToolInput<'_>) -> Vec<crate::items::InputItem> + Send + Sync>;
 type NestedStreamFn<C> =
     Arc<dyn Fn(AgentToolStreamEvent<C>) -> BoxFuture<'static, ()> + Send + Sync>;
+/// Replaces the plain runner for a nested agent-tool run (a sandbox agent prepares its session
+/// first). Crate-private: `AgentAsToolOptions` is built with struct-update syntax elsewhere.
+pub(crate) type NestedRunFn<C> = Arc<
+    dyn Fn(
+            crate::items::RunInput,
+            crate::run::RunOptions<C>,
+        ) -> BoxFuture<'static, Result<crate::result::RunResult<C>>>
+        + Send
+        + Sync,
+>;
 
 /// A streaming event from a nested `Agent::as_tool` run.
 /// Mirrors `agents.agent.AgentToolStreamEvent`.
@@ -1167,6 +1177,14 @@ impl<C: Send + Sync + 'static> Agent<C> {
         &self,
         options: AgentAsToolOptions<C>,
     ) -> Result<crate::tool::FunctionTool<C>> {
+        self.try_as_tool_with_runner(options, None)
+    }
+
+    pub(crate) fn try_as_tool_with_runner(
+        &self,
+        options: AgentAsToolOptions<C>,
+        runner: Option<NestedRunFn<C>>,
+    ) -> Result<crate::tool::FunctionTool<C>> {
         use crate::items::RunInput;
         use crate::run::{RunOptions, Runner};
         use crate::run_state::RunState;
@@ -1203,11 +1221,13 @@ impl<C: Send + Sync + 'static> Agent<C> {
         let is_enabled = options.is_enabled.clone();
         let failure_error_function = options.failure_error_function.clone();
         let opts = Arc::new(options);
+        let runner = runner;
         let schema_for_builder = schema.clone();
         let mut tool =
             FunctionTool::new_raw(name, description, schema, move |tool_ctx, args: String| {
                 let agent = agent.clone();
                 let opts = opts.clone();
+                let runner = runner.clone();
                 let schema = schema_for_builder.clone();
                 async move {
                     let payload = if args.trim().is_empty() { "{}" } else { &args };
@@ -1299,7 +1319,12 @@ impl<C: Send + Sync + 'static> Agent<C> {
                                 )
                                 .await
                             }
-                            None => Runner::run_with_options(agent.clone(), input, run_opts).await,
+                            None => match &runner {
+                                Some(run) => run(input, run_opts).await,
+                                None => {
+                                    Runner::run_with_options(agent.clone(), input, run_opts).await
+                                }
+                            },
                         }
                     };
                     let result = match run.await {

@@ -1141,7 +1141,7 @@ impl WorkerLauncher for ProcessLauncher {
             pid,
             child,
             stdin: Some(stdin),
-            stdout: tokio::io::BufReader::new(stdout),
+            stdout: Some(tokio::io::BufReader::new(stdout)),
             uncertain: false,
             requested_path: String::new(),
         }))
@@ -1172,7 +1172,7 @@ struct ProcessWorker {
     pid: u32,
     child: tokio::process::Child,
     stdin: Option<tokio::process::ChildStdin>,
-    stdout: tokio::io::BufReader<tokio::process::ChildStdout>,
+    stdout: Option<tokio::io::BufReader<tokio::process::ChildStdout>>,
     uncertain: bool,
     requested_path: String,
 }
@@ -1192,7 +1192,10 @@ impl ProcessWorker {
             return Err(self.lost());
         }
         let mut response = String::new();
-        match self.stdout.read_line(&mut response).await {
+        let Some(stdout) = self.stdout.as_mut() else {
+            return Err(self.lost());
+        };
+        match stdout.read_line(&mut response).await {
             Ok(read) if read > 0 => {}
             _ => return Err(self.lost()),
         }
@@ -1280,17 +1283,35 @@ impl RemovalWorker for ProcessWorker {
     }
 
     async fn close(&mut self) -> io::Result<()> {
-        let mut first: Option<io::Error> = None;
-        if let Some(mut stdin) = self.stdin.take()
-            && let Err(error) = stdin.shutdown().await
-        {
-            first.get_or_insert(error);
-        }
-        if let Err(error) = self.child.wait().await {
-            first.get_or_insert(error);
-        }
-        first.map_or(Ok(()), Err)
+        let stdin = self.stdin.take();
+        let stdout = self.stdout.take();
+        close_transport(stdin, self.child.wait(), move || drop(stdout)).await
     }
+}
+
+/// Close a worker's transport in Python's order: shut its input, reap the process, release its
+/// output. Every step runs even when an earlier one failed, and the first failure is the one
+/// reported (`_Worker.close`).
+async fn close_transport<W, Wait, Exit>(
+    stdin: Option<W>,
+    wait: Wait,
+    release_output: impl FnOnce(),
+) -> io::Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+    Wait: std::future::Future<Output = io::Result<Exit>>,
+{
+    let mut first: Option<io::Error> = None;
+    if let Some(mut stdin) = stdin
+        && let Err(error) = stdin.shutdown().await
+    {
+        first.get_or_insert(error);
+    }
+    if let Err(error) = wait.await {
+        first.get_or_insert(error);
+    }
+    release_output();
+    first.map_or(Ok(()), Err)
 }
 
 #[async_trait]
@@ -1320,5 +1341,86 @@ impl super::docker::RemovalAuthority for DockerRemovalService {
 
     async fn release(&self, container_id: &str) -> SandboxResult<()> {
         DockerRemovalService::release(self, container_id).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+    use std::io;
+    use std::pin::Pin;
+    use std::rc::Rc;
+    use std::task::{Context, Poll};
+
+    use tokio::io::AsyncWrite;
+
+    use super::close_transport;
+
+    /// A writer whose shutdown records itself and fails with a broken pipe.
+    struct BrokenInput(Rc<RefCell<Vec<&'static str>>>);
+
+    impl AsyncWrite for BrokenInput {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.0.borrow_mut().push("stdin.close");
+            Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "input pipe closed",
+            )))
+        }
+    }
+
+    /// `test_worker_close_reaps_and_closes_output_after_broken_input_pipe`: a broken input pipe
+    /// does not skip reaping the process or releasing its output, the input failure is the one
+    /// reported, and the secondary wait failure is dropped.
+    #[tokio::test]
+    async fn a_broken_input_pipe_still_reaps_and_releases_the_output() {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let waited = events.clone();
+        let released = events.clone();
+
+        let result = close_transport(
+            Some(BrokenInput(events.clone())),
+            async move {
+                waited.borrow_mut().push("wait");
+                Err::<(), _>(io::Error::other("secondary wait failure"))
+            },
+            move || released.borrow_mut().push("stdout.close"),
+        )
+        .await;
+
+        let error = result.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(error.to_string(), "input pipe closed");
+        assert_eq!(*events.borrow(), ["stdin.close", "wait", "stdout.close"]);
+    }
+
+    /// With a healthy input a failing wait is the reported error, and the output is still
+    /// released.
+    #[tokio::test]
+    async fn a_failed_wait_is_reported_when_the_input_closes_cleanly() {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let released = events.clone();
+
+        let result = close_transport(
+            None::<Vec<u8>>,
+            async { Err::<(), _>(io::Error::other("wait failed")) },
+            move || released.borrow_mut().push("stdout.close"),
+        )
+        .await;
+
+        assert_eq!(result.unwrap_err().to_string(), "wait failed");
+        assert_eq!(*events.borrow(), ["stdout.close"]);
     }
 }

@@ -108,9 +108,18 @@ pub struct ServerConversationTracker {
     /// may drop some). They are offered again on the next call until a call carries them or the
     /// server produces them.
     remaining_initial_input: Option<Vec<InputItem>>,
+    /// Whether reasoning item ids are removed before items are sent. A reasoning item sent
+    /// without its id is recognised as delivered when it comes up again with the id.
+    omit_reasoning_item_ids: bool,
 }
 
 impl ServerConversationTracker {
+    /// Follow the run's reasoning-id policy: under `Omit` the delivered form of a reasoning
+    /// item carries no id, and [`needs_send`](Self::needs_send) matches it that way.
+    pub fn set_omit_reasoning_item_ids(&mut self, omit: bool) {
+        self.omit_reasoning_item_ids = omit;
+    }
+
     /// The durable half of the tracker, for `RunState`.
     pub fn state(&self) -> ServerConversationState {
         self.state.clone()
@@ -341,18 +350,30 @@ impl ServerConversationTracker {
             return false;
         }
         let fp = fingerprint(raw, false);
-        if let Some(fp) = &fp
-            && self.state.server_output_fingerprints.contains(fp)
+        // The form the model call carries: a reasoning item loses its id under the omit policy.
+        let delivered_fp = if self.omit_reasoning_item_ids
+            && raw.get("type").and_then(Value::as_str) == Some("reasoning")
         {
-            return false;
+            let mut stripped = raw.clone();
+            if let Value::Object(map) = &mut stripped {
+                map.remove("id");
+            }
+            fingerprint(&stripped, false)
+        } else {
+            None
+        };
+        for candidate in [&fp, &delivered_fp].into_iter().flatten() {
+            if self.state.server_output_fingerprints.contains(candidate) {
+                return false;
+            }
         }
         // A generated item delivered by an earlier turn of this run (or of the run a state
         // was taken from) is already on the server. Python skips it by object identity
         // (`sent_items`); the content fingerprint plays that role here.
-        if let Some(fp) = &fp
-            && self.state.sent_item_fingerprints.contains(fp)
-        {
-            return false;
+        for candidate in [&fp, &delivered_fp].into_iter().flatten() {
+            if self.state.sent_item_fingerprints.contains(candidate) {
+                return false;
+            }
         }
         if self.primed_from_state
             && normalize_server_item_id(raw.get("id")).is_none()

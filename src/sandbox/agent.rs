@@ -152,6 +152,47 @@ impl<C: Send + Sync + 'static> SandboxAgent<C> {
         }
     }
 
+    /// Expose this sandbox agent as a tool of another agent.
+    ///
+    /// Each call prepares the sandbox the way [`SandboxRunner`](crate::sandbox::SandboxRunner)
+    /// does for a top-level run (capability tools, instructions, manifest, session from `config`)
+    /// and tears it down when the nested run completes. Python reads that configuration from the
+    /// parent run's `RunConfig.sandbox`; Rust's `RunConfig` has no such field, so it is given
+    /// here.
+    pub fn as_tool(
+        &self,
+        tool_name: impl Into<String>,
+        tool_description: impl Into<String>,
+        config: crate::sandbox::SandboxRunConfig,
+    ) -> crate::tool::FunctionTool<C> {
+        self.as_tool_with(
+            crate::agent::AgentAsToolOptions::new()
+                .tool_name(tool_name)
+                .tool_description(tool_description),
+            config,
+        )
+    }
+
+    /// [`as_tool`](Self::as_tool) with full options. Panics on invalid options, like
+    /// [`Agent::as_tool_with`].
+    pub fn as_tool_with(
+        &self,
+        options: crate::agent::AgentAsToolOptions<C>,
+        config: crate::sandbox::SandboxRunConfig,
+    ) -> crate::tool::FunctionTool<C> {
+        let sandbox_agent = self.clone();
+        let runner: crate::agent::NestedRunFn<C> = Arc::new(move |input, run_opts| {
+            let (agent, config) = (sandbox_agent.clone(), config.clone());
+            Box::pin(async move {
+                crate::sandbox::SandboxRunner::run_with_options(&agent, input, &config, run_opts)
+                    .await
+            })
+        });
+        self.agent
+            .try_as_tool_with_runner(options, Some(runner))
+            .unwrap_or_else(|error| panic!("{error}"))
+    }
+
     /// Wrap an existing agent, keeping the default capability set.
     pub fn from_agent(agent: Agent<C>) -> Self {
         SandboxAgent {

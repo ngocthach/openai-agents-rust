@@ -18,6 +18,7 @@
 //! strategies `bind`, `docker_volume`, `in_container`; env value `str`; snapshots `noop`, `local`,
 //! `remote`. Provider mount strategies are registered by the extensions.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -262,16 +263,69 @@ pub fn parse_env_value(payload: &Value) -> SandboxResult<Arc<dyn EnvValue>> {
     })
 }
 
+/// Parses the payload of one registered environment value type.
+pub type EnvValueParser = Arc<dyn Fn(&Value) -> SandboxResult<Arc<dyn EnvValue>> + Send + Sync>;
+
+static ENV_VALUE_TYPES: std::sync::Mutex<BTreeMap<String, EnvValueParser>> =
+    std::sync::Mutex::new(BTreeMap::new());
+
+/// Register a custom environment value type so manifests carrying it persist and restore.
+///
+/// Mirrors Python's `EnvValue` subclass registration: `name` is the `type` discriminator the
+/// payload carries (the implementation's [`EnvValue::to_payload`] writes it), and `parser`
+/// rebuilds the value from that payload. A name that is empty, is `str` or is already registered
+/// is refused with a `SandboxConfigInvalid` error.
+pub fn register_env_value_type(name: &str, parser: EnvValueParser) -> SandboxResult<()> {
+    if name.is_empty() || name == "str" {
+        return Err(invalid_manifest(format!(
+            "env value type `{name}` cannot be registered"
+        )));
+    }
+    let mut types = ENV_VALUE_TYPES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if types.contains_key(name) {
+        return Err(invalid_manifest(format!(
+            "env value type `{name}` is already registered"
+        )));
+    }
+    types.insert(name.to_string(), parser);
+    Ok(())
+}
+
+fn registered_env_value_parser(name: &str) -> Option<EnvValueParser> {
+    ENV_VALUE_TYPES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(name)
+        .cloned()
+}
+
+fn registered_env_value_names() -> String {
+    let types = ENV_VALUE_TYPES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    std::iter::once("str".to_string())
+        .chain(types.keys().cloned())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Write an environment value as its payload.
 pub fn env_value_to_value(value: &dyn EnvValue) -> SandboxResult<Value> {
-    let any = value
-        .as_any()
+    if let Some(any) = value.as_any()
+        && let Some(literal) = any.downcast_ref::<StrEnvValue>()
+    {
+        return serde_json::to_value(EnvValueRecord::Str(literal.clone()))
+            .map_err(|_| unwritable("environment value"));
+    }
+    let kind = value.env_value_type();
+    let payload = value
+        .to_payload()
+        .filter(|payload| payload.get("type").and_then(Value::as_str) == Some(kind))
+        .filter(|_| registered_env_value_parser(kind).is_some())
         .ok_or_else(|| unwritable("environment value"))?;
-    let record = any
-        .downcast_ref::<StrEnvValue>()
-        .map(|v| EnvValueRecord::Str(v.clone()))
-        .ok_or_else(|| unwritable("environment value"))?;
-    serde_json::to_value(record).map_err(|_| unwritable("environment value"))
+    Ok(payload)
 }
 
 /// Parse a snapshot payload (`noop`, `local` or `remote`).
@@ -553,9 +607,13 @@ fn parse_env_value_mapping(payload: &Value) -> SandboxResult<Arc<dyn EnvValue>> 
     };
     match kind {
         "str" => parse_env_value(payload).map_err(|_| invalid_manifest("env value is invalid")),
-        other => Err(invalid_manifest(format!(
-            "Unknown env value type `{other}`. Registered types: str"
-        ))),
+        other => match registered_env_value_parser(other) {
+            Some(parser) => parser(payload),
+            None => Err(invalid_manifest(format!(
+                "Unknown env value type `{other}`. Registered types: {}",
+                registered_env_value_names()
+            ))),
+        },
     }
 }
 

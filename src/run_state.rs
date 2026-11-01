@@ -541,9 +541,32 @@ impl RunState {
     /// without reporting it.
     pub fn try_approve(&mut self, item: &ToolApprovalItem, always_approve: bool) -> Result<()> {
         check_function_decision(item, always_approve)?;
+        self.check_unambiguous_pending(item)?;
         self.approvals.try_approve(item, always_approve)?;
         self.restored_unbound_approval_call_ids
             .remove(item.call_id());
+        Ok(())
+    }
+
+    /// Refuse a decision for an invocation identity that more than one pending approval of
+    /// the same agent carries: the decision could not say which owner it was meant for.
+    fn check_unambiguous_pending(&self, item: &ToolApprovalItem) -> Result<()> {
+        let Some(binding) = crate::run_context::approval_binding(item) else {
+            return Ok(());
+        };
+        let owners = self
+            .interruptions
+            .iter()
+            .filter(|candidate| {
+                candidate.agent == item.agent
+                    && crate::run_context::approval_binding(candidate).as_ref() == Some(&binding)
+            })
+            .count();
+        if owners > 1 {
+            return Err(AgentsError::user(
+                "Cannot apply approval because multiple current pending approvals contain the same tool invocation identity, or because it belongs to both the current run and a nested agent-tool run. Use unique call IDs.",
+            ));
+        }
         Ok(())
     }
 
@@ -556,6 +579,7 @@ impl RunState {
         rejection_message: Option<String>,
     ) -> Result<()> {
         check_function_decision(item, always_reject)?;
+        self.check_unambiguous_pending(item)?;
         self.approvals
             .try_reject(item, always_reject, rejection_message)?;
         self.restored_unbound_approval_call_ids

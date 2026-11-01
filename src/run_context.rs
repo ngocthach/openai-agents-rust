@@ -179,8 +179,27 @@ fn non_empty(s: &str) -> Option<&str> {
 /// to the item's own `tool_name` the way Python reads persisted legacy items.
 fn hosted_request(item: &ToolApprovalItem) -> Option<HostedRequest<'_>> {
     let raw = &item.raw_item;
-    if raw.extra.get("type").and_then(Value::as_str) != Some("mcp_approval_request") {
-        return None;
+    match raw.extra.get("type").and_then(Value::as_str) {
+        Some("mcp_approval_request") => {}
+        // A generic hosted call wrapping a request: the request's own payload is its identity,
+        // and a malformed id there is never replaced by the wrapper's call id.
+        Some("hosted_tool_call") => {
+            let provider = raw.extra.get("provider_data").filter(|p| {
+                p.get("type").and_then(Value::as_str) == Some("mcp_approval_request")
+            })?;
+            let field = |name: &str| {
+                provider
+                    .get(name)
+                    .and_then(Value::as_str)
+                    .and_then(non_empty)
+            };
+            return Some(HostedRequest {
+                request_id: field("id"),
+                server_label: field("server_label"),
+                tool_name: field("name"),
+            });
+        }
+        _ => return None,
     }
     Some(HostedRequest {
         request_id: non_empty(&raw.call_id),

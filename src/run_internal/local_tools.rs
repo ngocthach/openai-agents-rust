@@ -286,15 +286,23 @@ async fn start_hooks<C: Send + Sync + 'static>(
     env: &ToolEnv<'_, C>,
     ctx: &ToolContext<C>,
     tool: &Tool<C>,
-) {
+) -> Result<()> {
     // From here on user code runs: a retry must not run it again.
     env.ctx.mark_invocation_executed(&ctx.tool_call_id);
-    if let Some(h) = env.hooks {
-        h.on_tool_start(ctx, env.agent, tool).await;
-    }
-    if let Some(h) = &env.agent.hooks {
-        h.on_tool_start(ctx, env.agent, tool).await;
-    }
+    let run_hook = async {
+        match env.hooks {
+            Some(h) => h.try_on_tool_start(ctx, env.agent, tool).await,
+            None => Ok(()),
+        }
+    };
+    let agent_hook = async {
+        match &env.agent.hooks {
+            Some(h) => h.try_on_tool_start(ctx, env.agent, tool).await,
+            None => Ok(()),
+        }
+    };
+    let (run_hook, agent_hook) = futures::join!(run_hook, agent_hook);
+    run_hook.and(agent_hook)
 }
 
 async fn end_hooks<C: Send + Sync + 'static>(
@@ -302,14 +310,22 @@ async fn end_hooks<C: Send + Sync + 'static>(
     ctx: &ToolContext<C>,
     tool: &Tool<C>,
     output: &str,
-) {
+) -> Result<()> {
     let out = ToolOutput::Text(output.to_string());
-    if let Some(h) = env.hooks {
-        h.on_tool_end(ctx, env.agent, tool, &out).await;
-    }
-    if let Some(h) = &env.agent.hooks {
-        h.on_tool_end(ctx, env.agent, tool, &out).await;
-    }
+    let run_hook = async {
+        match env.hooks {
+            Some(h) => h.try_on_tool_end(ctx, env.agent, tool, &out).await,
+            None => Ok(()),
+        }
+    };
+    let agent_hook = async {
+        match &env.agent.hooks {
+            Some(h) => h.try_on_tool_end(ctx, env.agent, tool, &out).await,
+            None => Ok(()),
+        }
+    };
+    let (run_hook, agent_hook) = futures::join!(run_hook, agent_hook);
+    run_hook.and(agent_hook)
 }
 
 /// Execute one local tool call.
@@ -550,7 +566,7 @@ async fn run_computer<C: Send + Sync + 'static>(
         .with_run_config(env.config.clone());
     let invoke = async {
         let computer = tool.resolve(env.ctx).await?;
-        start_hooks(env, &tool_ctx, &tool_enum).await;
+        start_hooks(env, &tool_ctx, &tool_enum).await?;
         run_computer_actions(computer.as_ref(), &raw).await
     };
     let shot = match scope::with_span(span.clone(), Box::pin(invoke)).await {
@@ -596,8 +612,10 @@ async fn run_computer<C: Send + Sync + 'static>(
             }
             None => Ok(None),
         };
-        if custom_data.is_ok() {
-            end_hooks(env, &tool_ctx, &tool_enum, &shot).await;
+        if custom_data.is_ok()
+            && let Err(e) = end_hooks(env, &tool_ctx, &tool_enum, &shot).await
+        {
+            return Err(e);
         }
         custom_data
     };
@@ -670,7 +688,7 @@ async fn run_shell<C: Send + Sync + 'static>(
         .with_run_config(env.config.clone());
     let requested_max = data.action.max_output_length;
     let run = async {
-        start_hooks(env, &tool_ctx, &tool_enum).await;
+        start_hooks(env, &tool_ctx, &tool_enum).await?;
         let mut status = "completed";
         let mut max_output_length: Option<usize> = None;
         let mut structured: Option<Vec<Value>> = None;
@@ -764,17 +782,27 @@ async fn run_shell<C: Send + Sync + 'static>(
         if let Some(p) = provider_meta {
             raw_item["provider_data"] = p;
         }
-        (raw_item, output_text)
+        Ok::<_, AgentsError>((raw_item, output_text))
     };
-    let (raw_item, output_text) = scope::with_span(span.clone(), Box::pin(run)).await;
+    let (raw_item, output_text) = match scope::with_span(span.clone(), Box::pin(run)).await {
+        Ok(done) => done,
+        Err(e) => {
+            span.finish();
+            return Err(e);
+        }
+    };
     ctl.commit(&raw_item, &Value::String(output_text.clone()));
     let post = end_hooks(env, &tool_ctx, &tool_enum, &output_text);
-    if scope::with_span(span.clone(), Box::pin(ctl.post_invoke(post)))
-        .await
-        .is_none()
-    {
-        span.finish();
-        return Ok(LocalOutcome::Stopped);
+    match scope::with_span(span.clone(), Box::pin(ctl.post_invoke(post))).await {
+        None => {
+            span.finish();
+            return Ok(LocalOutcome::Stopped);
+        }
+        Some(Err(e)) => {
+            span.finish();
+            return Err(e);
+        }
+        Some(Ok(())) => {}
     }
     finish_span(env, &span, &output_text);
     span.finish();
@@ -801,7 +829,7 @@ async fn run_local_shell<C: Send + Sync + 'static>(
         .with_agent(env.agent.clone())
         .with_run_config(env.config.clone());
     let tool_enum = Tool::LocalShell(tool.clone());
-    start_hooks(env, &tool_ctx, &tool_enum).await;
+    start_hooks(env, &tool_ctx, &tool_enum).await?;
     let result = (tool.executor)(LocalShellCommandRequest {
         ctx: env.ctx.clone(),
         data: raw.clone(),
@@ -809,12 +837,13 @@ async fn run_local_shell<C: Send + Sync + 'static>(
     .await?;
     let raw_item = json!({"type": "local_shell_call_output", "call_id": call_id, "output": result});
     ctl.commit(&raw_item, &Value::String(result.clone()));
-    if ctl
+    match ctl
         .post_invoke(end_hooks(env, &tool_ctx, &tool_enum, &result))
         .await
-        .is_none()
     {
-        return Ok(LocalOutcome::Stopped);
+        None => return Ok(LocalOutcome::Stopped),
+        Some(Err(e)) => return Err(e),
+        Some(Ok(())) => {}
     }
     Ok(LocalOutcome::Output {
         raw_item,
@@ -899,7 +928,7 @@ async fn run_apply_patch<C: Send + Sync + 'static>(
         .with_agent(env.agent.clone())
         .with_run_config(env.config.clone());
     let run = async {
-        start_hooks(env, &tool_ctx, &tool_enum).await;
+        start_hooks(env, &tool_ctx, &tool_enum).await?;
         let mut status = ApplyPatchStatus::Completed;
         let applied = async {
             let mut outputs = Vec::new();
@@ -945,9 +974,16 @@ async fn run_apply_patch<C: Send + Sync + 'static>(
         if !output_text.is_empty() {
             raw_item["output"] = json!(output_text);
         }
-        (raw_item, output_text, status)
+        Ok::<_, AgentsError>((raw_item, output_text, status))
     };
-    let (raw_item, output_text, status) = scope::with_span(span.clone(), Box::pin(run)).await;
+    let (raw_item, output_text, status) = match scope::with_span(span.clone(), Box::pin(run)).await
+    {
+        Ok(done) => done,
+        Err(e) => {
+            span.finish();
+            return Err(e);
+        }
+    };
     ctl.commit(&raw_item, &Value::String(output_text.clone()));
     let post = async {
         let custom_data = match &tool.custom_data_extractor {
@@ -964,8 +1000,10 @@ async fn run_apply_patch<C: Send + Sync + 'static>(
             }
             None => Ok(None),
         };
-        if custom_data.is_ok() {
-            end_hooks(env, &tool_ctx, &tool_enum, &output_text).await;
+        if custom_data.is_ok()
+            && let Err(e) = end_hooks(env, &tool_ctx, &tool_enum, &output_text).await
+        {
+            return Err(e);
         }
         custom_data
     };
@@ -1044,8 +1082,8 @@ async fn run_custom<C: Send + Sync + 'static>(
         .with_agent(env.agent.clone())
         .with_run_config(env.config.clone());
     let run = async {
-        start_hooks(env, &tool_ctx, &tool_enum).await;
-        match tool.invoke(tool_ctx.clone(), input.clone()).await {
+        start_hooks(env, &tool_ctx, &tool_enum).await?;
+        Ok::<_, AgentsError>(match tool.invoke(tool_ctx.clone(), input.clone()).await {
             Ok(t) => t,
             Err(e) => {
                 let msg = e.to_string();
@@ -1060,9 +1098,15 @@ async fn run_custom<C: Send + Sync + 'static>(
                 log_tool_error("Custom tool failed", &msg);
                 msg
             }
+        })
+    };
+    let text = match scope::with_span(span.clone(), Box::pin(run)).await {
+        Ok(text) => text,
+        Err(e) => {
+            span.finish();
+            return Err(e);
         }
     };
-    let text = scope::with_span(span.clone(), Box::pin(run)).await;
     let mut outcome = output_item(text.clone());
     let LocalOutcome::Output {
         raw_item,
@@ -1087,8 +1131,10 @@ async fn run_custom<C: Send + Sync + 'static>(
             }
             None => Ok(None),
         };
-        if extracted.is_ok() {
-            end_hooks(env, &tool_ctx, &tool_enum, &text).await;
+        if extracted.is_ok()
+            && let Err(e) = end_hooks(env, &tool_ctx, &tool_enum, &text).await
+        {
+            return Err(e);
         }
         extracted
     };

@@ -219,6 +219,9 @@ impl SandboxMemoryGenerationManager {
             }
             *stopped = true;
         }
+        // Closing the session ends the manager's registration, so a later run on the same
+        // session starts a fresh one.
+        crate::sandbox::capabilities::Memory::unregister_manager(&session, self);
         let rollouts: Vec<(String, String)> = self
             .rollout_files
             .lock()

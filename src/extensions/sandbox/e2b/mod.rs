@@ -68,6 +68,7 @@ use super::ports::{
     ExposedPortEndpoint, ExposedPortUnavailable, assert_exposed_port_configured,
     endpoint_from_authority, exposed_port_unavailable,
 };
+use super::{is_secret_option_name, persistable_identifier, redact_string_map, strip_url_secrets};
 use crate::sandbox::errors::{ErrorCode, SandboxError, SandboxResult};
 use crate::sandbox::http::{
     as_archive_read, bounded_read_zero, expect_success, http_error, parse_json, read_body_prefix,
@@ -496,7 +497,8 @@ fn missing_api_key() -> SandboxError {
 
 /// The E2B options a resumed session is rebuilt from.
 ///
-/// Mirrors the `mcp` field of Python's `E2BSandboxSessionState`, with one deliberate
+/// Mirrors the `mcp`, `template`, `metadata`, `base_envs` and `timeouts` fields of Python's
+/// `E2BSandboxSessionState`, with one deliberate
 /// difference: the persisted state stays credential-free, so only the non-secret shape of the
 /// MCP config is recorded. Server names are kept; an option whose name looks secret (`apiKey`,
 /// `token`, `secret`, `password`, `authorization`, ...) is dropped, and a URL loses its userinfo,
@@ -508,47 +510,28 @@ fn missing_api_key() -> SandboxError {
 pub struct E2BPersistedOptions {
     /// The non-secret shape of the MCP servers E2B starts inside the sandbox, by server name.
     pub mcp: BTreeMap<String, BTreeMap<String, String>>,
+    /// The template the sandbox was created from, so a replacement uses the same one. Absent
+    /// when it looked like a credential.
+    pub template: Option<String>,
+    /// Sandbox metadata, redacted the same way as the MCP options.
+    pub metadata: BTreeMap<String, String>,
+    /// Environment variables set at creation (Python's `base_envs`), redacted: entries whose
+    /// name or value looks secret are not recorded.
+    pub envs: BTreeMap<String, String>,
+    /// The operation timeouts the session ran with. Absent in a payload that predates them.
+    pub timeouts: Option<E2BSandboxTimeouts>,
 }
 
 impl std::fmt::Debug for E2BPersistedOptions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("E2BPersistedOptions")
             .field("mcp", &self.mcp.keys().collect::<Vec<_>>())
+            .field("template", &self.template)
+            .field("metadata", &self.metadata.keys().collect::<Vec<_>>())
+            .field("envs", &self.envs.keys().collect::<Vec<_>>())
+            .field("timeouts", &self.timeouts)
             .finish()
     }
-}
-
-/// Whether an MCP option name is likely to hold a secret.
-fn is_secret_option_name(name: &str) -> bool {
-    let name = name.to_ascii_lowercase();
-    [
-        "key",
-        "token",
-        "secret",
-        "password",
-        "passwd",
-        "auth",
-        "credential",
-        "cookie",
-        "bearer",
-        "signature",
-        "session",
-    ]
-    .iter()
-    .any(|needle| name.contains(needle))
-}
-
-/// A URL without userinfo, query or fragment; any other value is returned as it is.
-fn strip_url_secrets(value: &str) -> String {
-    let Some((scheme, rest)) = value.split_once("://") else {
-        return value.to_string();
-    };
-    let end = rest.find(['?', '#']).unwrap_or(rest.len());
-    let rest = &rest[..end];
-    let authority_end = rest.find('/').unwrap_or(rest.len());
-    let (authority, path) = rest.split_at(authority_end);
-    let host = authority.rsplit('@').next().unwrap_or(authority);
-    format!("{scheme}://{host}{path}")
 }
 
 impl E2BPersistedOptions {
@@ -567,17 +550,38 @@ impl E2BPersistedOptions {
                     (server.clone(), shape)
                 })
                 .collect(),
+            template: persistable_identifier(&options.resolved_template()),
+            metadata: redact_string_map(&options.metadata),
+            envs: redact_string_map(&options.envs),
+            timeouts: Some(options.timeouts.clone()),
         }
     }
 
-    /// Layer the recorded shape under the client's own MCP config: the client's value wins for
-    /// every key it sets, and a server only the client knows is kept.
+    /// Layer the recorded options under the client's own.
+    ///
+    /// The MCP config, metadata and environment merge key by key with the client's value
+    /// winning (the client holds the secrets the record left out), and a server or key only the
+    /// client knows is kept. The template and timeouts are the original session's: a
+    /// replacement sandbox is created from them.
     pub fn apply_to(self, options: &mut E2BSandboxClientOptions) {
+        fn layer<V>(recorded: BTreeMap<String, V>, own: &mut BTreeMap<String, V>) {
+            let mut merged = recorded;
+            merged.extend(std::mem::take(own));
+            *own = merged;
+        }
         let mut merged = self.mcp;
         for (server, config) in std::mem::take(&mut options.mcp) {
             merged.entry(server).or_default().extend(config);
         }
         options.mcp = merged;
+        layer(self.metadata, &mut options.metadata);
+        layer(self.envs, &mut options.envs);
+        if self.template.is_some() {
+            options.template = self.template;
+        }
+        if let Some(timeouts) = self.timeouts {
+            options.timeouts = timeouts;
+        }
     }
 
     /// The options persisted in `state`, when it carries any.

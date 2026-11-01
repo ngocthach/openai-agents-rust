@@ -1204,6 +1204,13 @@ pub trait SandboxSession: Send + Sync + fmt::Debug {
         None
     }
 
+    /// Whether `aclose` still shuts the session down after the snapshot capture or `stop`
+    /// failed. Backends that hold mount credentials in the sandbox return `true`, so a failed
+    /// close does not leave them running.
+    fn shutdown_after_failed_close(&self) -> bool {
+        false
+    }
+
     /// Whether [`persist_session_snapshot`] should fingerprint the workspace before archiving it.
     ///
     /// Mirrors Python's `_should_compute_snapshot_fingerprint_on_persist`.

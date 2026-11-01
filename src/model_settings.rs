@@ -88,6 +88,36 @@ impl Reasoning {
     }
 }
 
+/// Deserialize an optional backoff value, rejecting a negative or non-finite number as Python's
+/// `Field(ge=0)` does.
+fn deserialize_non_negative<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<f64>::deserialize(deserializer)?;
+    match value {
+        Some(v) if !v.is_finite() || v < 0.0 => Err(serde::de::Error::custom(
+            "Input should be greater than or equal to 0",
+        )),
+        other => Ok(other),
+    }
+}
+
+/// Deserialize an optional model-call timeout, rejecting zero, negative and non-finite numbers
+/// as Python's `FiniteFloat` with `Field(gt=0)` does.
+fn deserialize_positive_finite<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<f64>::deserialize(deserializer)?;
+    match value {
+        Some(v) if !v.is_finite() || v <= 0.0 => Err(serde::de::Error::custom(
+            "Input should be a finite number greater than 0",
+        )),
+        other => Ok(other),
+    }
+}
+
 /// Backoff configuration for runner-managed model retries. Every field is optional: an unset
 /// field falls back to the documented default when the delay is computed, and a partial override
 /// keeps the inherited value of the fields it does not set (see [`ModelSettings::resolve`]).
@@ -95,13 +125,25 @@ impl Reasoning {
 #[serde(default)]
 pub struct ModelRetryBackoffSettings {
     /// Delay before the first retry, in seconds (default 0.25).
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_non_negative"
+    )]
     pub initial_delay: Option<f64>,
     /// Upper bound of the computed backoff delay, in seconds (default 2.0).
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_non_negative"
+    )]
     pub max_delay: Option<f64>,
     /// Multiplier applied to the delay after every retry (default 2.0).
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_non_negative"
+    )]
     pub multiplier: Option<f64>,
     /// Whether to randomize the delay (default true).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -284,7 +326,11 @@ pub struct ModelSettings {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub preserve_raw_usage: Option<bool>,
     /// Maximum duration of each model-call attempt, in seconds.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_positive_finite"
+    )]
     pub timeout: Option<f64>,
 }
 

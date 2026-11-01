@@ -530,9 +530,11 @@ impl<C: Send + Sync + 'static> RealtimeSession<C> {
         }
         // A task that closes the session from inside must not abort itself mid-cleanup.
         let current = tokio::task::try_id();
-        let abort = |task: &JoinHandle<()>| {
+        let mut finalizing: Vec<JoinHandle<()>> = Vec::new();
+        let mut abort = |task: JoinHandle<()>| {
             if Some(task.id()) != current {
                 task.abort();
+                finalizing.push(task);
             }
         };
         if let Some(pump) = self
@@ -542,7 +544,7 @@ impl<C: Send + Sync + 'static> RealtimeSession<C> {
             .expect("realtime session poisoned")
             .take()
         {
-            abort(&pump);
+            abort(pump);
         }
         for task in self
             .inner
@@ -551,7 +553,7 @@ impl<C: Send + Sync + 'static> RealtimeSession<C> {
             .expect("realtime session poisoned")
             .drain(..)
         {
-            abort(&task);
+            abort(task);
         }
         for task in self
             .inner
@@ -560,7 +562,12 @@ impl<C: Send + Sync + 'static> RealtimeSession<C> {
             .expect("realtime session poisoned")
             .drain(..)
         {
-            abort(&task);
+            abort(task);
+        }
+        // The transport closes only after every background task has been dropped, so a late
+        // tool or guardrail result cannot reach a closed transport.
+        for task in finalizing {
+            let _ = task.await;
         }
         *self.inner.sender.lock().expect("realtime session poisoned") = None;
         {
@@ -684,12 +691,14 @@ pub(crate) async fn build_model_settings_from_agent<C: Send + Sync + 'static>(
         })
         .collect();
     specs.extend(handoffs.iter().map(RealtimeHandoff::to_spec));
-    validate_tool_names(&specs)?;
     settings.tools = Some(specs);
 
     if let Some(starting) = starting {
         settings.merge(starting);
     }
+    // The names that reach the model are the final ones: a connect-time override that replaces
+    // the agent's tools also replaces the conflict.
+    validate_tool_names(settings.tools.as_deref().unwrap_or_default())?;
     if tracing_disabled {
         settings.tracing = Some(RealtimeModelTracing::Disabled);
     }
