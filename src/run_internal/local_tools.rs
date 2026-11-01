@@ -235,10 +235,9 @@ async fn approval_gate<C: Send + Sync + 'static>(
     }
     match status {
         Some(false) => {
-            let message = env
-                .ctx
-                .rejection_message(agent, &tool_key, &call_id)
-                .unwrap_or_else(|| {
+            let message = match env.ctx.rejection_message(agent, &tool_key, &call_id) {
+                Some(message) => message,
+                None => {
                     format_tool_error_for(
                         env.config,
                         env.ctx,
@@ -249,7 +248,9 @@ async fn approval_gate<C: Send + Sync + 'static>(
                         DEFAULT_APPROVAL_REJECTION_MESSAGE.to_string(),
                         None,
                     )
-                });
+                    .await
+                }
+            };
             Ok(Gate::Rejected(message))
         }
         _ => Ok(Gate::Proceed),

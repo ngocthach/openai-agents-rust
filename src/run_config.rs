@@ -67,6 +67,74 @@ pub struct ToolErrorFormatterArgs<'a, C> {
     pub error: Option<&'a crate::error::AgentsError>,
 }
 
+/// Formats the model-visible message for a tool error the SDK answers itself.
+///
+/// Port of Python's `ToolErrorFormatter`: it may await and it may fail. `Ok(None)` keeps the SDK
+/// default message, and so does an `Err`, which is logged (the detail only when the tool-data
+/// logging policy allows it) and never ends the run: Python catches whatever a formatter raises.
+/// Build one with [`tool_error_formatter_fn`] (plain closure), [`try_tool_error_formatter_fn`]
+/// (plain closure that may fail) or [`async_tool_error_formatter_fn`] (async).
+pub type ToolErrorFormatter<C> = Arc<
+    dyn for<'a> Fn(&'a ToolErrorFormatterArgs<'a, C>) -> BoxFuture<'a, Result<Option<String>>>
+        + Send
+        + Sync,
+>;
+
+/// Wrap a synchronous closure that returns the message (or `None`) as a [`ToolErrorFormatter`].
+pub fn tool_error_formatter_fn<C, F>(f: F) -> ToolErrorFormatter<C>
+where
+    F: for<'a> Fn(&ToolErrorFormatterArgs<'a, C>) -> Option<String> + Send + Sync + 'static,
+{
+    async_tool_error_formatter_fn(move |args| Box::pin(std::future::ready(Ok(f(args)))))
+}
+
+/// Wrap a synchronous closure that may fail as a [`ToolErrorFormatter`]. An `Err` is logged and
+/// the default message is used.
+pub fn try_tool_error_formatter_fn<C, F>(f: F) -> ToolErrorFormatter<C>
+where
+    F: for<'a> Fn(&ToolErrorFormatterArgs<'a, C>) -> Result<Option<String>> + Send + Sync + 'static,
+{
+    async_tool_error_formatter_fn(move |args| Box::pin(std::future::ready(f(args))))
+}
+
+/// Wrap an async closure as a [`ToolErrorFormatter`]. The closure returns a boxed future, usually
+/// `Box::pin(async move { ... })`.
+pub fn async_tool_error_formatter_fn<C, F>(f: F) -> ToolErrorFormatter<C>
+where
+    F: for<'a> Fn(&'a ToolErrorFormatterArgs<'a, C>) -> BoxFuture<'a, Result<Option<String>>>
+        + Send
+        + Sync
+        + 'static,
+{
+    Arc::new(f)
+}
+
+/// Ask `formatter` for the message of `args`, falling back to `None` (the caller's default) when
+/// it fails. Port of the `try`/`except Exception` around Python's formatter call.
+pub(crate) async fn apply_tool_error_formatter<C>(
+    formatter: &ToolErrorFormatter<C>,
+    args: &ToolErrorFormatterArgs<'_, C>,
+) -> Option<String> {
+    match formatter(args).await {
+        Ok(message) => message,
+        Err(error) => {
+            match args.kind {
+                ToolErrorKind::ToolException => {
+                    crate::logger::log_tool_action_warning("Tool error formatter failed", &error)
+                }
+                ToolErrorKind::ApprovalRejected => {
+                    crate::logger::log_tool_action_error("Tool error formatter failed", &error)
+                }
+                ToolErrorKind::ToolNotFound => crate::logger::log_tool_action_error(
+                    "Tool error formatter failed for missing tool",
+                    &error,
+                ),
+            }
+            None
+        }
+    }
+}
+
 impl<C> fmt::Debug for ToolErrorFormatterArgs<'_, C> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ToolErrorFormatterArgs")
@@ -194,8 +262,6 @@ type SessionInputCallback = Arc<
 >;
 type CallModelInputFilter<C> =
     Arc<dyn Fn(CallModelData<C>) -> BoxFuture<'static, Result<ModelInputData>> + Send + Sync>;
-type ToolErrorFormatter<C> =
-    Arc<dyn for<'a> Fn(&ToolErrorFormatterArgs<'a, C>) -> Option<String> + Send + Sync>;
 /// Maps the normalized transcript to the input of the next agent when nesting handoff history.
 pub type HandoffHistoryMapper = Arc<dyn Fn(Vec<InputItem>) -> Vec<InputItem> + Send + Sync>;
 
@@ -405,7 +471,13 @@ impl<C: Send + Sync + 'static> RunConfig<C> {
     where
         F: Fn(HandoffInputData) -> HandoffInputData + Send + Sync + 'static,
     {
-        self.handoff_input_filter = Some(Arc::new(f));
+        self.handoff_input_filter = Some(crate::handoffs::handoff_input_filter(f));
+        self
+    }
+
+    /// Set a global [`HandoffInputFilter`], which may await and may fail (an `Err` ends the run).
+    pub fn with_handoff_input_filter_handler(mut self, filter: HandoffInputFilter) -> Self {
+        self.handoff_input_filter = Some(filter);
         self
     }
 
@@ -440,7 +512,14 @@ impl<C: Send + Sync + 'static> RunConfig<C> {
     where
         F: for<'a> Fn(&ToolErrorFormatterArgs<'a, C>) -> Option<String> + Send + Sync + 'static,
     {
-        self.tool_error_formatter = Some(Arc::new(f));
+        self.tool_error_formatter = Some(tool_error_formatter_fn(f));
+        self
+    }
+
+    /// Customize model-visible tool error messages with a [`ToolErrorFormatter`], which may
+    /// await and may fail (a failure keeps the default message).
+    pub fn with_tool_error_formatter_handler(mut self, formatter: ToolErrorFormatter<C>) -> Self {
+        self.tool_error_formatter = Some(formatter);
         self
     }
 

@@ -78,8 +78,9 @@ pub use guardrail::{
     OutputGuardrailResult,
 };
 pub use handoffs::{
-    Handoff, HandoffHistoryMapper, HandoffInputData, HandoffInputFilter, handoff,
-    nest_handoff_history,
+    Handoff, HandoffHistoryMapper, HandoffInputData, HandoffInputFilter,
+    async_handoff_input_filter, handoff, handoff_input_filter, nest_handoff_history,
+    try_handoff_input_filter,
 };
 pub use items::{
     FunctionCall, FunctionCallOutput, InputItem, ItemHelpers, MessageOutput, ModelResponse,
@@ -105,8 +106,9 @@ pub use run::{
     get_default_agent_runner, set_default_agent_runner,
 };
 pub use run_config::{
-    CallModelData, ModelInputData, RunConfig, ToolErrorFormatterArgs, ToolErrorKind,
-    ToolExecutionConfig, ToolNotFoundBehavior,
+    CallModelData, ModelInputData, RunConfig, ToolErrorFormatter, ToolErrorFormatterArgs,
+    ToolErrorKind, ToolExecutionConfig, ToolNotFoundBehavior, async_tool_error_formatter_fn,
+    tool_error_formatter_fn, try_tool_error_formatter_fn,
 };
 pub use run_context::{ApprovalStatus, RunContext};
 pub use run_error_handlers::{RunErrorHandlerInput, RunErrorHandlerResult, RunErrorHandlers};

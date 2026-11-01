@@ -180,7 +180,7 @@ pub(crate) struct ToolExecResult {
     pub output_guardrail_results: Vec<ToolOutputGuardrailResult>,
 }
 
-fn format_tool_error<C>(
+async fn format_tool_error<C>(
     config: &RunConfig<C>,
     ctx: &RunContext<C>,
     kind: ToolErrorKind,
@@ -198,11 +198,12 @@ fn format_tool_error<C>(
         default_message,
         None,
     )
+    .await
 }
 
 /// Apply the run's tool error formatter for a tool of the given runtime type.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn format_tool_error_for<C>(
+pub(crate) async fn format_tool_error_for<C>(
     config: &RunConfig<C>,
     ctx: &RunContext<C>,
     kind: ToolErrorKind,
@@ -222,7 +223,7 @@ pub(crate) fn format_tool_error_for<C>(
             run_context: ctx,
             error,
         };
-        if let Some(m) = f(&args) {
+        if let Some(m) = crate::run_config::apply_tool_error_formatter(f, &args).await {
             return m;
         }
     }
@@ -230,7 +231,7 @@ pub(crate) fn format_tool_error_for<C>(
 }
 
 /// Model-visible output for a tool the model called but the agent does not have.
-pub(crate) fn tool_not_found_message<C>(
+pub(crate) async fn tool_not_found_message<C>(
     config: &RunConfig<C>,
     ctx: &RunContext<C>,
     name: &str,
@@ -244,6 +245,7 @@ pub(crate) fn tool_not_found_message<C>(
         call_id,
         format!("Tool '{name}' not found."),
     )
+    .await
 }
 
 fn output_outcome(call: &FunctionCall, output: ToolOutput) -> ToolOutcome {
@@ -422,16 +424,20 @@ pub(crate) async fn execute_function_tool<C: Send + Sync + 'static>(
                         env.ctx
                             .function_tool_status(&env.agent.name, &approval_key, &call.call_id);
                 }
-                let message = decided.rejection_message.unwrap_or_else(|| {
-                    format_tool_error(
-                        env.config,
-                        env.ctx,
-                        ToolErrorKind::ApprovalRejected,
-                        &tool.name,
-                        &call.call_id,
-                        DEFAULT_APPROVAL_REJECTION_MESSAGE.to_string(),
-                    )
-                });
+                let message = match decided.rejection_message {
+                    Some(message) => message,
+                    None => {
+                        format_tool_error(
+                            env.config,
+                            env.ctx,
+                            ToolErrorKind::ApprovalRejected,
+                            &tool.name,
+                            &call.call_id,
+                            DEFAULT_APPROVAL_REJECTION_MESSAGE.to_string(),
+                        )
+                        .await
+                    }
+                };
                 let span = create_span(
                     SpanData::Function {
                         name: tool.qualified_name(),
@@ -602,7 +608,8 @@ pub(crate) async fn execute_function_tool<C: Send + Sync + 'static>(
                                 &call.call_id,
                                 msg,
                                 Some(&e),
-                            );
+                            )
+                            .await;
                             sdk_generated_text = true;
                         }
                         // The default policy keeps the error out of traces even when sensitive

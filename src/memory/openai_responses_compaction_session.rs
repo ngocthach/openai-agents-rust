@@ -1162,6 +1162,8 @@ mod tests {
 
     #[test]
     fn orphaned_assistant_ids_are_stripped() {
+        assert!(strip_orphaned_assistant_ids(Vec::new()).is_empty());
+
         let items = vec![InputItem(
             json!({"id": "msg_1", "role": "assistant", "content": "x"}),
         )];

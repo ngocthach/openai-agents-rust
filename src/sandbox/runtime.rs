@@ -307,6 +307,16 @@ impl SandboxSessionGuard {
         self.release(true).await.map(|_| ())
     }
 
+    /// [`close`](Self::close), also returning the session state as the teardown left it.
+    ///
+    /// The state is read after the workspace capture and before the release, as
+    /// [`suspend`](Self::suspend) reads it. It is what a finished run files under the sandbox
+    /// section of its run state (Python serializes it once cleanup succeeded); a teardown error
+    /// returns no state.
+    pub async fn close_with_state(self) -> Result<SandboxSessionState> {
+        self.release(true).await
+    }
+
     /// Release the session and return the state needed to resume it later.
     ///
     /// Mirrors Python, where a paused run is cleaned up exactly like a finished one: interactive
@@ -339,13 +349,13 @@ impl SandboxSessionGuard {
         Ok(state)
     }
 
-    async fn release(self, persist: bool) -> Result<()> {
+    async fn release(self, persist: bool) -> Result<SandboxSessionState> {
         let owned = self.client.is_some();
         let tracing_disabled = self.tracing_disabled;
         let teardown = async move {
             let _ = self.session.pty_terminate_all().await;
             match self.client {
-                None => Ok(()),
+                None => Ok(self.session.session_state()),
                 Some(client) => {
                     use crate::sandbox::session_lifecycle as lifecycle;
                     let manifest = self.session.manifest().clone();
@@ -362,6 +372,8 @@ impl SandboxSessionGuard {
                         Ok(())
                     };
                     let session = self.session.clone();
+                    // Read before the delete invalidates what the session reports.
+                    let state = session.session_state();
                     let deleted = client.delete(self.session).await;
                     lifecycle::close_dependencies(&session).await;
                     hooks?;
@@ -375,7 +387,7 @@ impl SandboxSessionGuard {
                             &manifest, error,
                         )
                     })?;
-                    Ok(())
+                    Ok(state)
                 }
             }
         };
@@ -973,7 +985,7 @@ impl SandboxRunner {
                 .unwrap_or_else(|| key_for_agent_name(&prepared.graph, &result.last_agent.name)),
             Err(_) => agent.name().to_string(),
         };
-        let sandbox_state = if suspend {
+        let session_state = if suspend {
             match guard.suspend().await {
                 // Carry the rollout id across the suspend so the resumed half appends to the
                 // same rollout instead of starting a new one.
@@ -984,19 +996,33 @@ impl SandboxRunner {
                 }
             }
         } else {
-            if let Err(error) = guard.close().await {
-                log_sandbox_failure(protected, "Failed to tear down the sandbox session", &error);
+            match guard.close_with_state().await {
+                Ok(state) => Some(state.with_rollout_id(Some(rollout_id))),
+                Err(error) => {
+                    log_sandbox_failure(
+                        protected,
+                        "Failed to tear down the sandbox session",
+                        &error,
+                    );
+                    None
+                }
             }
-            None
         };
-        // The run state carries the sandbox section of the sessions this run suspended. A run
-        // that finished leaves what it was resumed from untouched; a caller-owned session has no
-        // state to resume from, and a suspend that failed leaves nothing to resume.
+        // The outcome reports the states only of a run that left its sandbox suspended; the run
+        // state's section (below) is written after a finished run too, as Python does.
+        let (reported_state, reported_by_agent) = if suspend {
+            (session_state.clone(), sandbox_states_by_agent.clone())
+        } else {
+            (None, Default::default())
+        };
+        // The run state carries the sandbox section of the sessions this run released. A
+        // caller-owned session has no state to resume from, and a release that failed leaves
+        // nothing to resume.
         let mut result = result?;
         if config.session.is_some() {
             result.state.sandbox = None;
-        } else if suspend {
-            result.state.sandbox = match (&sandbox_state, &config.client) {
+        } else {
+            result.state.sandbox = match (&session_state, &config.client) {
                 (Some(state), Some(client)) => suspended_section(
                     &mut prepared.resume,
                     &prepared.graph,
@@ -1011,8 +1037,8 @@ impl SandboxRunner {
         }
         Ok(SandboxRunOutcome {
             result,
-            sandbox_state,
-            sandbox_states_by_agent,
+            sandbox_state: reported_state,
+            sandbox_states_by_agent: reported_by_agent,
             // The manager is handed back only when this run did not flush it.
             memory_manager: if flushed { None } else { memory },
         })
@@ -1172,12 +1198,13 @@ impl SandboxRunner {
                     rollout_id,
                 )
                 .await;
-                // The streamed completion names the last agent but carries no handle to it, so
-                // two agents sharing a name resolve to the first of them.
-                if completion.is_suspended()
-                    && let (Some(state), Some(backend_id)) = (&state, &backend_id)
-                {
-                    let current_key = key_for_agent_name(&graph, &completion.last_agent_name);
+                // The completion carries the identity of the last agent, so two agents sharing
+                // a name resolve to their own keys; the name is the fallback.
+                if let (Some(state), Some(backend_id)) = (&state, &backend_id) {
+                    let current_key = graph
+                        .key_for_prepared_id(completion.last_agent_id)
+                        .map(str::to_string)
+                        .unwrap_or_else(|| key_for_agent_name(&graph, &completion.last_agent_name));
                     *hook_section.lock().expect("poisoned") = suspended_section(
                         &mut resume,
                         &graph,
@@ -1188,7 +1215,7 @@ impl SandboxRunner {
                         &current_key,
                     );
                 }
-                *hook_state.lock().expect("poisoned") = state;
+                *hook_state.lock().expect("poisoned") = state.filter(|_| completion.is_suspended());
             })
         }));
 
@@ -1250,15 +1277,16 @@ impl<C: Send + Sync + 'static> SandboxStreamedRun<C> {
         self.sandbox_state.lock().expect("poisoned").clone()
     }
 
-    /// The sandbox section of the suspended sessions (see
-    /// [`RunState::sandbox`](crate::RunState)), once the stream has finished with the run paused.
+    /// The sandbox section of the released sessions (see
+    /// [`RunState::sandbox`](crate::RunState)), once the stream has finished, whether the run
+    /// paused or ended. `None` when the release failed or the caller owns the session.
     ///
     /// One entry per agent session, so [`SandboxSessionMode::PerAgent`] runs resume every agent.
     pub fn sandbox_resume_state(&self) -> Option<serde_json::Value> {
         self.resume_section.lock().expect("poisoned").clone()
     }
 
-    /// A resumable snapshot of the run, carrying the sandbox section when the run paused.
+    /// A resumable snapshot of the run, carrying the sandbox section of the released sessions.
     ///
     /// [`RunResultStreaming::to_state`] plus [`sandbox_resume_state`](Self::sandbox_resume_state),
     /// so a run resumed from it restores the agents' sessions.
@@ -1288,8 +1316,9 @@ impl<C: Send + Sync + 'static> SandboxStreamedRun<C> {
     }
 }
 
-/// Release a sandbox session after a run: record memory, then suspend or tear down.
-/// Suspend or close the per-agent sessions of a finished run.
+/// Release the other agents' sessions and collect the state each was left in: after a suspend
+/// (the run is paused) and after a teardown (the run finished), as Python serializes the section
+/// in both cases. A session whose release failed has no entry.
 async fn release_agent_guards(
     guards: Vec<(String, SandboxSessionGuard)>,
     suspend: bool,
@@ -1313,12 +1342,17 @@ async fn release_agent_guards(
             }
             continue;
         }
-        if let Err(error) = guard.close().await {
-            log_sandbox_failure(
-                protected,
-                &format!("Failed to tear down the sandbox session of `{name}`"),
-                &error,
-            );
+        match guard.close_with_state().await {
+            Ok(state) => {
+                states.insert(name, state.with_rollout_id(Some(rollout_id.to_string())));
+            }
+            Err(error) => {
+                log_sandbox_failure(
+                    protected,
+                    &format!("Failed to tear down the sandbox session of `{name}`"),
+                    &error,
+                );
+            }
         }
     }
     states
@@ -1392,6 +1426,9 @@ fn suspended_section<C: Send + Sync + 'static>(
     }
 }
 
+/// Release the starting agent's session: suspend it when the run paused, else tear it down.
+/// Either way the session state is returned for the run state's sandbox section; `None` when the
+/// release failed.
 async fn finish_sandbox_run(
     guard: SandboxSessionGuard,
     suspend: bool,
@@ -1416,10 +1453,13 @@ async fn finish_sandbox_run(
             }
         }
     }
-    if let Err(error) = guard.close().await {
-        log_sandbox_failure(protected, "Failed to tear down the sandbox session", &error);
+    match guard.close_with_state().await {
+        Ok(state) => Some(state.with_rollout_id(Some(rollout_id))),
+        Err(error) => {
+            log_sandbox_failure(protected, "Failed to tear down the sandbox session", &error);
+            None
+        }
     }
-    None
 }
 
 /// Whether the session's manifest holds a mount whose credentials a provider failure could echo.

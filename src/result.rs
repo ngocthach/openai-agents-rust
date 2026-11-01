@@ -427,6 +427,9 @@ pub struct StreamCompletion {
     /// Name of the agent that was active when the run ended: the last agent of the result, or
     /// the agent the stream had reached when the run failed.
     pub last_agent_name: String,
+    /// Identity of that agent: the address of its `Arc<Agent>` (`Arc::as_ptr(&agent) as usize`),
+    /// which tells apart agents that share a name. `0` when unknown.
+    pub last_agent_id: usize,
 }
 
 impl StreamCompletion {
@@ -554,6 +557,7 @@ impl<C: Send + Sync + 'static> RunResultStreaming<C> {
             let completion = match self.result.as_ref() {
                 None => StreamCompletion {
                     last_agent_name: self.current_agent.name.clone(),
+                    last_agent_id: Arc::as_ptr(&self.current_agent) as usize,
                     ..Default::default()
                 },
                 Some(result) => StreamCompletion {
@@ -563,6 +567,7 @@ impl<C: Send + Sync + 'static> RunResultStreaming<C> {
                     new_items: result.new_items.clone(),
                     final_output: result.final_output.clone(),
                     last_agent_name: result.last_agent.name.clone(),
+                    last_agent_id: Arc::as_ptr(&result.last_agent) as usize,
                 },
             };
             hook(completion).await;

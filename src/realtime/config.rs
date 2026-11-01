@@ -701,9 +701,9 @@ pub type RealtimeToolErrorArgs<'a, C> = ToolErrorFormatterArgs<'a, C>;
 
 /// Formats the model-visible message for a tool call the SDK answers itself.
 ///
-/// Returning `None` keeps the default message.
-pub type RealtimeToolErrorFormatter<C> =
-    std::sync::Arc<dyn for<'a> Fn(&ToolErrorFormatterArgs<'a, C>) -> Option<String> + Send + Sync>;
+/// The core [`ToolErrorFormatter`](crate::run_config::ToolErrorFormatter): it may await and may fail, and returning `None` (or failing)
+/// keeps the default message.
+pub type RealtimeToolErrorFormatter<C> = crate::run_config::ToolErrorFormatter<C>;
 
 /// Configuration for a whole realtime run.
 pub struct RealtimeRunConfig<C> {

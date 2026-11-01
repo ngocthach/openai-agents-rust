@@ -695,6 +695,9 @@ pub struct FunctionTool<C> {
     output_validator: Option<OutputValidatorFn>,
     /// See [`ApprovalArgsCheckFn`]; set by [`FunctionTool::new`].
     approval_args_check: Option<ApprovalArgsCheckFn>,
+    /// Whether the argument type runs application code while parsing. See
+    /// [`FunctionTool::with_args_have_validators`].
+    args_have_validators: bool,
     /// Human-readable title of the MCP tool this one was derived from, when it declared one.
     /// Mirrors `FunctionTool._mcp_title`.
     pub mcp_title: Option<String>,
@@ -740,6 +743,7 @@ impl<C> Clone for FunctionTool<C> {
             output_json_schema: self.output_json_schema.clone(),
             output_validator: self.output_validator.clone(),
             approval_args_check: self.approval_args_check.clone(),
+            args_have_validators: self.args_have_validators,
             mcp_title: self.mcp_title.clone(),
             is_codex_tool: self.is_codex_tool,
             invoke: self.invoke.clone(),
@@ -1157,6 +1161,7 @@ impl<C: Send + Sync + 'static> FunctionTool<C> {
             output_json_schema: None,
             output_validator: None,
             approval_args_check: None,
+            args_have_validators: false,
             mcp_title: None,
             is_codex_tool: false,
             namespace: None,
@@ -1233,6 +1238,9 @@ impl<C: Send + Sync + 'static> FunctionTool<C> {
         arguments: &str,
         call_id: &str,
     ) -> bool {
+        if self.args_have_validators && matches!(self.needs_approval, NeedsApproval::Dynamic(_)) {
+            return true;
+        }
         if let (NeedsApproval::Dynamic(_), Some(check)) =
             (&self.needs_approval, &self.approval_args_check)
         {
@@ -1242,6 +1250,21 @@ impl<C: Send + Sync + 'static> FunctionTool<C> {
             }
         }
         self.needs_approval.evaluate(ctx, arguments, call_id).await
+    }
+
+    /// Declare that the argument type runs application code while it is parsed (a
+    /// `deserialize_with` function, a custom `Deserialize`, a validating constructor).
+    ///
+    /// Rust cannot see such code, so the tool states it. A dynamic approval rule is then never
+    /// consulted: every call pauses for a manual decision before any parsing runs, and the
+    /// application's validation happens only after approval, then follows the tool's failure
+    /// policy. This is the counterpart of Python skipping the rule for argument models with
+    /// custom validators, validator plugins, `model_post_init` or default factories. Without the
+    /// marker a dynamic rule is consulted for arguments that match the declared schema, and
+    /// `Deserialize` never runs before approval. A static `needs_approval` is unaffected.
+    pub fn with_args_have_validators(mut self, have_validators: bool) -> Self {
+        self.args_have_validators = have_validators;
+        self
     }
 
     /// Set the per-call timeout.

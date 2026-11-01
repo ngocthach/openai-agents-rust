@@ -663,9 +663,13 @@ impl<C: Send + Sync + 'static> PreparedSandboxGraph<C> {
 
     /// The identity key of a prepared agent of this graph.
     pub fn key_for_prepared(&self, agent: &Arc<Agent<C>>) -> Option<&str> {
-        self.keys_by_prepared_ptr
-            .get(&(Arc::as_ptr(agent) as usize))
-            .map(String::as_str)
+        self.key_for_prepared_id(Arc::as_ptr(agent) as usize)
+    }
+
+    /// The identity key of the prepared agent whose `Arc` address is `id`, as a streamed run
+    /// reports it in [`StreamCompletion::last_agent_id`](crate::StreamCompletion).
+    pub fn key_for_prepared_id(&self, id: usize) -> Option<&str> {
+        self.keys_by_prepared_ptr.get(&id).map(String::as_str)
     }
 }
 

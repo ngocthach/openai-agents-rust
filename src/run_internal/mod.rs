@@ -3863,14 +3863,10 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
                 .collect(),
         ));
 
-        let processed = match self.process_response(
-            &agent,
-            &tools,
-            &handoffs,
-            &response,
-            true,
-            &HashSet::new(),
-        ) {
+        let processed = match self
+            .process_response(&agent, &tools, &handoffs, &response, true, &HashSet::new())
+            .await
+        {
             Ok(processed) => processed,
             Err(e) => {
                 if self.server_managed() {
@@ -4162,8 +4158,9 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
             None => return Ok(NextStep::RunAgain),
         };
         let done: HashSet<String> = self.generated_items.iter().filter_map(call_id_of).collect();
-        let mut processed =
-            self.process_response(&agent, &tools, &handoffs, &response, false, &done)?;
+        let mut processed = self
+            .process_response(&agent, &tools, &handoffs, &response, false, &done)
+            .await?;
         self.reconcile_resumed_approvals(&tools, &handoffs, &mut processed, &done)?;
         // A call that started running in an earlier attempt and never committed its output
         // is not retried. Port of the `binding_status[2] and not binding_status[1]` branch of
@@ -4350,7 +4347,7 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
 
     /// Classify the output of a model response. When `append` is true the items are added to
     /// the run (and streamed); `skip` lists call ids that already have outputs.
-    fn process_response(
+    async fn process_response(
         &mut self,
         agent: &Arc<Agent<C>>,
         tools: &[Tool<C>],
@@ -4913,7 +4910,8 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
                                         &self.ctx,
                                         &fc.name,
                                         &fc.call_id,
-                                    );
+                                    )
+                                    .await;
                                     let out = ToolOutput::Text(msg);
                                     let raw = ItemHelpers::tool_call_output_item(fc, &out);
                                     let item = RunItem::new(
@@ -5662,7 +5660,8 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
             return Err(error);
         }
         for fc in std::mem::take(&mut processed.missing_approved) {
-            let msg = tools::tool_not_found_message(&self.config, &self.ctx, &fc.name, &fc.call_id);
+            let msg =
+                tools::tool_not_found_message(&self.config, &self.ctx, &fc.name, &fc.call_id).await;
             let raw = ItemHelpers::tool_call_output_item(&fc, &ToolOutput::Text(msg.clone()));
             let item = RunItem::new(
                 agent.name.clone(),
@@ -6197,11 +6196,12 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
                 new_items: self.generated_items[pre_handoff_count..].to_vec(),
                 input_items: None,
             };
-            crate::handoffs::clear_nested_provenance();
-            let filtered = filter(data);
+            let (filtered, forwarded) =
+                crate::handoffs::run_handoff_input_filter(&filter, data).await;
+            let filtered = filtered?;
             // Ownership is what the filter's nested history forwarded, not what it happens to
             // equal: a custom history that merely repeats an item's payload claims nothing.
-            for (key, input) in crate::handoffs::take_nested_provenance() {
+            for (key, input) in forwarded {
                 self.nested_history_owned_items
                     .push(crate::result::NestedOwnedRef { key, input });
             }

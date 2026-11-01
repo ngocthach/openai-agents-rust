@@ -1357,12 +1357,14 @@ impl<C: Send + Sync + 'static> SessionInner<C> {
         }
 
         let default_message = format!("Tool {} not found", call.name);
-        let message = self.format_tool_error(
-            RealtimeToolErrorKind::ToolNotFound,
-            &call.name,
-            &call.call_id,
-            &default_message,
-        );
+        let message = self
+            .format_tool_error(
+                RealtimeToolErrorKind::ToolNotFound,
+                &call.name,
+                &call.call_id,
+                &default_message,
+            )
+            .await;
         self.commit_tool_output(
             &call,
             PendingToolOutput {
@@ -1650,19 +1652,22 @@ impl<C: Send + Sync + 'static> SessionInner<C> {
             .rejection_message(&agent.name, &tool.name, &call.call_id)
         {
             Some(message) => message,
-            None => self.format_tool_error(
-                RealtimeToolErrorKind::ApprovalRejected,
-                &tool.name,
-                &call.call_id,
-                DEFAULT_APPROVAL_REJECTION_MESSAGE,
-            ),
+            None => {
+                self.format_tool_error(
+                    RealtimeToolErrorKind::ApprovalRejected,
+                    &tool.name,
+                    &call.call_id,
+                    DEFAULT_APPROVAL_REJECTION_MESSAGE,
+                )
+                .await
+            }
         };
         self.complete_tool_call(agent, tool, call, ToolOutput::Text(message))
             .await
     }
 
     /// Let the run config reword a message the SDK sends in place of a tool result.
-    fn format_tool_error(
+    async fn format_tool_error(
         &self,
         kind: RealtimeToolErrorKind,
         tool_name: &str,
@@ -1681,7 +1686,9 @@ impl<C: Send + Sync + 'static> SessionInner<C> {
             run_context: &self.context,
             error: None,
         };
-        formatter(&args).unwrap_or_else(|| default_message.to_string())
+        crate::run_config::apply_tool_error_formatter(formatter, &args)
+            .await
+            .unwrap_or_else(|| default_message.to_string())
     }
 
     /// Switch to the handoff target, push its settings and answer the call.

@@ -1466,6 +1466,13 @@ impl SandboxSession for E2BSandboxSession {
     }
 
     async fn running(&self) -> SandboxResult<bool> {
+        // A session whose workspace root `start` has not prepared is not running yet, whatever
+        // the platform says about the sandbox behind it (Python's `workspace_root_ready` gate).
+        // The runner relies on this to start a session a caller built but never started, and the
+        // workspace event sink holds its buffer until the session is usable.
+        if !self.started.load(Ordering::SeqCst) {
+            return Ok(false);
+        }
         let response = tokio::time::timeout(
             self.options.timeouts.keepalive,
             self.platform(self.http.get(format!(
@@ -1492,7 +1499,12 @@ impl SandboxSession for E2BSandboxSession {
     }
 
     async fn exec(&self, request: ExecRequest) -> SandboxResult<ExecResult> {
-        let cwd = self.resolve_cwd(&request.cwd)?;
+        // Until `start` has prepared the workspace root it may not exist, so a command with no
+        // explicit directory runs wherever envd puts it instead of failing on a missing cwd.
+        let cwd = match (&request.cwd, self.started.load(Ordering::SeqCst)) {
+            (None, false) => None,
+            _ => Some(self.resolve_cwd(&request.cwd)?),
+        };
         let user = request.user.as_ref().map(|user| user.name.clone());
         // envd takes the user out of band, so the `sudo` wrapper must not be built here.
         let env = self.request_envs(&request);
@@ -1501,8 +1513,7 @@ impl SandboxSession for E2BSandboxSession {
             ..request.clone()
         }
         .resolved_argv();
-        self.exec_at(argv, Some(cwd), &env, request.timeout, user)
-            .await
+        self.exec_at(argv, cwd, &env, request.timeout, user).await
     }
 
     async fn read_file(&self, path: &str) -> SandboxResult<Vec<u8>> {

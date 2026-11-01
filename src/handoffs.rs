@@ -31,7 +31,62 @@ pub struct HandoffInputData {
 }
 
 /// A function that rewrites the input the next agent receives.
-pub type HandoffInputFilter = Arc<dyn Fn(HandoffInputData) -> HandoffInputData + Send + Sync>;
+///
+/// Port of Python's `HandoffInputFilter`: it may await and it may fail. An `Err` ends the run
+/// with that error, as an exception raised by a Python filter does; it runs after the handoff
+/// invocation succeeded, so it is never covered by the handoff's failure error function. Build
+/// one with [`handoff_input_filter`] (plain closure), [`try_handoff_input_filter`] (plain
+/// closure that may fail) or [`async_handoff_input_filter`] (async).
+pub type HandoffInputFilter =
+    Arc<dyn Fn(HandoffInputData) -> BoxFuture<'static, Result<HandoffInputData>> + Send + Sync>;
+
+/// Wrap a synchronous closure as a [`HandoffInputFilter`].
+pub fn handoff_input_filter<F>(f: F) -> HandoffInputFilter
+where
+    F: Fn(HandoffInputData) -> HandoffInputData + Send + Sync + 'static,
+{
+    async_handoff_input_filter(move |data| {
+        let out = f(data);
+        async move { Ok(out) }
+    })
+}
+
+/// Wrap a synchronous closure that may fail as a [`HandoffInputFilter`]. An `Err` ends the run.
+pub fn try_handoff_input_filter<F>(f: F) -> HandoffInputFilter
+where
+    F: Fn(HandoffInputData) -> Result<HandoffInputData> + Send + Sync + 'static,
+{
+    async_handoff_input_filter(move |data| {
+        let out = f(data);
+        async move { out }
+    })
+}
+
+/// Wrap an async closure as a [`HandoffInputFilter`].
+pub fn async_handoff_input_filter<F, Fut>(f: F) -> HandoffInputFilter
+where
+    F: Fn(HandoffInputData) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<HandoffInputData>> + Send + 'static,
+{
+    Arc::new(move |data| Box::pin(f(data)))
+}
+
+/// Run `filter` and collect which run items a [`nest_handoff_history`] call inside it forwarded:
+/// `(occurrence key, forwarded input)`.
+///
+/// The record is scoped to the filter's future, so it follows the filter across await points and
+/// worker threads, and concurrent runs never see each other's entries.
+pub(crate) async fn run_handoff_input_filter(
+    filter: &HandoffInputFilter,
+    data: HandoffInputData,
+) -> (Result<HandoffInputData>, Vec<(u64, serde_json::Value)>) {
+    let record: NestedProvenance = Arc::default();
+    let result = NESTED_PROVENANCE
+        .scope(record.clone(), async move { filter(data).await })
+        .await;
+    let forwarded = std::mem::take(&mut *record.lock().unwrap_or_else(|e| e.into_inner()));
+    (result, forwarded)
+}
 
 /// Maps the transcript of a handoff to the input of the next agent.
 pub type HandoffHistoryMapper = crate::run_config::HandoffHistoryMapper;
@@ -66,7 +121,12 @@ pub fn nest_handoff_history(
             .zip(normalized.iter())
             .filter(|(_, (_, forward))| *forward)
             .filter_map(|(item, (plain, _))| Some((item.occurrence.0?, plain.0.clone())));
-        NESTED_PROVENANCE.with(|p| p.borrow_mut().extend(forwarded));
+        // Outside a handoff input filter nothing owns the record, so there is nothing to keep.
+        let _ = NESTED_PROVENANCE.try_with(|p| {
+            p.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .extend(forwarded)
+        });
     }
     // Earlier summaries are flattened back into the items they recorded, as Python does, so a
     // custom mapper receives the transcript itself rather than a summary of a summary.
@@ -90,22 +150,13 @@ pub fn nest_handoff_history(
     }
 }
 
-thread_local! {
-    /// Occurrence keys and forwarded inputs recorded by [`nest_handoff_history`] on this thread.
-    /// The runner drains it right after a handoff input filter returns, which is what ties a
-    /// filter's output to the run items it kept, as Python's provenance does.
-    static NESTED_PROVENANCE: std::cell::RefCell<Vec<(u64, serde_json::Value)>> =
-        const { std::cell::RefCell::new(Vec::new()) };
-}
+type NestedProvenance = Arc<std::sync::Mutex<Vec<(u64, serde_json::Value)>>>;
 
-/// Start a fresh provenance record for the handoff input filter about to run.
-pub(crate) fn clear_nested_provenance() {
-    NESTED_PROVENANCE.with(|p| p.borrow_mut().clear());
-}
-
-/// The provenance recorded since [`clear_nested_provenance`]: `(occurrence key, forwarded input)`.
-pub(crate) fn take_nested_provenance() -> Vec<(u64, serde_json::Value)> {
-    NESTED_PROVENANCE.with(|p| std::mem::take(&mut *p.borrow_mut()))
+tokio::task_local! {
+    /// Occurrence keys and forwarded inputs recorded by [`nest_handoff_history`] while a handoff
+    /// input filter runs. The runner reads it right after the filter returns, which is what ties
+    /// a filter's output to the run items it kept, as Python's provenance does.
+    static NESTED_PROVENANCE: NestedProvenance;
 }
 
 type InvokeFn<C> =
@@ -339,7 +390,15 @@ impl<C: Send + Sync + 'static> Handoff<C> {
     where
         F: Fn(HandoffInputData) -> HandoffInputData + Send + Sync + 'static,
     {
-        self.input_filter = Some(Arc::new(f));
+        self.input_filter = Some(handoff_input_filter(f));
+        self
+    }
+
+    /// Filter the input the next agent receives with a [`HandoffInputFilter`], which may await
+    /// and may fail (an `Err` ends the run). Build one with [`try_handoff_input_filter`] or
+    /// [`async_handoff_input_filter`].
+    pub fn with_input_filter_handler(mut self, filter: HandoffInputFilter) -> Self {
+        self.input_filter = Some(filter);
         self
     }
 
