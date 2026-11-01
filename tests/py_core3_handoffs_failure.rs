@@ -2,13 +2,12 @@
 //! `tests/test_handoff_failure_error_function.py`.
 //!
 //! Python-only cases, not ported here:
-//! - `async_formatter=True` and the re-raise half of `async_formatter=False`: the Rust
-//!   `failure_error_function` is a synchronous closure that returns text, so it cannot be async
-//!   and cannot re-raise the caught error.
+//! - `async_formatter=True`, the re-raise half and `failure="formatter"`: ported in
+//!   `py_core10_r10b_failure_formatters.rs` (the formatter is a `ToolErrorFn`, which may await
+//!   and may fail).
 //! - `failure="cancel"`: `asyncio.CancelledError` is an asyncio control-flow exception; Rust
 //!   cancels a run by dropping its future or through the stream cancel handle.
-//! - `failure="formatter"` and `failure="filter"`: a Rust formatter and input filter return
-//!   plain values, so they cannot fail. Only the `on_handoff` callback can.
+//! - `failure="filter"`: a Rust input filter returns a plain value, so it cannot fail.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};

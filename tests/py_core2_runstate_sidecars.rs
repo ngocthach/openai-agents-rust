@@ -919,59 +919,10 @@ fn tool_input_survives_serialization_round_trip() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Deliberate difference: unreadable items are an error, not a skip
-// ---------------------------------------------------------------------------
-
 fn items_wire(items: Value) -> Value {
     let mut wire = make_state().to_json().unwrap();
     wire["generated_items"] = items;
     wire
-}
-
-#[test]
-fn rust_refuses_an_item_without_an_agent_instead_of_skipping_it() {
-    // Python skips the item with a log line. A skipped item is history the resumed run never
-    // sees, so Rust refuses the snapshot.
-    let message = err_text(RunState::from_json(items_wire(json!([{
-        "type": "message_output_item", "raw_item": owned_message(),
-    }]))));
-    assert!(message.contains("without an agent"), "{message}");
-    let message = err_text(RunState::from_json(items_wire(json!([{
-        "type": "handoff_output_item",
-        "raw_item": {"role": "assistant", "content": "Handoff message"},
-    }]))));
-    assert!(message.contains("without an agent"), "{message}");
-}
-
-#[test]
-fn rust_refuses_an_item_without_a_type_instead_of_skipping_it() {
-    let message = err_text(RunState::from_json(items_wire(json!([{
-        "agent": {"name": "TestAgent"}, "raw_item": owned_message(),
-    }]))));
-    assert!(message.contains("<missing>"), "{message}");
-}
-
-#[test]
-fn rust_refuses_a_malformed_item_instead_of_skipping_it() {
-    let message = err_text(RunState::from_json(items_wire(json!([{
-        "type": "message_output_item", "agent": {"name": "TestAgent"},
-        "raw_item": "not-an-object",
-    }]))));
-    assert!(message.contains("message_output_item"), "{message}");
-}
-
-#[test]
-fn rust_keeps_a_tool_output_whose_raw_item_has_no_type() {
-    // Python's union-adapter fallback fails validation and skips such an item; Rust keeps it,
-    // since the payload is plain JSON and dropping it would lose history.
-    let items = RunState::from_json(items_wire(json!([{
-        "type": "tool_call_output_item", "agent": {"name": "TestAgent"},
-        "raw_item": {"call_id": "call123", "output": "result"}, "output": "result",
-    }])))
-    .unwrap()
-    .generated_items;
-    assert_eq!(items.len(), 1);
 }
 
 // ---------------------------------------------------------------------------

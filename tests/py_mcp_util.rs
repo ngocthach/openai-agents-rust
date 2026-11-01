@@ -878,7 +878,9 @@ async fn the_default_failure_formatter_hides_the_error_from_the_model() {
     let message = formatter(
         &RunContext::new(()),
         &AgentsError::other("Error invoking MCP tool crashing_tool: crash with SECRET_CRASH_123"),
-    );
+    )
+    .await
+    .unwrap();
     assert_eq!(
         message,
         "An error occurred while running the tool. Please try again."

@@ -539,10 +539,12 @@ async fn mcp_tool_retains_factory_failure_policy() {
     for (level, policy) in cases {
         let _f = fixture().await;
         let handler: Option<openai_agents_sdk::tool::ToolErrorFn<()>> = match policy {
-            "custom" => Some(Arc::new(
+            "custom" => Some(openai_agents_sdk::tool::tool_error_fn(
                 |_c: &openai_agents_sdk::RunContext<()>, _e: &AgentsError| "per-tool".to_string(),
             )),
-            "explicit-default" => Some(Arc::new(default_tool_error_function::<()>)),
+            "explicit-default" => Some(openai_agents_sdk::tool::tool_error_fn(
+                default_tool_error_function::<()>,
+            )),
             _ => None,
         };
         let mut server_config = MCPServerConfig::default();

@@ -1023,7 +1023,8 @@ fn deserialize_handoff_output_items_with_string_agents() {
          "raw_item": {"role": "assistant", "content": "Handoff message"}},
     ]))
     .unwrap();
-    assert_eq!(items.len(), 3);
+    // The third item names no source, so Python skips it (a handoff output needs both agents).
+    assert_eq!(items.len(), 2);
     for item in &items {
         match &item.kind {
             RunItemKind::HandoffOutput { target_agent, .. } => assert_eq!(target_agent, "Agent2"),
@@ -1031,7 +1032,7 @@ fn deserialize_handoff_output_items_with_string_agents() {
         }
     }
     assert_eq!(items[0].agent, "Agent1");
-    assert_eq!(items[2].agent, "Agent2");
+    assert_eq!(items[1].agent, "Agent1");
 }
 
 #[test]

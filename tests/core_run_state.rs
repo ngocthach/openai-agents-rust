@@ -381,7 +381,7 @@ fn reads_python_tool_search_items_and_hosted_mcp_interruptions() {
 }
 
 #[test]
-fn an_unreadable_item_is_an_error_rather_than_a_silent_drop() {
+fn an_unreadable_item_is_skipped_like_python() {
     let wire = json!({
         "$schemaVersion": "1.21",
         "current_agent": {"name": "A"},
@@ -391,8 +391,13 @@ fn an_unreadable_item_is_an_error_rather_than_a_silent_drop() {
             "agent": {"name": "A"},
         }],
     });
-    let err = RunState::from_json(wire).unwrap_err().to_string();
-    assert!(err.contains("some_future_item"), "{err}");
+    // Python's reader has no branch for an unknown item type and drops it.
+    assert!(
+        RunState::from_json(wire)
+            .unwrap()
+            .generated_items
+            .is_empty()
+    );
 }
 
 #[test]

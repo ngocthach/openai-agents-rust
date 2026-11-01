@@ -68,18 +68,12 @@ async fn run_mode(
     }
 }
 
-/// Python: `test_first_nested_handoff_after_restore_uses_explicit_occurrence_lineage`, the
-/// current snapshot (the tool search items are replayed once) and, as a recorded divergence, the
-/// released 1.12 layout without an ownership ledger.
-///
-/// Python restores `_session_items` and `_generated_items` as two lists that only a persisted
-/// index map ties together, so a 1.12 snapshot cannot prove which session item a forwarded copy
-/// came from and stays conservative: it replays both, twice in total. The Rust state keeps one
-/// list of generated items, so the lineage is known without the map and the items are replayed
-/// once. The legacy half therefore pins Rust's no-duplicate behaviour and is not counted as a
-/// port of Python's duplicating one.
+/// Python: `test_first_nested_handoff_after_restore_uses_explicit_occurrence_lineage`, for the
+/// current snapshot (the tool search items are replayed once) and the released 1.12 layout
+/// without an ownership ledger, which cannot prove which items an earlier handoff forwarded and
+/// so replays them twice.
 #[tokio::test]
-async fn first_nested_handoff_after_restore_replays_tool_search_items_once() {
+async fn first_nested_handoff_after_restore_uses_explicit_occurrence_lineage() {
     #[derive(Deserialize, JsonSchema)]
     struct NoArgs {}
     for streamed in [false, true] {
@@ -156,7 +150,7 @@ async fn first_nested_handoff_after_restore_replays_tool_search_items_once() {
             .await
             .unwrap();
             let replay = resumed.to_input_list();
-            let expected = 1;
+            let expected = if legacy_snapshot { 2 } else { 1 };
             for kind in ["tool_search_call", "tool_search_output"] {
                 let found = replay.iter().filter(|i| i.0["type"] == kind).count();
                 assert_eq!(found, expected, "{label}: {kind}");

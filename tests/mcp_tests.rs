@@ -658,11 +658,13 @@ async fn a_server_tool_policy_overrides_the_agent_failure_formatter() {
         eprintln!("python not available; skipping");
         return;
     };
-    let policy = MCPToolPolicy::<()>::new().with_failure_error_function(Some(Arc::new(
-        |_ctx: &openai_agents_sdk::RunContext<()>, _e: &openai_agents_sdk::AgentsError| {
-            "server-level failure message".to_string()
-        },
-    )));
+    let policy = MCPToolPolicy::<()>::new().with_failure_error_function(Some(
+        openai_agents_sdk::tool::tool_error_fn(
+            |_ctx: &openai_agents_sdk::RunContext<()>, _e: &openai_agents_sdk::AgentsError| {
+                "server-level failure message".to_string()
+            },
+        ),
+    ));
     let server: Arc<dyn MCPServer> = Arc::new(s.with_tool_policy(policy));
     server.connect().await.unwrap();
     let model = Arc::new(FakeModel::new());
