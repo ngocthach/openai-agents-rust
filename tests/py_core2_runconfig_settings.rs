@@ -575,7 +575,7 @@ async fn provider_chosen_model_settings() {
                 Some(s) => Agent::<()>::new("test").with_model_settings(s),
                 None => Agent::<()>::new("test"),
             };
-            let original_settings = agent.model_settings.clone();
+            let original_settings = agent.model_settings().clone();
             let mut config = provider_config(provider.clone());
             config.model_settings = run_settings;
             assert_eq!(
@@ -585,7 +585,7 @@ async fn provider_chosen_model_settings() {
             );
             assert_eq!(provider.last_requested(), Some(None), "{id}");
             assert_eq!(model.settings(0), expected, "{id} streamed={streamed}");
-            assert_eq!(agent.model_settings, original_settings, "{id}");
+            assert_eq!(agent.model_settings(), &original_settings, "{id}");
         }
     }
 }
@@ -750,7 +750,7 @@ async fn provider_preserves_explicit_settings_equal_to_environment_defaults() {
                 Some("chosen")
             );
             assert_eq!(model.settings(0), explicit, "{default_name} {streamed}");
-            assert_eq!(agent.model_settings, explicit);
+            assert_eq!(agent.model_settings(), &explicit);
         }
     }
 }
@@ -956,7 +956,7 @@ async fn in_place_reasoning_assignment_preserves_explicit_settings() {
                 "before" => original.clone_with(|_| {}),
                 _ => original,
             };
-            agent.model_settings.reasoning = Some(Reasoning::effort("none"));
+            agent.model_settings_mut().reasoning = Some(Reasoning::effort("none"));
             if clone_timing == "after" {
                 agent = agent.clone_with(|_| {});
             }

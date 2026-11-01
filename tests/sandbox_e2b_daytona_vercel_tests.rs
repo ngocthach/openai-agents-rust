@@ -1532,8 +1532,9 @@ async fn vercel_rejects_an_unsupported_exec_user() {
 
 #[tokio::test]
 async fn e2b_start_tolerates_an_existing_workspace_root() {
-    // `start` creates the root, then `Manifest::apply` creates it again. envd answers the second
-    // call with Connect's `already_exists`, which must not fail the session.
+    // The first `mkdir` of the root succeeds; envd answers the second with Connect's
+    // `already_exists`, which must not fail the session. (`start` itself only creates a root that
+    // is missing, and the manifest applier's root `mkdir` after it makes no call.)
     let seen = Arc::new(Mutex::new(0usize));
     let handler_seen = seen.clone();
     let server =
@@ -1580,10 +1581,15 @@ async fn e2b_start_tolerates_an_existing_workspace_root() {
     );
     let session = client.create(None).await.expect("create");
     session.start().await.expect("start");
-    assert!(
-        *seen.lock().expect("poisoned") >= 2,
-        "the manifest applier should have created the root again"
-    );
+    session
+        .mkdir("/workspace", true)
+        .await
+        .expect("first mkdir");
+    session
+        .mkdir("/workspace", true)
+        .await
+        .expect("an existing root is tolerated");
+    assert_eq!(*seen.lock().expect("poisoned"), 2);
     server.stop();
 }
 

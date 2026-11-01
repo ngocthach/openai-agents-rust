@@ -991,7 +991,7 @@ async fn a_resume_keeps_the_workspace_and_resets_the_forced_tool_choice() {
                 Arc::new(Shell::new().with_pty(false).with_needs_approval(true)),
             ])
             .map_agent(|agent| {
-                let mut settings = agent.model_settings.clone();
+                let mut settings = agent.model_settings().clone();
                 settings.tool_choice = Some(ToolChoice::required());
                 agent.with_model_settings(settings)
             })

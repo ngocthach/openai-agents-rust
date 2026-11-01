@@ -124,7 +124,7 @@ async fn preparation_prepares_the_default_compaction_policy() {
         .unwrap();
 
     let extra_args = prepared
-        .model_settings
+        .model_settings()
         .extra_args
         .as_ref()
         .expect("extra args");

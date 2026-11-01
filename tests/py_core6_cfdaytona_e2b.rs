@@ -294,6 +294,10 @@ async fn e2b_preserved_start_still_prepares_the_workspace_root() {
                 "/v2/sandboxes/sb-persisted/connect" => {
                     MockResponse::json(json!({ "sandboxID": "sb-persisted" }))
                 }
+                // The resumed sandbox lost its workspace root: the `test -d` probe fails.
+                "/process.Process/Start" if start_body(request)["process"]["cmd"] == "test" => {
+                    finished("", 1)
+                }
                 "/process.Process/Start" => finished("", 0),
                 _ => MockResponse::json(json!({})),
             },
@@ -316,8 +320,9 @@ async fn e2b_preserved_start_still_prepares_the_workspace_root() {
         .iter()
         .map(start_body)
         .collect();
-    assert_eq!(bodies[0]["process"]["cmd"], "mkdir");
-    assert_eq!(bodies[0]["process"]["cwd"], "/");
+    assert_eq!(bodies[0]["process"]["cmd"], "test");
+    assert_eq!(bodies[1]["process"]["cmd"], "mkdir");
+    assert_eq!(bodies[1]["process"]["cwd"], "/");
     assert_eq!(bodies.last().expect("pwd")["process"]["cwd"], "/workspace");
     assert!(session.system_state_preserved_on_start());
     server.stop();

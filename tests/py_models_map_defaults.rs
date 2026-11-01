@@ -530,14 +530,14 @@ async fn clone_explicit_settings_equal_to_defaults_are_not_recomputed() {
 async fn clone_preserves_settings_customized_after_construction() {
     // replacement = false: a field mutated in place on the agent's own settings.
     let mut agent = Agent::<()>::new("test").with_model("gpt-5");
-    agent.model_settings.temperature = Some(0.3);
+    agent.model_settings_mut().temperature = Some(0.3);
     let cloned = agent.clone_with(|a| a.model = Some(AgentModel::Name("gpt-4.1".into())));
     assert_eq!(resolved_settings(&cloned).await.temperature, Some(0.3));
 
     // replacement = true: assigning an equal object is still an explicit settings choice.
     let mut agent = Agent::<()>::new("test").with_model("gpt-5");
-    agent.model_settings = get_default_model_settings(Some("gpt-5"));
-    let expected = agent.model_settings.clone();
+    *agent.model_settings_mut() = get_default_model_settings(Some("gpt-5"));
+    let expected = agent.model_settings().clone();
     let cloned = agent.clone_with(|a| a.model = Some(AgentModel::Name("gpt-4.1".into())));
     assert_eq!(resolved_settings(&cloned).await, expected);
 }

@@ -489,11 +489,15 @@ async fn e2b_client_create_defaults_the_template_to_the_sandbox_type() {
 // Session start, exec and filesystem
 // ---------------------------------------------------------------------------------------------
 
-/// A handler that answers the create, the workspace-root preparation and one command.
+/// A handler that answers the create, the workspace-root preparation and one command. The
+/// sandbox starts without a workspace root, so the `test -d` probe `start` runs fails.
 fn session_handler(stdout: &'static str, exit_code: i64) -> impl Fn(&Recorded) -> MockResponse {
     move |request: &Recorded| match request.path.as_str() {
         "/v2/sandboxes" => MockResponse::json(created_sandbox()),
         "/filesystem.Filesystem/MakeDir" => MockResponse::json(json!({})),
+        "/process.Process/Start" if start_command(request) == "test -d /workspace" => {
+            process_stream("", 1)
+        }
         "/process.Process/Start" => process_stream(stdout, exit_code),
         _ => MockResponse::json(json!({})),
     }
@@ -523,10 +527,12 @@ async fn e2b_start_prepares_workspace_root_for_command_cwd() {
         .into_iter()
         .filter(|request| !support::is_resolver_request(request))
         .collect();
-    assert_eq!(start_command(&starts[0]), "mkdir -p -- /workspace");
-    assert_eq!(start_request(&starts[0])["process"]["cwd"], "/");
-    assert_eq!(start_command(&starts[1]), "pwd");
-    assert_eq!(start_request(&starts[1])["process"]["cwd"], "/workspace");
+    assert_eq!(start_command(&starts[0]), "test -d /workspace");
+    assert!(start_request(&starts[0])["process"]["cwd"].is_null());
+    assert_eq!(start_command(&starts[1]), "mkdir -p -- /workspace");
+    assert_eq!(start_request(&starts[1])["process"]["cwd"], "/");
+    assert_eq!(start_command(&starts[2]), "pwd");
+    assert_eq!(start_request(&starts[2])["process"]["cwd"], "/workspace");
     server.stop();
 }
 
@@ -575,7 +581,12 @@ async fn e2b_start_raises_when_the_filesystem_api_refuses_the_root() {
         "{}",
         error.message
     );
-    assert!(start_requests(&server).is_empty(), "no command ran");
+    assert!(
+        start_requests(&server)
+            .iter()
+            .all(|request| start_command(request) == "test -d /workspace"),
+        "only the root probe ran"
+    );
     server.stop();
 }
 

@@ -143,21 +143,23 @@ async fn an_in_place_edit_preserves_the_captured_defaults() {
     }
 }
 
-/// Without an edit the settings keep following the selected model, and a direct field
-/// assignment is not tracked (unset fields still follow the selected model).
+/// Without an edit the settings keep following the selected model; a write through the
+/// public accessor is tracked like Python's in-place assignment (the field is private).
 #[tokio::test]
-async fn untouched_and_directly_assigned_settings_follow_the_selected_model() {
+async fn untouched_settings_follow_the_selected_model_and_writes_are_tracked() {
     let _g = env("gpt-5.6-luna").await;
     let untouched = Agent::<()>::new("test");
     let settings = run(&untouched, &Named::new(), false).await;
     assert_eq!(settings, get_default_model_settings(Some("gpt-5")));
 
     let mut assigned = Agent::<()>::new("test");
-    assigned.model_settings.verbosity = Some("low".into());
+    assigned.model_settings_mut().verbosity = Some("low".into());
     let settings = run(&assigned, &Named::new(), false).await;
+    // The write kept the defaults captured at construction (the env default model), as
+    // Python's tracked assignment does, instead of following the selected model.
     assert_eq!(
         settings.reasoning,
-        get_default_model_settings(Some("gpt-5")).reasoning
+        get_default_model_settings(None).reasoning
     );
     assert_eq!(settings.verbosity.as_deref(), Some("low"));
 }

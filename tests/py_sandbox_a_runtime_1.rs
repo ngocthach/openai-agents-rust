@@ -912,7 +912,7 @@ async fn tool_choice_required_is_reset_after_the_first_tool_call() {
         .with_instructions("Base instructions.")
         .with_tool(function_tool::<()>("capability_tool", "ok"))
         .map_agent(|agent| {
-            let mut settings = agent.model_settings.clone();
+            let mut settings = agent.model_settings().clone();
             settings.tool_choice = Some(openai_agents_sdk::model_settings::ToolChoice::required());
             agent.with_model_settings(settings)
         });
