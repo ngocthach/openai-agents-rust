@@ -105,7 +105,7 @@ async fn decide_and_resume(
 
 fn formatter_config() -> RunConfig<()> {
     let mut c = RunConfig::default();
-    c.tool_error_formatter = Some(Arc::new(|args| {
+    c.tool_error_formatter = Some(openai_agents_sdk::tool_error_formatter_fn(|args| {
         Some(format!(
             "run-level {} denied ({})",
             args.tool_name, args.call_id
@@ -179,7 +179,7 @@ async fn a_formatter_returning_none_keeps_the_default_rejection() {
         Decision::Reject,
         || {
             let mut c = RunConfig::default();
-            c.tool_error_formatter = Some(Arc::new(|_args| None));
+            c.tool_error_formatter = Some(openai_agents_sdk::tool_error_formatter_fn(|_args| None));
             c
         },
         None,

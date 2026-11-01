@@ -4,9 +4,11 @@
 //! never while the approval is being decided. Python's pydantic validators, validator plugins
 //! and `model_post_init` map to those Rust hooks.
 //!
-//! Rust cannot tell such code from a derived parse, so a dynamic approval rule is still consulted
-//! for arguments that match the schema; the cases assert the part both languages share, that no
-//! validation code ran before the decision.
+//! Rust cannot tell such code from a derived parse, so without a declaration a dynamic approval
+//! rule is still consulted for arguments that match the schema; these cases assert the part both
+//! languages share, that no validation code ran before the decision. A tool that declares its
+//! validators with `FunctionTool::with_args_have_validators` is never consulted either; those
+//! cases live in `py_core11_r11a_validator_rule.rs`.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicUsize, Ordering};

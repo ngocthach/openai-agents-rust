@@ -96,7 +96,7 @@ async fn a_missing_tool_message_goes_through_the_error_formatter() {
     let kinds = Arc::new(Mutex::new(Vec::new()));
     let k = kinds.clone();
     let mut config = not_found_config();
-    config.tool_error_formatter = Some(Arc::new(move |args| {
+    config.tool_error_formatter = Some(openai_agents_sdk::tool_error_formatter_fn(move |args| {
         k.lock().unwrap().push(args.kind);
         (args.kind == ToolErrorKind::ToolNotFound)
             .then(|| format!("{} unavailable for {}", args.tool_name, args.call_id))

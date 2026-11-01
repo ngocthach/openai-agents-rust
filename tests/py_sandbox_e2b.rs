@@ -593,6 +593,7 @@ async fn e2b_exec_uses_the_manifest_root_and_session_environment() {
         .create(Some(Manifest::new().with_env("FROM_MANIFEST", "2")))
         .await
         .expect("create");
+    session.start().await.expect("start");
 
     let result = session
         .exec(ExecRequest::argv(["find", "."]).with_env("PER_CALL", "3"))
@@ -601,7 +602,12 @@ async fn e2b_exec_uses_the_manifest_root_and_session_environment() {
 
     assert_eq!(result.exit_code, 0);
     assert_eq!(result.stdout_text(), "out");
-    let value = start_request(&start_requests(&server)[0]);
+    let requests = start_requests(&server);
+    let find = requests
+        .iter()
+        .find(|request| start_command(request) == "find .")
+        .expect("the find command");
+    let value = start_request(find);
     assert_eq!(value["process"]["cmd"], "find");
     assert_eq!(value["process"]["args"], json!(["."]));
     assert_eq!(value["process"]["cwd"], "/workspace");
@@ -823,8 +829,8 @@ async fn e2b_surfaces_a_filesystem_error_that_is_not_tolerated() {
     server.stop();
 }
 
-/// `test_e2b_running_checks_remote_after_workspace_ready`: `running` reads the platform state and
-/// is false for anything but `running`.
+/// `test_e2b_running_checks_remote_after_workspace_ready`: once `start` has prepared the
+/// workspace root, `running` reads the platform state and is false for anything but `running`.
 #[tokio::test]
 async fn e2b_running_reads_the_platform_state() {
     for (state, expected) in [("running", true), ("paused", false)] {
@@ -832,16 +838,62 @@ async fn e2b_running_reads_the_platform_state() {
             if request.method == "GET" {
                 MockResponse::json(json!({ "state": state }))
             } else {
-                MockResponse::json(created_sandbox())
+                session_handler("", 0)(request)
             }
         })
         .await;
         let session = client(&server.base_url).create(None).await.expect("create");
+        session.start().await.expect("start");
 
         assert_eq!(session.running().await.expect("running"), expected);
         assert_eq!(server.find("GET", "/sandboxes/sb-123").method, "GET");
         server.stop();
     }
+}
+
+/// `test_e2b_running_requires_workspace_root_ready`: a session whose workspace root has not been
+/// prepared is not running, and the platform is not even asked.
+#[tokio::test]
+async fn e2b_running_requires_the_workspace_root_to_be_ready() {
+    let server = support::start_resolving(support::Resolver::E2b, move |request: &Recorded| {
+        if request.method == "GET" {
+            MockResponse::json(json!({ "state": "running" }))
+        } else {
+            session_handler("", 0)(request)
+        }
+    })
+    .await;
+    let session = client(&server.base_url).create(None).await.expect("create");
+
+    assert!(!session.running().await.expect("running"));
+    assert_eq!(server.count("GET", "/sandboxes/sb-123"), 0);
+
+    session.start().await.expect("start");
+    assert!(session.running().await.expect("running"));
+    session.stop().await.expect("stop");
+    assert!(!session.running().await.expect("running after stop"));
+    server.stop();
+}
+
+/// `test_e2b_exec_omits_cwd_until_workspace_ready`: before `start` has prepared the workspace
+/// root a command carries no working directory.
+#[tokio::test]
+async fn e2b_exec_omits_the_cwd_until_the_workspace_root_is_ready() {
+    let server = support::start_resolving(support::Resolver::E2b, session_handler("", 0)).await;
+    let session = client(&server.base_url).create(None).await.expect("create");
+
+    session
+        .exec(ExecRequest::argv(["find", "."]))
+        .await
+        .expect("exec before start");
+
+    let requests = start_requests(&server);
+    let find = requests
+        .iter()
+        .find(|request| start_command(request) == "find .")
+        .expect("the find command");
+    assert!(start_request(find)["process"].get("cwd").is_none());
+    server.stop();
 }
 
 /// A platform that cannot be reached reports "not running" rather than failing the caller.
@@ -851,11 +903,12 @@ async fn e2b_running_reports_false_when_the_platform_refuses() {
         if request.method == "GET" {
             MockResponse::empty(503)
         } else {
-            MockResponse::json(created_sandbox())
+            session_handler("", 0)(request)
         }
     })
     .await;
     let session = client(&server.base_url).create(None).await.expect("create");
+    session.start().await.expect("start");
 
     assert!(!session.running().await.expect("running"));
     server.stop();

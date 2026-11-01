@@ -135,7 +135,7 @@ async fn an_explicit_rejection_message_wins_over_the_run_level_formatter() {
     let model = Arc::new(FakeRealtimeModel::new());
     let runs = Arc::new(AtomicUsize::new(0));
     let run = RealtimeRunConfig {
-        tool_error_formatter: Some(Arc::new(|args| {
+        tool_error_formatter: Some(openai_agents_sdk::tool_error_formatter_fn(|args| {
             Some(format!(
                 "run-level {} denied ({})",
                 args.tool_name, args.call_id

@@ -450,18 +450,44 @@ async fn a_section_for_another_backend_is_refused() {
     );
 }
 
-/// Python: `test_session_manager_preserves_existing_payload_when_no_sandbox_session_is_used`:
-/// a resumed run that finishes leaves the section it was resumed from in its state.
+/// A resumed run that finishes writes a fresh section from the sessions it released, as Python's
+/// cleanup does (`serialize_resume_state` runs for every run that used a sandbox): the agent it
+/// stopped at is now `triage`, and both agents' sessions are still filed.
 #[tokio::test]
-async fn a_finished_resumed_run_keeps_the_section_it_was_resumed_from() {
+async fn a_finished_resumed_run_writes_a_fresh_section() {
     let snapshots = tempfile::tempdir().unwrap();
     let json = paused_triage_run(&snapshots, SandboxSessionMode::PerAgent).await;
     let state = RunState::from_json_str(&json).unwrap();
     let before = state.sandbox.clone().unwrap();
+    assert_eq!(before["current_agent_key"], "worker");
 
     let resumed = resume_and_read(&snapshots, SandboxSessionMode::PerAgent, state).await;
 
-    assert_eq!(resumed.to_state().sandbox, Some(before));
+    let after = resumed
+        .to_state()
+        .sandbox
+        .expect("a finished run writes it");
+    assert_eq!(after["backend_id"], "unix_local");
+    assert_eq!(after["current_agent_key"], "triage");
+    assert_eq!(after["current_agent_name"], "triage");
+    let sessions = after["sessions_by_agent"].as_object().unwrap();
+    assert_eq!(
+        sessions.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["triage", "worker"]
+    );
+    assert_eq!(
+        after["session_state"], sessions["triage"]["session_state"],
+        "the top-level state is the current agent's"
+    );
+    assert_eq!(sessions["worker"]["agent_name"], "worker");
+    // The same sessions came back, so their ids are those the paused run recorded.
+    for key in ["triage", "worker"] {
+        assert_eq!(
+            sessions[key]["session_state"]["session_id"],
+            before["sessions_by_agent"][key]["session_state"]["session_id"],
+            "{key} resumed its own session"
+        );
+    }
 }
 
 /// Python: `test_session_manager_omits_existing_payload_for_injected_live_session`: a session

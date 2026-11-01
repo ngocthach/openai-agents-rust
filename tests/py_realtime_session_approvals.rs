@@ -627,7 +627,7 @@ async fn a_pending_rejection_does_not_send_twice_when_the_call_is_redelivered() 
 }
 
 fn denial_formatter() -> openai_agents_sdk::realtime::RealtimeToolErrorFormatter<()> {
-    Arc::new(|args| {
+    openai_agents_sdk::tool_error_formatter_fn(|args| {
         Some(format!(
             "run-level {} denied ({})",
             args.tool_name, args.call_id

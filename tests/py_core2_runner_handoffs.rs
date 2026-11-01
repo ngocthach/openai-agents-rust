@@ -593,7 +593,8 @@ async fn server_managed_history_rejects_handoff_input_filters() {
             if from_handoff {
                 h = h.with_input_filter(|data| data);
             } else {
-                config.handoff_input_filter = Some(Arc::new(|data| data));
+                config.handoff_input_filter =
+                    Some(openai_agents_sdk::handoff_input_filter(|data| data));
             }
             let triage = Arc::new(
                 Agent::<()>::new("triage")

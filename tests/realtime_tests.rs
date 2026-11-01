@@ -2566,11 +2566,13 @@ async fn the_tool_error_formatter_is_the_core_one() {
         .with_tool(weather_tool())
         .into_arc();
     let config = RealtimeRunConfig::<()> {
-        tool_error_formatter: Some(Arc::new(|args: &ToolErrorFormatterArgs<'_, ()>| {
-            assert!(matches!(args.kind, ToolErrorKind::ToolNotFound));
-            assert!(args.error.is_none());
-            Some(format!("no tool called {}", args.tool_name))
-        })),
+        tool_error_formatter: Some(openai_agents_sdk::tool_error_formatter_fn(
+            |args: &ToolErrorFormatterArgs<'_, ()>| {
+                assert!(matches!(args.kind, ToolErrorKind::ToolNotFound));
+                assert!(args.error.is_none());
+                Some(format!("no tool called {}", args.tool_name))
+            },
+        )),
         ..Default::default()
     };
     let session = RealtimeRunner::new(agent)
