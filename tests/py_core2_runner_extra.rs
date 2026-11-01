@@ -195,7 +195,7 @@ async fn a_policy_can_approve_an_unsafe_stateful_replay() {
         .with_model_settings(ModelSettings {
             retry: Some(
                 ModelRetrySettings {
-                    max_retries: 1,
+                    max_retries: Some(1),
                     ..Default::default()
                 }
                 .with_policy(policy),

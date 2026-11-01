@@ -108,13 +108,13 @@ fn retry_settings() -> ModelSettings {
     ModelSettings {
         retry: Some(
             ModelRetrySettings {
-                max_retries: 1,
-                backoff: ModelRetryBackoffSettings {
-                    initial_delay: 0.0,
-                    max_delay: 0.0,
-                    multiplier: 1.0,
-                    jitter: false,
-                },
+                max_retries: Some(1),
+                backoff: Some(ModelRetryBackoffSettings {
+                    initial_delay: Some(0.0),
+                    max_delay: Some(0.0),
+                    multiplier: Some(1.0),
+                    jitter: Some(false),
+                }),
                 ..Default::default()
             }
             .with_policy(openai_agents_sdk::retry::retry_policies::http_status(vec![
@@ -1615,13 +1615,13 @@ async fn a_retry_does_not_resend_the_initial_input() {
                 .with_model_settings(ModelSettings {
                     retry: Some(
                         ModelRetrySettings {
-                            max_retries: 1,
-                            backoff: ModelRetryBackoffSettings {
-                                initial_delay: 0.0,
-                                max_delay: 0.0,
-                                multiplier: 1.0,
-                                jitter: false,
-                            },
+                            max_retries: Some(1),
+                            backoff: Some(ModelRetryBackoffSettings {
+                                initial_delay: Some(0.0),
+                                max_delay: Some(0.0),
+                                multiplier: Some(1.0),
+                                jitter: Some(false),
+                            }),
                             ..Default::default()
                         }
                         .with_policy(openai_agents_sdk::retry::retry_policies::network_error()),

@@ -232,10 +232,11 @@ fn dictionary_model_settings_preserve_reasoning_extensions() {
         ])
     );
     let retry = settings.retry.as_ref().unwrap();
-    assert_eq!(retry.max_retries, 0);
-    assert!(!retry.backoff.jitter);
-    // Omitted backoff fields keep their defaults.
-    assert_eq!(retry.backoff.initial_delay, 0.25);
+    assert_eq!(retry.max_retries, Some(0));
+    let backoff = retry.backoff.as_ref().unwrap();
+    assert_eq!(backoff.jitter, Some(false));
+    // Omitted backoff fields stay unset and use the documented defaults when the delay is computed.
+    assert_eq!(backoff.initial_delay, None);
 }
 
 /// Python: `test_agent_rejects_unknown_first_party_dictionary_model_settings` (4 cases).

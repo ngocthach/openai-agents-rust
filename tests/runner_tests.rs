@@ -854,13 +854,15 @@ async fn model_retry_on_retryable_status() {
     let agent = Agent::<()>::new("A")
         .with_model_settings(openai_agents_sdk::ModelSettings::default().with_retry(
             openai_agents_sdk::model_settings::ModelRetrySettings {
-                max_retries: 2,
-                backoff: openai_agents_sdk::model_settings::ModelRetryBackoffSettings {
-                    initial_delay: 0.01,
-                    max_delay: 0.01,
-                    multiplier: 1.0,
-                    jitter: false,
-                },
+                max_retries: Some(2),
+                backoff: Some(
+                    openai_agents_sdk::model_settings::ModelRetryBackoffSettings {
+                        initial_delay: Some(0.01),
+                        max_delay: Some(0.01),
+                        multiplier: Some(1.0),
+                        jitter: Some(false),
+                    },
+                ),
                 ..Default::default()
             },
         ))
@@ -875,16 +877,16 @@ async fn model_retry_policies_decide_and_respect_budget() {
     use openai_agents_sdk::retry::{RetryDecision, RetryPolicy, retry_policies};
     use openai_agents_sdk::testing::ModelStep;
     let fast = ModelRetryBackoffSettings {
-        initial_delay: 0.0,
-        max_delay: 0.0,
-        multiplier: 1.0,
-        jitter: false,
+        initial_delay: Some(0.0),
+        max_delay: Some(0.0),
+        multiplier: Some(1.0),
+        jitter: Some(false),
     };
     let settings = |policy: RetryPolicy, max: u32| {
         openai_agents_sdk::ModelSettings::default().with_retry(
             ModelRetrySettings {
-                max_retries: max,
-                backoff: fast.clone(),
+                max_retries: Some(max),
+                backoff: Some(fast.clone()),
                 ..Default::default()
             }
             .with_policy(policy),

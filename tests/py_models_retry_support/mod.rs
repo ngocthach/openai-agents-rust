@@ -267,12 +267,12 @@ pub fn retry(
     policy: Option<RetryPolicy>,
 ) -> ModelRetrySettings {
     ModelRetrySettings {
-        max_retries,
-        backoff: ModelRetryBackoffSettings {
-            initial_delay,
-            jitter: false,
+        max_retries: Some(max_retries),
+        backoff: Some(ModelRetryBackoffSettings {
+            initial_delay: Some(initial_delay),
+            jitter: Some(false),
             ..Default::default()
-        },
+        }),
         policy,
         ..Default::default()
     }

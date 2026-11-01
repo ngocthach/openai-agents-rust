@@ -30,14 +30,14 @@ use serde_json::json;
 #[test]
 fn zero_backoff_values_are_allowed() {
     let backoff = ModelRetryBackoffSettings {
-        initial_delay: 0.0,
-        max_delay: 0.0,
-        multiplier: 0.0,
-        jitter: true,
+        initial_delay: Some(0.0),
+        max_delay: Some(0.0),
+        multiplier: Some(0.0),
+        jitter: Some(true),
     };
-    assert_eq!(backoff.initial_delay, 0.0);
-    assert_eq!(backoff.max_delay, 0.0);
-    assert_eq!(backoff.multiplier, 0.0);
+    assert_eq!(backoff.initial_delay, Some(0.0));
+    assert_eq!(backoff.max_delay, Some(0.0));
+    assert_eq!(backoff.multiplier, Some(0.0));
 }
 
 #[test]

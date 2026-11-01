@@ -89,13 +89,13 @@ fn all_fields() -> ModelSettings {
             json!({"custom_param": "value", "another_param": 42}),
         )),
         retry: Some(ModelRetrySettings {
-            max_retries: 2,
-            backoff: ModelRetryBackoffSettings {
-                initial_delay: 0.1,
-                max_delay: 1.0,
-                multiplier: 2.0,
-                jitter: false,
-            },
+            max_retries: Some(2),
+            backoff: Some(ModelRetryBackoffSettings {
+                initial_delay: Some(0.1),
+                max_delay: Some(1.0),
+                multiplier: Some(2.0),
+                jitter: Some(false),
+            }),
             ..Default::default()
         }),
         context_management: Some(vec![
@@ -395,11 +395,11 @@ fn the_retry_policy_is_excluded_from_serialization() {
     let settings = ModelSettings {
         retry: Some(
             ModelRetrySettings {
-                max_retries: 1,
-                backoff: ModelRetryBackoffSettings {
-                    initial_delay: 0.1,
+                max_retries: Some(1),
+                backoff: Some(ModelRetryBackoffSettings {
+                    initial_delay: Some(0.1),
                     ..Default::default()
-                },
+                }),
                 ..Default::default()
             }
             .with_policy(openai_agents_sdk::retry::retry_policies::http_status(vec![
@@ -422,11 +422,11 @@ fn the_retry_policy_is_dropped_by_a_round_trip() {
     let settings = ModelSettings {
         retry: Some(
             ModelRetrySettings {
-                max_retries: 2,
-                backoff: ModelRetryBackoffSettings {
-                    initial_delay: 0.5,
+                max_retries: Some(2),
+                backoff: Some(ModelRetryBackoffSettings {
+                    initial_delay: Some(0.5),
                     ..Default::default()
-                },
+                }),
                 ..Default::default()
             }
             .with_policy(openai_agents_sdk::retry::retry_policies::http_status(vec![
@@ -439,8 +439,8 @@ fn the_retry_policy_is_dropped_by_a_round_trip() {
     let text = serde_json::to_string(&settings).unwrap();
     let back: ModelSettings = serde_json::from_str(&text).unwrap();
     let retry = back.retry.unwrap();
-    assert_eq!(retry.max_retries, 2);
-    assert_eq!(retry.backoff.initial_delay, 0.5);
+    assert_eq!(retry.max_retries, Some(2));
+    assert_eq!(retry.backoff.unwrap().initial_delay, Some(0.5));
     assert!(retry.policy.is_none());
 }
 
@@ -460,15 +460,15 @@ fn nested_retry_input_is_deserialized_into_settings() {
     .unwrap();
 
     let retry = settings.retry.unwrap();
-    assert_eq!(retry.max_retries, 3);
+    assert_eq!(retry.max_retries, Some(3));
     assert_eq!(
         retry.backoff,
-        ModelRetryBackoffSettings {
-            initial_delay: 0.25,
-            max_delay: 2.0,
-            multiplier: 3.0,
-            jitter: false,
-        }
+        Some(ModelRetryBackoffSettings {
+            initial_delay: Some(0.25),
+            max_delay: Some(2.0),
+            multiplier: Some(3.0),
+            jitter: Some(false),
+        })
     );
 }
 
@@ -481,15 +481,15 @@ fn falsey_retry_backoff_values_survive_a_round_trip() {
     }))
     .unwrap();
 
-    assert!(!retry.backoff.jitter);
+    assert_eq!(retry.backoff.as_ref().unwrap().jitter, Some(false));
     let value = serde_json::to_value(&retry).unwrap();
     assert_eq!(value["backoff"]["jitter"], json!(false));
 }
 
-/// An omitted `backoff` falls back to the documented defaults rather than failing.
+/// An omitted `backoff` stays unset (the documented defaults apply when the delay is computed).
 #[test]
-fn an_omitted_backoff_uses_the_defaults() {
+fn an_omitted_backoff_stays_unset() {
     let retry: ModelRetrySettings = serde_json::from_value(json!({"max_retries": 1})).unwrap();
-    assert_eq!(retry.backoff, ModelRetryBackoffSettings::default());
-    assert_eq!(retry.max_retries, 1);
+    assert_eq!(retry.backoff, None);
+    assert_eq!(retry.max_retries, Some(1));
 }

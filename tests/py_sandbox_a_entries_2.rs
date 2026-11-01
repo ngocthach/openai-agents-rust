@@ -6,10 +6,9 @@
 //! run against a recording session and assert on what the session saw (commands, writes, the
 //! order they started and finished in) instead of on the callback arguments.
 //!
-//! Python's `Manifest` is a pydantic model with a tagged-union registry for env values. Rust has
-//! no `model_dump`/`model_validate` surface on `Manifest` (the persisted session state
-//! deliberately carries no manifest contents), so the serialization tests have no counterpart
-//! and are accounted for in the parity report, not here.
+//! Python's `Manifest` is a pydantic model with a tagged-union registry for env values. Rust
+//! reads and writes the payload with `Manifest::from_value` / `to_value`; those serialization
+//! and dictionary-configuration tests are ported in `tests/py_core8_r8g1_manifest.rs`.
 //!
 //! Rust keeps manifest entries in a `BTreeMap`, so entries materialize in key order where
 //! Python's dict preserves insertion order. Tests whose Python version depends on insertion
