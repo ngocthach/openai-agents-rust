@@ -155,8 +155,7 @@ mod voice_surface {
 /// Python: `test_all_public_exception_classes_are_reexported`. Every exception class of
 /// `agents.exceptions` is a variant of the one `AgentsError` enum, reachable from the crate root
 /// together with `RunErrorDetails`. The match has no wildcard: a new variant must be added here
-/// (and so to the released surface) deliberately. `MCPToolCancellationError`, an internal MCP
-/// cancellation marker of the Python event loop, has no Rust variant.
+/// (and so to the released surface) deliberately.
 #[test]
 fn every_exception_class_is_a_variant_reachable_from_the_crate_root() {
     use openai_agents_sdk::{AgentsError, RunErrorDetails};
@@ -169,6 +168,7 @@ fn every_exception_class_is_a_variant_reachable_from_the_crate_root() {
             AgentsError::ModelTimeoutError { .. } => "ModelTimeoutError",
             AgentsError::UserError { .. } => "UserError",
             AgentsError::ToolTimeoutError { .. } => "ToolTimeoutError",
+            AgentsError::MCPToolCancellationError { .. } => "MCPToolCancellationError",
             AgentsError::InputGuardrailTripwireTriggered { .. } => {
                 "InputGuardrailTripwireTriggered"
             }

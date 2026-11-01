@@ -132,6 +132,8 @@ fn round_trips_through_the_envelope() {
 
     // Everything else has to survive the envelope untouched.
     restored.restored_unbound_approval_call_ids.clear();
+    // Also read-derived from the snapshot's approvals, so it is set on the restored state only.
+    restored.restored_function_approval_keys.clear();
     assert_eq!(restored, state);
 }
 

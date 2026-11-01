@@ -724,6 +724,28 @@ fn filesystem_apply_patch_can_require_approval_and_view_image_can_be_dropped() {
     assert_eq!(tool_names(&tools), vec!["apply_patch"]);
 }
 
+/// Python: `test_configure_tools_can_replace_tool_instances`: `view_image` can be made to require
+/// approval (Python replaces the tool with `needs_approval=True`); it needs none by default.
+#[test]
+fn filesystem_view_image_can_require_approval() {
+    use openai_agents_sdk::tool::NeedsApproval;
+    let session = Arc::new(RecordingSession::new());
+    let default_tools =
+        Capability::<()>::tools(&Filesystem::new(), &binding(session.clone())).unwrap();
+    assert!(matches!(
+        function_tool(&default_tools, "view_image").needs_approval,
+        NeedsApproval::Static(false)
+    ));
+
+    let capability = Filesystem::new().with_view_image_needs_approval(true);
+    let tools = Capability::<()>::tools(&capability, &binding(session)).unwrap();
+    assert!(matches!(
+        function_tool(&tools, "view_image").needs_approval,
+        NeedsApproval::Static(true)
+    ));
+    assert_eq!(tool_names(&tools), vec!["view_image", "apply_patch"]);
+}
+
 /// Python: `test_tools_and_configurator_receive_bound_workspace_scope` and
 /// `test_tools_passes_bound_run_as_to_file_tools`: both tools act inside the bound scope.
 #[tokio::test]

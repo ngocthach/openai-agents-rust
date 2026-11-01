@@ -1256,6 +1256,37 @@ async fn url_merges_client_default_query_under_request_query() {
     );
 }
 
+#[tokio::test]
+async fn omitted_query_removes_inherited_and_request_parameters() {
+    let server = spawn_server(vec![Conn::Ws(vec![Step::Recv, Step::Send(completed("r"))])]).await;
+    let client = OpenAIClient::new("sk-test")
+        .with_default_query("route", "team-a")
+        .with_default_query("region", "us")
+        .without_query("token")
+        .without_query("route")
+        .with_websocket_base_url(format!("ws://127.0.0.1:{}/v1?token=abc", server.port));
+    let settings = ModelSettings {
+        extra_query: Some(HashMap::from([
+            ("route".to_string(), "team-b".to_string()),
+            ("keep".to_string(), "1".to_string()),
+        ])),
+        ..Default::default()
+    };
+    OpenAIResponsesWSModel::new("gpt-4", client)
+        .get_response(req_with("hi", settings))
+        .await
+        .unwrap();
+    let hs = server.handshakes();
+    assert_eq!(hs[0].path(), "/v1/responses");
+    assert_eq!(
+        hs[0].query(),
+        HashMap::from([
+            ("region".to_string(), "us".to_string()),
+            ("keep".to_string(), "1".to_string()),
+        ])
+    );
+}
+
 // ------------------------------------------------------------- usage accounting
 
 #[tokio::test]
