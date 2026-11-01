@@ -15,6 +15,7 @@ use openai_agents_sdk::handoffs::Handoff;
 use openai_agents_sdk::items::{InputItem, OutputItem, RunInput};
 use openai_agents_sdk::model_settings::{ModelSettings, ToolChoice};
 use openai_agents_sdk::run::{RunCheckpoint, RunOptions};
+use openai_agents_sdk::run_context::RunContext;
 use openai_agents_sdk::stream_events::{RunItemStreamEventName, StreamEvent};
 use openai_agents_sdk::testing::{
     ScriptedModel, ScriptedStep, assistant_message, function_call_full,
@@ -156,20 +157,45 @@ fn failing_after(name: &str, gate: Arc<Event>, message: &'static str) -> Functio
 struct EndHook {
     tool_name: Option<String>,
     event: Arc<Event>,
+    /// Fails the run from `on_agent_end`: always for `Some(None)`, and only once the shared
+    /// effects list holds the ticket for `Some(Some(effects))`.
+    final_fails: Option<Option<Arc<Mutex<Vec<String>>>>>,
+    /// Fails the run from `on_tool_end` for every tool but `tool_name`.
+    fail_other_tools: bool,
 }
 
 #[async_trait::async_trait]
 impl RunHooks<()> for EndHook {
-    async fn on_tool_end(
+    async fn try_on_tool_end(
         &self,
         _context: &ToolContext<()>,
         _agent: &Agent<()>,
         tool: &Tool<()>,
         _result: &ToolOutput,
-    ) {
+    ) -> Result<()> {
         if self.tool_name.as_deref().is_none_or(|n| n == tool.name()) {
             self.event.set();
+        } else if self.fail_other_tools {
+            return Err(AgentsError::user("synthetic hook failure"));
         }
+        Ok(())
+    }
+
+    async fn try_on_agent_end(
+        &self,
+        _context: &RunContext<()>,
+        _agent: &Agent<()>,
+        _output: &Value,
+    ) -> Result<()> {
+        let fails = match &self.final_fails {
+            None => false,
+            Some(None) => true,
+            Some(Some(effects)) => *effects.lock().unwrap() == vec!["create_ticket".to_string()],
+        };
+        if fails {
+            return Err(AgentsError::user("final hook failure"));
+        }
+        Ok(())
     }
 }
 
@@ -177,6 +203,8 @@ fn end_hook(tool_name: Option<&str>, event: Arc<Event>) -> Arc<dyn RunHooks<()>>
     Arc::new(EndHook {
         tool_name: tool_name.map(str::to_string),
         event,
+        final_fails: None,
+        fail_other_tools: false,
     })
 }
 
@@ -287,8 +315,7 @@ fn output_infos<T>(results: &[T], info: impl Fn(&T) -> &Value) -> Vec<Value> {
 
 #[tokio::test]
 async fn completed_sibling_survives_tool_batch_failure() {
-    // The `hook` failure is Python-only: Rust `RunHooks` cannot fail.
-    for failure in ["input", "output", "handler"] {
+    for failure in ["input", "output", "handler", "hook"] {
         for streaming in [false, true] {
             let finished = Event::new();
             let effects = Arc::new(Mutex::new(Vec::<String>::new()));
@@ -362,9 +389,15 @@ async fn completed_sibling_survives_tool_batch_failure() {
                 });
             let session: Arc<dyn Session> = Arc::new(InMemorySession::new("test"));
             let checkpoint = RunCheckpoint::new();
+            let hooks: Arc<dyn RunHooks<()>> = Arc::new(EndHook {
+                tool_name: Some("create_ticket".into()),
+                event: finished.clone(),
+                final_fails: None,
+                fail_other_tools: failure == "hook",
+            });
             let options = RunOptions::default()
                 .session(session.clone())
-                .hooks(end_hook(Some("create_ticket"), finished.clone()))
+                .hooks(hooks)
                 .checkpoint(&checkpoint);
             let (outcome, output_events) = run_collect(&agent, "go", streaming, options).await;
             let error = outcome.unwrap_err();
@@ -390,11 +423,24 @@ async fn completed_sibling_survives_tool_batch_failure() {
                 ),
             }
             assert_eq!(*effects.lock().unwrap(), vec!["create_ticket"], "{label}");
-            let expected = s(&[
-                "reasoning",
-                "function_call:ticket",
-                "function_call_output:ticket",
-            ]);
+            // An end hook runs after the output passed its tool guardrails, so its failure keeps
+            // the failing call's output too.
+            let expected = if failure == "hook" {
+                s(&[
+                    "reasoning",
+                    "function_call:email",
+                    "reasoning",
+                    "function_call:ticket",
+                    "function_call_output:email",
+                    "function_call_output:ticket",
+                ])
+            } else {
+                s(&[
+                    "reasoning",
+                    "function_call:ticket",
+                    "function_call_output:ticket",
+                ])
+            };
             let run_data = error.run_data().expect("run data");
             assert!(
                 output_infos(&run_data.tool_input_guardrail_results, |r| &r
@@ -408,7 +454,9 @@ async fn completed_sibling_survives_tool_batch_failure() {
                     .output
                     .output_info)
                 .contains(&json!("output accepted")),
-                "{label}"
+                "{label}: {:?} / {:?}",
+                shape(&run_data_items(run_data)),
+                run_data.tool_output_guardrail_results.len()
             );
             assert_eq!(shape(&run_data_items(run_data)), expected, "{label}");
             let history = session_items(session.as_ref()).await;
@@ -420,14 +468,20 @@ async fn completed_sibling_survives_tool_batch_failure() {
                 .filter(|i| i["type"] == "reasoning")
                 .map(|i| i["id"].as_str().unwrap())
                 .collect();
-            assert_eq!(reasoning_ids, vec!["rs_ticket"], "{label}");
+            let expected_reasoning = if failure == "hook" {
+                vec!["rs_before", "rs_ticket"]
+            } else {
+                vec!["rs_ticket"]
+            };
+            assert_eq!(reasoning_ids, expected_reasoning, "{label}");
             assert_eq!(history.last().unwrap()["output"], json!("ticket T-1"));
             if streaming {
-                assert_eq!(
-                    shape(&output_events),
-                    s(&["function_call_output:ticket"]),
-                    "{label}"
-                );
+                let expected_outputs: Vec<String> = expected
+                    .iter()
+                    .filter(|i| i.starts_with("function_call_output:"))
+                    .cloned()
+                    .collect();
+                assert_eq!(shape(&output_events), expected_outputs, "{label}");
                 let state = checkpoint.take().expect("a failure checkpoint");
                 let state = RunState::from_json(state.to_json().unwrap()).unwrap();
                 assert!(
@@ -706,14 +760,15 @@ async fn fresh_guarded_terminal_failure_keeps_output_private() {
 
 #[tokio::test]
 async fn completed_history_at_failure_boundaries() {
-    // `provider_final_hook` / `final_hook` (hooks cannot fail), `mcp_callback` (the hosted MCP
-    // approval callback cannot fail) and `tool_cancel` / `native_cancel` (asyncio
-    // cancellation) are Python-only.
+    // `mcp_callback` (the hosted MCP approval callback cannot fail) and `tool_cancel` /
+    // `native_cancel` (asyncio cancellation) are Python-only.
     for boundary in [
         "provider",
+        "provider_final_hook",
         "provider_shell",
         "handoff",
         "tool_behavior",
+        "final_hook",
         "parent_cancel",
     ] {
         for streaming in [false, true] {
@@ -770,6 +825,13 @@ async fn completed_history_at_failure_boundaries() {
                     })),
                     call("fail", "fail"),
                 ],
+                "provider_final_hook" => vec![
+                    OutputItem::from_value(json!({
+                        "id": "ws_done", "type": "web_search_call", "status": "completed",
+                        "action": {"type": "search", "query": "synthetic query"},
+                    })),
+                    assistant_message("done"),
+                ],
                 _ => vec![
                     call("create_ticket", "ticket"),
                     call(
@@ -782,7 +844,7 @@ async fn completed_history_at_failure_boundaries() {
                     ),
                 ],
             };
-            if boundary == "tool_behavior" {
+            if boundary == "tool_behavior" || boundary == "final_hook" {
                 calls.truncate(1);
             }
             let model = scripted(vec![calls, vec![assistant_message("done")]]);
@@ -811,15 +873,28 @@ async fn completed_history_at_failure_boundaries() {
                     },
                 ));
             }
+            if boundary == "final_hook" {
+                agent = agent.with_tool_use_behavior(ToolUseBehavior::StopOnFirstTool);
+            }
             let session: Arc<dyn Session> = Arc::new(InMemorySession::new("failure-boundaries"));
             let checkpoint = RunCheckpoint::new();
+            let hooks: Arc<dyn RunHooks<()>> = Arc::new(EndHook {
+                tool_name: Some("create_ticket".into()),
+                event: completed.clone(),
+                final_fails: match boundary {
+                    "provider_final_hook" => Some(None),
+                    "final_hook" => Some(Some(effects.clone())),
+                    _ => None,
+                },
+                fail_other_tools: false,
+            });
             let options = RunOptions::default()
                 .session(session.clone())
-                .hooks(end_hook(Some("create_ticket"), completed.clone()))
+                .hooks(hooks)
                 .checkpoint(&checkpoint);
             let expected = match boundary {
                 "parent_cancel" => Vec::new(),
-                "provider" => s(&["web_search_call"]),
+                "provider" | "provider_final_hook" => s(&["web_search_call"]),
                 "provider_shell" => s(&["shell_call:shell", "shell_call_output:shell"]),
                 _ => s(&["function_call:ticket", "function_call_output:ticket"]),
             };

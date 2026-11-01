@@ -496,11 +496,9 @@ impl<C: Send + Sync + 'static> Capability<C> for ManifestMutationCapability {
 /// Python: `test_runner_guardrail_trip_blocks_running_injected_session_mutation` and the streamed
 /// variant.
 ///
-/// DEFERRED: Python leaves a running injected session untouched when a blocking guardrail trips.
-/// Rust patches the capability-added entries into the live session during preparation, which
-/// happens before the guardrail runs, for the same reason as above. The assertions pin the
-/// current behavior: the tripwire is raised and the injected session is neither stopped nor shut
-/// down.
+/// The runner prepares the agent after the blocking guardrails, so a tripped guardrail never
+/// reaches the injected session; `py_core14_r14b_injected_guardrail.rs` asserts the full Python
+/// postconditions (no entries applied, no validation, no start).
 #[tokio::test]
 async fn a_tripped_guardrail_never_stops_a_running_injected_session() {
     let model = model();

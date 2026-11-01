@@ -348,18 +348,24 @@ fn native_tool(kind: &str, probe: &Arc<Probe>, block_extractor: bool) -> (Tool<(
 type HookFuture = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
 
 /// `on_tool_end` runs `action` with the name of the finished tool.
-struct EndHook(Box<dyn Fn(String) -> HookFuture + Send + Sync>);
+/// With `raises`, the hook then fails the run for every tool except `failed_tool`, as Python's
+/// `raise ValueError("synthetic native end-hook failure")` does.
+struct EndHook(Box<dyn Fn(String) -> HookFuture + Send + Sync>, bool);
 
 #[async_trait]
 impl RunHooks<()> for EndHook {
-    async fn on_tool_end(
+    async fn try_on_tool_end(
         &self,
         _context: &ToolContext<()>,
         _agent: &Agent<()>,
         tool: &Tool<()>,
         _result: &ToolOutput,
-    ) {
+    ) -> Result<()> {
         (self.0)(tool.name().to_string()).await;
+        if self.1 && tool.name() != "failed_tool" {
+            return Err(AgentsError::user("synthetic native end-hook failure"));
+        }
+        Ok(())
     }
 }
 
@@ -368,7 +374,15 @@ where
     F: Fn(String) -> Fut + Send + Sync + 'static,
     Fut: std::future::Future<Output = ()> + Send + 'static,
 {
-    Arc::new(EndHook(Box::new(move |name| Box::pin(action(name)))))
+    Arc::new(EndHook(Box::new(move |name| Box::pin(action(name))), false))
+}
+
+fn raising_end_hook<F, Fut>(action: F) -> Arc<dyn RunHooks<()>>
+where
+    F: Fn(String) -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    Arc::new(EndHook(Box::new(move |name| Box::pin(action(name))), true))
 }
 
 #[derive(Debug)]
@@ -447,18 +461,18 @@ async fn join(task: tokio::task::JoinHandle<Outcome>) -> Outcome {
 
 #[tokio::test]
 async fn native_finalization_survives_sibling_failure() {
-    // `hook_raises` is Python-only: a Rust `RunHooks::on_tool_end` cannot fail.
     let cases = [
-        ("computer", "extractor"),
-        ("custom", "extractor"),
-        ("patch", "extractor"),
-        ("custom", "hook"),
-        ("shell", "hook"),
-        ("local_shell", "hook"),
+        ("computer", "extractor", false),
+        ("custom", "extractor", false),
+        ("patch", "extractor", false),
+        ("custom", "hook", false),
+        ("shell", "hook", false),
+        ("local_shell", "hook", false),
+        ("custom", "hook", true),
     ];
     for streaming in [false, true] {
-        for (kind, phase) in cases {
-            let label = format!("{kind}/{phase} streaming={streaming}");
+        for (kind, phase, hook_raises) in cases {
+            let label = format!("{kind}/{phase}/raises={hook_raises} streaming={streaming}");
             let probe = Probe::new();
             let failed = Event::new();
             let (native, native_call) = native_tool(kind, &probe, phase == "extractor");
@@ -476,7 +490,7 @@ async fn native_finalization_survives_sibling_failure() {
             let _ = entered;
             let hook_probe = probe.clone();
             let hook_blocks = phase == "hook";
-            let hooks = end_hook(move |name| {
+            let action = move |name: String| {
                 let probe = hook_probe.clone();
                 async move {
                     if name == "failed_tool" {
@@ -488,7 +502,12 @@ async fn native_finalization_survives_sibling_failure() {
                     }
                     probe.finalized.set();
                 }
-            });
+            };
+            let hooks = if hook_raises {
+                raising_end_hook(action)
+            } else {
+                end_hook(action)
+            };
             let agent = Agent::<()>::new("native-agent")
                 .with_model_instance(scripted(vec![vec![
                     native_call,

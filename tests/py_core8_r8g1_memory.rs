@@ -30,13 +30,20 @@ fn model_with(replies: &[&str]) -> Arc<FakeModel> {
     model
 }
 
-fn worker(model: Arc<FakeModel>) -> SandboxAgent<()> {
+fn memory_config() -> Memory {
     // The memory models are never called: nothing here closes the session.
-    let memory = Memory::new().with_generate(Some(
+    Memory::new().with_generate(Some(
         MemoryGenerateConfig::new()
             .with_phase_one_model(AgentModel::Instance(model_with(&[])))
             .with_phase_two_model(AgentModel::Instance(model_with(&[]))),
-    ));
+    ))
+}
+
+fn worker(model: Arc<FakeModel>) -> SandboxAgent<()> {
+    worker_with(model, memory_config())
+}
+
+fn worker_with(model: Arc<FakeModel>, memory: Memory) -> SandboxAgent<()> {
     SandboxAgent::<()>::new("worker")
         .with_model_instance(model)
         .with_instructions("Worker.")
@@ -106,8 +113,10 @@ async fn segments_are_grouped_by_the_sdk_session() {
     let (client, session) = local_session().await;
     let config = SandboxRunConfig::with_session(session.clone());
     let chat = chat_session("chat-session");
-    let first = worker(model_with(&["first done"]));
-    let second = worker(model_with(&["second done"]));
+    // Agents that share a layout share one memory configuration.
+    let memory = memory_config();
+    let first = worker_with(model_with(&["first done"]), memory.clone());
+    let second = worker_with(model_with(&["second done"]), memory);
 
     let mut options = RunOptions::<()>::default();
     options.session = Some(chat.clone());

@@ -1096,7 +1096,8 @@ async fn the_playback_tracker_decides_where_audio_is_truncated() {
     assert_eq!(audio.item_id, "item_1");
 
     // The transport told the tracker which format the session negotiated.
-    assert_eq!(tracker.audio_format().as_deref(), Some("audio/pcm"));
+    // The GA `audio/pcm` name is normalized to `pcm16`, as Python does.
+    assert_eq!(tracker.audio_format().as_deref(), Some("pcm16"));
 
     // The user heard only 30 ms of the 100 ms the model sent.
     tracker.on_play_ms("item_1", 0, 30.0);
