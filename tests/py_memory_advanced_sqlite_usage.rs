@@ -308,9 +308,8 @@ async fn a_failed_usage_write_leaves_the_database_unlocked() {
         )
         .unwrap();
 
-    // Python swallows and logs this failure; Rust reports it as an error. Either way the
-    // failed write must not strand a transaction.
-    let _ = session.store_run_usage(&usage_data()).await;
+    // The failure is logged, not returned, and must not strand a transaction.
+    session.store_run_usage(&usage_data()).await.unwrap();
 
     let probe = Connection::open(&path).unwrap();
     probe.busy_handler(None).unwrap();
