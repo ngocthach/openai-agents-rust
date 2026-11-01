@@ -226,6 +226,109 @@ fn normalize_output_items(output: &[Value]) -> Result<Vec<InputItem>> {
 /// Walks both backwards, consuming exchange digests as it goes: items the exchange contains but
 /// storage does not are skipped, while a stored item that is missing or out of order ends the
 /// match. `session_items.len()` means nothing matched.
+/// Read the complete stored history, refusing one longer than `max_rollback_items`.
+async fn all_items(
+    store: &Arc<dyn Session>,
+    max_rollback_items: Option<usize>,
+) -> Result<Vec<InputItem>> {
+    let limit = match max_rollback_items {
+        None => ALL_SESSION_ITEMS_LIMIT,
+        Some(budget) => budget.saturating_add(1),
+    };
+    let items = store.get_items(Some(limit)).await?;
+    if max_rollback_items.is_some_and(|budget| items.len() > budget) {
+        return Err(AgentsError::user(
+            "Compaction history exceeds max_rollback_items; history was retained",
+        ));
+    }
+    Ok(items)
+}
+
+/// Treat clear -> add as one replacement transaction, as Python does: whether the clear returned
+/// decides how a failure is recovered.
+async fn clear_add_restore(
+    store: Arc<dyn Session>,
+    max_rollback_items: Option<usize>,
+    output_items: Vec<InputItem>,
+    previous: Vec<InputItem>,
+) -> Result<()> {
+    let mut cleared = false;
+    let replace = async {
+        store.clear_session().await?;
+        cleared = true;
+        if !output_items.is_empty() {
+            store.add_items(output_items).await?;
+        }
+        Ok::<(), AgentsError>(())
+    };
+    match replace.await {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            if cleared {
+                restore_history(&store, previous, &error, true).await;
+            } else {
+                restore_after_failed_clear(&store, max_rollback_items, previous, &error).await;
+            }
+            Err(error)
+        }
+    }
+}
+
+/// Recover from a `clear_session` that failed: inspect the store, leave it alone when the failed
+/// clear changed nothing, and otherwise re-add the previous items without clearing again. Port of
+/// `_restore_underlying_session_items_after_failed_clear`.
+async fn restore_after_failed_clear(
+    store: &Arc<dyn Session>,
+    max_rollback_items: Option<usize>,
+    previous: Vec<InputItem>,
+    clear_error: &AgentsError,
+) {
+    let current = match all_items(store, max_rollback_items).await {
+        Ok(current) => current,
+        Err(inspection_error) => {
+            crate::logger::log_model_and_tool_action_warning(
+                "Failed to inspect session history after compaction replacement clear failed.",
+                &inspection_error,
+            );
+            return;
+        }
+    };
+    if current == previous {
+        return;
+    }
+    restore_history(store, previous, clear_error, false).await;
+}
+
+/// Put `previous` back, optionally clearing what is stored first. Failures are logged and never
+/// replace the error that triggered the recovery.
+async fn restore_history(
+    store: &Arc<dyn Session>,
+    previous: Vec<InputItem>,
+    cause: &AgentsError,
+    clear_first: bool,
+) {
+    let outcome = async {
+        if clear_first {
+            store.clear_session().await?;
+        }
+        if !previous.is_empty() {
+            store.add_items(previous).await?;
+        }
+        Ok::<(), AgentsError>(())
+    }
+    .await;
+    match outcome {
+        Ok(()) => crate::logger::log_model_and_tool_action_warning(
+            "Restored previous session history after compaction replacement failed",
+            cause,
+        ),
+        Err(restore_error) => crate::logger::log_model_and_tool_action_warning(
+            "Failed to restore session history after compaction replacement failed.",
+            &restore_error,
+        ),
+    }
+}
+
 #[cfg(test)]
 fn match_model_exchange_suffix(
     session_items: &[InputItem],
@@ -519,20 +622,7 @@ impl OpenAIResponsesCompactionSession {
     /// Reads one item beyond the budget so an oversized history is detected rather than
     /// silently truncated. Port of `_get_all_underlying_session_items`.
     async fn all_underlying_items(&self) -> Result<Vec<InputItem>> {
-        let limit = match self.max_rollback_items {
-            None => ALL_SESSION_ITEMS_LIMIT,
-            Some(budget) => budget.saturating_add(1),
-        };
-        let items = self.store().get_items(Some(limit)).await?;
-        if self
-            .max_rollback_items
-            .is_some_and(|budget| items.len() > budget)
-        {
-            return Err(AgentsError::user(
-                "Compaction history exceeds max_rollback_items; history was retained",
-            ));
-        }
-        Ok(items)
+        all_items(&self.store(), self.max_rollback_items).await
     }
 
     /// Use a specific OpenAI client for the compaction requests.
@@ -921,6 +1011,11 @@ impl OpenAIResponsesCompactionSession {
     }
 
     /// Replace the stored history, restoring `previous` when the replacement fails.
+    ///
+    /// The clear, the add and the restore after a failure run on their own task
+    /// ([`crate::memory::await_session_mutation`]): a caller that is dropped between the clear
+    /// and the add (a cancelled `select!` branch, an aborted task) cannot leave the store empty,
+    /// because the restore still runs.
     async fn replace_history(
         &self,
         output_items: Vec<InputItem>,
@@ -935,78 +1030,14 @@ impl OpenAIResponsesCompactionSession {
         {
             return Ok(());
         }
-        // Treat clear -> add as one replacement transaction, as Python does: whether the clear
-        // returned decides how a failure is recovered.
-        let mut cleared = false;
-        let replace = async {
-            store.clear_session().await?;
-            cleared = true;
-            if !output_items.is_empty() {
-                store.add_items(output_items).await?;
-            }
-            Ok::<(), AgentsError>(())
-        };
-        match replace.await {
-            Ok(()) => Ok(()),
-            Err(error) => {
-                if cleared {
-                    self.restore(previous, &error, true).await;
-                } else {
-                    self.restore_after_failed_clear(previous, &error).await;
-                }
-                Err(error)
-            }
-        }
-    }
-
-    /// Recover from a `clear_session` that failed: inspect the store, leave it alone when the
-    /// failed clear changed nothing, and otherwise re-add the previous items without clearing
-    /// again. Port of `_restore_underlying_session_items_after_failed_clear`.
-    async fn restore_after_failed_clear(
-        &self,
-        previous: Vec<InputItem>,
-        clear_error: &AgentsError,
-    ) {
-        let current = match self.all_underlying_items().await {
-            Ok(current) => current,
-            Err(inspection_error) => {
-                crate::logger::log_model_and_tool_action_warning(
-                    "Failed to inspect session history after compaction replacement clear failed.",
-                    &inspection_error,
-                );
-                return;
-            }
-        };
-        if current == previous {
-            return;
-        }
-        self.restore(previous, clear_error, false).await;
-    }
-
-    /// Put `previous` back, optionally clearing what is stored first. Failures are logged and
-    /// never replace the error that triggered the recovery.
-    async fn restore(&self, previous: Vec<InputItem>, cause: &AgentsError, clear_first: bool) {
-        let store = self.store();
-        let outcome = async {
-            if clear_first {
-                store.clear_session().await?;
-            }
-            if !previous.is_empty() {
-                store.add_items(previous).await?;
-            }
-            Ok::<(), AgentsError>(())
-        }
-        .await;
-        match outcome {
-            Ok(()) => crate::logger::log_model_and_tool_action_warning(
-                "Restored previous session history after compaction replacement failed",
-                cause,
-            ),
-            Err(restore_error) => crate::logger::log_model_and_tool_action_warning(
-                "Failed to restore session history after compaction replacement failed.",
-                &restore_error,
-            ),
-        }
+        let max_rollback_items = self.max_rollback_items;
+        crate::memory::await_session_mutation(clear_add_restore(
+            store,
+            max_rollback_items,
+            output_items,
+            previous,
+        ))
+        .await
     }
 
     /// Remember that `response_id` still owes a compaction once its tool outputs settle.

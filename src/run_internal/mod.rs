@@ -191,7 +191,14 @@ impl<C> ProcessedResponse<C> {
     }
 }
 
-struct RunLoop<C> {
+struct RunLoop<C: Send + Sync + 'static> {
+    /// Set while `run` is in flight: a run dropped in that state (its future was cancelled)
+    /// still leaves a checkpoint, as Python's in-place state mutation does.
+    in_flight: bool,
+    /// Set while the final output guardrails run over a turn that is not yet in the session:
+    /// a run dropped in that state still persists the turn, as Python does when the guardrail
+    /// is cancelled (nothing rejected the output).
+    guardrail_persist: bool,
     starting_agent: Arc<Agent<C>>,
     current_agent: Arc<Agent<C>>,
     /// The trace and span the run was entered in, captured before its task span starts. Session
@@ -998,6 +1005,38 @@ fn blocked_tool_output_payload(raw_item: &Value, message: &str) -> Value {
     sanitized
 }
 
+/// Rebuild a retained blocked function call from allowlisted fields only, so a provider's
+/// extra payload on the call never reaches the history. Port of `blocked_function_call_payload`.
+fn blocked_tool_call_payload(raw_item: &Value) -> Value {
+    let text = |key: &str| {
+        raw_item
+            .get(key)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    };
+    let mut sanitized = json!({
+        "type": "function_call",
+        "name": text("name"),
+        "arguments": text("arguments"),
+        "call_id": text("call_id"),
+    });
+    for key in ["id", "namespace", "status"] {
+        if let Some(v) = raw_item.get(key).and_then(Value::as_str) {
+            sanitized[key] = Value::String(v.to_string());
+        }
+    }
+    if raw_item
+        .get("caller")
+        .and_then(|c| c.get("type"))
+        .and_then(Value::as_str)
+        == Some("direct")
+    {
+        sanitized["caller"] = json!({"type": "direct"});
+    }
+    sanitized
+}
+
 fn call_id_of(item: &RunItem) -> Option<String> {
     match &item.kind {
         RunItemKind::ToolCallOutput { raw_item, .. }
@@ -1108,6 +1147,8 @@ pub(crate) async fn run_loop<C: Send + Sync + 'static>(
         notice_has_local: None,
         inflight_notice: None,
         write_in_progress: Default::default(),
+        in_flight: false,
+        guardrail_persist: false,
         published_checkpoint: false,
         inline_notice: false,
         partial_history_rejected: false,
@@ -1642,6 +1683,20 @@ fn resolve_trace_settings<C>(
     settings
 }
 
+impl<C: Send + Sync + 'static> Drop for RunLoop<C> {
+    fn drop(&mut self) {
+        if !self.in_flight || std::thread::panicking() {
+            return;
+        }
+        if self.guardrail_persist {
+            self.persist_turn_after_cancelled_guardrail();
+        }
+        if let Some(slot) = &self.checkpoint {
+            slot.set(self.failure_checkpoint());
+        }
+    }
+}
+
 impl<C: Send + Sync + 'static> RunLoop<C> {
     fn restore(&mut self, mut state: RunState, restore_usage: bool) -> Result<()> {
         if state.schema_version != CURRENT_SCHEMA_VERSION {
@@ -2126,6 +2181,7 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
     }
 
     async fn run(&mut self) -> Result<RunResult<C>> {
+        self.in_flight = true;
         // An immediate cancel of a streamed run stops it at its next await point; the cleanup
         // below still runs, as Python's `finally` blocks do for a cancelled run task.
         let cancel = self.sink.as_ref().map(|s| s.control.clone());
@@ -2149,6 +2205,7 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
                 {
                     slot.take();
                 }
+                self.in_flight = false;
                 Ok(r)
             }
             Err(e) => {
@@ -2158,6 +2215,7 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
                 if matches!(e, AgentsError::InputGuardrailTripwireTriggered { .. })
                     && let Err(save_error) = self.persist_input_for_guardrail_trip().await
                 {
+                    self.in_flight = false;
                     return Err(save_error);
                 }
                 // A run cancelled while the session was acknowledging its write waits for that
@@ -2171,6 +2229,7 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
                 if let Some(slot) = &self.checkpoint {
                     slot.set(self.failure_checkpoint());
                 }
+                self.in_flight = false;
                 // A data-redacted error must not carry the run's payload either.
                 if e.is_data_redacted() {
                     return Err(e);
@@ -2612,6 +2671,44 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
         Ok((output, item))
     }
 
+    /// The run was dropped while its final output guardrails were running: no guardrail
+    /// rejected the turn, so it is written to the session from a detached task (the append
+    /// cannot be awaited from `Drop`, and a half-written append must not be aborted).
+    fn persist_turn_after_cancelled_guardrail(&mut self) {
+        let Some(session) = self.session.clone() else {
+            return;
+        };
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let mut items = Vec::new();
+        if !self.input_saved_to_session {
+            items.extend(self.session_input.clone());
+        }
+        let start = self.session_saved_items.min(self.generated_items.len());
+        let mut new: Vec<InputItem> = items_to_input(&self.generated_items[start..]);
+        if !session.manages_history_remotely() {
+            let policy = self.reasoning_item_id_policy;
+            new = new
+                .into_iter()
+                .map(|item| strip_reasoning_id(item, policy))
+                .collect();
+        }
+        items.extend(new);
+        let items = items::deduplicate_input_items_preferring_latest(items);
+        self.input_saved_to_session = true;
+        self.session_saved_items = self.generated_items.len();
+        if items.is_empty() {
+            return;
+        }
+        let ctx = self.ctx.clone();
+        handle.spawn(crate::memory::await_session_mutation(async move {
+            session
+                .add_items_with_context(SessionRunContext::new(&ctx), items)
+                .await
+        }));
+    }
+
     /// Run the agent's and the run's output guardrails over `output`, recording each result.
     /// Returns the first tripped result with the index its batch started at.
     async fn run_final_output_guardrails(
@@ -2624,6 +2721,11 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
         if guardrails.is_empty() {
             return Ok(None);
         }
+        self.guardrail_persist = self.session.is_some()
+            && self.pending_write.is_none()
+            && !self.recoverable_write
+            && !self.recovered_tool_outputs
+            && !self.server_managed();
         let (results, outcome) = race_output_guardrails(
             guardrails,
             self.ctx.clone(),
@@ -2632,6 +2734,7 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
             self.agent_span.clone(),
         )
         .await;
+        self.guardrail_persist = false;
         let batch_start = self.output_guardrail_results.len();
         let tripped = results
             .iter()
@@ -2800,12 +2903,17 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
         // Port of `blocked_function_call_payload` / `blocked_function_output_payload`.
         let redact = |items: &mut [RunItem], from: usize| {
             for item in items.iter_mut().skip(from) {
-                if let RunItemKind::ToolCallOutput {
-                    raw_item, output, ..
-                } = &mut item.kind
-                {
-                    *raw_item = blocked_tool_output_payload(raw_item, &message);
-                    *output = Value::String(message.clone());
+                match &mut item.kind {
+                    RunItemKind::ToolCallOutput {
+                        raw_item, output, ..
+                    } => {
+                        *raw_item = blocked_tool_output_payload(raw_item, &message);
+                        *output = Value::String(message.clone());
+                    }
+                    RunItemKind::ToolCall { raw_item } => {
+                        *raw_item = blocked_tool_call_payload(raw_item);
+                    }
+                    _ => {}
                 }
             }
         };
@@ -2858,7 +2966,7 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
             approvals: self.ctx.export_approvals(),
             agent_owner_names: agent_identity::names_by_identity_key(&self.starting_agent),
             ambiguous_agent_owners: agent_identity::ambiguous_identity_keys(&self.starting_agent),
-            nested_agent_tool_states: self.ctx.nested_states(),
+            nested_agent_tool_states: self.ctx.nested_states_for_checkpoint(),
             input_guardrail_results: self.input_guardrail_results.clone(),
             output_guardrail_results: self.output_guardrail_results.clone(),
             tool_input_guardrail_results: self.tool_input_guardrail_results.clone(),

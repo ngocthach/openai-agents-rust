@@ -35,6 +35,28 @@ pub struct OpenAIConversationsSession {
     mutation_lock: Mutex<()>,
 }
 
+/// Create an empty conversation and return its id.
+async fn create_conversation(client: &OpenAIClient) -> Result<String> {
+    let (v, _) = client
+        .post_json("conversations", &json!({"items": []}), None, None)
+        .await?;
+    v.get("id")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| AgentsError::other("Conversations API returned no id"))
+}
+
+/// Start a new conversation now and return its id (`conv_...`), without building a session.
+///
+/// Port of `start_openai_conversations_session`. Without a client the process default client
+/// is used, falling back to one built from the environment.
+pub async fn start_openai_conversations_session(client: Option<OpenAIClient>) -> Result<String> {
+    let client = client.unwrap_or_else(|| {
+        crate::models::get_default_openai_client().unwrap_or_else(OpenAIClient::from_env)
+    });
+    create_conversation(&client).await
+}
+
 impl OpenAIConversationsSession {
     /// A session that creates a new conversation on first use.
     pub fn new() -> Self {
@@ -105,15 +127,7 @@ impl OpenAIConversationsSession {
         if let Some(id) = guard.as_ref() {
             return Ok(id.clone());
         }
-        let (v, _) = self
-            .client
-            .post_json("conversations", &json!({"items": []}), None, None)
-            .await?;
-        let id = v
-            .get("id")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .ok_or_else(|| AgentsError::other("Conversations API returned no id"))?;
+        let id = create_conversation(&self.client).await?;
         self.publish_id(Some(&id));
         *guard = Some(id.clone());
         Ok(id)
@@ -226,6 +240,23 @@ fn sanitize_for_conversation(item: &InputItem) -> Value {
     value
 }
 
+/// A reasoning item with neither a server identity nor encrypted content cannot be replayed from
+/// the conversation, so it is not written. Port of `_is_unpersistable_for_openai_conversation`,
+/// applied after sanitization (which already removed the SDK's placeholder id).
+fn is_unpersistable(item: &Value) -> bool {
+    item.get("type").and_then(Value::as_str) == Some("reasoning")
+        && !non_empty(item.get("id"))
+        && !non_empty(item.get("encrypted_content"))
+}
+
+fn non_empty(value: Option<&Value>) -> bool {
+    match value {
+        None | Some(Value::Null) => false,
+        Some(Value::String(s)) => !s.is_empty(),
+        Some(_) => true,
+    }
+}
+
 fn strip_server_fields(mut v: Value) -> Value {
     if let Value::Object(m) = &mut v {
         m.remove("id");
@@ -264,14 +295,18 @@ impl Session for OpenAIConversationsSession {
     /// saved and later ones are never sent. Retrying the whole list can duplicate what was
     /// already stored, so a caller must reconcile the remote history first.
     async fn add_items(&self, items: Vec<InputItem>) -> Result<()> {
+        let items: Vec<Value> = items
+            .iter()
+            .map(sanitize_for_conversation)
+            .filter(|item| !is_unpersistable(item))
+            .collect();
         if items.is_empty() {
             return Ok(());
         }
         let _guard = self.mutation_lock.lock().await;
         let id = self.conversation_id().await?;
         for chunk in items.chunks(MAX_ITEMS_PER_REQUEST) {
-            let body =
-                json!({"items": chunk.iter().map(sanitize_for_conversation).collect::<Vec<_>>()});
+            let body = json!({ "items": chunk });
             self.client
                 .post_json(&format!("conversations/{id}/items"), &body, None, None)
                 .await?;

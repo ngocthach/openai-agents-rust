@@ -604,6 +604,9 @@ struct Inner {
     nested_states: BTreeMap<String, Value>,
     /// Interruptions raised by nested agent tool runs, keyed by tool call id.
     nested_interruptions: BTreeMap<String, Vec<ToolApprovalItem>>,
+    /// Nested `Agent::as_tool` runs resumed from a parked state and still in flight, keyed by
+    /// tool call id: the state they were resumed from and the slot their progress lands in.
+    nested_resumes: BTreeMap<String, (Value, crate::run::RunCheckpoint)>,
     /// The invocations decisions were recorded for, keyed by call id. Mirrors
     /// `RunContextWrapper._tool_invocations`: a decision binds the exact call it was made for.
     invocations: BTreeMap<String, crate::run_state::ToolInvocationRecord>,
@@ -1038,6 +1041,41 @@ impl<C> RunContext<C> {
 
     pub(crate) fn take_nested_state(&self, call_id: &str) -> Option<Value> {
         self.lock().nested_states.remove(call_id)
+    }
+
+    /// Track a nested run resumed from `state`: while it is in flight, a checkpoint of the outer
+    /// run carries the nested run's own checkpoint (or `state` while it has none yet), so a
+    /// cancelled resume does not rerun what the nested run already committed. Port of
+    /// `record_agent_tool_resume_state`.
+    pub(crate) fn begin_nested_resume(
+        &self,
+        call_id: &str,
+        state: Value,
+        slot: crate::run::RunCheckpoint,
+    ) {
+        self.lock()
+            .nested_resumes
+            .insert(call_id.to_string(), (state, slot));
+    }
+
+    /// Stop tracking the nested resume behind `call_id`.
+    pub(crate) fn end_nested_resume(&self, call_id: &str) {
+        self.lock().nested_resumes.remove(call_id);
+    }
+
+    /// The nested states a checkpoint of this run carries: the parked ones plus the latest state
+    /// of every nested run resumed and not yet finished.
+    pub(crate) fn nested_states_for_checkpoint(&self) -> BTreeMap<String, Value> {
+        let inner = self.lock();
+        let mut states = inner.nested_states.clone();
+        for (call_id, (original, slot)) in &inner.nested_resumes {
+            let latest = slot
+                .peek()
+                .and_then(|state| state.to_json().ok())
+                .unwrap_or_else(|| original.clone());
+            states.insert(call_id.clone(), latest);
+        }
+        states
     }
 
     pub(crate) fn set_nested_interruption(

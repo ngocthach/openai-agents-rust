@@ -49,7 +49,9 @@ pub(crate) fn openai_conversations_chunk_size() -> usize {
 pub use mongodb_session::{
     DEFAULT_MESSAGES_COLLECTION, DEFAULT_SESSIONS_COLLECTION, MongoDBSession, generation_filter,
 };
-pub use openai_conversations_session::OpenAIConversationsSession;
+pub use openai_conversations_session::{
+    OpenAIConversationsSession, start_openai_conversations_session,
+};
 pub use openai_responses_compaction_session::{
     CompactionContext, CompactionMode, DEFAULT_COMPACTION_THRESHOLD, OpenAIResponsesCompactionArgs,
     OpenAIResponsesCompactionSession, ResolvedCompactionMode, ShouldTriggerCompaction,
@@ -344,6 +346,22 @@ pub trait Session: Send + Sync + fmt::Debug {
 
     /// Remove all items.
     async fn clear_session(&self) -> Result<()>;
+
+    /// [`Session::pop_item_validated`] for a run: the removal is scoped by the run's context
+    /// (see [`Session::get_items_with_context`]). The default pops through
+    /// [`Session::pop_item_with_context`] and validates afterwards, so a store that claims and
+    /// validates atomically but ignores the context overrides it with its own validated pop.
+    async fn pop_item_validated_with_context(
+        &self,
+        ctx: SessionRunContext<'_>,
+        validate: PopValidator,
+    ) -> Result<Option<InputItem>> {
+        let item = self.pop_item_with_context(ctx).await?;
+        if let Some(item) = &item {
+            validate(item)?;
+        }
+        Ok(item)
+    }
 
     /// [`Session::get_items`] for a run: the runner calls this with the run's context, so a
     /// session that scopes its history by the context (a tenant, a user) can override it.

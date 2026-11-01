@@ -1151,11 +1151,12 @@ impl Core {
 
     /// Wait out the backoff for the `n`-th retry already taken.
     async fn backoff(&self, taken: u32) {
-        let mut delay = self.config.retry_backoff_seconds_base * 2f64.powi(taken as i32);
-        if let Some(max) = self.config.retry_backoff_seconds_max {
-            delay = delay.min(max);
-        }
-        tokio::time::sleep(Duration::from_secs_f64(delay.max(0.0))).await;
+        tokio::time::sleep(backoff_delay(
+            self.config.retry_backoff_seconds_base,
+            self.config.retry_backoff_seconds_max,
+            taken,
+        ))
+        .await;
     }
 
     fn log_retry(&self, e: &AgentsError) {
@@ -1165,19 +1166,21 @@ impl Core {
         );
     }
 
-    async fn retry<T, F, Fut>(&self, mut f: F) -> Result<T>
+    /// Run `f`, retrying a failure while the budget lasts. `attempt` counts the retries already
+    /// taken, so several calls that pass the same counter (the pages of one listing) draw on one
+    /// budget, as Python's single `_run_with_retries` around the whole page loop does.
+    async fn retry<T, F, Fut>(&self, attempt: &mut i32, mut f: F) -> Result<T>
     where
         F: FnMut() -> Fut,
         Fut: std::future::Future<Output = Result<T>>,
     {
-        let mut attempt: i32 = 0;
         loop {
             match self.with_timeout(f()).await {
                 Ok(v) => return Ok(v),
-                Err(e) if self.unlimited_retries() || attempt < self.config.max_retry_attempts => {
+                Err(e) if self.unlimited_retries() || *attempt < self.config.max_retry_attempts => {
                     self.log_retry(&e);
-                    self.backoff(attempt.max(0) as u32).await;
-                    attempt = attempt.saturating_add(1);
+                    self.backoff((*attempt).max(0) as u32).await;
+                    *attempt = attempt.saturating_add(1);
                 }
                 Err(e) => return Err(e),
             }
@@ -1237,15 +1240,16 @@ impl Core {
             state.refresh_sequence += 1;
             (state.generation, state.refresh_sequence)
         };
-        // Each page request retries on its own, as Python's `_list_tools_page` does, so a
-        // transient failure on page N never refetches (or recounts) the pages already read.
+        // A failed page is retried alone, so a transient failure on page N never refetches the
+        // pages already read; the retries of every page draw on one budget.
         let mut out = Vec::new();
         let mut cursor: Option<String> = None;
         let mut pages = 0usize;
+        let mut retries_taken: i32 = 0;
         loop {
             let page_cursor = cursor.clone();
             let page = self
-                .retry(|| async {
+                .retry(&mut retries_taken, || async {
                     let s = self.peer().await?;
                     s.list_tools(page_cursor.clone().map(|c| {
                         rmcp::model::PaginatedRequestParams::default().with_cursor(Some(c))
@@ -2178,5 +2182,63 @@ impl MCPServerManager {
         let servers = self.servers.clone();
         self.cleanup_servers(servers).await;
         self.refresh_active();
+    }
+}
+
+/// The wait before the retry that follows `taken` earlier backoffs: `base * 2^taken`, bounded by
+/// `max` when one is configured.
+fn backoff_delay(base: f64, max: Option<f64>, taken: u32) -> Duration {
+    let mut delay = base * 2f64.powi(taken.min(i32::MAX as u32) as i32);
+    if let Some(max) = max {
+        delay = delay.min(max);
+    }
+    if !delay.is_finite() {
+        return Duration::MAX;
+    }
+    Duration::from_secs_f64(delay.max(0.0))
+}
+
+#[cfg(test)]
+mod backoff_tests {
+    use super::backoff_delay;
+    use std::time::Duration;
+
+    fn schedule(base: f64, max: Option<f64>, count: u32) -> Vec<f64> {
+        (0..count)
+            .map(|taken| backoff_delay(base, max, taken).as_secs_f64())
+            .collect()
+    }
+
+    /// Python: `test_generic_backoff_remains_uncapped_by_default`.
+    #[test]
+    fn the_backoff_doubles_and_is_uncapped_by_default() {
+        assert_eq!(
+            schedule(1.0, None, 8),
+            [1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0]
+        );
+    }
+
+    /// Python: `test_generic_backoff_respects_configured_maximum` and
+    /// `test_streamable_http_backoff_respects_configured_maximum`.
+    #[test]
+    fn the_backoff_stops_growing_at_the_configured_maximum() {
+        assert_eq!(
+            schedule(1.0, Some(64.0), 9),
+            [1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 64.0, 64.0]
+        );
+        assert_eq!(backoff_delay(1.0, Some(0.0), 5), Duration::ZERO);
+    }
+
+    /// Python: `test_streamable_http_backoff_grows_with_unlimited_retries`: three failures wait
+    /// 1, 2 and 4 seconds, however many retries remain.
+    #[test]
+    fn the_first_three_backoffs_are_one_two_and_four_times_the_base() {
+        assert_eq!(schedule(1.0, None, 3), [1.0, 2.0, 4.0]);
+        assert_eq!(schedule(0.5, None, 3), [0.5, 1.0, 2.0]);
+    }
+
+    #[test]
+    fn a_runaway_exponent_does_not_panic() {
+        assert!(backoff_delay(1.0, None, u32::MAX) >= Duration::from_secs(1));
     }
 }

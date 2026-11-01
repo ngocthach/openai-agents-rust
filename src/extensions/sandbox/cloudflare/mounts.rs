@@ -278,10 +278,15 @@ impl MountStrategy for CloudflareBucketMountStrategy {
     ) -> SandboxResult<()> {
         self.config.validate()?;
         let connection = self.connection(session, mount_path)?;
+        // The sandbox's own filesystem decides where the path lands: a workspace symlink must not
+        // carry the bucket out of the workspace.
+        let resolved = session
+            .validate_remote_path_access(mount_path, true, false)
+            .await?;
         connection
             .mount_bucket(
                 &self.config.bucket_name,
-                mount_path,
+                &resolved,
                 self.config.to_request_options(),
             )
             .await
@@ -294,7 +299,10 @@ impl MountStrategy for CloudflareBucketMountStrategy {
         mount_path: &str,
     ) -> SandboxResult<()> {
         let connection = self.connection(session, mount_path)?;
-        connection.unmount_bucket(mount_path).await
+        let resolved = session
+            .validate_remote_path_access(mount_path, true, false)
+            .await?;
+        connection.unmount_bucket(&resolved).await
     }
 }
 

@@ -752,6 +752,9 @@ pub struct E2BSandboxSession {
     http: reqwest::Client,
     remote: RwLock<RemoteHandle>,
     started: AtomicBool,
+    /// `start` already created the workspace root, so the manifest applier's root `mkdir` that
+    /// follows it must not go through the filesystem API a second time.
+    skip_next_root_mkdir: AtomicBool,
     paused: AtomicBool,
     released: tokio::sync::Mutex<bool>,
     ptys: RemotePtyManager,
@@ -805,6 +808,7 @@ impl E2BSandboxSession {
             snapshot_id: session_id.clone(),
             session_id,
             started: AtomicBool::new(false),
+            skip_next_root_mkdir: AtomicBool::new(false),
             paused: AtomicBool::new(false),
             released: tokio::sync::Mutex::new(false),
             ptys: RemotePtyManager::new(),
@@ -1396,17 +1400,30 @@ impl SandboxSession for E2BSandboxSession {
 
     async fn start(&self) -> SandboxResult<()> {
         let root = self.manifest.root().to_string();
-        // The filesystem API can create roots the command user cannot, so it goes first; the
-        // command below then proves the root is usable as a working directory.
-        self.make_dir(&root).await.map_err(|error| {
-            SandboxError::new(
-                ErrorCode::WorkspaceStartError,
-                format!(
-                    "Failed to create the E2B workspace root `{root}`: {}",
-                    error.message
-                ),
+        // The filesystem API can create roots the command user cannot, so it goes first when the
+        // root is missing; an existing root needs no filesystem API call at all. The command
+        // below then proves the root is usable as a working directory.
+        let root_exists = self
+            .exec_at(
+                vec!["test".into(), "-d".into(), root.clone()],
+                None,
+                &self.command_envs(),
+                Some(self.options.timeouts.fast_op),
+                None,
             )
-        })?;
+            .await
+            .is_ok_and(|probe| probe.ok());
+        if !root_exists {
+            self.make_dir(&root).await.map_err(|error| {
+                SandboxError::new(
+                    ErrorCode::WorkspaceStartError,
+                    format!(
+                        "Failed to create the E2B workspace root `{root}`: {}",
+                        error.message
+                    ),
+                )
+            })?;
+        }
         let prepared = self
             .exec_at(
                 vec!["mkdir".into(), "-p".into(), "--".into(), root.clone()],
@@ -1426,6 +1443,7 @@ impl SandboxSession for E2BSandboxSession {
             ));
         }
         self.started.store(true, Ordering::SeqCst);
+        self.skip_next_root_mkdir.store(true, Ordering::SeqCst);
         let result = if self.resuming {
             match restore_session_snapshot(self).await {
                 Ok(false) => self
@@ -1442,6 +1460,7 @@ impl SandboxSession for E2BSandboxSession {
         };
         result.inspect_err(|_| {
             self.started.store(false, Ordering::SeqCst);
+            self.skip_next_root_mkdir.store(false, Ordering::SeqCst);
         })?;
         Ok(())
     }
@@ -1596,9 +1615,31 @@ impl SandboxSession for E2BSandboxSession {
             .unwrap_or_default())
     }
 
-    async fn mkdir(&self, path: &str, _parents: bool) -> SandboxResult<()> {
-        // envd's MakeDir always creates the missing parents.
+    async fn mkdir(&self, path: &str, parents: bool) -> SandboxResult<()> {
+        let normalized = self.normalize_path_for_write(path)?;
+        if normalized.trim_end_matches('/') == self.manifest.root().trim_end_matches('/') {
+            if self.skip_next_root_mkdir.swap(false, Ordering::SeqCst) {
+                return Ok(());
+            }
+            // The root has to stay creatable when it disappeared remotely, and remote path
+            // validation runs its helper with the workspace as the working directory.
+            return self.make_dir(&normalized).await;
+        }
         let resolved = self.validate_remote_path_access(path, true, false).await?;
+        // envd's MakeDir always creates the missing parents, so the contract of a plain `mkdir`
+        // is kept by probing the parent first.
+        if !parents {
+            let parent = match resolved.rfind('/') {
+                Some(0) => "/".to_string(),
+                Some(index) => resolved[..index].to_string(),
+                None => ".".to_string(),
+            };
+            let argv = vec!["test".to_string(), "-d".to_string(), parent];
+            let probe = self.exec(ExecRequest::argv(argv.clone())).await?;
+            if !probe.ok() {
+                return Err(SandboxError::exec_nonzero(&argv, &probe));
+            }
+        }
         self.make_dir(&resolved).await
     }
 

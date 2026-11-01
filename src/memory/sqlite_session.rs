@@ -339,6 +339,16 @@ impl Session for SqliteSession {
         self.pop_item_validated(Box::new(|_| Ok(()))).await
     }
 
+    /// The store keeps one history per session id and ignores the run's context, so a run's
+    /// validated pop is the same atomic claim.
+    async fn pop_item_validated_with_context(
+        &self,
+        _ctx: super::SessionRunContext<'_>,
+        validate: super::PopValidator,
+    ) -> Result<Option<InputItem>> {
+        self.pop_item_validated(validate).await
+    }
+
     /// Claim the newest row and run `validate` on it inside the transaction that owns its
     /// removal, so a rejected item keeps its row id and its position.
     ///
@@ -391,17 +401,20 @@ impl Session for SqliteSession {
 
     async fn clear_session(&self) -> Result<()> {
         self.blocking(move |conn, s| {
-            conn.execute(
+            // One transaction: a failure on the sessions row restores the messages deleted
+            // before it, and no write lock is left behind.
+            let tx = conn.unchecked_transaction().map_err(sql_err)?;
+            tx.execute(
                 &format!("DELETE FROM {} WHERE session_id = ?", s.messages_table),
                 params![s.session_id],
             )
             .map_err(sql_err)?;
-            conn.execute(
+            tx.execute(
                 &format!("DELETE FROM {} WHERE session_id = ?", s.sessions_table),
                 params![s.session_id],
             )
             .map_err(sql_err)?;
-            Ok(())
+            tx.commit().map_err(sql_err)
         })
         .await
     }

@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 use sha2::Sha256;
 
 use super::fernet::Fernet;
-use super::{CompactionSnapshot, Session, SessionSettings, SnapshotHandle};
+use super::{CompactionSnapshot, Session, SessionRunContext, SessionSettings, SnapshotHandle};
 use crate::error::{AgentsError, Result};
 use crate::items::InputItem;
 
@@ -343,23 +343,31 @@ impl EncryptedSession {
     }
 }
 
-#[async_trait]
-impl Session for EncryptedSession {
-    fn session_id(&self) -> &str {
-        &self.session_id
+impl EncryptedSession {
+    /// Read the wrapped store, with the run's context when there is one, so a store that scopes
+    /// its history by the context (a tenant, a user) sees the same scope through encryption.
+    async fn read_underlying(
+        &self,
+        ctx: Option<SessionRunContext<'_>>,
+        limit: Option<usize>,
+    ) -> Result<Vec<InputItem>> {
+        match ctx {
+            Some(ctx) => self.underlying.get_items_with_context(ctx, limit).await,
+            None => self.underlying.get_items(limit).await,
+        }
     }
 
-    fn session_settings(&self) -> Option<SessionSettings> {
-        self.underlying.session_settings()
-    }
-
-    async fn get_items(&self, limit: Option<usize>) -> Result<Vec<InputItem>> {
+    async fn read_scoped(
+        &self,
+        ctx: Option<SessionRunContext<'_>>,
+        limit: Option<usize>,
+    ) -> Result<Vec<InputItem>> {
         let limit = super::resolve_session_limit(limit, self.session_settings().as_ref());
         let budget = self.max_scan_items;
         match limit {
             Some(0) => return Ok(Vec::new()),
             None if budget.is_none() => {
-                let stored = self.underlying.get_items(None).await?;
+                let stored = self.read_underlying(ctx, None).await?;
                 return Ok(self.unwrap_valid_items(&stored));
             }
             _ => {}
@@ -374,7 +382,7 @@ impl Session for EncryptedSession {
             (None, None) => unreachable!("handled above"),
         };
         loop {
-            let stored = self.underlying.get_items(Some(window)).await?;
+            let stored = self.read_underlying(ctx, Some(window)).await?;
             let valid = self.unwrap_valid_items(&stored);
             if let Some(n) = limit
                 && valid.len() >= n
@@ -400,15 +408,27 @@ impl Session for EncryptedSession {
         }
     }
 
-    /// Encrypt and append. The write runs under [`super::await_session_mutation`], so a dropped
-    /// caller cannot leave the store holding part of a batch.
-    async fn add_items(&self, items: Vec<InputItem>) -> Result<()> {
+    /// Encrypt and append, scoped by the run's context when there is one. The write runs under
+    /// [`super::await_session_mutation`], so a dropped caller cannot leave the store holding
+    /// part of a batch.
+    async fn add_scoped(
+        &self,
+        ctx: Option<SessionRunContext<'_>>,
+        items: Vec<InputItem>,
+    ) -> Result<()> {
         if items.is_empty() {
             return Ok(());
         }
         let encrypted = self.encrypt_items(&items)?;
         let underlying = Arc::clone(&self.underlying);
-        super::await_session_mutation(async move { underlying.add_items(encrypted).await }).await
+        match ctx {
+            // The context only borrows from the caller, so the write stays on this task.
+            Some(ctx) => underlying.add_items_with_context(ctx, encrypted).await,
+            None => {
+                super::await_session_mutation(async move { underlying.add_items(encrypted).await })
+                    .await
+            }
+        }
     }
 
     /// Remove and return the most recent readable item, skipping expired or plaintext records.
@@ -420,7 +440,7 @@ impl Session for EncryptedSession {
     /// SQLite path does. A store that cannot claim and validate atomically falls back to the
     /// trait's default, which pops first and therefore does remove such an envelope — the same
     /// split Python draws between `SQLiteSession` and every other backend.
-    async fn pop_item(&self) -> Result<Option<InputItem>> {
+    async fn pop_scoped(&self, ctx: Option<SessionRunContext<'_>>) -> Result<Option<InputItem>> {
         loop {
             let cipher = self.cipher.clone();
             let validate: super::PopValidator = Box::new(move |item: &InputItem| {
@@ -440,7 +460,15 @@ impl Session for EncryptedSession {
                     )
                 })
             });
-            let Some(stored) = self.underlying.pop_item_validated(validate).await? else {
+            let popped = match ctx {
+                Some(ctx) => {
+                    self.underlying
+                        .pop_item_validated_with_context(ctx, validate)
+                        .await?
+                }
+                None => self.underlying.pop_item_validated(validate).await?,
+            };
+            let Some(stored) = popped else {
                 return Ok(None);
             };
             if let Some(item) = self.unwrap_item(&stored) {
@@ -449,8 +477,62 @@ impl Session for EncryptedSession {
         }
     }
 
+    async fn clear_scoped(&self, ctx: Option<SessionRunContext<'_>>) -> Result<()> {
+        match ctx {
+            Some(ctx) => self.underlying.clear_session_with_context(ctx).await,
+            None => self.underlying.clear_session().await,
+        }
+    }
+}
+
+#[async_trait]
+impl Session for EncryptedSession {
+    fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    fn session_settings(&self) -> Option<SessionSettings> {
+        self.underlying.session_settings()
+    }
+
+    async fn get_items(&self, limit: Option<usize>) -> Result<Vec<InputItem>> {
+        self.read_scoped(None, limit).await
+    }
+
+    async fn add_items(&self, items: Vec<InputItem>) -> Result<()> {
+        self.add_scoped(None, items).await
+    }
+
+    async fn pop_item(&self) -> Result<Option<InputItem>> {
+        self.pop_scoped(None).await
+    }
+
     async fn clear_session(&self) -> Result<()> {
-        self.underlying.clear_session().await
+        self.clear_scoped(None).await
+    }
+
+    async fn get_items_with_context(
+        &self,
+        ctx: SessionRunContext<'_>,
+        limit: Option<usize>,
+    ) -> Result<Vec<InputItem>> {
+        self.read_scoped(Some(ctx), limit).await
+    }
+
+    async fn add_items_with_context(
+        &self,
+        ctx: SessionRunContext<'_>,
+        items: Vec<InputItem>,
+    ) -> Result<()> {
+        self.add_scoped(Some(ctx), items).await
+    }
+
+    async fn pop_item_with_context(&self, ctx: SessionRunContext<'_>) -> Result<Option<InputItem>> {
+        self.pop_scoped(Some(ctx)).await
+    }
+
+    async fn clear_session_with_context(&self, ctx: SessionRunContext<'_>) -> Result<()> {
+        self.clear_scoped(Some(ctx)).await
     }
 
     /// Whether the wrapped session wants the runner to record the last model exchange.

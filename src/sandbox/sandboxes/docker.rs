@@ -1929,14 +1929,16 @@ pub fn manifest_has_protected_mounts(manifest: &Manifest) -> bool {
 
 /// Replace `error`'s provider text when `manifest` has protected mounts.
 ///
-/// The error code and operation survive, because a caller branches on them; the message,
-/// context and cause — everything a provider could have put a credential in — do not.
+/// The error code, operation and retry flag survive, because a caller branches on them; the
+/// message, context and cause — everything a provider could have put a credential in — do not.
 pub fn redact_for_protected_mounts(manifest: &Manifest, error: SandboxError) -> SandboxError {
     if !manifest_has_protected_mounts(manifest) {
         return error;
     }
     let mut safe = SandboxError::new(error.code, PROTECTED_MOUNT_ERROR_MESSAGE);
     safe.op = error.op;
+    // A retry decision is a plain flag, not provider text, and callers' retry policies read it.
+    safe.retryable = error.retryable;
     safe
 }
 

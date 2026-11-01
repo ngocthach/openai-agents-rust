@@ -512,9 +512,11 @@ pub(crate) async fn execute_function_tool<C: Send + Sync + 'static>(
             return Ok(error_outcome(tool.output_json_schema.as_ref(), &call, msg));
         }
         let tool_enum = Tool::Function(tool.clone());
-        // From here on user code runs: a retry must not run it again.
-        env.ctx.mark_invocation_executed(&call.call_id);
+        // From here on user code runs: a retry must not run it again. A call that only resumes
+        // a nested agent run is exempt: the nested run keeps its own committed progress, so a
+        // retry of the outer call resumes it instead of repeating anything.
         if !continues_nested_run {
+            env.ctx.mark_invocation_executed(&call.call_id);
             if let Some(h) = env.hooks {
                 h.on_tool_start(&tool_ctx, env.agent, &tool_enum).await;
             }

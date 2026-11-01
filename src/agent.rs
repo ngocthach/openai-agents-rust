@@ -265,8 +265,10 @@ pub struct Agent<C> {
     pub handoffs: Vec<Handoff<C>>,
     /// Model to use (defaults to the run config model or the provider default).
     pub model: Option<AgentModel>,
-    /// Model settings.
-    pub model_settings: ModelSettings,
+    /// Model settings. Private so every write goes through the tracked accessors
+    /// ([`Agent::with_model_settings`], [`Agent::model_settings_mut`]); read with
+    /// [`Agent::model_settings`].
+    pub(crate) model_settings: ModelSettings,
     /// Whether `model_settings` were set explicitly (otherwise model defaults apply).
     pub(crate) model_settings_explicit: bool,
     /// The default-model settings captured when the agent was created, used when neither the
@@ -431,13 +433,19 @@ impl<C: Send + Sync + 'static> Agent<C> {
         self
     }
 
+    /// The agent's model settings as stored (unset fields still follow the selected model
+    /// until the settings are made explicit).
+    pub fn model_settings(&self) -> &ModelSettings {
+        &self.model_settings
+    }
+
     /// Edit the agent's model settings in place.
     ///
     /// Port of Python's tracked in-place write (`agent.model_settings.verbosity = "low"`): the
     /// first call makes the settings explicit even if the value written equals the default.
     /// The defaults captured when the agent was created are kept, with the edit on top, instead
-    /// of being recomputed from whichever model the run selects. Assigning a field of the public
-    /// `model_settings` directly is not tracked: unset fields still follow the selected model.
+    /// of being recomputed from whichever model the run selects. The field itself is private,
+    /// so every write is tracked this way.
     pub fn model_settings_mut(&mut self) -> &mut ModelSettings {
         if !self.model_settings_explicit {
             self.model_settings = self
@@ -1266,7 +1274,16 @@ impl<C: Send + Sync + 'static> Agent<C> {
                     run_opts.conversation_id = opts.conversation_id.clone();
                     run_opts.session = opts.session.clone();
                     let input: RunInput = match parent.take_nested_state(&tool_ctx.tool_call_id) {
-                        Some(state) => RunInput::State(Box::new(RunState::from_json(state)?)),
+                        Some(state) => {
+                            let nested = RunState::from_json(state.clone())?;
+                            // Keep the nested run's progress reachable from the caller's
+                            // checkpoints while it resumes: a cancelled resume then keeps the
+                            // tool outputs the nested run already committed.
+                            let slot = crate::run::RunCheckpoint::new();
+                            parent.begin_nested_resume(&tool_ctx.tool_call_id, state, slot.clone());
+                            run_opts.checkpoint = Some(slot);
+                            RunInput::State(Box::new(nested))
+                        }
                         None => input_text,
                     };
                     let run = async {
@@ -1290,10 +1307,16 @@ impl<C: Send + Sync + 'static> Agent<C> {
                         Err(e) => match &opts.failure_error_function {
                             // Report the failure to the calling model instead of failing the
                             // outer run. Port of `as_tool(failure_error_function=...)`.
-                            Some(f) => return Ok(ToolOutput::Text(f(&parent, &e).await?)),
+                            Some(f) => {
+                                parent.end_nested_resume(&tool_ctx.tool_call_id);
+                                return Ok(ToolOutput::Text(f(&parent, &e).await?));
+                            }
+                            // The failure propagates: a checkpoint of the outer run keeps the
+                            // nested state, so a retry resumes the nested run where it stopped.
                             None => return Err(e),
                         },
                     };
+                    parent.end_nested_resume(&tool_ctx.tool_call_id);
                     if !result.interruptions.is_empty() {
                         let state = result.to_state().to_json()?;
                         parent.set_nested_interruption(
