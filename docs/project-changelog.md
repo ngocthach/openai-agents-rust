@@ -1,5 +1,47 @@
 # Changelog
 
+## 0.15.0 (2026-11-01)
+
+Reads in full the groups where the round-11 random audit found invalid Python-only reasons (provider and model
+extensions, session stores, MCP errors, codex tool, agent-as-tool) and fixes what they exposed. 98 more parity
+cases moved out of the Python-only bucket (56 ported, 42 covered). Measured state: 12,641 Python test cases,
+8,715 ported, 724 covered, 3,202 Python-only, 0 not ported, 0 unaccounted. Notes by area:
+`plans/reports/py-test-parity-core12-*.md`. No live model call was made.
+
+Fixes and additions:
+
+- Agent-as-tool: a nested run's progress is reachable from the outer run's `RunCheckpoint`, an outer call that
+  only resumes a nested run is not treated as executed, and a cancelled or dropped run leaves a checkpoint, so a
+  retry does not run the committed tool again.
+- Sessions: a run dropped while its output guardrails run still writes its turn (from a detached task; an
+  immediate cancel of a streamed run writes nothing); blocked tool calls are rebuilt from allowlisted fields so
+  `provider_data` no longer reaches the session; reasoning items without a usable id are not written to the
+  conversations store; `start_openai_conversations_session` is new; `SqliteSession::clear_session` is one
+  transaction; a compaction replacement runs on its own task so a dropped caller cannot leave the store empty;
+  `EncryptedSession` forwards the run context (new defaulted `Session::pop_item_validated_with_context`).
+- MCP: the `list_tools` retry budget is shared across pages.
+- Sandbox: E2B `start` probes the workspace root and only calls the files API when it is missing, `mkdir` of the
+  root skips remote validation and `mkdir` without `parents` fails when the parent is missing; Cloudflare bucket
+  mounts validate the path in the sandbox and send the resolved path; a transient failure on a Docker session
+  with credentialed mounts stays retryable.
+- `Agent::model_settings` is private: read it with `model_settings()` and write it with `with_model_settings` or
+  `model_settings_mut`, so a write keeps the defaults captured when the agent was created.
+
+Breaking changes: `Agent::model_settings` is no longer a public field; E2B `mkdir` without `parents` no longer
+creates missing parents; the E2B start probe changes what a mock sandbox must answer to `test -d`;
+`Session` has one more defaulted method.
+
+Known gaps (real differences): the Docker removal service (about 190 cases) is a root host-side helper that is
+deliberately not part of this library; provider options (Vercel runtime and network policy, Modal builder
+version and resources, E2B mcp) live in the client options, not in the persisted session state; E2B and Daytona
+PTY start have no per-call timeout; a dropped guardrail run's detached session write cannot report its own
+failure, and a context-scoped `EncryptedSession` append is not shielded from a dropped caller; groups carried
+over on earlier reasons without a fresh read include the MCP exception-graph cases, redis-py internals, MCP
+manager worker tasks, advanced-SQLite interleavings and codex exec; Rust cannot detect a custom `Deserialize`,
+so a dynamic approval rule is consulted unless the tool opts in with `with_args_have_validators`; docs.rs builds
+without the `mongodb` feature; the websocket crate logs handshake data at TRACE through the `log` crate; the
+Redis atomic replace has only run against a mock.
+
 ## 0.14.0 (2026-11-01)
 
 Closes the last documented synchronous-API divergences and adds an independent measurement of the Python-only

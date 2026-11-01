@@ -1,0 +1,15 @@
+path,moved_to_ported,moved_to_covered,remaining_python_only
+tests/extensions/sandbox/test_blaxel.py,0,12,28
+tests/extensions/sandbox/test_cloudflare.py,3,0,2
+tests/extensions/sandbox/test_daytona.py,2,0,4
+tests/extensions/sandbox/test_e2b.py,5,3,6
+tests/extensions/sandbox/test_modal.py,6,11,24
+tests/extensions/sandbox/test_vercel.py,2,3,35
+tests/extensions/sandbox/test_vercel_provider_contract.py,1,0,4
+tests/models/test_any_llm_model.py,2,5,14
+tests/sandbox/test_mount_lifecycle.py,0,0,4
+tests/sandbox/test_mount_security.py,4,1,125
+tests/sandbox/test_session_sinks.py,0,0,4
+tests/sandbox/test_session_state_roundtrip.py,0,3,4
+tests/sandbox/test_session_utils.py,0,0,2
+tests/sandbox/test_snapshot.py,0,4,6
