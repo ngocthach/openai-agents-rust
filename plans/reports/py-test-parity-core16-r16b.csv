@@ -1,0 +1,33 @@
+path,moved_to_ported,moved_to_covered,remaining_python_only,read_depth
+tests/test_run_state.py,0,8,88,"full: heads of all 144 name-unmatched cases, bodies of the 38 representative or portable ones (3-line parametrized shells delegate to the shared helper bodies read)"
+tests/realtime/test_session.py,10,0,22,"full: heads of all 77 name-unmatched cases, bodies of every case that touched Rust-portable behaviour"
+tests/models/test_openai_responses.py,1,0,27,"full: heads of all 127 name-unmatched cases, bodies of the 8 candidates; renamed ports matched to py_models_responses_*.rs"
+tests/test_function_tool.py,0,0,23,full: bodies or heads of all 34 name-unmatched cases
+tests/sandbox/test_unix_local_user_file_io.py,0,0,19,full: heads of all 15 cases; every one runs the in-process sudo worker fixture
+tests/extensions/memory/test_advanced_sqlite_session.py,0,0,14,"full: heads of all 101 name-unmatched cases, bodies of the 9 candidates; renamed ports matched in py_memory_advanced_sqlite*.rs and py_core13_r13b/py_core8_r8g3 files"
+tests/extensions/memory/test_memory_imports.py,0,0,13,full: both cases (heads; parametrized import checks)
+tests/memory/test_session.py,0,0,11,"full: heads of all 36 name-unmatched cases, per-group table matched to py_memory_session.rs"
+tests/docs/test_translate_docs.py,0,0,9,full: all 9 cases (heads and 4 bodies; one docs-script function)
+tests/realtime/test_realtime_model_settings.py,6,0,2,"full: heads of all 10 cases, bodies of the SIP and starting-settings ones"
+tests/test_agent_config.py,0,0,7,"full: heads of all 14 cases, bodies of 6"
+tests/test_agent_tool_state.py,0,0,6,full: all 6 bodies
+tests/test_tool_use_behavior.py,0,0,6,full: all 5 name-unmatched bodies
+tests/voice/test_openai_model_provider.py,0,0,5,full: all 5 bodies
+tests/sandbox/test_client_options.py,0,0,4,full: all 8 name-unmatched cases
+tests/test_function_tool_approval_arguments.py,0,0,4,full: bodies or heads of all 10 name-unmatched cases
+tests/extensions/sandbox/test_daytona.py,0,0,3,full: heads of all 53 name-unmatched cases; SDK-fake bodies matched to py_sandbox_daytona.rs and py_core6_cfdaytona_daytona.rs
+tests/models/test_agent_registration.py,0,0,3,full: all 4 name-unmatched bodies
+tests/sandbox/capabilities/test_skills_capability.py,0,0,3,full: heads of all 48 name-unmatched cases (the python-only 3 are constructor combinations)
+tests/test_doc_parsing.py,0,0,3,full: all 4 bodies
+tests/test_run_state_agent_identity.py,0,0,3,"full: heads of all 18 cases, Rust counterparts located"
+tests/utils/test_pretty_print_and_items.py,3,0,0,full: all 3 bodies
+tests/models/test_openai_responses_converter.py,0,0,2,full: all 3 name-unmatched bodies
+tests/sandbox/test_session_state_roundtrip.py,0,0,2,full: heads of all 19 name-unmatched cases (pydantic registry/redaction)
+tests/test_pretty_print.py,0,0,2,full: the 3 candidates among the python-only cases
+tests/voice/test_openai_stt_session_config.py,0,0,2,full: both bodies
+tests/realtime/test_playback_tracker.py,1,0,0,full: all 7 name-unmatched bodies
+tests/sandbox/capabilities/test_filesystem_capability.py,1,0,0,full: all 6 name-unmatched bodies
+tests/test_agent_as_tool_callback_validation.py,0,0,1,full: heads of both cases
+tests/test_function_schema_logger_restore.py,0,0,1,full: the single body
+tests/test_tool_output_conversion.py,0,0,1,full: heads of all 23 name-unmatched cases; ported in py_core6_streamedleft_items.rs
+tests/voice/test_openai_stt_client_config.py,0,0,1,full: both bodies

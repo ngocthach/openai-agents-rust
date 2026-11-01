@@ -1,5 +1,66 @@
 # Changelog
 
+## 0.18.0 (2026-11-02)
+
+Closes eight of the nine divergences listed as known gaps in 0.17.0 and re-reads the remaining Python-only files
+in seven batches. 221 more parity cases moved out of the Python-only bucket (134 ported, 87 covered). Measured
+state: 12,641 Python test cases, 9,166 ported, 884 covered, 2,591 Python-only, 0 not ported, 0 unaccounted.
+Notes by area: `plans/reports/py-test-parity-core16-*.md`. No live model call was made.
+
+Fixes and additions:
+
+- Hooks and replay: a function or computer call whose end hook failed is refused with `already executed` when
+  the same call id returns on a fresh run sharing the context; a streamed run emits `tool_called` before a
+  failing `on_llm_end` hook ends the run.
+- Sinks: `EventSink::bind` has a default, `CallbackSink::with_session` and `raising_with_session` pass the bound
+  session to the callback, and `ChainedSink` forwards the bind.
+- Macros: `#[function_tool]` accepts methods taking `&self` or `self` (the receiver type must be `Clone + Send +
+  Sync + 'static`) and associated functions written `#[function_tool(associated)]`; a synchronous tool body runs
+  on the tokio blocking pool.
+- MCP: new `AgentsError::MCPToolCancellationError { message, run_data }` for a cancelled MCP tool call; the
+  default MCP HTTP and SSE clients no longer follow redirects (a caller-supplied `http_client` keeps its own
+  policy).
+- Realtime: connect-time tool lists decide dispatch; `RealtimeRunConfig::with_initial_tools` and
+  `with_initial_handoffs` carry live tools and handoffs; a failed `connect` restores the previous model name;
+  an interrupt error lists every failure; a transcript received before STT setup finishes is delivered;
+  `OpenAIClient::without_query` omits a query parameter from HTTP and websocket URLs.
+- Approvals: `ApprovalPolicy::DynamicForAgent` and `evaluate_for_agent` pass the agent name to local-tool policies
+  and the sandbox `apply_patch` tool stops evaluating once a decision for the call exists; `try_approve` and
+  `try_reject` refuse decisions for ambiguous owners; a restored snapshot onto indistinguishable same-named
+  agents asks again instead of applying the saved decision.
+- Sandbox: Vercel shutdown unmounts S3 mounts first and retries a failed stop once; unix-local `mkdir_as` and
+  `rm_as` check access under `sudo -u` and then act natively; Add File for a run-as user stages the file and
+  hard-links it into place; a failing session `start` or capability `check_manifest` on a manifest with
+  credentialed mounts returns only the fixed protected-mount sentence; `Filesystem::with_view_image_needs_approval`
+  requires approval for `view_image`.
+- Sessions: `pop_item` and `clear_session` on the compaction session drop the stored response chain before the
+  deletion starts; the voice pipeline aborts and awaits its sibling TTS tasks after a failure;
+  `OpenAIVoiceModelProvider` honours the process default client and has `with_organization` and `with_project`.
+- Other: the memory-generation and held-write pairing fixes listed in `core16-r16a.md`, settlement of an unpaired
+  hosted MCP approval request only when its response is present or its approval is still open, and
+  `RunState::try_approve` ambiguity handling.
+
+Breaking changes: `AgentsError` and `ApprovalPolicy` each gained a variant, so exhaustive matches need updating;
+`RunState` gained a `#[serde(skip)]` public field, so struct literals need `..Default::default()`; a failed
+turn's call ids are refused on replay; after a failed Vercel mount transition the session refuses commands;
+the default MCP clients no longer follow redirects; `OpenAIVoiceModelProvider` no longer derives `Default`;
+`#[function_tool]` bodies that are synchronous run on the blocking pool.
+
+Known gaps (real differences): a restored `RunContext` carried through `export_approvals`/`import_approvals`
+still binds approvals to an agent by name, and `ToolApprovalItem.agent` is a name, so a user-built item cannot
+say which same-named agent it approved (fixing it needs a new field on the public struct); Rust awaits a parallel
+input guardrail before running a turn's tools where Python runs them concurrently (seven batch-failure cases);
+Python re-prepares the sandbox each turn where Rust prepares once per run; capability-changed path grants are
+not applied to an injected sandbox session; `OpenAIProvider::get_model` without an API key succeeds where Python
+raises; Vercel has no workspace-command serialization while S3 mounts activate; unix-local start with
+`workspace_root_ready=false` re-applies the whole manifest where Python re-applies only ephemeral entries;
+`is_enabled` callbacks and the hosted MCP approval callback are infallible; `ResponsesWebSocketSession` has no
+`run` wrappers; the `docker-removal` feature's privileged Linux paths have not run against a real container and
+the feature is excluded from the docs.rs build; many Python-only files were read at name level plus the bodies of
+portable-looking candidates (about 30 files of one batch in `core16-r16e.md`); docs.rs builds without the
+`mongodb` feature; the websocket crate logs handshake data at TRACE through the `log` crate; the Redis atomic
+replace and the Redis Cluster path have only run against mocks.
+
 ## 0.17.0 (2026-11-01)
 
 Fallible hooks, Redis Cluster reads, a per-session memory-manager registry and the findings of a case-by-case
