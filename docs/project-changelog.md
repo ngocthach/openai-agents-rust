@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.11.1 (2026-11-01)
+
+Documentation build only; the library code is identical to 0.11.0. The 0.11.0 build on docs.rs failed because
+the `mongodb` 3.9 dependency does not compile on the nightly compiler docs.rs uses (a compiler async-drop cycle
+error inside `mongodb`, not in this crate). docs.rs now builds every feature except `mongodb`, so the
+`MongoDBSession` page is missing from docs.rs until the dependency compiles there again; the feature itself is
+unchanged and is documented in the README.
+
 ## 0.11.0 (2026-11-01)
 
 Second audit pass over the parity ledger's Python-only bucket: every file that still had Python-only cases was

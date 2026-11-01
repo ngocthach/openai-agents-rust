@@ -1,6 +1,6 @@
 [package]
 name = "openai-agents-sdk"
-version = "0.11.0"
+version = "0.11.1"
 edition = "2024"
 rust-version = "1.89"
 description = "Unofficial Rust port of the OpenAI Agents SDK: agents, tools, handoffs, guardrails, sessions, tracing, MCP"
@@ -14,7 +14,9 @@ categories = ["api-bindings", "asynchronous"]
 exclude = ["plans/", ".claude/", ".github/"]
 
 [package.metadata.docs.rs]
-all-features = true
+# Every feature except `mongodb`: the `mongodb` 3.9 crate fails to compile on the nightly docs.rs
+# currently uses (a compiler async-drop cycle error), which fails the whole documentation build.
+features = ["macros", "sqlite", "mcp", "websocket", "realtime", "voice", "sandbox", "encrypt", "redis", "sqlx", "provider-auth"]
 
 [workspace]
 members = ["macros"]
