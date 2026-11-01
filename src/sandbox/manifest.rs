@@ -1091,6 +1091,28 @@ impl Manifest {
         Ok(())
     }
 
+    /// Read a manifest the application wrote, in Python's manifest payload shape. See
+    /// [`parse_manifest`](crate::sandbox::persisted_registry::parse_manifest).
+    pub fn from_value(payload: &serde_json::Value) -> SandboxResult<Manifest> {
+        crate::sandbox::persisted_registry::parse_manifest(payload)
+    }
+
+    /// Read a manifest from configuration that is not trusted application code, which cannot
+    /// name host files or extra path grants. See
+    /// [`parse_untrusted_manifest`](crate::sandbox::persisted_registry::parse_untrusted_manifest).
+    pub fn from_untrusted_value(
+        payload: &serde_json::Value,
+        parameter_name: &str,
+    ) -> SandboxResult<Manifest> {
+        crate::sandbox::persisted_registry::parse_untrusted_manifest(payload, parameter_name)
+    }
+
+    /// Write this manifest in Python's manifest payload shape. See
+    /// [`manifest_to_value`](crate::sandbox::persisted_registry::manifest_to_value).
+    pub fn to_value(&self) -> SandboxResult<serde_json::Value> {
+        crate::sandbox::persisted_registry::manifest_to_value(self)
+    }
+
     /// Render the workspace layout for the model. Mirrors Python's `Manifest.describe()`: the
     /// tree of [`render_tree`](Self::render_tree), one level deep, truncated to
     /// [`MAX_MANIFEST_DESCRIPTION_CHARS`].

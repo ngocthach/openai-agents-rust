@@ -330,6 +330,7 @@ impl VercelSandboxResources {
 
 /// Settings used when creating a Vercel-backed session.
 #[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, Eq)]
+#[serde(default)]
 pub struct VercelSandboxClientOptions {
     /// Bearer token. Falls back to `VERCEL_OIDC_TOKEN`, then `VERCEL_TOKEN`.
     pub token: Option<String>,
@@ -1080,6 +1081,20 @@ impl VercelSandboxSession {
         }
     }
 
+    /// Whether `manifest` holds exactly the mounts this session was created with.
+    ///
+    /// Mirrors Python's `_runtime_s3_mount_topology_matches`.
+    fn s3_topology_matches(&self, manifest: &Manifest) -> bool {
+        let signature = |manifest: &Manifest| -> BTreeSet<(String, String)> {
+            manifest
+                .mount_targets()
+                .into_iter()
+                .map(|(mount, path)| (mount_path_key(&path), format!("{mount:?}")))
+                .collect()
+        };
+        signature(&self.manifest) == signature(manifest)
+    }
+
     /// Whether an S3 mount may be attached right now.
     ///
     /// Mirrors Python's `_runtime_s3_mount_activation_allowed`: Vercel fixes its mount topology
@@ -1627,6 +1642,47 @@ impl VercelSandboxSession {
 
 #[async_trait]
 impl SandboxSession for VercelSandboxSession {
+    /// Mirrors Python's `_validate_manifest_application`: Vercel fixes its S3 mount topology when
+    /// the sandbox is created, so a live manifest may not change it, and non-mount entries can
+    /// only be added to a running session.
+    async fn validate_manifest_application(
+        &self,
+        manifest: &Manifest,
+        session_running: Option<bool>,
+    ) -> SandboxResult<()> {
+        let refuse = |message: &str| {
+            SandboxError::new(ErrorCode::MountConfigInvalid, message.to_string())
+                .with_context("backend", BACKEND_ID)
+        };
+        if self.s3_mount_activation_allowed() {
+            return Ok(());
+        }
+        if !self.s3_topology_matches(manifest) {
+            return Err(refuse(
+                "Vercel S3 mount topology is fixed when the sandbox is created; dynamic \
+                 manifest application is not supported",
+            ));
+        }
+        let has_fixed_mounts = self
+            .manifest
+            .mount_targets()
+            .into_iter()
+            .any(|(mount, _)| mount.strategy.strategy_type() == VERCEL_S3_MOUNT_STRATEGY);
+        if has_fixed_mounts {
+            let running = match session_running {
+                Some(running) => running,
+                None => self.running().await?,
+            };
+            if !running {
+                return Err(refuse(
+                    "Vercel sessions with fixed S3 mounts must be running before non-mount \
+                     manifest entries can be applied; create a new session instead",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn id(&self) -> &str {
         &self.session_key
     }

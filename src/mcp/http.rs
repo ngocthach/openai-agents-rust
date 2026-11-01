@@ -95,7 +95,12 @@ impl StreamableHttpClient for ObservedHttpClient {
         {
             Ok(response) => Ok(self.observe(response)),
             Err(e) if ignorable => {
-                log::warn!(target: crate::logger::LOG_TARGET, "Ignoring failed MCP initialized notification: {e}");
+                crate::logger::log_tool_action_warning(
+                    "Ignoring failed MCP initialized notification",
+                    &crate::error::AgentsError::other(super::logging::redact_credentials(
+                        &e.to_string(),
+                    )),
+                );
                 Ok(StreamableHttpPostResponse::Accepted)
             }
             Err(e) => Err(e),
@@ -126,7 +131,12 @@ impl StreamableHttpClient for ObservedHttpClient {
         {
             Ok(response) => Ok(self.observe(response)),
             Err(e) if ignorable => {
-                log::warn!(target: crate::logger::LOG_TARGET, "Ignoring failed MCP initialized notification: {e}");
+                crate::logger::log_tool_action_warning(
+                    "Ignoring failed MCP initialized notification",
+                    &crate::error::AgentsError::other(super::logging::redact_credentials(
+                        &e.to_string(),
+                    )),
+                );
                 Ok(StreamableHttpPostResponse::Accepted)
             }
             Err(e) => Err(e),

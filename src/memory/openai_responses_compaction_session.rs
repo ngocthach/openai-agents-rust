@@ -485,7 +485,8 @@ impl OpenAIResponsesCompactionSession {
             session_id: session_id.into(),
             underlying,
             view: std::sync::RwLock::new(None),
-            client: OpenAIClient::from_env(),
+            client: crate::models::get_default_openai_client()
+                .unwrap_or_else(OpenAIClient::from_env),
             model: "gpt-4.1".to_string(),
             compaction_mode: CompactionMode::Auto,
             should_trigger: Arc::new(default_should_trigger_compaction),
@@ -925,10 +926,18 @@ impl OpenAIResponsesCompactionSession {
         output_items: Vec<InputItem>,
         previous: Vec<InputItem>,
     ) -> Result<()> {
+        // A store that replaces its whole history in one step is preferred: a crash leaves the
+        // old or the new history, never an empty one. Its failure needs no restore.
+        let store = self.store();
+        if store
+            .replace_history_atomically(output_items.clone())
+            .await?
+        {
+            return Ok(());
+        }
         // Treat clear -> add as one replacement transaction, as Python does: whether the clear
         // returned decides how a failure is recovered.
         let mut cleared = false;
-        let store = self.store();
         let replace = async {
             store.clear_session().await?;
             cleared = true;
@@ -1069,7 +1078,15 @@ impl Session for OpenAIResponsesCompactionSession {
     async fn pop_item(&self) -> Result<Option<InputItem>> {
         self.ensure_wrappable()?;
         let _guard = self.mutation_lock.lock().await;
-        let popped = self.underlying.pop_item().await?;
+        let popped = match self.underlying.pop_item().await {
+            Ok(popped) => popped,
+            Err(error) => {
+                // The deletion may have committed before the acknowledgement failed, so the
+                // stored response chain can no longer be trusted.
+                *self.state.lock().await = CompactionState::default();
+                return Err(error);
+            }
+        };
         if popped.is_some() {
             let mut state = self.state.lock().await;
             *state = CompactionState::default();
@@ -1080,9 +1097,11 @@ impl Session for OpenAIResponsesCompactionSession {
     async fn clear_session(&self) -> Result<()> {
         self.ensure_wrappable()?;
         let _guard = self.mutation_lock.lock().await;
-        self.underlying.clear_session().await?;
+        let cleared = self.underlying.clear_session().await;
+        // A failed clear may have committed before the acknowledgement failed, so the stored
+        // response chain is dropped either way.
         *self.state.lock().await = CompactionState::default();
-        Ok(())
+        cleared
     }
 
     async fn on_run_completed(&self, info: &SessionRunCompletion) -> Result<Usage> {

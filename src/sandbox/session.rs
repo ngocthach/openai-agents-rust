@@ -1063,6 +1063,20 @@ pub trait SandboxSession: Send + Sync + fmt::Debug {
         false
     }
 
+    /// A provider's veto on applying `manifest` to this live (injected) session.
+    ///
+    /// `session_running` is the session's running state when the caller already asked for it;
+    /// `None` leaves the provider to ask. Port of Python's `_validate_manifest_application`,
+    /// which `SandboxRuntimeSessionManager` runs before it processes a live manifest. The
+    /// default accepts everything.
+    async fn validate_manifest_application(
+        &self,
+        _manifest: &Manifest,
+        _session_running: Option<bool>,
+    ) -> SandboxResult<()> {
+        Ok(())
+    }
+
     /// Whether any extra path grant is read-only, which is what makes a recursive removal need
     /// the in-sandbox resolver.
     fn has_read_only_grant(&self) -> bool {

@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 
+use super::pinned_ops;
 use crate::sandbox::archive::{
     TarValidationOptions, extract_tar_to, rebase_archive_symlink_targets, validate_tar_bytes,
 };
@@ -35,6 +36,9 @@ use crate::sandbox::types::{ExecResult, SandboxArchiveLimits};
 
 /// Prefix of the temporary workspace directories created for Unix-local sessions.
 const WORKSPACE_PREFIX: &str = "openai-agents-sandbox-";
+
+/// What a caller is told when a create failed after it had claimed the destination.
+const INCOMPLETE_CREATE_MESSAGE: &str = "File creation failed after claiming the destination. The file may contain incomplete contents. Inspect the destination before using update_file or removing it to retry; retrying Add File without inspection is unsafe.";
 
 /// Options for a host-shell sandbox, mirroring Python's `UnixLocalSandboxClientOptions`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -347,6 +351,7 @@ pub struct UnixLocalSandboxSession {
     /// Runs between a path being validated and the file being opened. Production code never
     /// sets it; a test uses it to swap a directory for a symlink inside that window.
     after_validate: Option<AfterValidateHook>,
+    after_pin: Option<AfterValidateHook>,
     /// Whether the mounts were already detached by `stop`, so `shutdown` does not detach them a
     /// second time. Cleared whenever the session starts.
     mounts_detached: AtomicBool,
@@ -409,6 +414,7 @@ impl UnixLocalSandboxSession {
             mount_transition: crate::sandbox::mounts::MountTransition::new(),
             running: AtomicBool::new(false),
             after_validate: None,
+            after_pin: None,
             mounts_detached: AtomicBool::new(false),
             ptys: PtyManager::new(),
             snapshot: None,
@@ -602,6 +608,49 @@ impl UnixLocalSandboxSession {
         Ok(())
     }
 
+    /// Read a regular workspace file, all of it or the first `limit` bytes.
+    async fn read_workspace_file(&self, path: &str, limit: Option<u64>) -> SandboxResult<Vec<u8>> {
+        let host = self.host_path_for(path, false).await?;
+        // A FIFO with no peer blocks forever on open, and a device node would hand the model
+        // whatever the kernel produces. Python's file ops `fstat` the descriptor and refuse
+        // anything that is not a regular file; checking the entry first does the same without
+        // ever opening it.
+        reject_special_file(&host, path, false).await?;
+        self.run_after_validate(&host);
+        let read_error = |e: std::io::Error| {
+            let code = if e.kind() == std::io::ErrorKind::NotFound {
+                ErrorCode::WorkspaceReadNotFound
+            } else {
+                ErrorCode::WorkspaceArchiveReadError
+            };
+            SandboxError::new(code, format!("Failed to read `{path}`: {e}"))
+        };
+        use tokio::io::AsyncReadExt as _;
+        // Non-blocking, so a FIFO swapped in after the entry check is opened (and then refused
+        // as not a regular file) instead of blocking forever waiting for a writer.
+        let mut file = tokio::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(O_NONBLOCK)
+            .open(&host)
+            .await
+            .map_err(read_error)?;
+        let handle = file.metadata().await.map_err(read_error)?;
+        if !handle.is_file() {
+            return Err(SandboxError::new(
+                ErrorCode::WorkspaceArchiveReadError,
+                format!("`{path}` is not a regular file"),
+            ));
+        }
+        self.verify_opened(&handle, &host, path, false).await?;
+        let mut contents = Vec::new();
+        match limit {
+            Some(limit) => file.take(limit).read_to_end(&mut contents).await,
+            None => file.read_to_end(&mut contents).await,
+        }
+        .map_err(read_error)?;
+        Ok(contents)
+    }
+
     /// Resolve a model-provided path for reading or writing.
     ///
     /// Writes through a read-only mount are rejected.
@@ -720,38 +769,60 @@ impl UnixLocalSandboxSession {
         self
     }
 
+    /// Run `hook` once an operation has pinned the directory that holds its entry and before it
+    /// acts on the entry. A test swaps the parent or the leaf here to show the operation is bound
+    /// to the descriptor it already holds. It has no production use.
+    #[doc(hidden)]
+    pub fn with_after_pin_hook(mut self, hook: Arc<dyn Fn(&Path) + Send + Sync>) -> Self {
+        self.after_pin = Some(AfterValidateHook(hook));
+        self
+    }
+
     fn run_after_validate(&self, host: &Path) {
         if let Some(hook) = &self.after_validate {
             (hook.0)(host);
         }
     }
 
-    /// The resolved directory that holds `host`, or `None` when it cannot be resolved.
-    async fn parent_identity(host: &Path) -> Option<PathBuf> {
-        tokio::fs::canonicalize(host.parent()?).await.ok()
-    }
-
-    /// Fail when the directory holding `host` now resolves somewhere else than it did before.
+    /// Open the directory that holds `host` and keep it open, so the operation that follows acts
+    /// on the entry relative to that descriptor.
     ///
-    /// Operations that act on the entry itself (`rm`, `mv`, `same_file`) never follow a leaf
-    /// link, so the leaf is not compared, but a parent replaced by a link after validation would
-    /// send the operation out of the workspace. The resolution is taken before and after the
-    /// window in which a workspace process could swap the parent, and a difference refuses the
-    /// operation. It compares resolutions rather than re-running grant policy, so entries that
-    /// a grant names exactly (whose parent is not itself granted) keep working.
-    fn refuse_swapped_parent(
-        before: Option<PathBuf>,
-        after: Option<PathBuf>,
+    /// The parent is resolved *now*, after validation and after any window in which a workspace
+    /// process could have swapped it, and the resolution must still be authorized. It is then
+    /// opened component by component without following a link, so a component replaced between
+    /// the resolution and the open is refused, and one replaced afterwards cannot matter. The
+    /// leaf is never resolved: the operation acts on the entry itself.
+    async fn pin_parent(
+        &self,
+        host: &Path,
         path: &str,
-    ) -> SandboxResult<()> {
-        if before == after {
-            return Ok(());
+        for_write: bool,
+    ) -> SandboxResult<(std::os::fd::OwnedFd, std::ffi::OsString)> {
+        let changed = || {
+            SandboxError::new(
+                ErrorCode::InvalidManifestPath,
+                format!("`{path}` changed while it was being validated"),
+            )
+            .with_context("path", path.to_string())
+        };
+        let (Some(parent), Some(name)) = (host.parent(), host.file_name()) else {
+            return Err(changed());
+        };
+        let real_parent = tokio::fs::canonicalize(parent)
+            .await
+            .map_err(|_| changed())?;
+        self.authorize_real(host.to_path_buf(), real_parent.join(name), path, for_write)
+            .await
+            .map_err(|_| changed())?;
+        let pinned = real_parent.clone();
+        let fd = tokio::task::spawn_blocking(move || pinned_ops::open_dir_pinned(&pinned))
+            .await
+            .map_err(|_| changed())?
+            .map_err(|_| changed())?;
+        if let Some(hook) = &self.after_pin {
+            (hook.0)(host);
         }
-        Err(SandboxError::new(
-            ErrorCode::InvalidManifestPath,
-            format!("`{path}` changed while it was being validated"),
-        )
-        .with_context("path", path.to_string()))
+        Ok((fd, name.to_os_string()))
     }
 
     /// Confirm that an opened handle is still the workspace file `host` names.
@@ -2089,41 +2160,13 @@ impl SandboxSession for UnixLocalSandboxSession {
     }
 
     async fn read_file(&self, path: &str) -> SandboxResult<Vec<u8>> {
-        let host = self.host_path_for(path, false).await?;
-        // A FIFO with no peer blocks forever on open, and a device node would hand the model
-        // whatever the kernel produces. Python's file ops `fstat` the descriptor and refuse
-        // anything that is not a regular file; checking the entry first does the same without
-        // ever opening it.
-        reject_special_file(&host, path, false).await?;
-        self.run_after_validate(&host);
-        let read_error = |e: std::io::Error| {
-            let code = if e.kind() == std::io::ErrorKind::NotFound {
-                ErrorCode::WorkspaceReadNotFound
-            } else {
-                ErrorCode::WorkspaceArchiveReadError
-            };
-            SandboxError::new(code, format!("Failed to read `{path}`: {e}"))
-        };
-        use tokio::io::AsyncReadExt as _;
-        // Non-blocking, so a FIFO swapped in after the entry check is opened (and then refused
-        // as not a regular file) instead of blocking forever waiting for a writer.
-        let mut file = tokio::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(O_NONBLOCK)
-            .open(&host)
-            .await
-            .map_err(read_error)?;
-        let handle = file.metadata().await.map_err(read_error)?;
-        if !handle.is_file() {
-            return Err(SandboxError::new(
-                ErrorCode::WorkspaceArchiveReadError,
-                format!("`{path}` is not a regular file"),
-            ));
-        }
-        self.verify_opened(&handle, &host, path, false).await?;
-        let mut contents = Vec::new();
-        file.read_to_end(&mut contents).await.map_err(read_error)?;
-        Ok(contents)
+        self.read_workspace_file(path, None).await
+    }
+
+    /// A native prefix read: only `max_bytes` leave the file, so a log the workload keeps
+    /// appending to is never read whole just to look at its start. No process is started.
+    async fn read_bounded_unchecked(&self, path: &str, max_bytes: usize) -> SandboxResult<Vec<u8>> {
+        self.read_workspace_file(path, Some(max_bytes as u64)).await
     }
 
     /// Move a workspace entry with `rename(2)`.
@@ -2136,29 +2179,29 @@ impl SandboxSession for UnixLocalSandboxSession {
     async fn mv(&self, source: &str, destination: &str) -> SandboxResult<()> {
         let from = self.host_path_for(source, true).await?;
         let to = self.host_path_for(destination, true).await?;
-        let from_before = Self::parent_identity(&from).await;
-        let to_before = Self::parent_identity(&to).await;
         self.run_after_validate(&from);
-        Self::refuse_swapped_parent(from_before, Self::parent_identity(&from).await, source)?;
-        Self::refuse_swapped_parent(to_before, Self::parent_identity(&to).await, destination)?;
-        let metadata = tokio::fs::symlink_metadata(&from).await.map_err(|e| {
-            SandboxError::new(
-                ErrorCode::ExecNonZero,
-                format!("Failed to move `{source}`: {e}"),
-            )
-        })?;
-        if !(metadata.is_file() || metadata.is_symlink()) {
-            return Err(SandboxError::new(
-                ErrorCode::ExecNonZero,
-                format!("`{source}` must be a regular file or symlink to be moved"),
-            ));
-        }
-        tokio::fs::rename(&from, &to).await.map_err(|e| {
-            SandboxError::new(
-                ErrorCode::ExecNonZero,
-                format!("Failed to move `{source}` to `{destination}`: {e}"),
-            )
+        let (from_dir, from_name) = self.pin_parent(&from, source, true).await?;
+        let (to_dir, to_name) = self.pin_parent(&to, destination, true).await?;
+        let (source_label, destination_label) = (source.to_string(), destination.to_string());
+        tokio::task::spawn_blocking(move || {
+            let moving = |message: String| SandboxError::new(ErrorCode::ExecNonZero, message);
+            let stat = pinned_ops::stat_at(&from_dir, &from_name, false)
+                .map_err(|e| moving(format!("Failed to move `{source_label}`: {e}")))?;
+            let kind = pinned_ops::kind_of(&stat);
+            if !(kind == rustix::fs::FileType::RegularFile || kind == rustix::fs::FileType::Symlink)
+            {
+                return Err(moving(format!(
+                    "`{source_label}` must be a regular file or symlink to be moved"
+                )));
+            }
+            pinned_ops::rename_at(&from_dir, &from_name, &to_dir, &to_name).map_err(|e| {
+                moving(format!(
+                    "Failed to move `{source_label}` to `{destination_label}`: {e}"
+                ))
+            })
         })
+        .await
+        .map_err(|e| SandboxError::new(ErrorCode::ExecNonZero, format!("move task failed: {e}")))?
     }
 
     /// Claim the leaf exclusively, so a name that appeared after the caller looked is refused.
@@ -2222,10 +2265,21 @@ impl SandboxSession for UnixLocalSandboxSession {
             self.discard_created(&handle, &host).await;
             return Err(error);
         }
-        file.write_all(contents).await.map_err(failed)?;
+        // From here the name is claimed. A failure leaves whatever was written and the file is
+        // never deleted: another process may already own it, and retrying without looking is
+        // unsafe, which the error says.
+        let incomplete = |_: std::io::Error| {
+            SandboxError::new(
+                ErrorCode::WorkspaceArchiveWriteError,
+                INCOMPLETE_CREATE_MESSAGE,
+            )
+            .with_context("path", host.to_string_lossy())
+            .with_retryable(false)
+        };
+        file.write_all(contents).await.map_err(incomplete)?;
         // `tokio::fs::File` hands its writes to a blocking thread, and dropping it does not wait
         // for them. Without a flush a caller that reads the file straight back can see it empty.
-        file.flush().await.map_err(failed)
+        file.flush().await.map_err(incomplete)
     }
 
     /// Compare device and inode of the two leaves directly instead of shelling out to `test`.
@@ -2236,7 +2290,6 @@ impl SandboxSession for UnixLocalSandboxSession {
         follow_symlinks: bool,
         user: Option<&crate::sandbox::types::User>,
     ) -> SandboxResult<bool> {
-        use std::os::unix::fs::MetadataExt as _;
         if user.is_some() {
             // Fall back to the exec-based check, which runs as the requested user.
             let l = self.normalize_path(left)?;
@@ -2267,29 +2320,31 @@ impl SandboxSession for UnixLocalSandboxSession {
         }
         let left_host = self.host_path_for(left, false).await?;
         let right_host = self.host_path_for(right, false).await?;
-        let left_before = Self::parent_identity(&left_host).await;
-        let right_before = Self::parent_identity(&right_host).await;
         self.run_after_validate(&left_host);
-        Self::refuse_swapped_parent(left_before, Self::parent_identity(&left_host).await, left)?;
-        Self::refuse_swapped_parent(
-            right_before,
-            Self::parent_identity(&right_host).await,
-            right,
-        )?;
-        let stat = async |path: &std::path::Path| {
-            if follow_symlinks {
-                tokio::fs::metadata(path).await
-            } else {
-                tokio::fs::symlink_metadata(path).await
+        let (left_dir, left_name) = self.pin_parent(&left_host, left, false).await?;
+        let (right_dir, right_name) = self.pin_parent(&right_host, right, false).await?;
+        tokio::task::spawn_blocking(move || {
+            let stat =
+                |dir, name: &std::ffi::OsStr| pinned_ops::stat_at(dir, name, follow_symlinks);
+            let (Ok(l), Ok(r)) = (stat(&left_dir, &left_name), stat(&right_dir, &right_name))
+            else {
+                return false;
+            };
+            if !follow_symlinks
+                && (pinned_ops::kind_of(&l) == rustix::fs::FileType::Symlink
+                    || pinned_ops::kind_of(&r) == rustix::fs::FileType::Symlink)
+            {
+                return false;
             }
-        };
-        let (Ok(l), Ok(r)) = (stat(&left_host).await, stat(&right_host).await) else {
-            return Ok(false);
-        };
-        if !follow_symlinks && (l.file_type().is_symlink() || r.file_type().is_symlink()) {
-            return Ok(false);
-        }
-        Ok(l.dev() == r.dev() && l.ino() == r.ino())
+            (l.st_dev, l.st_ino) == (r.st_dev, r.st_ino)
+        })
+        .await
+        .map_err(|e| {
+            SandboxError::new(
+                ErrorCode::ExecNonZero,
+                format!("same_file task failed: {e}"),
+            )
+        })
     }
 
     /// List a directory natively, so a name is never re-parsed out of `ls -la` text.
@@ -2299,7 +2354,6 @@ impl SandboxSession for UnixLocalSandboxSession {
     /// listing through a safe alias reports the entries' real locations; the session's own root
     /// spelling is kept so callers that match entries against the workspace root still do.
     async fn ls(&self, path: &str) -> SandboxResult<Vec<crate::sandbox::types::FileEntry>> {
-        use std::os::unix::fs::MetadataExt as _;
         let host = self.host_path_for(path, false).await?;
         // A directory swapped for a link after validation must not be listed through it.
         self.run_after_validate(&host);
@@ -2315,34 +2369,48 @@ impl SandboxSession for UnixLocalSandboxSession {
             },
             Err(_) => host.clone(),
         };
-        let mut entries = tokio::fs::read_dir(&host).await.map_err(|e| {
+        let inaccessible = |e: &dyn std::fmt::Display| {
             SandboxError::new(
                 ErrorCode::ExecNonZero,
                 format!("ls: cannot access `{path}`: {e}"),
             )
             .with_context("path", path.to_string())
-        })?;
+        };
+        // The directory is resolved again now, must still be authorized, and is then opened
+        // without following a link: a directory swapped for a link after validation is refused,
+        // and one swapped later cannot redirect the listing.
+        let real = tokio::fs::canonicalize(&host)
+            .await
+            .map_err(|e| inaccessible(&e))?;
+        self.authorize_real(host.clone(), real.clone(), path, false)
+            .await
+            .map_err(|_| {
+                SandboxError::new(
+                    ErrorCode::InvalidManifestPath,
+                    format!("`{path}` changed while it was being validated"),
+                )
+                .with_context("path", path.to_string())
+            })?;
+        let found = tokio::task::spawn_blocking(move || {
+            let dir = pinned_ops::open_dir_pinned(&real)?;
+            pinned_ops::list_dir(&dir)
+        })
+        .await
+        .map_err(|e| inaccessible(&e))?
+        .map_err(|e| inaccessible(&e))?;
         let mut listing = Vec::new();
-        while let Some(entry) = entries.next_entry().await.map_err(|e| {
-            SandboxError::new(
-                ErrorCode::ExecNonZero,
-                format!("ls: cannot read `{path}`: {e}"),
-            )
-        })? {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            // `symlink_metadata`: an entry is described as itself, never as what it points at.
-            let Ok(metadata) = tokio::fs::symlink_metadata(entry.path()).await else {
-                continue;
-            };
+        for (os_name, stat) in found {
+            let name = os_name.to_string_lossy().into_owned();
+            let kind = pinned_ops::kind_of(&stat);
             listing.push(crate::sandbox::types::FileEntry {
                 path: base.join(&name).to_string_lossy().into_owned(),
                 name,
-                size: Some(metadata.len()),
+                size: Some(stat.st_size as u64),
                 permissions: Some(crate::sandbox::types::Permissions::from_mode(
-                    metadata.mode(),
+                    stat.st_mode as u32,
                 )),
-                is_dir: metadata.is_dir(),
-                is_symlink: metadata.file_type().is_symlink(),
+                is_dir: kind == rustix::fs::FileType::Directory,
+                is_symlink: kind == rustix::fs::FileType::Symlink,
             });
         }
         listing.sort_by(|a, b| a.name.cmp(&b.name));
@@ -2367,9 +2435,7 @@ impl SandboxSession for UnixLocalSandboxSession {
         // link in that position points at, so the normalized spelling is used instead.
         self.host_path_for(path, true).await?;
         let host = PathBuf::from(self.normalize_path_for_write(path)?);
-        let parent_before = Self::parent_identity(&host).await;
         self.run_after_validate(&host);
-        Self::refuse_swapped_parent(parent_before, Self::parent_identity(&host).await, path)?;
         if recursive {
             self.refuse_removal_over_read_only_grants(&host, path)
                 .await?;
@@ -2388,36 +2454,40 @@ impl SandboxSession for UnixLocalSandboxSession {
             // and a stale link must never reach through to the directory it names.
             target = real;
         }
-        let metadata = match tokio::fs::symlink_metadata(&target).await {
-            Ok(metadata) => metadata,
-            // A recursive removal of nothing succeeds, so clearing a workspace is idempotent. A
-            // plain `rm` of a path that is not there is the caller's mistake, and Python reports
-            // it as a non-zero `rm`.
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound && recursive => return Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                let shown = target.to_string_lossy().into_owned();
-                return Err(SandboxError::exec_nonzero(
-                    &["rm".to_string(), "--".to_string(), shown.clone()],
-                    &ExecResult {
-                        stdout: Vec::new(),
-                        stderr: format!("rm: cannot remove `{shown}`: {e}").into_bytes(),
-                        exit_code: 1,
-                    },
-                ));
+        // The entry's parent is pinned now; the entry is inspected and removed relative to it.
+        let (dir, name) = self.pin_parent(&target, path, true).await?;
+        let shown = target.to_string_lossy().into_owned();
+        let label = path.to_string();
+        tokio::task::spawn_blocking(move || {
+            match pinned_ops::stat_at(&dir, &name, false) {
+                Ok(_) => {}
+                // A recursive removal of nothing succeeds, so clearing a workspace is
+                // idempotent. A plain `rm` of a path that is not there is the caller's mistake,
+                // and Python reports it as a non-zero `rm`.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound && recursive => return Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(SandboxError::exec_nonzero(
+                        &["rm".to_string(), "--".to_string(), shown.clone()],
+                        &ExecResult {
+                            stdout: Vec::new(),
+                            stderr: format!("rm: cannot remove `{shown}`: {e}").into_bytes(),
+                            exit_code: 1,
+                        },
+                    ));
+                }
+                Err(e) => return Err(rm_failure(&label, &e)),
             }
-            Err(e) => return Err(rm_failure(path, &e)),
-        };
-        let removed = if metadata.is_dir() {
-            if recursive {
-                tokio::fs::remove_dir_all(&target).await
-            } else {
-                // `rmdir`: an empty directory goes, a populated one is refused.
-                tokio::fs::remove_dir(&target).await
-            }
-        } else {
-            tokio::fs::remove_file(&target).await
-        };
-        removed.map_err(|e| rm_failure(path, &e))
+            // `rmdir` for a directory without `recursive`: an empty one goes, a populated one is
+            // refused.
+            pinned_ops::remove_at(&dir, &name, recursive).map_err(|e| rm_failure(&label, &e))
+        })
+        .await
+        .map_err(|e| {
+            SandboxError::new(
+                ErrorCode::WorkspaceArchiveWriteError,
+                format!("rm task failed: {e}"),
+            )
+        })?
     }
 
     /// Create a directory natively.
@@ -2431,23 +2501,69 @@ impl SandboxSession for UnixLocalSandboxSession {
         self.run_after_validate(&host);
         let host = self.host_path_for(path, true).await?;
         let host = self.resolve_for_create(host, path, true).await?;
-        if let Ok(metadata) = tokio::fs::symlink_metadata(&host).await
-            && metadata.is_dir()
-        {
-            return Ok(());
-        }
-        let created = if parents {
-            tokio::fs::create_dir_all(&host).await
-        } else {
-            tokio::fs::create_dir(&host).await
-        };
-        created.map_err(|e| {
+        let failed = |e: &dyn std::fmt::Display| {
             SandboxError::new(
                 ErrorCode::WorkspaceArchiveWriteError,
                 format!("Failed to create directory `{path}`: {e}"),
             )
             .with_context("path", path.to_string())
+        };
+        // A link that already resolves to an authorized directory (the workspace root spelled
+        // through an alias, say) is that directory; `create_dir_all` has always accepted it.
+        if parents
+            && tokio::fs::symlink_metadata(&host)
+                .await
+                .is_ok_and(|metadata| metadata.file_type().is_symlink())
+            && let Ok(real) = tokio::fs::canonicalize(&host).await
+            && tokio::fs::metadata(&real).await.is_ok_and(|m| m.is_dir())
+            && self
+                .authorize_real(host.clone(), real, path, true)
+                .await
+                .is_ok()
+        {
+            return Ok(());
+        }
+        // The deepest ancestor that exists is resolved now, must still be authorized and is
+        // pinned; the missing components are created below it one at a time, each opened
+        // without following a link before the next is made.
+        let mut base = host.parent().map(Path::to_path_buf).unwrap_or_default();
+        let mut rest: Vec<std::ffi::OsString> = Vec::new();
+        if let Some(leaf) = host.file_name() {
+            rest.push(leaf.to_os_string());
+        }
+        let real_base = loop {
+            match tokio::fs::canonicalize(&base).await {
+                Ok(real) => break real,
+                Err(_) => match (base.file_name(), base.parent()) {
+                    (Some(name), Some(parent)) => {
+                        rest.insert(0, name.to_os_string());
+                        base = parent.to_path_buf();
+                    }
+                    _ => return Err(failed(&"no existing ancestor")),
+                },
+            }
+        };
+        let mut intended = real_base.clone();
+        intended.extend(&rest);
+        self.authorize_real(host.clone(), intended, path, true)
+            .await
+            .map_err(|_| {
+                SandboxError::new(
+                    ErrorCode::InvalidManifestPath,
+                    format!("`{path}` changed while it was being validated"),
+                )
+                .with_context("path", path.to_string())
+            })?;
+        if !parents && rest.len() > 1 {
+            return Err(failed(&"No such file or directory"));
+        }
+        tokio::task::spawn_blocking(move || {
+            let dir = pinned_ops::open_dir_pinned(&real_base)?;
+            pinned_ops::mkdir_below(&dir, &rest, parents)
         })
+        .await
+        .map_err(|e| failed(&e))?
+        .map_err(|e| failed(&e))
     }
 
     async fn write_file(&self, path: &str, contents: &[u8]) -> SandboxResult<()> {

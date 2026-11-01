@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
 use super::{RunLoop, strip_item_id};
 use crate::error::{AgentsError, Result};
 use crate::items::InputItem;
-use crate::memory::{Session, compaction_item_digest};
+use crate::memory::{Session, SessionRunContext, compaction_item_digest};
 
 /// Whether a pending write record is the withheld batch of an interruption.
 pub(super) fn is_held(record: &Value) -> bool {
@@ -129,7 +129,12 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
         match &before {
             None if !acknowledged => {
                 // No append has started. The record is already retained if this read fails.
-                let tail = session.get_items(Some(items.len() + 1)).await?;
+                let tail = session
+                    .get_items_with_context(
+                        SessionRunContext::new(&self.ctx),
+                        Some(items.len() + 1),
+                    )
+                    .await?;
                 pending["before"] = json!(digests(&session, &tail));
                 self.pending_write = Some(pending.clone());
                 append = true;
@@ -138,7 +143,9 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
                 let before = before.unwrap_or_default();
                 let batch = digests(&session, &items);
                 let expected: Vec<String> = before.iter().chain(batch.iter()).cloned().collect();
-                let tail = session.get_items(Some(expected.len())).await?;
+                let tail = session
+                    .get_items_with_context(SessionRunContext::new(&self.ctx), Some(expected.len()))
+                    .await?;
                 let observed = digests(&session, &tail);
                 let committed = observed == expected;
                 let mut unchanged = if before.is_empty() {
@@ -180,8 +187,13 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
         if append {
             let batch = items.clone();
             let target = session.clone();
-            crate::memory::await_session_mutation(async move { target.add_items(batch).await })
-                .await?;
+            let ctx = self.ctx.clone();
+            crate::memory::await_session_mutation(async move {
+                target
+                    .add_items_with_context(SessionRunContext::new(&ctx), batch)
+                    .await
+            })
+            .await?;
         }
         if let Some(exchange) = pending.get("compaction_model_exchange") {
             let digests: Vec<String> = exchange

@@ -213,6 +213,7 @@ impl Default for DaytonaSandboxTimeouts {
 
 /// Settings used when creating a Daytona-backed session.
 #[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, Eq)]
+#[serde(default)]
 pub struct DaytonaSandboxClientOptions {
     /// API key for the platform API. Falls back to `DAYTONA_API_KEY`.
     pub api_key: Option<String>,

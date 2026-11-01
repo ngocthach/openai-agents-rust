@@ -66,6 +66,30 @@ fn messages_index_name(messages_table: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
+/// Switch the connection to WAL mode and enable foreign keys.
+///
+/// Concurrent first connections to one new file can fail the WAL switch with "database is
+/// locked" before the busy timeout applies, so a busy or locked answer is retried for a few
+/// seconds; any other failure is returned at once.
+fn enable_wal(conn: &Connection) -> Result<()> {
+    const RETRY_FOR: std::time::Duration = std::time::Duration::from_secs(5);
+    let started = std::time::Instant::now();
+    loop {
+        match conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;") {
+            Ok(()) => return Ok(()),
+            Err(rusqlite::Error::SqliteFailure(failure, _))
+                if matches!(
+                    failure.code,
+                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                ) && started.elapsed() < RETRY_FOR =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(error) => return Err(sql_err(error)),
+        }
+    }
+}
+
 impl SqliteSession {
     /// An in-memory session (lost when dropped).
     pub fn in_memory(session_id: impl Into<String>) -> Result<Self> {
@@ -125,12 +149,38 @@ impl SqliteSession {
         }
     }
 
+    /// A file-backed session whose tables are not created yet; the caller creates them with
+    /// [`SqliteSession::create_tables_on`] inside a transaction of its own.
+    pub(super) fn open_uninitialized(
+        session_id: impl Into<String>,
+        db_path: impl AsRef<Path>,
+        sessions_table: &str,
+        messages_table: &str,
+    ) -> Result<Self> {
+        if !valid_identifier(sessions_table) || !valid_identifier(messages_table) {
+            return Err(AgentsError::user("Invalid SQLite table name"));
+        }
+        let conn = Connection::open(db_path).map_err(sql_err)?;
+        enable_wal(&conn)?;
+        Ok(SqliteSession {
+            session_id: session_id.into(),
+            conn: Arc::new(Mutex::new(conn)),
+            sessions_table: sessions_table.to_string(),
+            messages_table: messages_table.to_string(),
+            settings: None,
+        })
+    }
+
     fn init(&self) -> Result<()> {
         let conn = self.conn.lock().expect("sqlite poisoned");
+        enable_wal(&conn)?;
+        self.create_tables_on(&conn)
+    }
+
+    /// Create the session and message tables on `conn`.
+    pub(super) fn create_tables_on(&self, conn: &Connection) -> Result<()> {
         conn.execute_batch(&format!(
-            "PRAGMA journal_mode=WAL;
-             PRAGMA foreign_keys=ON;
-             CREATE TABLE IF NOT EXISTS {s} (
+            "CREATE TABLE IF NOT EXISTS {s} (
                 session_id TEXT PRIMARY KEY,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -296,7 +346,14 @@ impl Session for SqliteSession {
     async fn pop_item_validated(&self, validate: super::PopValidator) -> Result<Option<InputItem>> {
         self.blocking(move |conn, s| {
             loop {
-                let tx = conn.unchecked_transaction().map_err(sql_err)?;
+                // Immediate: the claim reads the newest row and then deletes it, so a deferred
+                // transaction would fail instead of waiting when another connection wrote in
+                // between.
+                let tx = rusqlite::Transaction::new_unchecked(
+                    conn,
+                    rusqlite::TransactionBehavior::Immediate,
+                )
+                .map_err(sql_err)?;
                 let row: Option<(i64, String)> = tx
                     .query_row(
                         &format!(
@@ -393,7 +450,11 @@ impl Session for SqliteSession {
     ) -> Result<bool> {
         let handles: Vec<String> = handles.iter().map(|h| h.0.clone()).collect();
         self.blocking(move |conn, s| {
-            let tx = conn.unchecked_transaction().map_err(sql_err)?;
+            let tx = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )
+            .map_err(sql_err)?;
             let mut stmt = tx
                 .prepare(&format!(
                     "SELECT id FROM {} WHERE session_id = ? ORDER BY id DESC LIMIT ?",

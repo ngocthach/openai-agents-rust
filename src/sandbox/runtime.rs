@@ -853,19 +853,20 @@ impl SandboxRunner {
         let rollout_id = prepared.rollout_id.clone();
         let sandbox_states_by_agent =
             release_agent_guards(prepared.agent_guards, suspend, &rollout_id).await;
+        let protected = session_protects_mounts(guard.session());
         let sandbox_state = if suspend {
             match guard.suspend().await {
                 // Carry the rollout id across the suspend so the resumed half appends to the
                 // same rollout instead of starting a new one.
                 Ok(state) => Some(state.with_rollout_id(Some(rollout_id))),
                 Err(error) => {
-                    log::warn!(target: crate::logger::LOG_TARGET, "Failed to suspend the sandbox session: {error}");
+                    log_sandbox_failure(protected, "Failed to suspend the sandbox session", &error);
                     None
                 }
             }
         } else {
             if let Err(error) = guard.close().await {
-                log::warn!(target: crate::logger::LOG_TARGET, "Failed to tear down the sandbox session: {error}");
+                log_sandbox_failure(protected, "Failed to tear down the sandbox session", &error);
             }
             None
         };
@@ -1091,19 +1092,28 @@ async fn release_agent_guards(
 ) -> std::collections::BTreeMap<String, SandboxSessionState> {
     let mut states = std::collections::BTreeMap::new();
     for (name, guard) in guards {
+        let protected = session_protects_mounts(guard.session());
         if suspend {
             match guard.suspend().await {
                 Ok(state) => {
                     states.insert(name, state.with_rollout_id(Some(rollout_id.to_string())));
                 }
                 Err(error) => {
-                    log::warn!(target: crate::logger::LOG_TARGET, "Failed to suspend the sandbox session of `{name}`: {error}");
+                    log_sandbox_failure(
+                        protected,
+                        &format!("Failed to suspend the sandbox session of `{name}`"),
+                        &error,
+                    );
                 }
             }
             continue;
         }
         if let Err(error) = guard.close().await {
-            log::warn!(target: crate::logger::LOG_TARGET, "Failed to tear down the sandbox session of `{name}`: {error}");
+            log_sandbox_failure(
+                protected,
+                &format!("Failed to tear down the sandbox session of `{name}`"),
+                &error,
+            );
         }
     }
     states
@@ -1123,19 +1133,40 @@ async fn finish_sandbox_run(
     {
         log::warn!(target: crate::logger::LOG_TARGET, "Failed to generate sandbox memory: {error}");
     }
+    let protected = session_protects_mounts(guard.session());
     if suspend {
         match guard.suspend().await {
             Ok(state) => return Some(state.with_rollout_id(Some(rollout_id))),
             Err(error) => {
-                log::warn!(target: crate::logger::LOG_TARGET, "Failed to suspend the sandbox session: {error}");
+                log_sandbox_failure(protected, "Failed to suspend the sandbox session", &error);
                 return None;
             }
         }
     }
     if let Err(error) = guard.close().await {
-        log::warn!(target: crate::logger::LOG_TARGET, "Failed to tear down the sandbox session: {error}");
+        log_sandbox_failure(protected, "Failed to tear down the sandbox session", &error);
     }
     None
+}
+
+/// Whether the session's manifest holds a mount whose credentials a provider failure could echo.
+fn session_protects_mounts(session: &Arc<dyn crate::sandbox::session::SandboxSession>) -> bool {
+    session
+        .manifest()
+        .mount_targets()
+        .iter()
+        .any(|(mount, _)| mount.strategy.carries_credentials(mount))
+}
+
+/// Log a suspend or teardown failure that never fails the run. A session with a credentialed
+/// mount logs the sentence alone, whatever the logging policy says, because a provider's error can
+/// repeat the mount's configuration; any other failure follows the tool-data policy.
+fn log_sandbox_failure(protected: bool, message: &str, error: &dyn std::fmt::Display) {
+    if protected {
+        log::warn!(target: crate::logger::LOG_TARGET, "{message}");
+    } else {
+        crate::logger::log_tool_action_warning(message, error);
+    }
 }
 
 /// Reconcile a live session's manifest with the one the agent's capabilities want.
@@ -1157,10 +1188,15 @@ pub async fn apply_live_session_manifest(
     if entry_signature_map(current) == entry_signature_map(processed)
         && manifest_topology_matches(current, processed)
     {
+        session.validate_manifest_application(current, None).await?;
         return Ok(());
     }
     validate_live_session_host_path_grants(current, processed)?;
-    if !session.running().await? {
+    let running = session.running().await?;
+    session
+        .validate_manifest_application(processed, Some(running))
+        .await?;
+    if !running {
         // A session that has not started yet materializes the manifest it was built with, so
         // there is nothing to patch into a live workspace.
         return Ok(());

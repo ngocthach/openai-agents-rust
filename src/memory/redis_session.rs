@@ -129,6 +129,35 @@ end
 return 1
 "#;
 
+/// Replace the whole history in one step, like `clear_session` followed by an append.
+///
+/// `ARGV` is the TTL in milliseconds, the session id, then the replacement items. The metadata
+/// and counter keys are deleted too, so an empty replacement leaves no key behind and a
+/// non-empty one starts a fresh metadata hash.
+const REPLACE_ALL_SCRIPT: &str = r#"
+local err = guard()
+if err then return redis.error_reply(err) end
+local ttl_ms = tonumber(ARGV[1])
+local stamp = now()
+redis.call('DEL', KEYS[1], KEYS[2], KEYS[3])
+if #ARGV > 2 then
+  redis.call('HSET', KEYS[2], 'session_id', ARGV[2])
+  redis.call('HSET', KEYS[2], 'created_at', stamp)
+  for i = 3, #ARGV do
+    redis.call('RPUSH', KEYS[1], ARGV[i])
+  end
+  redis.call('HSET', KEYS[2], 'updated_at', stamp)
+  if ttl_ms > 0 then
+    for i = 1, 3 do
+      if redis.call('EXISTS', KEYS[i]) == 1 then
+        redis.call('PEXPIRE', KEYS[i], ttl_ms)
+      end
+    end
+  end
+end
+return 1
+"#;
+
 /// Serialize an item the way the Python backend does (compact JSON).
 fn serialize_item(item: &InputItem) -> Result<String> {
     Ok(serde_json::to_string(item.as_value())?)
@@ -435,6 +464,24 @@ impl Session for RedisSession {
         }
         let replaced: i64 = cmd.query_async(&mut *conn).await.map_err(redis_err)?;
         Ok(replaced == 1)
+    }
+
+    async fn replace_history_atomically(&self, items: Vec<InputItem>) -> Result<bool> {
+        let replacement = items
+            .iter()
+            .map(serialize_item)
+            .collect::<Result<Vec<_>>>()?;
+        let ttl_ms = self.ttl_millis()?;
+        let mut conn = self.connection.lock().await;
+        let mut cmd = self.script(REPLACE_ALL_SCRIPT);
+        cmd.arg(ttl_ms).arg(&self.session_id);
+        for entry in &replacement {
+            cmd.arg(entry);
+        }
+        cmd.query_async::<i64>(&mut *conn)
+            .await
+            .map(|_| true)
+            .map_err(redis_err)
     }
 
     async fn clear_session(&self) -> Result<()> {

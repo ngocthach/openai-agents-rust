@@ -38,7 +38,9 @@ async fn with_timeout<T>(
     timeout: Option<f64>,
     fut: impl std::future::Future<Output = Result<T>>,
 ) -> Result<T> {
-    match timeout {
+    // A non-finite or absurdly large timeout can never fire; treat it as no timeout instead of
+    // panicking when it is converted to a `Duration`.
+    match timeout.filter(|secs| Duration::try_from_secs_f64(*secs).is_ok()) {
         Some(secs) if secs > 0.0 => {
             // The attempt's future owns the model span. It is only dropped after this function
             // returns, so the timeout is recorded in the slot first and the span can record it
@@ -175,7 +177,7 @@ fn should_disable_provider_retries(
         return true;
     }
     if let Some(retry) = retry
-        && retry.max_retries == 0
+        && retry.max_retries_or_default() == 0
     {
         // An explicit no-retry budget also disables hidden provider retries.
         return true;
@@ -185,12 +187,12 @@ fn should_disable_provider_retries(
             return true;
         }
         return match retry {
-            Some(retry) if retry.policy.is_some() => retry.max_retries > 0,
+            Some(retry) if retry.policy.is_some() => retry.max_retries_or_default() > 0,
             _ => false,
         };
     }
     match retry {
-        Some(retry) if stateful => retry.max_retries > 0 && retry.policy.is_some(),
+        Some(retry) if stateful => retry.max_retries_or_default() > 0 && retry.policy.is_some(),
         _ => false,
     }
 }
@@ -207,7 +209,7 @@ fn should_disable_websocket_retry(
     let Some(retry) = retry else {
         return false;
     };
-    if retry.max_retries == 0 {
+    if retry.max_retries_or_default() == 0 {
         return true;
     }
     retry
@@ -219,7 +221,7 @@ fn should_disable_websocket_retry(
 /// The legacy `conversation_locked` retry stays unless the caller opts out with
 /// `max_retries=0`. Port of `_should_preserve_conversation_locked_compatibility`.
 fn preserves_conversation_locked_compatibility(retry: Option<&ModelRetrySettings>) -> bool {
-    retry.is_none_or(|r| r.max_retries > 0)
+    retry.is_none_or(|r| r.max_retries_or_default() > 0)
 }
 
 async fn scope_retry_flags<T>(
@@ -329,7 +331,7 @@ pub(crate) async fn call_model<C: Send + Sync + 'static>(
             let decision = crate::retry::evaluate_retry_for(
                 &err,
                 attempt + 1,
-                retry.max_retries,
+                retry.max_retries_or_default(),
                 policy,
                 sink.is_some(),
                 replay_unsafe_request,
@@ -356,8 +358,8 @@ pub(crate) async fn call_model<C: Send + Sync + 'static>(
             continue;
         }
         if replay_unsafe_request
-            || attempt >= retry.max_retries
-            || !is_retryable(&err, &retry.retry_statuses, stateful)
+            || attempt >= retry.max_retries_or_default()
+            || !is_retryable(&err, &retry.retry_statuses_or_default(), stateful)
         {
             return Err(err);
         }

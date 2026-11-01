@@ -725,7 +725,7 @@ impl RealtimeModel for OpenAIRealtimeWebSocketModel {
                 if let Err(problem) = validate_client_event(&message) {
                     // Python drops a raw message that is not a client event and carries on.
                     log_model_action_error("Failed to convert raw message", &message);
-                    log::debug!(target: crate::logger::LOG_TARGET, "{problem}");
+                    crate::logger::log_model_action_debug("Raw message rejected", &problem);
                     return Ok(());
                 }
                 if message.get("type").and_then(Value::as_str) == Some("response.create") {

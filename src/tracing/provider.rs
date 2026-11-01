@@ -245,10 +245,24 @@ impl TraceProvider for DefaultTraceProvider {
 /// `catch_unwind`; the diagnostic names the processor the way `_processor_diagnostic_extra`
 /// does. Under `panic = "abort"` the process still aborts — nothing can catch that.
 fn isolate(action: &str, processor: &Arc<dyn TracingProcessor>, f: impl FnOnce()) {
-    if std::panic::catch_unwind(AssertUnwindSafe(f)).is_err() {
-        log::error!(
-            target: crate::logger::LOG_TARGET,
-            "Error in trace processor during {action} (trace_processor: {processor:?})"
-        );
+    if let Err(payload) = std::panic::catch_unwind(AssertUnwindSafe(f)) {
+        // The processor's identity and the panic text can carry model or tool data, so both
+        // follow the mixed policy: with either flag set only the fixed message is logged.
+        let detail = payload
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_string())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "processor panicked".to_string());
+        let message = match action {
+            "force_flush" => "Error flushing trace processor".to_string(),
+            "shutdown" => "Error shutting down trace processor".to_string(),
+            other => format!("Error in trace processor during {other}"),
+        };
+        let message = if crate::debug::dont_log_model_data() || crate::debug::dont_log_tool_data() {
+            message
+        } else {
+            format!("{message} (trace_processor: {processor:?})")
+        };
+        crate::logger::log_model_and_tool_action_error(&message, &detail);
     }
 }

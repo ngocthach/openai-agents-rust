@@ -5,4 +5,6 @@
 //! (`agents.extensions.sandbox.*`) are not ported.
 
 pub mod docker;
+#[cfg(unix)]
+mod pinned_ops;
 pub mod unix_local;

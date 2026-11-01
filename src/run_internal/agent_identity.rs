@@ -79,6 +79,12 @@ fn agent_signature<C>(agent: &Agent<C>) -> String {
         Some(AgentModel::Instance(m)) => json!({"type": m.model_name()}),
     };
     let model_settings = serde_json::to_value(&agent.model_settings).unwrap_or(Value::Null);
+    let tool_use_behavior = match &agent.tool_use_behavior {
+        ToolUseBehavior::RunLlmAgain => json!("run_llm_again"),
+        ToolUseBehavior::StopOnFirstTool => json!("stop_on_first_tool"),
+        ToolUseBehavior::StopAtTools(s) => json!({"stop_at_tool_names": s.stop_at_tool_names}),
+        ToolUseBehavior::Custom(_) => json!({"callable": "tool_use_behavior"}),
+    };
     // `serde_json::Map` is ordered by key, so this text is stable.
     json!({
         "agent_type": "agent",
@@ -92,6 +98,7 @@ fn agent_signature<C>(agent: &Agent<C>) -> String {
         "output_guardrails": output_guardrails,
         "output_type": agent.output_type.as_ref().map(|s| s.name()),
         "reset_tool_choice": agent.reset_tool_choice,
+        "tool_use_behavior": tool_use_behavior,
         "tools": tools,
     })
     .to_string()

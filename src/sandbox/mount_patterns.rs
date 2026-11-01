@@ -1096,8 +1096,48 @@ pub struct S3FilesOptions {
     pub access_point: Option<String>,
     /// File system region.
     pub region: Option<String>,
-    /// Extra `mount -o` settings, in the order they are rendered.
+    /// Extra `mount -o` settings, in the order they are rendered. Written as an ordered map, as
+    /// Python's `dict[str, str | None]`; the earlier array of pairs is still read.
+    #[serde(with = "ordered_option_map")]
     pub extra_options: Vec<(String, Option<String>)>,
+}
+
+/// Serde form of an ordered list of `mount -o` settings: a JSON object whose key order is the
+/// rendering order, with `null` for a bare flag.
+mod ordered_option_map {
+    use serde::de::Error as _;
+    use serde::ser::SerializeMap;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(
+        options: &[(String, Option<String>)],
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(options.len()))?;
+        for (key, value) in options {
+            map.serialize_entry(key, value)?;
+        }
+        map.end()
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Vec<(String, Option<String>)>, D::Error> {
+        match serde_json::Value::deserialize(deserializer)? {
+            serde_json::Value::Object(map) => map
+                .into_iter()
+                .map(|(key, value)| match value {
+                    serde_json::Value::Null => Ok((key, None)),
+                    serde_json::Value::String(text) => Ok((key, Some(text))),
+                    _ => Err(D::Error::custom("extra_options values must be strings")),
+                })
+                .collect(),
+            serde_json::Value::Array(pairs) => {
+                serde_json::from_value(serde_json::Value::Array(pairs)).map_err(D::Error::custom)
+            }
+            _ => Err(D::Error::custom("extra_options must be an object")),
+        }
+    }
 }
 
 /// Mounts an existing Amazon S3 Files file system with `mount -t s3files`. Mirrors

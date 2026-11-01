@@ -103,6 +103,7 @@ impl Default for BlaxelTimeouts {
 
 /// Settings used when creating a Blaxel-backed session.
 #[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, Eq)]
+#[serde(default)]
 pub struct BlaxelSandboxClientOptions {
     /// The sandbox image, or the Blaxel default when unset.
     pub image: Option<String>,

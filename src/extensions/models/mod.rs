@@ -1027,14 +1027,16 @@ fn normalize_reasoning_effort(settings: &mut ModelSettings) {
 
 macro_rules! delegate_model {
     ($ty:ident) => {
-        delegate_model!($ty, |_request: &mut ModelRequest| {});
+        delegate_model!($ty, |_this: &$ty,
+                              _request: &mut ModelRequest|
+         -> Result<()> { Ok(()) });
     };
     ($ty:ident, $prepare:expr) => {
         #[async_trait]
         impl Model for $ty {
             async fn get_response(&self, mut request: ModelRequest) -> Result<ModelResponse> {
                 #[allow(clippy::redundant_closure_call)]
-                ($prepare)(&mut request);
+                ($prepare)(self, &mut request)?;
                 self.inner.get_response(request).await
             }
             async fn stream_response(
@@ -1042,7 +1044,7 @@ macro_rules! delegate_model {
                 mut request: ModelRequest,
             ) -> Result<ResponseEventStream> {
                 #[allow(clippy::redundant_closure_call)]
-                ($prepare)(&mut request);
+                ($prepare)(self, &mut request)?;
                 self.inner.stream_response(request).await
             }
             fn model_name(&self) -> Option<String> {
@@ -1158,8 +1160,11 @@ impl LitellmModel {
     }
 }
 
-delegate_model!(LitellmModel, |request: &mut ModelRequest| {
+delegate_model!(LitellmModel, |_this: &LitellmModel,
+                               request: &mut ModelRequest|
+ -> Result<()> {
     normalize_reasoning_effort(&mut request.model_settings);
+    Ok(())
 });
 
 /// Resolves `provider/model` names to [`LitellmModel`]s. Port of `LitellmProvider`.
@@ -1277,7 +1282,42 @@ impl AnyLLMModel {
     }
 }
 
-delegate_model!(AnyLLMModel);
+/// Drop `null` object members and `null` array items from a replayed Responses input value:
+/// any-llm validates replayed items against models that reject explicit nulls.
+fn strip_null_fields(value: Value) -> Value {
+    match value {
+        Value::Array(items) => Value::Array(
+            items
+                .into_iter()
+                .filter(|v| !v.is_null())
+                .map(strip_null_fields)
+                .collect(),
+        ),
+        Value::Object(map) => Value::Object(
+            map.into_iter()
+                .filter(|(_, v)| !v.is_null())
+                .map(|(k, v)| (k, strip_null_fields(v)))
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
+delegate_model!(AnyLLMModel, |this: &AnyLLMModel,
+                              request: &mut ModelRequest|
+ -> Result<()> {
+    if request.prompt.is_some() {
+        return Err(AgentsError::user(
+            "AnyLLMModel does not currently support prompt-managed requests.",
+        ));
+    }
+    if this.api == AdapterApi::Responses {
+        for item in &mut request.input {
+            item.0 = strip_null_fields(item.0.take());
+        }
+    }
+    Ok(())
+});
 
 /// Resolves `provider/model` names to [`AnyLLMModel`]s. Port of `AnyLLMProvider`.
 #[derive(Debug, Clone, Default)]

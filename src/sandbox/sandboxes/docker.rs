@@ -39,6 +39,7 @@ pub const DEFAULT_PYTHON_SANDBOX_IMAGE: &str = "python:3.14-slim";
 
 /// Settings used when creating a Docker-backed session.
 #[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, Eq)]
+#[serde(default)]
 pub struct DockerSandboxClientOptions {
     /// The image the container runs.
     pub image: String,
@@ -996,14 +997,20 @@ impl SandboxSession for DockerSandboxSession {
         let output = self
             .runner
             .run(&["start".to_string(), self.container_id.clone()], None)
-            .await?;
+            .await
+            .map_err(|error| redact_for_protected_mounts(&self.manifest, error))?;
         if output.exit_code != 0 {
-            return Err(SandboxError::new(
-                ErrorCode::WorkspaceStartError,
-                format!(
-                    "`docker start` failed for `{}`: {}",
-                    self.container_id,
-                    output.stderr_text().trim()
+            // The daemon can echo a mount driver's options when a volume fails to attach, so a
+            // manifest with protected mounts never gets the daemon's text back.
+            return Err(redact_for_protected_mounts(
+                &self.manifest,
+                SandboxError::new(
+                    ErrorCode::WorkspaceStartError,
+                    format!(
+                        "`docker start` failed for `{}`: {}",
+                        self.container_id,
+                        output.stderr_text().trim()
+                    ),
                 ),
             ));
         }

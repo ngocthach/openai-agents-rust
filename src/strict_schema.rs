@@ -876,4 +876,61 @@ mod tests {
         let schema = serde_json::json!({"type": "object", "additionalProperties": true});
         assert!(ensure_strict_json_schema(&schema).is_err());
     }
+
+    #[test]
+    fn open_object_rejection_is_opt_in() {
+        let schema = serde_json::json!({"type": "object", "properties": {}});
+        let closed = ensure_strict_json_schema_with(&schema, false).unwrap();
+        assert_eq!(closed["additionalProperties"], false);
+        let err = ensure_strict_json_schema_with(&schema, true).unwrap_err();
+        assert!(
+            err.to_string().contains("permits undeclared properties"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn open_object_rejection_rejects_preserved_pure_refs() {
+        for (reference, name) in [("#/$defs/value", "value"), ("#/$defs/a%20b", "a b")] {
+            let schema = serde_json::json!({
+                "$defs": {name: {"type": "string"}},
+                "type": "object",
+                "properties": {"value": {"$ref": reference}},
+            });
+            let default = ensure_strict_json_schema_with(&schema, false).unwrap();
+            assert_eq!(
+                default["properties"]["value"],
+                serde_json::json!({"$ref": reference})
+            );
+            let err = ensure_strict_json_schema_with(&schema, true).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("reference whose target was not validated"),
+                "{err}"
+            );
+        }
+    }
+
+    /// A singleton `allOf` reference chain spends the node budget on every hop.
+    #[test]
+    fn a_singleton_all_of_ref_chain_spends_the_node_budget() {
+        let mut schemas = serde_json::Map::new();
+        for i in 0..=MAX_SCHEMA_NODES {
+            schemas.insert(
+                format!("S{i}"),
+                serde_json::json!({"$ref": format!("#/components/schemas/S{}", i + 1)}),
+            );
+        }
+        schemas.insert(
+            format!("S{}", MAX_SCHEMA_NODES + 1),
+            serde_json::json!({"type": "object", "properties": {}}),
+        );
+        let schema = serde_json::json!({
+            "components": {"schemas": schemas},
+            "type": "object",
+            "allOf": [{"$ref": "#/components/schemas/S0"}],
+        });
+        let err = ensure_strict_json_schema(&schema).unwrap_err();
+        assert!(err.to_string().contains("too large"), "{err}");
+    }
 }

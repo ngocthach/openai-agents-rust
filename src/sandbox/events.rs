@@ -384,11 +384,9 @@ impl fmt::Debug for CallbackSink {
 impl EventSink for CallbackSink {
     async fn emit(&self, event: &SandboxSessionEvent) {
         if let Err(error) = (self.callback)(event) {
-            log::warn!(
-                target: crate::logger::LOG_TARGET,
-                "sandbox event callback failed: {}",
-                error.code
-            );
+            // The failure's own text may repeat what the event described, so it is logged only
+            // when tool data may be logged; the sink and the event stay out of the message.
+            crate::logger::log_tool_action_error("Sandbox event sink failed (ignored)", &error);
         }
     }
 
@@ -892,11 +890,18 @@ impl Instrumentation {
     /// policies as it delivers to each. The raw bytes the event carried never reach a sink.
     pub async fn emit(&self, event: SandboxSessionEvent) {
         if let Err(error) = self.deliver(event).await {
-            log::warn!(
-                target: crate::logger::LOG_TARGET,
-                "sandbox event delivery failed: {}",
-                error.code
-            );
+            // Neither the sink nor the event is named: both can describe the workload. The
+            // sink's own failure text appears only where tool data may be logged.
+            match error.context.get("cause") {
+                Some(cause) => crate::logger::log_tool_action_error(
+                    "Sandbox event sink failed (ignored)",
+                    cause,
+                ),
+                None => crate::logger::log_tool_action_error(
+                    "Sandbox event sink failed (ignored)",
+                    &error.code,
+                ),
+            }
         }
     }
 
@@ -921,10 +926,16 @@ impl Instrumentation {
             self.sink.emit(event).await;
             return Ok(());
         }
-        self.sink
-            .try_emit(event)
-            .await
-            .map_err(|_| SandboxError::new(ErrorCode::EventSinkFailed, "sandbox event sink failed"))
+        self.sink.try_emit(event).await.map_err(|cause| {
+            let error = SandboxError::new(ErrorCode::EventSinkFailed, "sandbox event sink failed");
+            // The sink's text can repeat what the event described, so it travels with the
+            // error only where tool data may be logged.
+            if crate::debug::dont_log_tool_data() {
+                error
+            } else {
+                error.with_context("cause", cause.to_string())
+            }
+        })
     }
 
     /// Emit the start event for one operation and return it, for the matching finish.
@@ -1532,6 +1543,16 @@ impl crate::sandbox::session::SandboxSession for InstrumentedSession {
 
     fn resolves_paths_remotely(&self) -> bool {
         self.inner.resolves_paths_remotely()
+    }
+
+    async fn validate_manifest_application(
+        &self,
+        manifest: &crate::sandbox::Manifest,
+        session_running: Option<bool>,
+    ) -> SandboxResult<()> {
+        self.inner
+            .validate_manifest_application(manifest, session_running)
+            .await
     }
 
     fn normalize_path_for_write(&self, path: &str) -> SandboxResult<String> {

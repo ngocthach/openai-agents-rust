@@ -38,7 +38,9 @@ pub struct OpenAIConversationsSession {
 impl OpenAIConversationsSession {
     /// A session that creates a new conversation on first use.
     pub fn new() -> Self {
-        Self::with_client(OpenAIClient::from_env())
+        Self::with_client(
+            crate::models::get_default_openai_client().unwrap_or_else(OpenAIClient::from_env),
+        )
     }
 
     /// A session that creates a new conversation with a specific client.

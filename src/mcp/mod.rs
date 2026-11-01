@@ -840,11 +840,75 @@ fn svc_err(e: impl fmt::Display) -> AgentsError {
     AgentsError::other(redact_credentials(&format!("MCP error: {e}")))
 }
 
+/// The status code in a transport failure's text (`HTTP 503`), when it names one.
+fn http_status_in(text: &str) -> Option<u16> {
+    let rest = text.split("HTTP ").nth(1)?;
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok().filter(|code| (100..600).contains(code))
+}
+
+/// Turn a failed HTTP or SSE connect into the credential-free message Python raises for it.
+///
+/// A failure that is not a transport failure keeps its (redacted) text.
+fn connect_failure(name: &str, e: impl fmt::Display) -> AgentsError {
+    let text = e.to_string();
+    let reason = if let Some(code) = http_status_in(&text) {
+        match reqwest::StatusCode::from_u16(code)
+            .ok()
+            .and_then(|s| s.canonical_reason())
+        {
+            Some(phrase) => format!("HTTP error {code} ({phrase})"),
+            None => format!("HTTP error {code}"),
+        }
+    } else if text.contains("error sending request") || text.to_lowercase().contains("connect") {
+        "Could not reach the server.".to_string()
+    } else if text.to_lowercase().contains("timed out") || text.contains("Timeout") {
+        "Connection timeout.".to_string()
+    } else {
+        return svc_err(text);
+    };
+    AgentsError::user(format!(
+        "Failed to connect to MCP server '{name}': {reason}"
+    ))
+}
+
+/// Turn a failed MCP request into the credential-free message Python raises for it.
+///
+/// `prefix` is the part before the reason, for example
+/// `Failed to list tools from MCP server 'name'`. A transport failure is reduced to its HTTP
+/// status, a lost connection, a timeout or a bare "Request failed."; the server's own
+/// JSON-RPC errors keep their text.
+fn request_failure(prefix: &str, e: rmcp::ServiceError) -> AgentsError {
+    let reason = match &e {
+        rmcp::ServiceError::McpError(_) => return svc_err(e),
+        rmcp::ServiceError::Timeout { .. } => "Connection timeout.".to_string(),
+        rmcp::ServiceError::TransportClosed => {
+            "Connection lost. The server may have disconnected.".to_string()
+        }
+        other => {
+            let text = other.to_string();
+            match http_status_in(&text) {
+                Some(code) => format!("HTTP error {code}"),
+                None if text.to_lowercase().contains("connect") => {
+                    "Connection lost. The server may have disconnected.".to_string()
+                }
+                None => "Request failed.".to_string(),
+            }
+        }
+    };
+    AgentsError::user(format!("{prefix}: {reason}"))
+}
+
 /// Whether a failed request should be retried on a freshly opened session.
 ///
 /// Port of `_should_retry_in_isolated_session`: a transport that was cancelled, closed, timed
 /// out or failed to send is worth a second session; a server-side JSON-RPC error is not.
 fn should_retry_in_isolated_session(e: &rmcp::ServiceError) -> bool {
+    // A server that reports its own request timeout (JSON-RPC code 408) is as retryable as one
+    // that timed out client-side; every other server-side error is final.
+    if let rmcp::ServiceError::McpError(error) = e {
+        return error.code.0 == 408;
+    }
     matches!(
         e,
         rmcp::ServiceError::TransportSend(_)
@@ -967,14 +1031,20 @@ impl Core {
                 );
                 let transport = StreamableHttpClientTransport::with_client(client_wrapper, config);
                 Connection {
-                    service: client.serve(transport).await.map_err(svc_err)?,
+                    service: client
+                        .serve(transport)
+                        .await
+                        .map_err(|e| connect_failure(&self.log_name(), e))?,
                     child: None,
                 }
             }
             TransportSpec::Sse(p) => {
                 let transport = sse::connect(p).await?;
                 Connection {
-                    service: client.serve(transport).await.map_err(svc_err)?,
+                    service: client
+                        .serve(transport)
+                        .await
+                        .map_err(|e| connect_failure(&self.log_name(), e))?,
                     child: None,
                 }
             }
@@ -983,6 +1053,22 @@ impl Core {
     }
 
     async fn connect(&self) -> Result<()> {
+        // Python rejects a non-positive page limit when the server is built; the builder here
+        // cannot fail, so the same error is raised before anything is opened.
+        if self.config.max_list_pages == Some(0) {
+            return Err(AgentsError::user(
+                "max_list_pages must be a positive integer or None.",
+            ));
+        }
+        if self
+            .config
+            .retry_backoff_seconds_max
+            .is_some_and(|max| !max.is_finite() || max < 0.0)
+        {
+            return Err(AgentsError::user(
+                "retry_backoff_seconds_max must be a non-negative finite number of seconds or None.",
+            ));
+        }
         let mut guard = self.connection.lock().await;
         if guard.is_some() {
             return Ok(());
@@ -1004,6 +1090,18 @@ impl Core {
     /// The server name with URL credentials, query and fragment removed.
     fn log_name(&self) -> String {
         get_mcp_server_log_name(&self.name)
+    }
+
+    fn operation_prefix(&self, operation: &str) -> String {
+        format!("Failed to {operation} on MCP server '{}'", self.log_name())
+    }
+
+    fn call_prefix(&self, params: &rmcp::model::CallToolRequestParams) -> String {
+        format!(
+            "Failed to call tool '{}' on MCP server '{}'",
+            params.name,
+            self.log_name()
+        )
     }
 
     fn timeout_error(&self) -> AgentsError {
@@ -1153,7 +1251,12 @@ impl Core {
                         rmcp::model::PaginatedRequestParams::default().with_cursor(Some(c))
                     }))
                     .await
-                    .map_err(svc_err)
+                    .map_err(|e| {
+                        request_failure(
+                            &format!("Failed to list tools from MCP server '{}'", self.log_name()),
+                            e,
+                        )
+                    })
                 })
                 .await?;
             pages += 1;
@@ -1301,7 +1404,7 @@ impl Core {
                 Err(e) if allow_isolated_retry && should_retry_in_isolated_session(&e) => {
                     SharedOutcome::NeedsIsolation
                 }
-                Err(e) => SharedOutcome::Failed(svc_err(e)),
+                Err(e) => SharedOutcome::Failed(request_failure(&self.call_prefix(params), e)),
             }
         };
         let outcome = match self.config.client_session_timeout {
@@ -1331,7 +1434,7 @@ impl Core {
                     .service
                     .call_tool(params.clone())
                     .await
-                    .map_err(svc_err)
+                    .map_err(|e| request_failure(&self.call_prefix(params), e))
             })
             .await;
         connection.close().await;
@@ -1352,7 +1455,11 @@ impl Core {
                 .clone()
                 .map(|c| rmcp::model::PaginatedRequestParams::default().with_cursor(Some(c)));
             let page = self
-                .with_timeout(async { s.list_prompts(params).await.map_err(svc_err) })
+                .with_timeout(async {
+                    s.list_prompts(params)
+                        .await
+                        .map_err(|e| request_failure(&self.operation_prefix("list prompts"), e))
+                })
                 .await?;
             pages += 1;
             out.extend(
@@ -1375,7 +1482,11 @@ impl Core {
             rmcp::model::PaginatedRequestParams::default().with_cursor(Some(c.to_string()))
         });
         let result = self
-            .with_timeout(async { s.list_resources(params).await.map_err(svc_err) })
+            .with_timeout(async {
+                s.list_resources(params)
+                    .await
+                    .map_err(|e| request_failure(&self.operation_prefix("list resources"), e))
+            })
             .await?;
         Ok(serde_json::to_value(result)?)
     }
@@ -1386,7 +1497,11 @@ impl Core {
             rmcp::model::PaginatedRequestParams::default().with_cursor(Some(c.to_string()))
         });
         let result = self
-            .with_timeout(async { s.list_resource_templates(params).await.map_err(svc_err) })
+            .with_timeout(async {
+                s.list_resource_templates(params).await.map_err(|e| {
+                    request_failure(&self.operation_prefix("list resource templates"), e)
+                })
+            })
             .await?;
         Ok(serde_json::to_value(result)?)
     }
@@ -1396,7 +1511,11 @@ impl Core {
             serde_json::from_value(json!({"uri": uri}))?;
         let s = self.peer().await?;
         let result = self
-            .with_timeout(async { s.read_resource(params).await.map_err(svc_err) })
+            .with_timeout(async {
+                s.read_resource(params)
+                    .await
+                    .map_err(|e| request_failure(&self.operation_prefix("read resource"), e))
+            })
             .await?;
         Ok(serde_json::to_value(result)?)
     }
@@ -1419,7 +1538,11 @@ impl Core {
         let params: rmcp::model::GetPromptRequestParams = serde_json::from_value(req)?;
         let s = self.peer().await?;
         let r = self
-            .with_timeout(async { s.get_prompt(params).await.map_err(svc_err) })
+            .with_timeout(async {
+                s.get_prompt(params)
+                    .await
+                    .map_err(|e| request_failure(&self.operation_prefix("get prompt"), e))
+            })
             .await?;
         Ok(serde_json::to_value(r)?)
     }
@@ -1755,6 +1878,24 @@ impl MCPServerManager {
         self.cleanup_timeout = timeout;
     }
 
+    /// Reject a zero lifecycle timeout, as Python's constructor does with a `ValueError`.
+    /// A [`Duration`] cannot be negative, NaN or infinite, so zero is the only unsupported value.
+    /// Checked before any server is touched by [`MCPServerManager::connect_all`] and
+    /// [`MCPServerManager::reconnect`].
+    fn validate_lifecycle_timeouts(&self) -> Result<()> {
+        for (name, timeout) in [
+            ("connect_timeout_seconds", self.connect_timeout),
+            ("cleanup_timeout_seconds", self.cleanup_timeout),
+        ] {
+            if timeout.is_some_and(|d| d.is_zero()) {
+                return Err(AgentsError::user(format!(
+                    "{name} must be a positive finite number of seconds or None."
+                )));
+            }
+        }
+        Ok(())
+    }
+
     async fn connect_one(timeout: Option<Duration>, s: &Arc<dyn MCPServer>) -> Result<()> {
         match timeout {
             Some(d) => tokio::time::timeout(d, s.connect()).await.map_err(|_| {
@@ -1922,6 +2063,7 @@ impl MCPServerManager {
     /// Servers that are already connected are left alone. In strict mode the first failure is
     /// returned after every server this call opened has been closed again.
     pub async fn connect_all(&mut self) -> Result<()> {
+        self.validate_lifecycle_timeouts()?;
         let previously_connected: HashSet<usize> = self.connected.clone();
         let previous_active = self.active.clone();
         self.failed.clear();
@@ -1976,6 +2118,7 @@ impl MCPServerManager {
     /// server whose cleanup fails is not retried at all — its cleanup error stays in
     /// [`MCPServerManager::errors`].
     pub async fn reconnect(&mut self, failed_only: bool) -> Result<()> {
+        self.validate_lifecycle_timeouts()?;
         let to_retry = if failed_only {
             let failed: Vec<Arc<dyn MCPServer>> =
                 self.failed.iter().map(|(s, _)| s.clone()).collect();

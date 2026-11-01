@@ -145,12 +145,15 @@ pub struct ModalSandboxClientOptions {
     /// An existing Modal sandbox id to adopt instead of creating one.
     pub sandbox_id: Option<String>,
     /// How the workspace is captured into a snapshot.
+    #[serde(default)]
     pub workspace_persistence: ModalWorkspacePersistence,
     /// Ports Modal exposes over an encrypted tunnel.
+    #[serde(default)]
     pub exposed_ports: Vec<u16>,
     /// The GPU reservation, such as `A100` or `H100:8`.
     pub gpu: Option<String>,
     /// The sandbox lifetime in seconds.
+    #[serde(default = "default_timeout_secs")]
     pub timeout_secs: u32,
     /// The idle timeout in seconds.
     pub idle_timeout_secs: Option<u32>,
@@ -165,24 +168,49 @@ pub struct ModalSandboxClientOptions {
     /// `(request, limit)` pair.
     pub memory_limit_mb: Option<u32>,
     /// Override the image command with `sleep infinity` so the sandbox stays up for `exec`.
+    #[serde(default = "default_use_sleep_cmd")]
     pub use_sleep_cmd: bool,
     /// The Modal image builder version.
+    #[serde(default = "default_image_builder_version")]
     pub image_builder_version: Option<String>,
     /// How long `Sandbox.create` may take.
     pub sandbox_create_timeout: Option<Duration>,
     /// The default exec timeout.
+    #[serde(default = "default_exec_timeout")]
     pub exec_timeout: Duration,
     /// How long `snapshot_filesystem` may take.
+    #[serde(default = "default_snapshot_timeout")]
     pub snapshot_filesystem_timeout: Duration,
     /// How long restoring a filesystem snapshot may take.
     ///
     /// Restoring boots a replacement sandbox from the snapshot image, which is a different call
     /// from the capture, so Modal bounds it separately.
+    #[serde(default = "default_snapshot_timeout")]
     pub snapshot_filesystem_restore_timeout: Duration,
     /// The command that runs the helper, or the bundled helper when unset.
     pub helper_command: Option<Vec<String>>,
     /// The interpreter the bundled helper runs under.
     pub python: Option<String>,
+}
+
+fn default_timeout_secs() -> u32 {
+    300
+}
+
+fn default_use_sleep_cmd() -> bool {
+    true
+}
+
+fn default_image_builder_version() -> Option<String> {
+    Some(DEFAULT_IMAGE_BUILDER_VERSION.to_string())
+}
+
+fn default_exec_timeout() -> Duration {
+    DEFAULT_TIMEOUT
+}
+
+fn default_snapshot_timeout() -> Duration {
+    DEFAULT_SNAPSHOT_FILESYSTEM_TIMEOUT
 }
 
 // The helper command may carry a token in its environment arguments, so `Debug` names only the

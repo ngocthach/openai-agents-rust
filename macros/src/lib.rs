@@ -81,18 +81,27 @@ fn doc_lines(attrs: &[Attribute]) -> Vec<String> {
 }
 
 /// Split a doc comment into the description and per-argument descriptions. Recognizes
-/// rustdoc (`# Arguments` with `* \`name\` - text`) and Google style (`Args:` with
-/// `name: text`) sections.
+/// rustdoc (`# Arguments` with `* \`name\` - text`), Google (`Args:` with `name: text`), NumPy
+/// (`Parameters` over a dashed rule) and Sphinx (`:param name: text`) sections. The description is
+/// the text before the first section, so `Returns` and the like never reach it.
 fn parse_docs(lines: &[String]) -> (String, Vec<(String, String)>) {
+    if lines.iter().any(|l| l.trim_start().starts_with(":param ")) {
+        return parse_sphinx_docs(lines);
+    }
+    if let Some(at) = lines.windows(2).position(|w| is_numpy_header(&w[0], &w[1])) {
+        return parse_numpy_docs(lines, at);
+    }
     let mut description = Vec::new();
     let mut args: Vec<(String, String)> = Vec::new();
     let mut in_args = false;
+    let mut in_description = true;
     for line in lines {
         let t = line.trim();
         let lower = t.to_ascii_lowercase();
         if lower == "# arguments" || lower == "# args" || lower == "args:" || lower == "arguments:"
         {
             in_args = true;
+            in_description = false;
             continue;
         }
         if in_args {
@@ -127,10 +136,99 @@ fn parse_docs(lines: &[String]) -> (String, Vec<(String, String)>) {
             }
             continue;
         }
-        description.push(line.clone());
+        if t.starts_with('#') || (t.ends_with(':') && !t.contains(' ') && t.len() > 1) {
+            // Any other section (`Returns:`, `Note:`, `# Examples`) ends the description.
+            in_description = false;
+            continue;
+        }
+        if in_description {
+            description.push(line.clone());
+        }
     }
     let description = description.join("\n").trim().to_string();
     (description, args)
+}
+
+/// A NumPy section title: a word over a rule of dashes.
+fn is_numpy_header(title: &str, rule: &str) -> bool {
+    let rule = rule.trim();
+    !title.trim().is_empty()
+        && !rule.is_empty()
+        && rule.chars().all(|c| c == '-')
+        && !title.starts_with(char::is_whitespace)
+}
+
+/// NumPy style: `Parameters` over dashes, `name: type` entries with an indented description.
+fn parse_numpy_docs(lines: &[String], header: usize) -> (String, Vec<(String, String)>) {
+    let description = lines[..header].join("\n").trim().to_string();
+    let mut args: Vec<(String, String)> = Vec::new();
+    if !lines[header].trim().eq_ignore_ascii_case("parameters") {
+        return (description, args);
+    }
+    let mut i = header + 2;
+    while i < lines.len() {
+        let line = &lines[i];
+        if lines
+            .get(i + 1)
+            .is_some_and(|next| is_numpy_header(line, next))
+        {
+            break;
+        }
+        let t = line.trim();
+        if t.is_empty() {
+            i += 1;
+            continue;
+        }
+        if line.starts_with(char::is_whitespace) {
+            if let Some(last) = args.last_mut() {
+                if !last.1.is_empty() {
+                    last.1.push('\n');
+                }
+                last.1.push_str(t);
+            }
+        } else {
+            let name = t.split(':').next().unwrap_or(t).trim();
+            args.push((name.to_string(), String::new()));
+        }
+        i += 1;
+    }
+    (description, args)
+}
+
+/// Sphinx style: `:param name: text` fields, other `:field:` lines ignored.
+fn parse_sphinx_docs(lines: &[String]) -> (String, Vec<(String, String)>) {
+    let mut description = Vec::new();
+    let mut args: Vec<(String, String)> = Vec::new();
+    let mut in_fields = false;
+    let mut continuing = false;
+    for line in lines {
+        let t = line.trim();
+        if let Some(rest) = t.strip_prefix(":param ") {
+            in_fields = true;
+            // `:param type name: text` keeps the last word before the colon as the name.
+            if let Some((head, text)) = rest.split_once(':')
+                && let Some(name) = head.split_whitespace().last()
+            {
+                args.push((name.to_string(), text.trim().to_string()));
+                continuing = true;
+                continue;
+            }
+            continuing = false;
+        } else if t.starts_with(':') {
+            in_fields = true;
+            continuing = false;
+        } else if in_fields {
+            if t.is_empty() {
+                continuing = false;
+            } else if continuing && let Some(last) = args.last_mut() {
+                last.1.push('\n');
+                last.1.push_str(t);
+            }
+        } else {
+            description.push(line.clone());
+        }
+    }
+    (description.join("\n").trim().to_string(), args)
 }
 
 /// `ToolContext<C>` -> `Some(C)`.

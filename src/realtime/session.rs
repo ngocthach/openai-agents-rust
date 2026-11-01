@@ -175,6 +175,10 @@ struct SessionInner<C> {
     model_closed: AtomicBool,
     /// Serializes `close` so concurrent callers do not close the transport twice.
     close_lock: tokio::sync::Mutex<()>,
+    /// Completed close attempts, and the failure of the latest one, so callers that waited on
+    /// `close_lock` share the in-flight attempt's outcome instead of closing again.
+    close_attempts: AtomicU64,
+    last_close_failure: Mutex<Option<String>>,
     pump: Mutex<Option<JoinHandle<()>>>,
     guardrail_tasks: Mutex<Vec<JoinHandle<()>>>,
     /// Tool calls running on their own task, with `async_tool_calls` on.
@@ -307,6 +311,8 @@ impl<C: Send + Sync + 'static> RealtimeSession<C> {
             closed: AtomicBool::new(false),
             model_closed: AtomicBool::new(false),
             close_lock: tokio::sync::Mutex::new(()),
+            close_attempts: AtomicU64::new(0),
+            last_close_failure: Mutex::new(None),
             pump: Mutex::new(None),
             guardrail_tasks: Mutex::new(Vec::new()),
             tool_tasks: Mutex::new(Vec::new()),
@@ -485,7 +491,32 @@ impl<C: Send + Sync + 'static> RealtimeSession<C> {
 
     /// Close the session and its transport.
     pub async fn close(&self) -> Result<()> {
+        let attempts_seen = self.inner.close_attempts.load(Ordering::SeqCst);
         let _closing = self.inner.close_lock.lock().await;
+        if self.inner.close_attempts.load(Ordering::SeqCst) != attempts_seen {
+            // A close that was in flight when this call arrived has finished: share its outcome.
+            return match self
+                .inner
+                .last_close_failure
+                .lock()
+                .expect("realtime session poisoned")
+                .clone()
+            {
+                Some(message) => Err(AgentsError::other(message)),
+                None => Ok(()),
+            };
+        }
+        let result = self.close_locked().await;
+        *self
+            .inner
+            .last_close_failure
+            .lock()
+            .expect("realtime session poisoned") = result.as_ref().err().map(ToString::to_string);
+        self.inner.close_attempts.fetch_add(1, Ordering::SeqCst);
+        result
+    }
+
+    async fn close_locked(&self) -> Result<()> {
         if self.inner.closed.swap(true, Ordering::SeqCst) {
             // A repeat call only has work left when the transport failed to close before.
             if self.inner.model_closed.load(Ordering::SeqCst) {

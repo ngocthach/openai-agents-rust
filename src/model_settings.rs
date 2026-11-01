@@ -88,28 +88,43 @@ impl Reasoning {
     }
 }
 
-/// Backoff configuration for runner-managed model retries. A partial JSON object keeps the
-/// defaults of the omitted fields.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// Backoff configuration for runner-managed model retries. Every field is optional: an unset
+/// field falls back to the documented default when the delay is computed, and a partial override
+/// keeps the inherited value of the fields it does not set (see [`ModelSettings::resolve`]).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ModelRetryBackoffSettings {
-    /// Delay before the first retry, in seconds.
-    pub initial_delay: f64,
-    /// Upper bound of the computed backoff delay, in seconds.
-    pub max_delay: f64,
-    /// Multiplier applied to the delay after every retry.
-    pub multiplier: f64,
-    /// Whether to randomize the delay.
-    pub jitter: bool,
+    /// Delay before the first retry, in seconds (default 0.25).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub initial_delay: Option<f64>,
+    /// Upper bound of the computed backoff delay, in seconds (default 2.0).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_delay: Option<f64>,
+    /// Multiplier applied to the delay after every retry (default 2.0).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub multiplier: Option<f64>,
+    /// Whether to randomize the delay (default true).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub jitter: Option<bool>,
 }
 
-impl Default for ModelRetryBackoffSettings {
-    fn default() -> Self {
+impl ModelRetryBackoffSettings {
+    /// Default delay before the first retry, in seconds.
+    pub const DEFAULT_INITIAL_DELAY: f64 = 0.25;
+    /// Default upper bound of the backoff delay, in seconds.
+    pub const DEFAULT_MAX_DELAY: f64 = 2.0;
+    /// Default backoff multiplier.
+    pub const DEFAULT_MULTIPLIER: f64 = 2.0;
+    /// Jitter is on by default.
+    pub const DEFAULT_JITTER: bool = true;
+
+    /// Overlay the fields `over` sets on top of `self`.
+    pub fn merge(&self, over: &ModelRetryBackoffSettings) -> ModelRetryBackoffSettings {
         ModelRetryBackoffSettings {
-            initial_delay: 0.25,
-            max_delay: 2.0,
-            multiplier: 2.0,
-            jitter: true,
+            initial_delay: over.initial_delay.or(self.initial_delay),
+            max_delay: over.max_delay.or(self.max_delay),
+            multiplier: over.multiplier.or(self.multiplier),
+            jitter: over.jitter.or(self.jitter),
         }
     }
 }
@@ -120,42 +135,29 @@ impl Default for ModelRetryBackoffSettings {
 /// with the model's retry advice and the runner's replay-safety rules applied. Without one,
 /// network errors, timeouts and the HTTP statuses in `retry_statuses` are retried (stateful
 /// requests only on 429). Streamed requests are only retried before any output event.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+///
+/// Every field is optional so that [`ModelSettings::resolve`] can merge a partial override into
+/// inherited settings field by field; unset fields use the defaults described on each field.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ModelRetrySettings {
-    /// Number of retries after the initial attempt.
-    #[serde(default = "default_max_retries")]
-    pub max_retries: u32,
+    /// Number of retries after the initial attempt (default 2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_retries: Option<u32>,
     /// Backoff strategy.
-    #[serde(default)]
-    pub backoff: ModelRetryBackoffSettings,
-    /// HTTP status codes that trigger a retry.
-    #[serde(default = "default_retry_statuses")]
-    pub retry_statuses: Vec<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backoff: Option<ModelRetryBackoffSettings>,
+    /// HTTP status codes that trigger a retry (default 408, 409, 429, 500, 502, 503, 504).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_statuses: Option<Vec<u16>>,
     /// Runtime-only retry policy (not serialized).
     #[serde(skip)]
     pub policy: Option<crate::retry::RetryPolicy>,
 }
 
-fn default_max_retries() -> u32 {
-    ModelRetrySettings::default().max_retries
-}
-
-fn default_retry_statuses() -> Vec<u16> {
-    vec![408, 409, 429, 500, 502, 503, 504]
-}
-
-impl Default for ModelRetrySettings {
-    fn default() -> Self {
-        ModelRetrySettings {
-            max_retries: 2,
-            backoff: ModelRetryBackoffSettings::default(),
-            retry_statuses: default_retry_statuses(),
-            policy: None,
-        }
-    }
-}
-
 impl ModelRetrySettings {
+    /// Retry budget used when `max_retries` is unset.
+    pub const DEFAULT_MAX_RETRIES: u32 = 2;
+
     /// Use a retry policy.
     pub fn with_policy(mut self, policy: crate::retry::RetryPolicy) -> Self {
         self.policy = Some(policy);
@@ -164,16 +166,56 @@ impl ModelRetrySettings {
 
     /// Set the retry budget.
     pub fn with_max_retries(mut self, max_retries: u32) -> Self {
-        self.max_retries = max_retries;
+        self.max_retries = Some(max_retries);
         self
+    }
+
+    /// The effective retry budget.
+    pub fn max_retries_or_default(&self) -> u32 {
+        self.max_retries.unwrap_or(Self::DEFAULT_MAX_RETRIES)
+    }
+
+    /// The effective set of retryable HTTP statuses.
+    pub fn retry_statuses_or_default(&self) -> Vec<u16> {
+        self.retry_statuses
+            .clone()
+            .unwrap_or_else(|| vec![408, 409, 429, 500, 502, 503, 504])
+    }
+
+    /// Overlay the fields `over` sets on top of `self`; `backoff` is merged field by field.
+    pub fn merge(&self, over: &ModelRetrySettings) -> ModelRetrySettings {
+        let backoff = match (&self.backoff, &over.backoff) {
+            (Some(a), Some(b)) => Some(a.merge(b)),
+            (a, b) => b.clone().or_else(|| a.clone()),
+        };
+        ModelRetrySettings {
+            max_retries: over.max_retries.or(self.max_retries),
+            backoff,
+            retry_statuses: over
+                .retry_statuses
+                .clone()
+                .or_else(|| self.retry_statuses.clone()),
+            policy: over.policy.clone().or_else(|| self.policy.clone()),
+        }
     }
 
     /// Delay for the given retry attempt (1-based).
     pub fn delay_for_attempt(&self, attempt: u32) -> Duration {
-        let b = &self.backoff;
-        let base = b.initial_delay * b.multiplier.powi(attempt.saturating_sub(1) as i32);
-        let mut secs = base.min(b.max_delay).max(0.0);
-        if b.jitter {
+        let b = self.backoff.clone().unwrap_or_default();
+        let initial = b
+            .initial_delay
+            .unwrap_or(ModelRetryBackoffSettings::DEFAULT_INITIAL_DELAY);
+        let max_delay = b
+            .max_delay
+            .unwrap_or(ModelRetryBackoffSettings::DEFAULT_MAX_DELAY);
+        let multiplier = b
+            .multiplier
+            .unwrap_or(ModelRetryBackoffSettings::DEFAULT_MULTIPLIER);
+        let base = initial * multiplier.powi(attempt.saturating_sub(1) as i32);
+        let mut secs = base.min(max_delay).max(0.0);
+        if b.jitter
+            .unwrap_or(ModelRetryBackoffSettings::DEFAULT_JITTER)
+        {
             let factor: f64 = rand::random::<f64>() * 0.5 + 0.75;
             secs *= factor;
         }
@@ -282,12 +324,15 @@ impl ModelSettings {
             extra_query,
             extra_body,
             extra_headers,
-            retry,
             context_management,
             prompt_cache_options,
             preserve_raw_usage,
             timeout,
         );
+        out.retry = match (&self.retry, &other.retry) {
+            (Some(a), Some(b)) => Some(a.merge(b)),
+            (a, b) => b.clone().or_else(|| a.clone()),
+        };
         if self.extra_args.is_some() || other.extra_args.is_some() {
             let mut merged = Map::new();
             if let Some(a) = &self.extra_args {

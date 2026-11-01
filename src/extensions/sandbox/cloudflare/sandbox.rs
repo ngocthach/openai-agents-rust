@@ -69,11 +69,22 @@ pub struct CloudflareSandboxClientOptions {
     /// The bearer token, defaulting to `CLOUDFLARE_SANDBOX_API_KEY`.
     pub api_key: Option<String>,
     /// Ports the worker deployment exposes, recorded in the session state.
+    #[serde(default)]
     pub exposed_ports: Vec<u16>,
     /// The default exec timeout.
+    #[serde(default = "default_exec_timeout")]
     pub exec_timeout: Duration,
     /// The timeout applied to every non-exec request.
+    #[serde(default = "default_request_timeout")]
     pub request_timeout: Duration,
+}
+
+fn default_exec_timeout() -> Duration {
+    DEFAULT_EXEC_TIMEOUT
+}
+
+fn default_request_timeout() -> Duration {
+    DEFAULT_REQUEST_TIMEOUT
 }
 
 // The API key is a credential, so `Debug` never shows it.
@@ -465,6 +476,15 @@ pub struct CloudflareSandboxSession {
 }
 
 impl CloudflareSandboxSession {
+    /// Whether the manifest configures a mount whose credentials the worker holds, so provider
+    /// text that may echo them must stay out of logs.
+    fn has_protected_mount_authority(&self) -> bool {
+        self.manifest
+            .mount_targets()
+            .iter()
+            .any(|(mount, _)| mount.strategy.carries_credentials(mount))
+    }
+
     /// Attach a session to a sandbox the worker already created.
     pub fn new(connection: Arc<CloudflareConnection>, manifest: Manifest) -> Self {
         // The session id is its own value, as in the Python port: the worker's sandbox id is
@@ -994,7 +1014,14 @@ impl SandboxSession for CloudflareSandboxSession {
                         None,
                     ));
                 }
-                log::debug!(target: crate::logger::LOG_TARGET, "failed to delete the Cloudflare sandbox on shutdown");
+                if self.has_protected_mount_authority() {
+                    log::debug!(target: crate::logger::LOG_TARGET, "Failed to delete Cloudflare sandbox on shutdown");
+                } else {
+                    crate::logger::log_tool_action_debug(
+                        "Failed to delete Cloudflare sandbox on shutdown",
+                        &error,
+                    );
+                }
                 return Ok(());
             }
         };
@@ -1011,7 +1038,22 @@ impl SandboxSession for CloudflareSandboxSession {
                     Some(status.as_u16()),
                 ));
             }
-            log::debug!(target: crate::logger::LOG_TARGET, "failed to delete the Cloudflare sandbox on shutdown: HTTP {}", status.as_u16());
+            // The reply body may echo a mount request, so it is read only when neither the
+            // tool-data policy nor protected mount authority forbids logging it.
+            if self.has_protected_mount_authority() || crate::debug::dont_log_tool_data() {
+                log::debug!(target: crate::logger::LOG_TARGET, "Failed to delete Cloudflare sandbox on shutdown");
+            } else {
+                let body = response.bytes().await.unwrap_or_default();
+                log::debug!(
+                    target: crate::logger::LOG_TARGET,
+                    "Failed to delete Cloudflare sandbox on shutdown: {}",
+                    http_error_message(
+                        "DELETE /sandbox",
+                        status.as_u16(),
+                        format_response_body(&body)
+                    )
+                );
+            }
             return Ok(());
         }
         *deleted = true;

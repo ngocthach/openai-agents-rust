@@ -32,7 +32,7 @@ use crate::items::{
     RunItem, RunItemKind, ToolApprovalItem,
 };
 use crate::lifecycle::RunHooks;
-use crate::memory::Session;
+use crate::memory::{Session, SessionRunContext};
 use crate::model_settings::ModelSettings;
 use crate::models::interface::{Model, ModelRequest, ModelTracing, ToolSpec};
 use crate::result::{RunResult, StreamMsg};
@@ -1682,12 +1682,14 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
             .current_agent_identity
             .as_deref()
             .unwrap_or(&state.current_agent_name);
-        let agent =
-            agent_identity::resolve_identity(&self.starting_agent, identity).ok_or_else(|| {
-                // The message stays value-free: a snapshot's agent name is payload data.
-                // Python: "Run state agent not found in agent map".
-                AgentsError::user("Run state agent not found in agent map")
-            })?;
+        // The messages stay value-free: a snapshot's agent name and identity are payload data.
+        let not_found = if state.current_agent_identity.is_some() {
+            "Run state references an agent identity that is not present in the restored graph"
+        } else {
+            "Run state agent not found in agent map"
+        };
+        let agent = agent_identity::resolve_identity(&self.starting_agent, identity)
+            .ok_or_else(|| AgentsError::user(not_found))?;
         self.current_agent = agent;
         // Python refuses staged input behind a parked approval that may end the run. A state
         // restored from JSON has lost its build-time flag, so the check is repeated here.
@@ -2135,8 +2137,13 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
             return Ok(());
         }
         let items = self.session_input.clone();
-        crate::memory::await_session_mutation(async move { session.add_items(items).await })
-            .await?;
+        let ctx = self.ctx.clone();
+        crate::memory::await_session_mutation(async move {
+            session
+                .add_items_with_context(SessionRunContext::new(&ctx), items)
+                .await
+        })
+        .await?;
         self.input_saved_to_session = true;
         Ok(())
     }
@@ -2924,7 +2931,9 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
         if batch.is_empty() {
             return;
         }
-        if let Ok(tail) = session.get_items(Some(batch.len())).await
+        if let Ok(tail) = session
+            .get_items_with_context(SessionRunContext::new(&self.ctx), Some(batch.len()))
+            .await
             && tail == batch
         {
             self.session_saved_items = self.generated_items.len();
@@ -3059,7 +3068,10 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
         // `resume_pending_session_write`.
         let already_written = held
             && !items.is_empty()
-            && match session.get_items(Some(items.len())).await {
+            && match session
+                .get_items_with_context(SessionRunContext::new(&self.ctx), Some(items.len()))
+                .await
+            {
                 Ok(tail) => tail.len() == items.len() && tail == items,
                 Err(_) => false,
             };
@@ -3075,9 +3087,12 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
             } else {
                 // A cancelled run (a dropped `select!` branch, an elapsed timeout) must not
                 // abort a half-written session write. Port of `await_session_mutation`.
-                crate::memory::await_session_mutation(
-                    async move { session.add_items(items).await },
-                )
+                let ctx = self.ctx.clone();
+                crate::memory::await_session_mutation(async move {
+                    session
+                        .add_items_with_context(SessionRunContext::new(&ctx), items)
+                        .await
+                })
                 .await?;
             }
         }
@@ -3216,7 +3231,9 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
         };
         let defaults = session.session_settings().unwrap_or_default();
         let settings = defaults.resolve(self.config.session_settings.as_ref());
-        let history = session.get_items(settings.limit).await?;
+        let history = session
+            .get_items_with_context(SessionRunContext::new(&self.ctx), settings.limit)
+            .await?;
         // Session-only metadata never reaches the model, and history written before the caller
         // opted into omitting reasoning ids follows the policy on read too. Port of the
         // `strip_internal_input_item_metadata` / `apply_reasoning_item_id_policy` pass in

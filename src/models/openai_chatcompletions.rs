@@ -1567,11 +1567,12 @@ pub fn parse_chat_completion_as(
         .filter(|b: &Vec<Value>| !b.is_empty());
     // Prefer the structured/provider-native representations when a provider sends more than
     // one reasoning field on the same message.
-    let reasoning = message
-        .get("reasoning")
-        .and_then(Value::as_str)
-        .filter(|_| reasoning_content.is_empty() && thinking_blocks.is_none())
-        .unwrap_or("");
+    let reasoning = if reasoning_content.is_empty() && thinking_blocks.is_none() {
+        plaintext_reasoning(&message)
+    } else {
+        String::new()
+    };
+    let reasoning = reasoning.as_str();
     if !reasoning_content.is_empty() || !reasoning.is_empty() || thinking_blocks.is_some() {
         let mut provider_data = base_provider_data.clone();
         let mut item = json!({"type": "reasoning", "id": FAKE_RESPONSES_ID, "summary": []});
@@ -1704,6 +1705,33 @@ pub fn parse_chat_completion_as(
 const CONTENT_FILTER_REFUSAL: &str = "Response withheld by the provider's content filter.";
 
 /// Python truthiness of a JSON value.
+/// Flatten a provider's plaintext reasoning field to text: a string as-is, an object to its
+/// first non-empty `content`/`text`/`thinking`, an array to its joined parts. A message with no
+/// `reasoning` falls back to its `thinking` field.
+fn flatten_reasoning_value(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        Value::Object(map) => ["content", "text", "thinking"]
+            .iter()
+            .filter_map(|key| map.get(*key))
+            .map(flatten_reasoning_value)
+            .find(|text| !text.is_empty())
+            .unwrap_or_default(),
+        Value::Array(parts) => parts.iter().map(flatten_reasoning_value).collect(),
+        _ => String::new(),
+    }
+}
+
+fn plaintext_reasoning(message: &Value) -> String {
+    match message.get("reasoning").filter(|v| !v.is_null()) {
+        Some(reasoning) => flatten_reasoning_value(reasoning),
+        None => message
+            .get("thinking")
+            .map(flatten_reasoning_value)
+            .unwrap_or_default(),
+    }
+}
+
 fn truthy(v: Option<&Value>) -> bool {
     match v {
         None | Some(Value::Null) => false,
@@ -2381,9 +2409,9 @@ impl ChatStreamHandler {
         }
 
         // Plaintext reasoning from third-party platforms.
-        if let Some(Value::String(reasoning_text)) = delta.get("reasoning")
-            && !reasoning_text.is_empty()
-        {
+        let reasoning_text = plaintext_reasoning(delta);
+        if !reasoning_text.is_empty() {
+            let reasoning_text = &reasoning_text;
             if self.reasoning.is_none() {
                 self.open_reasoning(out, true);
             }

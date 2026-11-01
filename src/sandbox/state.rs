@@ -395,19 +395,22 @@ impl SandboxSessionState {
 
     /// Parse persisted session state.
     pub fn from_json_str(payload: &str) -> SandboxResult<Self> {
+        // The parser's own message can quote the offending value or field name, and a payload
+        // can carry credentials, so the error says only which kind of failure it was.
         let state: SandboxSessionState = serde_json::from_str(payload).map_err(|e| {
+            let what = match e.classify() {
+                serde_json::error::Category::Data => "payload",
+                _ => "JSON",
+            };
             SandboxError::new(
                 ErrorCode::SessionStateInvalid,
-                format!("Failed to parse sandbox session state: {e}"),
+                format!("sandbox session state {what} is invalid"),
             )
         })?;
         if state.schema_version != SESSION_STATE_SCHEMA_VERSION {
             return Err(SandboxError::new(
                 ErrorCode::SessionStateInvalid,
-                format!(
-                    "Unsupported sandbox session state version `{}`",
-                    state.schema_version
-                ),
+                "sandbox session state payload is invalid",
             ));
         }
         // Port 0 is representable but never a port a backend can expose, so a persisted state

@@ -623,6 +623,16 @@ fn is_user_message(item: &InputItem) -> bool {
     item.role() == Some("user")
 }
 
+/// Start a write transaction that takes SQLite's write lock before reading anything.
+///
+/// A transaction that reads first and writes later has to upgrade a stale read snapshot, which
+/// fails at once with "database is locked" when another connection wrote in between, without
+/// waiting for the busy timeout. Taking the lock up front makes concurrent writers queue.
+fn write_transaction(conn: &Connection) -> Result<rusqlite::Transaction<'_>> {
+    rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
+        .map_err(sql_err)
+}
+
 /// SQLite session that also records conversation structure, turns and usage.
 ///
 /// On top of the [`SqliteSession`] schema this adds two tables with the same shape as the
@@ -699,6 +709,23 @@ impl AdvancedSqliteSession {
     ) -> Result<Self> {
         let path = db_path.as_ref();
         preflight_structure_claim(path, sessions_table, messages_table, create_tables)?;
+        if create_tables {
+            let base = SqliteSession::open_uninitialized(
+                session_id,
+                path,
+                sessions_table,
+                messages_table,
+            )?;
+            let session = AdvancedSqliteSession {
+                base,
+                branch: Arc::new(Mutex::new(BranchState {
+                    branch: MAIN_BRANCH.to_string(),
+                    generation: 0,
+                })),
+            };
+            session.init_all_tables_atomically()?;
+            return Ok(session);
+        }
         let base = SqliteSession::with_tables(session_id, path, sessions_table, messages_table)?;
         Self::from_base(base, create_tables)
     }
@@ -745,9 +772,33 @@ impl AdvancedSqliteSession {
     fn init_structure_tables(&self, create_tables: bool) -> Result<()> {
         let ctx = self.ctx();
         let conn = self.base.connection().lock().expect("sqlite poisoned");
+        Self::init_structure_tables_on(&conn, &ctx, create_tables)
+    }
+
+    /// Create the base and structure tables in one write transaction, so a pair rejected by the
+    /// file's owner leaves nothing behind even when another connection is claiming the same
+    /// fresh file at the same moment.
+    fn init_all_tables_atomically(&self) -> Result<()> {
+        let ctx = self.ctx();
+        let conn = self.base.connection().lock().expect("sqlite poisoned");
+        conn.execute_batch("BEGIN IMMEDIATE").map_err(sql_err)?;
+        let created = self
+            .base
+            .create_tables_on(&conn)
+            .and_then(|()| Self::init_structure_tables_on(&conn, &ctx, true));
+        match created {
+            Ok(()) => conn.execute_batch("COMMIT").map_err(sql_err),
+            Err(error) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
+    }
+
+    fn init_structure_tables_on(conn: &Connection, ctx: &Ctx, create_tables: bool) -> Result<()> {
         if !create_tables {
-            claim_structure_tables(&conn, &ctx)?;
-            refresh_branch_after_external_clear(&conn, &ctx, false)?;
+            claim_structure_tables(conn, ctx)?;
+            refresh_branch_after_external_clear(conn, ctx, false)?;
             return Ok(());
         }
         conn.execute_batch(&format!(
@@ -795,10 +846,10 @@ impl AdvancedSqliteSession {
         ))
         .map_err(sql_err)?;
         // Validate the owner-bearing tables before anything else consumes them.
-        claim_structure_tables(&conn, &ctx)?;
-        ensure_branch_reservations(&conn, &ctx)?;
-        ensure_clear_generations(&conn, &ctx)?;
-        refresh_branch_after_external_clear(&conn, &ctx, false)
+        claim_structure_tables(conn, ctx)?;
+        ensure_branch_reservations(conn, ctx)?;
+        ensure_clear_generations(conn, ctx)?;
+        refresh_branch_after_external_clear(conn, ctx, false)
     }
 
     async fn blocking<T, F>(&self, f: F) -> Result<T>
@@ -1062,7 +1113,7 @@ impl AdvancedSqliteSession {
         }
         let target = branch_id.to_string();
         self.blocking(move |conn, ctx| {
-            let tx = conn.unchecked_transaction().map_err(sql_err)?;
+            let tx = write_transaction(conn)?;
             // Back-fill the reservations before the branch's rows, their only durable evidence
             // in a database written before reservations existed, are deleted.
             ensure_branch_reservations(&tx, ctx)?;
@@ -1425,7 +1476,7 @@ impl AdvancedSqliteSession {
 
     /// Insert items and their structure metadata in one transaction.
     fn insert_with_structure(conn: &Connection, ctx: &Ctx, items: &[InputItem]) -> Result<()> {
-        let tx = conn.unchecked_transaction().map_err(sql_err)?;
+        let tx = write_transaction(conn)?;
         Self::insert_with_structure_in(&tx, ctx, items)?;
         tx.commit().map_err(sql_err)
     }
@@ -1541,7 +1592,7 @@ impl Session for AdvancedSqliteSession {
         self.blocking(move |conn, ctx| {
             refresh_branch_after_external_clear(conn, ctx, true)?;
             let branch = ctx.branch_id();
-            let tx = conn.unchecked_transaction().map_err(sql_err)?;
+            let tx = write_transaction(conn)?;
             // Back-fill the reservations before deleting the rows that are their only durable
             // evidence in a database written before reservations existed.
             ensure_branch_reservations(&tx, ctx)?;
@@ -1644,7 +1695,7 @@ impl Session for AdvancedSqliteSession {
         let handles: Vec<String> = handles.iter().map(|h| h.0.clone()).collect();
         self.blocking(move |conn, ctx| {
             let branch = ctx.branch_id();
-            let tx = conn.unchecked_transaction().map_err(sql_err)?;
+            let tx = write_transaction(conn)?;
             let mut stmt = tx
                 .prepare(
                     "SELECT id, message_id FROM message_structure
@@ -1701,7 +1752,7 @@ impl Session for AdvancedSqliteSession {
     /// Remove every branch, structure row and usage row of this session.
     async fn clear_session(&self) -> Result<()> {
         self.blocking(move |conn, ctx| {
-            let tx = conn.unchecked_transaction().map_err(sql_err)?;
+            let tx = write_transaction(conn)?;
             // Back-fill the reservations before deleting their only durable evidence, so the
             // branch ids this session used stay reserved after the clear.
             ensure_branch_reservations(&tx, ctx)?;

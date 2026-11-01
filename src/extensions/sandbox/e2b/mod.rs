@@ -196,6 +196,7 @@ impl Default for E2BSandboxTimeouts {
 
 /// Settings used when creating an E2B-backed session.
 #[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, Eq)]
+#[serde(default)]
 pub struct E2BSandboxClientOptions {
     /// API key for the platform API. Falls back to `E2B_API_KEY`.
     pub api_key: Option<String>,
@@ -1194,27 +1195,35 @@ impl E2BSandboxSession {
             return Ok(());
         }
         self.pty_terminate_all().await.ok();
-        let result = if self.options.pause_on_exit {
+        // As in Python, a failure to release the sandbox is logged rather than raised: shutdown
+        // runs in cleanup paths where a second error would hide the first.
+        if self.options.pause_on_exit {
             // A `stop` already paused it; pausing a paused sandbox is a conflict, and falling
             // back to a kill would destroy a sandbox the caller asked to keep.
-            if self.paused.load(Ordering::SeqCst) {
-                Ok(())
-            } else {
-                match self.pause().await {
-                    Ok(()) => Ok(()),
-                    // A pause that cannot be taken must not leak the sandbox.
-                    Err(error) => {
-                        log::warn!(target: crate::logger::LOG_TARGET, "failed to pause the E2B sandbox, killing it instead: {error}");
-                        self.kill().await
-                    }
+            if !self.paused.load(Ordering::SeqCst)
+                && let Err(error) = self.pause().await
+            {
+                // A pause that cannot be taken must not leak the sandbox.
+                crate::logger::log_tool_action_warning(
+                    "Failed to pause E2B sandbox on shutdown; falling back to kill.",
+                    &error,
+                );
+                if let Err(error) = self.kill().await {
+                    crate::logger::log_tool_action_warning(
+                        "Failed to kill E2B sandbox after pause fallback failure.",
+                        &error,
+                    );
                 }
             }
-        } else {
-            self.kill().await
-        };
+        } else if let Err(error) = self.kill().await {
+            crate::logger::log_tool_action_warning(
+                "Failed to kill E2B sandbox on shutdown.",
+                &error,
+            );
+        }
         self.started.store(false, Ordering::SeqCst);
         *terminated = true;
-        result
+        Ok(())
     }
 
     /// Replace the backing sandbox with one created from a native snapshot template.

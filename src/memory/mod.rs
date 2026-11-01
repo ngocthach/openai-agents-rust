@@ -250,6 +250,39 @@ pub struct CompactionSnapshot {
     pub complete: bool,
 }
 
+/// A type-erased view of the run's [`RunContext`](crate::run_context::RunContext), handed to the `*_with_context` methods of
+/// [`Session`]. Downcast it with [`SessionRunContext::run_context`] to the context type the run
+/// was started with.
+#[derive(Clone, Copy)]
+pub struct SessionRunContext<'a> {
+    inner: &'a (dyn std::any::Any + Send + Sync),
+}
+
+impl<'a> SessionRunContext<'a> {
+    /// Wrap the run's context.
+    pub fn new<C: Send + Sync + 'static>(ctx: &'a crate::run_context::RunContext<C>) -> Self {
+        SessionRunContext { inner: ctx }
+    }
+
+    /// The run's context wrapper, when the run was started with a context of type `C`.
+    pub fn run_context<C: Send + Sync + 'static>(
+        &self,
+    ) -> Option<&'a crate::run_context::RunContext<C>> {
+        self.inner.downcast_ref()
+    }
+
+    /// The app-defined context object, when the run was started with a context of type `C`.
+    pub fn context<C: Send + Sync + 'static>(&self) -> Option<&'a C> {
+        self.run_context::<C>().map(|c| c.context())
+    }
+}
+
+impl fmt::Debug for SessionRunContext<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SessionRunContext").finish_non_exhaustive()
+    }
+}
+
 /// Stores conversation history for a session.
 ///
 /// The runner retrieves history before each run and stores new items after it.
@@ -310,6 +343,41 @@ pub trait Session: Send + Sync + fmt::Debug {
     /// Remove all items.
     async fn clear_session(&self) -> Result<()>;
 
+    /// [`Session::get_items`] for a run: the runner calls this with the run's context, so a
+    /// session that scopes its history by the context (a tenant, a user) can override it.
+    /// The default ignores the context and reads the unscoped history.
+    ///
+    /// Port of the opt-in `wrapper` argument of Python's `Session.get_items`.
+    async fn get_items_with_context(
+        &self,
+        _ctx: SessionRunContext<'_>,
+        limit: Option<usize>,
+    ) -> Result<Vec<InputItem>> {
+        self.get_items(limit).await
+    }
+
+    /// [`Session::add_items`] for a run; see [`Session::get_items_with_context`].
+    async fn add_items_with_context(
+        &self,
+        _ctx: SessionRunContext<'_>,
+        items: Vec<InputItem>,
+    ) -> Result<()> {
+        self.add_items(items).await
+    }
+
+    /// [`Session::pop_item`] for a run; see [`Session::get_items_with_context`].
+    async fn pop_item_with_context(
+        &self,
+        _ctx: SessionRunContext<'_>,
+    ) -> Result<Option<InputItem>> {
+        self.pop_item().await
+    }
+
+    /// [`Session::clear_session`] for a run; see [`Session::get_items_with_context`].
+    async fn clear_session_with_context(&self, _ctx: SessionRunContext<'_>) -> Result<()> {
+        self.clear_session().await
+    }
+
     /// Called after a run finished and its items were persisted. Sessions that compact history
     /// (for example `OpenAIResponsesCompactionSession`) override this and return the usage of
     /// any model requests they made, which the runner adds to the run usage.
@@ -351,6 +419,17 @@ pub trait Session: Send + Sync + fmt::Debug {
         _handles: &[SnapshotHandle],
         _items: Vec<InputItem>,
     ) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// Replace the whole stored history with `items` in one atomic step.
+    ///
+    /// Stores that can do this without a window where the history is empty override it and
+    /// return `true`; the compaction session then uses it instead of `clear_session` followed
+    /// by `add_items`. The default returns `false` without changing anything, and wrappers that
+    /// transform stored items (such as encryption) keep it, so they are never bypassed.
+    /// Port of the `_atomic_replace_items` hook of Python's `RedisSession`.
+    async fn replace_history_atomically(&self, _items: Vec<InputItem>) -> Result<bool> {
         Ok(false)
     }
 
