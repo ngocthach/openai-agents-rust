@@ -97,6 +97,14 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
         let Some(mut pending) = self.pending_write.clone().filter(|p| !is_held(p)) else {
             return Ok(());
         };
+        // Another settle of this checkpoint (a second resume of a checkpoint the first run
+        // published before its append) must not append the same batch concurrently.
+        let Some(claim) = self.write_in_progress.claim() else {
+            return Err(AgentsError::user(
+                "The pending Session write is already in progress for this RunState",
+            ));
+        };
+        let mut claim = Some(claim);
         let expected_id = pending
             .get("session_id")
             .and_then(Value::as_str)
@@ -185,16 +193,29 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
             }
         }
         if append {
+            // A caller that drops this run while the Session holds the append still has a
+            // checkpoint that carries the write, so a resume reconciles it instead of
+            // running the completed tool again.
+            if let Some(slot) = &self.checkpoint {
+                slot.set(self.failure_checkpoint());
+                self.published_checkpoint = true;
+            }
             let batch = items.clone();
             let target = session.clone();
             let ctx = self.ctx.clone();
-            crate::memory::await_session_mutation(async move {
+            // The claim travels with the append: a dropped caller must not free the flag while
+            // the Session is still writing, or a second resume could append the batch again.
+            let held = claim.take();
+            claim = crate::memory::await_session_mutation(async move {
                 target
                     .add_items_with_context(SessionRunContext::new(&ctx), batch)
-                    .await
+                    .await?;
+                Ok(held)
             })
             .await?;
         }
+        // Held to the end of the settle, notice included, as Python releases its flag in `finally`.
+        let _claim = claim;
         if let Some(exchange) = pending.get("compaction_model_exchange") {
             let digests: Vec<String> = exchange
                 .get("item_digests")

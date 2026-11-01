@@ -727,6 +727,111 @@ impl<C> fmt::Debug for FunctionTool<C> {
     }
 }
 
+/// Whether `value` has exactly the shape `schema` declares, so that parsing it would neither
+/// fail nor fill in, drop or convert anything. Conservative: a keyword this does not understand,
+/// a declared property that is absent and an undeclared one that is present all answer `false`,
+/// and the call then needs a manual approval. Numbers follow Python's float rule: a `number`
+/// must be written as a float, because an integer literal would be converted.
+fn schema_shape_accepts(root: &Value, schema: &Value, value: &Value, depth: usize) -> bool {
+    if depth > 64 {
+        return false;
+    }
+    let Value::Object(s) = schema else {
+        return matches!(schema, Value::Bool(true));
+    };
+    if let Some(reference) = s.get("$ref").and_then(Value::as_str) {
+        let Some(target) = reference.strip_prefix('#').and_then(|p| root.pointer(p)) else {
+            return false;
+        };
+        if !schema_shape_accepts(root, target, value, depth + 1) {
+            return false;
+        }
+    }
+    if let Some(all) = s.get("allOf").and_then(Value::as_array)
+        && !all
+            .iter()
+            .all(|sub| schema_shape_accepts(root, sub, value, depth + 1))
+    {
+        return false;
+    }
+    for key in ["anyOf", "oneOf"] {
+        if let Some(any) = s.get(key).and_then(Value::as_array)
+            && !any
+                .iter()
+                .any(|sub| schema_shape_accepts(root, sub, value, depth + 1))
+        {
+            return false;
+        }
+    }
+    if let Some(constant) = s.get("const")
+        && constant != value
+    {
+        return false;
+    }
+    if let Some(options) = s.get("enum").and_then(Value::as_array)
+        && !options.contains(value)
+    {
+        return false;
+    }
+    if s.contains_key("prefixItems") {
+        return false;
+    }
+    let type_accepts = |name: &str| match name {
+        "string" => value.is_string(),
+        "integer" => value.as_i64().is_some() || value.as_u64().is_some(),
+        "number" => value.is_f64(),
+        "boolean" => value.is_boolean(),
+        "null" => value.is_null(),
+        "array" => value.as_array().is_some_and(|items| match s.get("items") {
+            Some(item_schema) => items
+                .iter()
+                .all(|item| schema_shape_accepts(root, item_schema, item, depth + 1)),
+            None => true,
+        }),
+        "object" => value
+            .as_object()
+            .is_some_and(|map| object_shape_accepts(root, s, map, depth)),
+        _ => false,
+    };
+    match s.get("type") {
+        None => true,
+        Some(Value::String(name)) => type_accepts(name),
+        Some(Value::Array(names)) => names
+            .iter()
+            .any(|name| name.as_str().is_some_and(type_accepts)),
+        Some(_) => false,
+    }
+}
+
+fn object_shape_accepts(
+    root: &Value,
+    schema: &serde_json::Map<String, Value>,
+    map: &serde_json::Map<String, Value>,
+    depth: usize,
+) -> bool {
+    let properties = schema.get("properties").and_then(Value::as_object);
+    let additional = schema.get("additionalProperties");
+    if let Some(properties) = properties
+        && !properties.keys().all(|key| map.contains_key(key))
+    {
+        return false;
+    }
+    map.iter().all(|(key, item)| {
+        match properties.and_then(|props| props.get(key)) {
+            Some(declared) => schema_shape_accepts(root, declared, item, depth + 1),
+            None => match additional {
+                Some(extra @ Value::Object(_)) => {
+                    schema_shape_accepts(root, extra, item, depth + 1)
+                }
+                Some(Value::Bool(false)) => false,
+                // Without declared properties any key is data; with them an undeclared key
+                // would be dropped by parsing.
+                _ => properties.is_none(),
+            },
+        }
+    })
+}
+
 fn empty_object_schema() -> Value {
     json!({"type": "object", "properties": {}, "required": [], "additionalProperties": false})
 }
@@ -835,6 +940,10 @@ impl<C: Send + Sync + 'static> FunctionTool<C> {
             .get("properties")
             .and_then(Value::as_object)
             .map(|props| props.keys().cloned().collect());
+        // The inspection never runs the argument type's `Deserialize`: that may be custom code
+        // (a `deserialize_with` function, an application default), which belongs after the
+        // approval. The arguments are judged against the declared schema instead.
+        let inspection_schema = schema.clone();
         let approval_args_check: ApprovalArgsCheckFn = Arc::new(move |args: &Value| {
             let Value::Object(map) = args else {
                 return false;
@@ -844,7 +953,9 @@ impl<C: Send + Sync + 'static> FunctionTool<C> {
             {
                 return false;
             }
-            serde_json::from_value::<Args>(args.clone()).is_ok()
+            schema_shape_accepts(&inspection_schema, &inspection_schema, args, 0)
+                && crate::strict_schema::validate_value_constraints(&inspection_schema, args)
+                    .is_ok()
         });
         let mut tool = if strict {
             Self::build_strict(name.into(), description.into(), schema, invoke)?

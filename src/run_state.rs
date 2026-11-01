@@ -22,7 +22,7 @@ mod nested_history;
 mod sandbox_payload;
 mod wire;
 
-pub use wire::{SUPPORTED_SCHEMA_VERSIONS, ToolUseTrackerSnapshot};
+pub use wire::{SCHEMA_VERSION_SUMMARIES, SUPPORTED_SCHEMA_VERSIONS, ToolUseTrackerSnapshot};
 
 /// Current serialization schema version. Matches the Python SDK's `agents.run_state`
 /// schema, so snapshots are interoperable between the two SDKs.
@@ -212,6 +212,17 @@ pub struct RunState {
     /// on the stale item does not change that. Derived on read, never written.
     #[serde(skip)]
     pub foreign_owner_call_ids: BTreeSet<String>,
+    /// The agent name behind each identity key of the graph this state was built from, so the
+    /// owners of sticky approval decisions are written with a name and an identity. A key with no
+    /// entry is written as its own name. Filled by the run that builds the state and by reading a
+    /// snapshot; never written as such.
+    #[serde(skip)]
+    pub agent_owner_names: BTreeMap<String, String>,
+    /// Identity keys whose agent cannot be told apart from a same-named sibling (identical
+    /// configuration), so decisions they own are not carried into a snapshot. Port of
+    /// `_get_ambiguous_agent_ids`. Derived from the graph by the run that builds the state.
+    #[serde(skip)]
+    pub ambiguous_agent_owners: BTreeSet<String>,
     /// The snapshot's `context_meta` says its context cannot be rebuilt from the payload
     /// alone: it was written from a type the JSON does not describe, or omitted outright.
     /// Mirrors `_context_meta_requires_deserializer`. Read-only; derived on deserialization.
@@ -223,6 +234,10 @@ pub struct RunState {
     /// `(schema_major, schema_minor) < (1, 21)` gate in Python's `_deserialize_run_state`.
     #[serde(skip)]
     pub legacy_hook_identity_snapshot: bool,
+    /// The snapshot was written before schema `1.7`, which named approval owners by agent name
+    /// only: a decision recorded under a bare name applies to any same-named agent. Read-derived.
+    #[serde(skip)]
+    pub legacy_name_owner_snapshot: bool,
     /// The graph this snapshot came from has same-named agents that differ only by hook instance
     /// state. Set when the run builds the snapshot; [`to_json`](Self::to_json) then refuses to
     /// write it, as Python does. Derived from the graph, so it never travels on the wire.
@@ -233,6 +248,43 @@ pub struct RunState {
     /// snapshot; [`add_input`](Self::add_input) refuses such a state, as Python does.
     #[serde(skip)]
     pub tool_result_may_end_run: bool,
+    /// Shared by a run and the checkpoints it publishes: set while the run settles this state's
+    /// pending Session write, so a second resume of the same checkpoint cannot append the batch
+    /// concurrently. Mirrors `RunState._session_write_in_progress`; never written.
+    #[serde(skip)]
+    pub session_write_in_progress: SessionWriteInProgress,
+}
+
+/// A flag shared by every copy of a [`RunState`] taken from one run (see
+/// [`RunState::session_write_in_progress`]). Copies compare equal whatever it holds.
+#[derive(Debug, Clone, Default)]
+pub struct SessionWriteInProgress(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl SessionWriteInProgress {
+    /// Claim the flag, or `None` while another settle holds it. The claim is released when the
+    /// returned guard drops, including when the settling future is dropped mid-write.
+    pub(crate) fn claim(&self) -> Option<SessionWriteClaim> {
+        use std::sync::atomic::Ordering;
+        self.0
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .ok()
+            .map(|_| SessionWriteClaim(self.0.clone()))
+    }
+}
+
+impl PartialEq for SessionWriteInProgress {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+/// Releases a [`SessionWriteInProgress`] claim on drop.
+pub(crate) struct SessionWriteClaim(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for SessionWriteClaim {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 /// How [`RunState::from_json_with`] treats a snapshot whose context cannot be restored from
@@ -535,6 +587,10 @@ impl RunState {
             let unbound = state.unbound_approval_call_ids();
             state.restored_unbound_approval_call_ids.extend(unbound);
         }
+        if !is_legacy_rust {
+            let unbindable = wire::hosted_pending_without_arguments(&state, &value);
+            state.restored_unbound_approval_call_ids.extend(unbindable);
+        }
         if !is_legacy_rust && wire::schema_version_at_least(version, 1, 7) {
             state.foreign_owner_call_ids = wire::foreign_owner_call_ids(&state, &value);
         }
@@ -548,6 +604,7 @@ impl RunState {
             );
         }
         state.legacy_hook_identity_snapshot = version_precedes(version, (1, 21));
+        state.legacy_name_owner_snapshot = version_precedes(version, (1, 7));
         // The in-memory state is always current; the version only describes the payload read.
         state.schema_version = CURRENT_SCHEMA_VERSION.to_string();
         Ok(state)

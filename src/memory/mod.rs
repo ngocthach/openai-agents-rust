@@ -13,6 +13,7 @@ mod openai_conversations_session;
 mod openai_responses_compaction_session;
 #[cfg(feature = "redis")]
 mod redis_session;
+mod session_rewind;
 #[cfg(feature = "sqlite")]
 mod sqlite_session;
 #[cfg(feature = "sqlx")]
@@ -56,6 +57,7 @@ pub use openai_responses_compaction_session::{
 };
 #[cfg(feature = "redis")]
 pub use redis_session::{DEFAULT_KEY_PREFIX, RedisSession, redis_session_keys};
+pub use session_rewind::{fingerprint_input_item, rewind_session_items, wait_for_session_cleanup};
 #[cfg(feature = "sqlite")]
 pub use sqlite_session::SqliteSession;
 #[cfg(feature = "sqlx")]

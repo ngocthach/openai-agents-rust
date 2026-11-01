@@ -29,6 +29,100 @@ pub const SUPPORTED_SCHEMA_VERSIONS: [&str; 22] = [
     "1.13", "1.14", "1.15", "1.16", "1.17", "1.18", "1.19", "1.20", "1.21",
 ];
 
+/// A one-line historical summary of every supported schema version, oldest first. Mirrors
+/// Python's `SCHEMA_VERSION_SUMMARIES`: every schema bump adds one entry here, and the keys are
+/// exactly [`SUPPORTED_SCHEMA_VERSIONS`].
+pub const SCHEMA_VERSION_SUMMARIES: [(&str, &str); 22] = [
+    (
+        "1.0",
+        "Initial RunState snapshot format for HITL pause/resume flows.",
+    ),
+    (
+        "1.1",
+        "Same payload as 1.0, but introduces explicit backward-read support policy.",
+    ),
+    (
+        "1.2",
+        "Persists reasoning_item_id_policy for resumed and streamed follow-up turns.",
+    ),
+    (
+        "1.3",
+        "Updates resumed trace semantics to reattach traces without duplicate starts.",
+    ),
+    (
+        "1.4",
+        "Stores request_id alongside each serialized model response.",
+    ),
+    (
+        "1.5",
+        "Renumbered unreleased baseline for tool-search snapshots and richer tool metadata.",
+    ),
+    (
+        "1.6",
+        "Persists explicit approval rejection messages across resume flows.",
+    ),
+    (
+        "1.7",
+        "Persists duplicate-name agent identities across agent-owned state and sandbox resume state.",
+    ),
+    (
+        "1.8",
+        "Persists SDK-generated prompt cache keys across resume flows.",
+    ),
+    (
+        "1.9",
+        "Persists pending custom tool calls and tool origin metadata across resume flows.",
+    ),
+    (
+        "1.10",
+        "Allows serialized RunState snapshots to disable max_turns with null.",
+    ),
+    (
+        "1.11",
+        "Persists SDK-only custom data on tool output items across resume flows.",
+    ),
+    (
+        "1.12",
+        "Persists input cache-write token usage across resume flows.",
+    ),
+    (
+        "1.13",
+        "Persists programmatic tool calling and nested handoff history ownership across resume flows.",
+    ),
+    (
+        "1.14",
+        "Scopes hosted MCP approvals and restored requests by server label.",
+    ),
+    (
+        "1.15",
+        "Persists canonical tool invocation identity plus sanitized mount authority and trusted rebind metadata, durable pending input, and resumable next-model-call state.",
+    ),
+    (
+        "1.16",
+        "Persists Docker network-isolation state and lets an exact call approval decision override a sticky decision for the same tool.",
+    ),
+    (
+        "1.17",
+        "Persists Docker container labels and current-response generated-item ownership across resume flows, including pending resumed Session writes and terminal-unrecoverable runs.",
+    ),
+    (
+        "1.18",
+        "Binds restored local MCP calls to their configured server and original tool name, preserves independent apply_patch approval scopes, and binds function-tool approval decisions to their owning agent, and retains compaction metadata for pending Session writes, including acknowledgement and model-exchange evidence for compaction retry, and records named Vercel sandboxes alongside exact execution IDs.",
+    ),
+    (
+        "1.19",
+        "Persists the interrupted turn's withheld Session write as a held pending write, with the conversion policy its items were registered under and the current-response boundary, so an approval resume can settle it under the output-guardrail gate.",
+    ),
+    (
+        "1.20",
+        "Persists the pending tool output guardrail result boundary so a resumed run withholds current-response diagnostics until its terminal guardrails complete.",
+    ),
+    (
+        "1.21",
+        "Makes duplicate-agent identity independent of mutable hook instance state.",
+    ),
+];
+
 /// The first schema that may carry Programmatic Tool Calling items.
 const PROGRAMMATIC_TOOL_CALLING_MIN_SCHEMA_VERSION: (u32, u32) = (1, 13);
 /// The first schema that may carry agent-owned `function_tool_approvals`.
@@ -664,10 +758,15 @@ fn stamp_approval_owner_identity(value: &mut Value, name: &str, identity: &str) 
         Value::Object(map) => {
             if map.get("type").and_then(Value::as_str) == Some("tool_approval_item")
                 && let Some(Value::Object(agent)) = map.get_mut("agent")
-                && agent.get("name").and_then(Value::as_str) == Some(name)
                 && !agent.contains_key("identity")
             {
-                agent.insert("identity".into(), Value::String(identity.to_string()));
+                let owner = agent.get("name").and_then(Value::as_str);
+                // A parked approval names its owner by identity key; the name goes back to
+                // being the agent's own.
+                if owner == Some(name) || owner == Some(identity) {
+                    agent.insert("name".into(), Value::String(name.to_string()));
+                    agent.insert("identity".into(), Value::String(identity.to_string()));
+                }
             }
             for child in map.values_mut() {
                 stamp_approval_owner_identity(child, name, identity);
@@ -704,10 +803,73 @@ pub(super) fn foreign_owner_call_ids(state: &RunState, value: &Value) -> BTreeSe
                 .into_iter()
                 .flatten(),
         )
-        .filter(|(item, _)| item.agent == state.current_agent_name)
+        .filter(|(_, wire)| agent_name_of(wire.get("agent")) == state.current_agent_name)
         .filter(|(item, wire)| {
             let owner = agent_identity_of(wire.get("agent")).unwrap_or_else(|| item.agent.clone());
             owner != current_identity
+        })
+        .map(|(item, _)| item.call_id().to_string())
+        .collect()
+}
+
+/// The agent name behind each identity key a snapshot mentions: the current agent, the owners
+/// of sticky decisions and the owners of parked approvals.
+fn owner_names_from_wire(value: &Value) -> std::collections::BTreeMap<String, String> {
+    let mut names = std::collections::BTreeMap::new();
+    let mut note = |agent: Option<&Value>| {
+        if let Some(identity) = agent_identity_of(agent) {
+            names.insert(identity, agent_name_of(agent));
+        }
+    };
+    note(value.get("current_agent"));
+    let context = value.get("context");
+    for entry in context
+        .and_then(|c| c.get("function_tool_approvals"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        note(entry.get("agent"));
+    }
+    for entry in value
+        .get("current_step")
+        .and_then(|step| step.get("data"))
+        .and_then(|data| data.get("interruptions"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        note(entry.get("agent"));
+    }
+    names
+}
+
+/// Call ids of parked hosted MCP requests whose serialized `raw_item` has no `arguments`.
+/// A live request always carries them, so such an item cannot be bound to one invocation: it
+/// stays pending and is asked again whatever decision or ledger entry the snapshot holds. Port
+/// of the `arguments is None` unbindable branch of `_approval_binding`.
+pub(super) fn hosted_pending_without_arguments(
+    state: &RunState,
+    value: &Value,
+) -> BTreeSet<String> {
+    state
+        .interruptions
+        .iter()
+        .zip(
+            value
+                .get("current_step")
+                .and_then(|step| step.get("data"))
+                .and_then(|data| data.get("interruptions"))
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten(),
+        )
+        .filter(|(_, wire)| {
+            wire.get("raw_item")
+                .filter(|raw| {
+                    raw.get("type").and_then(Value::as_str) == Some("mcp_approval_request")
+                })
+                .is_some_and(|raw| raw.get("arguments").is_none())
         })
         .map(|(item, _)| item.call_id().to_string())
         .collect()
@@ -1067,19 +1229,29 @@ fn hosted_approvals_from_wire(context: &Value, state: &mut ApprovalsState) {
     }
 }
 
-fn approvals_to_wire(approvals: &ApprovalsState) -> Value {
+fn approvals_to_wire(state: &RunState) -> Value {
     Value::Array(
-        approvals
+        state
+            .approvals
             .0
             .iter()
             .filter(|(key, _)| crate::run_context::parse_hosted_key(key).is_none())
-            .map(|(key, record)| {
-                let (agent, tool_key) = split_approval_key(key);
-                json!({
-                    "agent": agent_ref(&agent),
+            .filter_map(|(key, record)| {
+                let (owner, tool_key) = split_approval_key(key);
+                // An owner that only graph order tells from a sibling carries no authority
+                // into a snapshot.
+                if state.ambiguous_agent_owners.contains(&owner) {
+                    return None;
+                }
+                let name = state
+                    .agent_owner_names
+                    .get(&owner)
+                    .map_or(owner.as_str(), String::as_str);
+                Some(json!({
+                    "agent": agent_ref_with_identity(name, Some(&owner)),
                     "tool_key": tool_key,
                     "decision": approval_decision_to_wire(record),
-                })
+                }))
             })
             .collect(),
     )
@@ -1089,7 +1261,9 @@ fn approvals_from_wire(context: &Value, version: &str) -> ApprovalsState {
     let mut state = ApprovalsState::default();
     if let Some(Value::Array(entries)) = context.get("function_tool_approvals") {
         for entry in entries {
-            let agent = agent_name_of(entry.get("agent"));
+            // The owner key is the identity of a duplicate-named agent, else its name.
+            let agent = agent_identity_of(entry.get("agent"))
+                .unwrap_or_else(|| agent_name_of(entry.get("agent")));
             let tool_key = entry
                 .get("tool_key")
                 .and_then(Value::as_str)
@@ -1437,7 +1611,8 @@ fn interruption_from_wire(value: &Value) -> Result<ToolApprovalItem> {
         .map(str::to_string)
         .unwrap_or_else(|| raw_item.name.clone());
     Ok(ToolApprovalItem {
-        agent: agent_name_of(value.get("agent")),
+        agent: agent_identity_of(value.get("agent"))
+            .unwrap_or_else(|| agent_name_of(value.get("agent"))),
         raw_item,
         tool_name,
         tool_origin: value
@@ -1989,7 +2164,7 @@ pub(super) fn to_wire(state: &RunState, include_tracing_api_key: bool) -> Result
     let context = json!({
         "usage": usage_to_wire(&state.usage),
         "approvals": Value::Object(Map::new()),
-        "function_tool_approvals": approvals_to_wire(&state.approvals),
+        "function_tool_approvals": approvals_to_wire(state),
         "tool_invocations": state.tool_invocations,
         "context": state.context.clone().unwrap_or(Value::Null),
         "context_meta": match &state.context {
@@ -2480,7 +2655,11 @@ pub(super) fn from_wire(value: &Value, version: &str) -> Result<RunState> {
         ),
         // Set by `RunState::from_json` from the payload version, which this literal does not see.
         legacy_hook_identity_snapshot: false,
+        legacy_name_owner_snapshot: false,
         hook_identity_ambiguous: false,
+        agent_owner_names: owner_names_from_wire(value),
+        ambiguous_agent_owners: Default::default(),
+        session_write_in_progress: Default::default(),
         tool_result_may_end_run: value
             .get("tool_result_may_end_run")
             .and_then(Value::as_bool)

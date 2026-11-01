@@ -66,8 +66,24 @@ pub fn scoped_tool_key(tool_name: &str, invocation_type: Option<&str>) -> String
     }
 }
 
+/// Prefix of the key a deferred top-level function tool's decisions are recorded under. Mirrors
+/// Python's `deferred_top_level:<name>` approval key.
+const DEFERRED_TOP_LEVEL_PREFIX: &str = "deferred_top_level:";
+
 /// [`scoped_tool_key`] for the tool call an approval item stands for.
+///
+/// A deferred top-level tool is called under a namespace equal to its own name. Its decisions
+/// are recorded under their own key, so approving it permanently never authorizes a visible tool
+/// that has the same bare name.
 pub fn approval_tool_key(tool_name: &str, call: &crate::items::FunctionCall) -> String {
+    let namespace = call
+        .extra
+        .get("namespace")
+        .and_then(Value::as_str)
+        .filter(|ns| !ns.is_empty());
+    if namespace == Some(tool_name) {
+        return format!("{DEFERRED_TOP_LEVEL_PREFIX}{tool_name}");
+    }
     scoped_tool_key(tool_name, call.extra.get("type").and_then(Value::as_str))
 }
 
@@ -307,13 +323,14 @@ impl ApprovalsState {
         message: Option<String>,
     ) -> crate::Result<()> {
         let Some(request) = hosted_request(item) else {
-            let rec = self
-                .0
-                .entry(approval_key(
-                    &item.agent,
-                    &approval_tool_key(&item.tool_name, &item.raw_item),
-                ))
-                .or_default();
+            let key = approval_tool_key(&item.tool_name, &item.raw_item);
+            // A per-call decision about a deferred top-level tool also answers a query by its
+            // bare name; a permanent one stays under the deferred key.
+            if !always && let Some(bare) = key.strip_prefix(DEFERRED_TOP_LEVEL_PREFIX) {
+                let rec = self.0.entry(approval_key(&item.agent, bare)).or_default();
+                apply_decision(rec, item.call_id(), false, approve, message.clone());
+            }
+            let rec = self.0.entry(approval_key(&item.agent, &key)).or_default();
             apply_decision(rec, item.call_id(), always, approve, message);
             return Ok(());
         };
@@ -402,10 +419,18 @@ impl ApprovalsState {
                 rejection_message: record_rejection_message(rec, call_id),
             };
         }
-        let legacy = lookup_names(tool_name).find_map(|name| {
-            self.0
-                .get(&approval_key("", name))
-                .filter(|rec| per_call_status(rec, call_id).is_some())
+        // A per-call decision recorded about a deferred top-level tool before it had its own key
+        // sits under the bare name; it still answers for its own call, never as a sticky grant.
+        let bare_per_call = tool_name
+            .strip_prefix(DEFERRED_TOP_LEVEL_PREFIX)
+            .and_then(|bare| self.0.get(&approval_key(agent, bare)))
+            .filter(|rec| per_call_status(rec, call_id).is_some());
+        let legacy = bare_per_call.or_else(|| {
+            lookup_names(tool_name).find_map(|name| {
+                self.0
+                    .get(&approval_key("", name))
+                    .filter(|rec| per_call_status(rec, call_id).is_some())
+            })
         });
         let Some(rec) = legacy else {
             return ApprovalStatus::default();

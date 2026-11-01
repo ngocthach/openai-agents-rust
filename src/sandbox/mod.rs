@@ -76,6 +76,7 @@ pub mod runtime;
 pub mod runtime_helpers;
 pub mod sandboxes;
 pub mod session;
+pub mod session_lifecycle;
 pub mod snapshot;
 pub mod state;
 pub mod testing;
@@ -140,6 +141,10 @@ pub use session::{
     clear_workspace_root_on_resume, compute_and_cache_snapshot_fingerprint,
     live_workspace_matches_snapshot_on_resume, parse_snapshot_fingerprint_record,
     read_cached_snapshot_fingerprint, snapshot_fingerprint_cache_path,
+};
+pub use session_lifecycle::{
+    PreStopHook, SandboxSessionLifecycle, aclose_session, pre_stop_hooks_failed,
+    register_pre_stop_hook, run_pre_stop_hooks,
 };
 pub use snapshot::{
     LocalSnapshot, NoopSnapshot, RemoteSnapshot, RemoteSnapshotClient, Snapshot, SnapshotSpec,

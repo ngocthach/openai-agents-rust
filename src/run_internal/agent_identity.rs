@@ -161,6 +161,44 @@ pub(crate) fn identity_key<C>(start: &Arc<Agent<C>>, agent: &Arc<Agent<C>>) -> S
         .unwrap_or_else(|| agent.name.clone())
 }
 
+/// The agent name behind every identity key of the graph rooted at `start`.
+pub(crate) fn names_by_identity_key<C>(
+    start: &Arc<Agent<C>>,
+) -> std::collections::BTreeMap<String, String> {
+    build_agent_identity_map(start)
+        .into_iter()
+        .map(|(key, agent)| (key, agent.name.clone()))
+        .collect()
+}
+
+/// Identity keys of agents that cannot be told apart from a same-named sibling: they share a
+/// name and an identical configuration signature, so which of them holds a key depends only on
+/// traversal order. Decisions owned by them are never carried across a checkpoint. Port of
+/// `_get_ambiguous_agent_ids`.
+pub(crate) fn ambiguous_identity_keys<C>(
+    start: &Arc<Agent<C>>,
+) -> std::collections::BTreeSet<String> {
+    let mut groups: HashMap<(String, bool, String), Vec<usize>> = HashMap::new();
+    let ordered = iter_agent_graph(start);
+    for agent in &ordered {
+        groups
+            .entry((
+                agent.name.clone(),
+                Arc::ptr_eq(agent, start),
+                agent_signature(agent),
+            ))
+            .or_default()
+            .push(Arc::as_ptr(agent) as usize);
+    }
+    let keys = identity_keys_by_ptr(start);
+    groups
+        .into_values()
+        .filter(|members| members.len() > 1)
+        .flatten()
+        .filter_map(|ptr| keys.get(&ptr).cloned())
+        .collect()
+}
+
 /// Identity keys by agent pointer.
 pub(crate) fn identity_keys_by_ptr<C>(start: &Arc<Agent<C>>) -> HashMap<usize, String> {
     build_agent_identity_map(start)

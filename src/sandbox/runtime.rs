@@ -315,12 +315,24 @@ impl SandboxSessionGuard {
     /// the caller supplied is only captured, never released, because the caller owns it.
     pub async fn suspend(self) -> Result<SandboxSessionState> {
         let session = self.session.clone();
-        let persisted = persist_session_snapshot(session.as_ref()).await;
+        // A session the guard owns runs its pre-stop hooks before anything is captured; a
+        // failing hook means the workspace is not captured at all.
+        let hooks = if self.client.is_some() {
+            crate::sandbox::session_lifecycle::run_pre_stop_hooks(&session).await
+        } else {
+            Ok(())
+        };
+        let persisted = if hooks.is_err() {
+            Ok(())
+        } else {
+            persist_session_snapshot(session.as_ref()).await
+        };
         // The state is read after the capture, so it names the snapshot just taken, and before
         // the release, because deleting the session invalidates what it reports.
         let state = session.session_state();
         // Capturing happened above; the release must not capture a second time.
         let released = self.release(false).await;
+        hooks?;
         persisted?;
         released?;
         Ok(state)
@@ -334,15 +346,35 @@ impl SandboxSessionGuard {
             match self.client {
                 None => Ok(()),
                 Some(client) => {
+                    use crate::sandbox::session_lifecycle as lifecycle;
+                    let manifest = self.session.manifest().clone();
+                    // Pre-stop hooks run first; a hook that failed (now or earlier) means the
+                    // workspace is not captured, but the session is still released.
+                    let hooks = lifecycle::run_pre_stop_hooks(&self.session).await;
+                    let hooks_failed =
+                        hooks.is_err() || lifecycle::pre_stop_hooks_failed(&self.session);
                     // A session with a snapshot configured is captured before it is released,
                     // and released even when the capture fails; the failure is reported after.
-                    let persisted = if persist {
+                    let persisted = if persist && !hooks_failed {
                         persist_session_snapshot(self.session.as_ref()).await
                     } else {
                         Ok(())
                     };
-                    client.delete(self.session).await?;
-                    Ok(persisted?)
+                    let session = self.session.clone();
+                    let deleted = client.delete(self.session).await;
+                    lifecycle::close_dependencies(&session).await;
+                    hooks?;
+                    deleted.map_err(|error| {
+                        crate::sandbox::sandboxes::docker::redact_for_protected_mounts(
+                            &manifest, error,
+                        )
+                    })?;
+                    persisted.map_err(|error| {
+                        crate::sandbox::sandboxes::docker::redact_for_protected_mounts(
+                            &manifest, error,
+                        )
+                    })?;
+                    Ok(())
                 }
             }
         };
@@ -450,8 +482,8 @@ pub struct SandboxRunOutcome<C> {
     /// Session state for the other agents' sessions, in
     /// [`SandboxSessionMode::PerAgent`] mode.
     ///
-    /// Mirrors Python's `sessions_by_agent`. Rust rejects duplicate agent names in a graph, so
-    /// the agent name is the resume key and Python's key-disambiguation machinery is not needed.
+    /// Mirrors Python's `sessions_by_agent`. The key is the agent's name, or `name#2`, `name#3`,
+    /// ... for further agents that share it.
     pub sandbox_states_by_agent: std::collections::BTreeMap<String, SandboxSessionState>,
     /// The memory generation manager of the session, when the run did not flush it.
     ///
@@ -821,7 +853,12 @@ impl SandboxRunner {
 
         // Record the run as a memory rollout segment, whether it finished or paused.
         let memory = match &result {
-            Ok(result) => active_memory_manager(&prepared, agent.name(), &result.last_agent.name),
+            Ok(result) => active_memory_manager(
+                &prepared,
+                agent.name(),
+                &result.last_agent.name,
+                Some(&result.last_agent),
+            ),
             Err(_) => prepared.memory_manager.clone(),
         };
         if let (Some(manager), Ok(result)) = (&memory, &result)
@@ -953,8 +990,12 @@ impl SandboxRunner {
                 let Some(prepared) = prepared_slot.lock().expect("poisoned").take() else {
                     return;
                 };
-                let memory_manager =
-                    active_memory_manager(&prepared, &starting_name, &completion.last_agent_name);
+                let memory_manager = active_memory_manager(
+                    &prepared,
+                    &starting_name,
+                    &completion.last_agent_name,
+                    None,
+                );
                 let PreparedRest {
                     agent_guards,
                     rollout_id,
@@ -1556,14 +1597,19 @@ fn active_memory_manager<C: Send + Sync + 'static>(
     prepared: &PreparedRest<C>,
     starting_name: &str,
     last_agent_name: &str,
+    last_agent: Option<&Arc<crate::Agent<C>>>,
 ) -> Option<Arc<SandboxMemoryGenerationManager>> {
-    if last_agent_name == starting_name {
+    // Two agents may share a name, so the active agent is found by identity when it is known.
+    let key = last_agent
+        .and_then(|agent| prepared.graph.key_for_prepared(agent))
+        .unwrap_or(last_agent_name);
+    if key == starting_name {
         return prepared.memory_manager.clone();
     }
     match prepared
         .graph
         .agents_by_name()
-        .get(last_agent_name)
+        .get(key)
         .map(|active| active.memory_capability().map(|m| m.build_manager()))
     {
         Some(Some(Ok(manager))) => manager,
@@ -1591,7 +1637,7 @@ fn install_per_turn_preparation<C: Send + Sync + 'static>(
         let graph = graph.clone();
         let existing = existing.clone();
         Box::pin(async move {
-            let agent_name = data.agent.name.clone();
+            let current_agent = data.agent.clone();
             let model_data = match existing {
                 None => data.model_data,
                 Some(filter) => {
@@ -1606,7 +1652,7 @@ fn install_per_turn_preparation<C: Send + Sync + 'static>(
             // The graph exists once the sandbox has been prepared, which happens before the
             // first model call.
             let input = match graph.get() {
-                Some(graph) => graph.process_context(&agent_name, model_data.input),
+                Some(graph) => graph.process_context_for_agent(&current_agent, model_data.input),
                 None => model_data.input,
             };
             Ok(ModelInputData {

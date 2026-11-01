@@ -34,7 +34,7 @@ fn strip_internal_metadata(mut item: Value) -> Value {
 
 /// A stable content fingerprint. `serde_json` writes object keys in insertion order for a
 /// `Map`, so the payload is re-serialized through a sorted intermediate first.
-fn fingerprint(item: &Value, ignore_ids: bool) -> Option<String> {
+pub(crate) fn fingerprint(item: &Value, ignore_ids: bool) -> Option<String> {
     let mut payload = strip_internal_metadata(item.clone());
     if ignore_ids && let Value::Object(m) = &mut payload {
         m.remove("id");
@@ -391,6 +391,33 @@ mod tests {
         let a = json!({"b": 1, "a": 2});
         let b = json!({"a": 2, "b": 1});
         assert_eq!(canonical_json(&a), canonical_json(&b));
+    }
+
+    #[test]
+    fn a_fingerprint_can_ignore_the_item_id() {
+        let item = json!({"id": "id-1", "type": "message", "role": "user", "content": "hi"});
+        let with_id = fingerprint(&item, false).unwrap();
+        let without_id = fingerprint(&item, true).unwrap();
+        assert!(with_id.contains("\"id\""));
+        assert!(!without_id.contains("\"id\""));
+    }
+
+    #[test]
+    fn a_fingerprint_ignores_internal_tool_call_metadata() {
+        let base = json!({
+            "type": "function_call", "call_id": "call_123", "name": "lookup_account",
+            "arguments": "{}"
+        });
+        let mut with_metadata = base.clone();
+        with_metadata["_agents_tool_description"] = json!("Lookup customer records.");
+        with_metadata["_agents_tool_title"] = json!("Lookup Account");
+        assert_eq!(
+            fingerprint(&base, false).unwrap(),
+            fingerprint(&with_metadata, false).unwrap()
+        );
+        let stripped = strip_internal_metadata(with_metadata);
+        assert!(stripped.get("_agents_tool_description").is_none());
+        assert!(stripped.get("_agents_tool_title").is_none());
     }
 
     #[test]

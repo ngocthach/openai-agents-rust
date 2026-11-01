@@ -27,6 +27,12 @@ use crate::tracing::{SpanData, create_span, scope};
 pub(crate) struct ToolEnv<'a, C> {
     pub ctx: &'a RunContext<C>,
     pub agent: &'a Arc<Agent<C>>,
+    /// The agent's identity key: its name, or `name#N` when several agents of the graph share
+    /// it. Approval decisions are owned by this key.
+    pub agent_key: &'a str,
+    /// Decisions recorded under the bare agent name also apply to a same-named agent whose
+    /// key differs (a pre-1.7 snapshot named owners by name only).
+    pub name_owner_fallback: bool,
     pub hooks: Option<&'a Arc<dyn RunHooks<C>>>,
     pub config: &'a Arc<RunConfig<C>>,
     /// Call ids whose restored approval decision authorizes nothing; see
@@ -354,9 +360,15 @@ pub(crate) async fn execute_function_tool<C: Send + Sync + 'static>(
         if env.unbound_approvals.contains(&call.call_id) {
             return None;
         }
-        env.ctx
-            .function_tool_status(&env.agent.name, &approval_key, &call.call_id)
-            .approved
+        let mut status = env
+            .ctx
+            .function_tool_status(env.agent_key, &approval_key, &call.call_id);
+        if status.approved.is_none() && env.name_owner_fallback && env.agent_key != env.agent.name {
+            status = env
+                .ctx
+                .function_tool_status(&env.agent.name, &approval_key, &call.call_id);
+        }
+        status.approved
     };
     // A recorded decision wins: the policy runs only for an undecided call, so a resumed call
     // never re-runs it and a rejection holds whatever the policy would say. A decision recorded
@@ -390,7 +402,7 @@ pub(crate) async fn execute_function_tool<C: Send + Sync + 'static>(
         match status {
             None => {
                 let item = ToolApprovalItem {
-                    agent: env.agent.name.clone(),
+                    agent: env.agent_key.to_string(),
                     raw_item: call.clone(),
                     tool_name: approval_name.clone(),
                     tool_origin: Some(tool.tool_origin()),
@@ -402,20 +414,24 @@ pub(crate) async fn execute_function_tool<C: Send + Sync + 'static>(
                 ));
             }
             Some(false) => {
-                let message = env
-                    .ctx
-                    .function_tool_status(&env.agent.name, &approval_key, &call.call_id)
-                    .rejection_message
-                    .unwrap_or_else(|| {
-                        format_tool_error(
-                            env.config,
-                            env.ctx,
-                            ToolErrorKind::ApprovalRejected,
-                            &tool.name,
-                            &call.call_id,
-                            DEFAULT_APPROVAL_REJECTION_MESSAGE.to_string(),
-                        )
-                    });
+                let mut decided =
+                    env.ctx
+                        .function_tool_status(env.agent_key, &approval_key, &call.call_id);
+                if decided.approved.is_none() && env.name_owner_fallback {
+                    decided =
+                        env.ctx
+                            .function_tool_status(&env.agent.name, &approval_key, &call.call_id);
+                }
+                let message = decided.rejection_message.unwrap_or_else(|| {
+                    format_tool_error(
+                        env.config,
+                        env.ctx,
+                        ToolErrorKind::ApprovalRejected,
+                        &tool.name,
+                        &call.call_id,
+                        DEFAULT_APPROVAL_REJECTION_MESSAGE.to_string(),
+                    )
+                });
                 let span = create_span(
                     SpanData::Function {
                         name: tool.qualified_name(),

@@ -159,7 +159,7 @@ async fn approval_gate<C: Send + Sync + 'static>(
     needs_approval: impl std::future::Future<Output = bool>,
     on_approval: Option<&OnApprovalFn<C>>,
 ) -> Result<Gate> {
-    let agent = &env.agent.name;
+    let agent = &env.agent_key.to_string();
     let call_id = call.call_id.clone();
     // Sticky decisions are scoped by how the tool was invoked, so a native `apply_patch_call`
     // approval never approves a custom tool of the same name.

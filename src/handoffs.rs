@@ -15,7 +15,7 @@ use crate::models::interface::FunctionToolSpec;
 use crate::run_context::RunContext;
 use crate::strict_schema::ensure_strict_json_schema;
 use crate::tool::{IsEnabled, ToolErrorFn};
-use crate::util::{BoxFuture, transform_string_function_style};
+use crate::util::{BoxFuture, transform_string_function_style_with};
 
 /// Data passed to a handoff input filter.
 #[derive(Debug, Clone, PartialEq)]
@@ -174,7 +174,8 @@ impl<C> fmt::Debug for Handoff<C> {
 
 /// Default tool name for a handoff to `agent_name`.
 pub fn default_tool_name(agent_name: &str) -> String {
-    transform_string_function_style(&format!("transfer_to_{agent_name}"))
+    // Whitespace alone is a normal way to name an agent, so only other invalid characters warn.
+    transform_string_function_style_with(&format!("transfer_to_{agent_name}"), false)
 }
 
 /// Default tool description for a handoff.

@@ -321,8 +321,10 @@ impl<C: Send + Sync + 'static> SandboxAgent<C> {
     /// That keeps every node reachable for resume without creating a reference cycle that would
     /// leak the prepared agents and the sandbox session with them.
     ///
-    /// Agent names must still be unique across the graph, because a resumed run has only the
-    /// name to go on.
+    /// Agents may share a name. The first agent of a name is keyed by it and the others as
+    /// `name#2`, `name#3`, ... (skipping any key another agent's literal name already uses), so
+    /// every map and per-agent session of the graph is keyed by these identity keys, which are
+    /// plain names whenever names are unique.
     pub async fn prepare_graph(
         &self,
         binding: &CapabilityBinding,
@@ -334,10 +336,9 @@ impl<C: Send + Sync + 'static> SandboxAgent<C> {
     /// One agent of this agent's sandbox handoff graph, by name.
     pub fn graph_agent(&self, name: &str) -> Option<Arc<SandboxAgent<C>>> {
         let root = Arc::new(self.clone());
-        let mut nodes: HashMap<String, GraphNode<C>> = HashMap::new();
-        let mut order: Vec<String> = Vec::new();
-        collect_graph(&root, &mut nodes, &mut order).ok()?;
-        nodes.remove(name).map(|node| node.agent)
+        let mut walk = GraphWalk::new(&root);
+        collect_graph(&root, &mut walk).ok()?;
+        walk.nodes.remove(name).map(|node| node.agent)
     }
 
     /// The names of every agent in this agent's sandbox handoff graph, in post order.
@@ -346,10 +347,9 @@ impl<C: Send + Sync + 'static> SandboxAgent<C> {
     /// sessions, which is why this is separate from preparation.
     pub fn graph_agent_names(&self) -> Result<Vec<String>> {
         let root = Arc::new(self.clone());
-        let mut nodes: HashMap<String, GraphNode<C>> = HashMap::new();
-        let mut order: Vec<String> = Vec::new();
-        collect_graph(&root, &mut nodes, &mut order)?;
-        Ok(order)
+        let mut walk = GraphWalk::new(&root);
+        collect_graph(&root, &mut walk)?;
+        Ok(walk.order)
     }
 
     /// Prepare the graph, binding each named agent to its own session.
@@ -363,9 +363,11 @@ impl<C: Send + Sync + 'static> SandboxAgent<C> {
         by_name: &HashMap<String, CapabilityBinding>,
     ) -> Result<PreparedSandboxGraph<C>> {
         let root = Arc::new(self.clone());
-        let mut nodes: HashMap<String, GraphNode<C>> = HashMap::new();
-        let mut order: Vec<String> = Vec::new();
-        collect_graph(&root, &mut nodes, &mut order)?;
+        let mut walk = GraphWalk::new(&root);
+        collect_graph(&root, &mut walk)?;
+        let GraphWalk {
+            nodes, order, keys, ..
+        } = walk;
 
         // Named targets are the cycle-closing edges: resolve them now that every node is known.
         for node in nodes.values() {
@@ -396,8 +398,9 @@ impl<C: Send + Sync + 'static> SandboxAgent<C> {
             let node = &nodes[name];
             let mut handoffs: Vec<Handoff<C>> = Vec::new();
             for (index, target) in node.agent.sandbox_handoffs.iter().enumerate() {
+                let target_key = target_key(target, &keys);
                 let handoff = if node.owned_edges.contains(&index) {
-                    let agent = prepared.get(target.name()).cloned().ok_or_else(|| {
+                    let agent = prepared.get(&target_key).cloned().ok_or_else(|| {
                         AgentsError::other(format!(
                             "sandbox handoff target `{}` was not prepared",
                             target.name()
@@ -405,12 +408,12 @@ impl<C: Send + Sync + 'static> SandboxAgent<C> {
                     })?;
                     Handoff::new(agent)
                 } else {
-                    weak_sandbox_handoff(target, cells[target.name()].clone())
+                    weak_sandbox_handoff(target, cells[&target_key].clone())
                 };
                 // A named back-edge carries no agent of its own, so the description comes from
                 // the node it points at.
                 let described = nodes
-                    .get(target.name())
+                    .get(&target_key)
                     .and_then(|n| n.agent.agent.handoff_description.clone());
                 handoffs.push(describe_handoff(handoff, target, described.as_deref()));
             }
@@ -436,8 +439,13 @@ impl<C: Send + Sync + 'static> SandboxAgent<C> {
             .get(self.name())
             .cloned()
             .ok_or_else(|| AgentsError::other("sandbox starting agent was not prepared"))?;
+        let keys_by_prepared_ptr = prepared
+            .iter()
+            .map(|(key, agent)| (Arc::as_ptr(agent) as usize, key.clone()))
+            .collect();
         Ok(PreparedSandboxGraph {
             starting_agent,
+            keys_by_prepared_ptr,
             agents_by_name: nodes
                 .into_iter()
                 .map(|(name, node)| (name, node.agent))
@@ -582,6 +590,9 @@ pub struct PreparedSandboxGraph<C> {
     /// Strong references to every prepared agent, so a node reachable only through a
     /// cycle-closing edge stays alive for as long as the graph does.
     prepared_by_name: HashMap<String, Arc<Agent<C>>>,
+    /// Identity key of each prepared agent, by pointer, so two agents sharing a name resolve to
+    /// their own capability sets.
+    keys_by_prepared_ptr: HashMap<usize, String>,
 }
 
 impl<C> fmt::Debug for PreparedSandboxGraph<C> {
@@ -601,6 +612,7 @@ impl<C> Clone for PreparedSandboxGraph<C> {
             starting_agent: self.starting_agent.clone(),
             agents_by_name: self.agents_by_name.clone(),
             prepared_by_name: self.prepared_by_name.clone(),
+            keys_by_prepared_ptr: self.keys_by_prepared_ptr.clone(),
         }
     }
 }
@@ -611,12 +623,13 @@ impl<C: Send + Sync + 'static> PreparedSandboxGraph<C> {
         &self.starting_agent
     }
 
-    /// The sandbox agents in the graph, keyed by name.
+    /// The sandbox agents in the graph, keyed by identity key (the name, or `name#N` for a
+    /// further agent sharing it).
     pub fn agents_by_name(&self) -> &HashMap<String, Arc<SandboxAgent<C>>> {
         &self.agents_by_name
     }
 
-    /// The prepared agents in the graph, keyed by name.
+    /// The prepared agents in the graph, keyed by identity key.
     pub fn prepared_by_name(&self) -> &HashMap<String, Arc<Agent<C>>> {
         &self.prepared_by_name
     }
@@ -630,6 +643,30 @@ impl<C: Send + Sync + 'static> PreparedSandboxGraph<C> {
             Some(agent) => agent.prepare_input(input),
         }
     }
+
+    /// [`process_context`](Self::process_context) for the prepared agent about to be called.
+    /// The agent is found by identity, so two agents sharing a name each apply their own
+    /// capabilities; an agent that is not one of the graph's falls back to its name.
+    pub fn process_context_for_agent(
+        &self,
+        agent: &Arc<Agent<C>>,
+        input: Vec<InputItem>,
+    ) -> Vec<InputItem> {
+        match self
+            .keys_by_prepared_ptr
+            .get(&(Arc::as_ptr(agent) as usize))
+        {
+            Some(key) => self.process_context(key, input),
+            None => self.process_context(&agent.name, input),
+        }
+    }
+
+    /// The identity key of a prepared agent of this graph.
+    pub fn key_for_prepared(&self, agent: &Arc<Agent<C>>) -> Option<&str> {
+        self.keys_by_prepared_ptr
+            .get(&(Arc::as_ptr(agent) as usize))
+            .map(String::as_str)
+    }
 }
 
 /// One node of the sandbox handoff graph, with its handoff edges classified.
@@ -639,30 +676,163 @@ struct GraphNode<C> {
     owned_edges: BTreeSet<usize>,
 }
 
+/// Agents sharing one name, with their position in reach order.
+type NameGroup<'a, C> = (&'a str, Vec<(usize, &'a Arc<SandboxAgent<C>>)>);
+
+/// The state of one walk over the sandbox handoff graph.
+struct GraphWalk<C> {
+    /// Nodes by identity key.
+    nodes: HashMap<String, GraphNode<C>>,
+    /// Identity keys in the post-order of the spanning tree.
+    order: Vec<String>,
+    /// Identity key of each agent, by pointer, decided before the walk.
+    keys: HashMap<usize, String>,
+    /// Keys of the agents the walk has reached so far.
+    visited: BTreeSet<usize>,
+}
+
+/// A deterministic description of a sandbox agent's configuration, used only to rank agents
+/// that share a name. The text does not depend on where the agent sits in the graph.
+fn sandbox_agent_signature<C: Send + Sync + 'static>(agent: &SandboxAgent<C>) -> String {
+    let mut capabilities: Vec<&str> = agent
+        .capabilities
+        .iter()
+        .map(|capability| capability.capability_type())
+        .collect();
+    capabilities.sort_unstable();
+    let mut handoffs: Vec<&str> = agent
+        .sandbox_handoffs
+        .iter()
+        .map(SandboxHandoffTarget::name)
+        .collect();
+    handoffs.sort_unstable();
+    let instructions = match &agent.agent.instructions {
+        None => Value::Null,
+        Some(Instructions::Static(text)) => Value::String(text.clone()),
+        Some(Instructions::Dynamic(_)) => serde_json::json!({"callable": "instructions"}),
+    };
+    let manifest: Vec<String> = agent
+        .default_manifest
+        .as_ref()
+        .map(|manifest| {
+            manifest
+                .entries()
+                .iter()
+                .map(|(name, entry)| format!("{name}={entry:?}"))
+                .collect()
+        })
+        .unwrap_or_default();
+    serde_json::json!({
+        "base_instructions": agent.base_instructions,
+        "capabilities": capabilities,
+        "handoffs": handoffs,
+        "instructions": instructions,
+        "manifest": manifest,
+        "run_as": agent.run_as.as_ref().map(|user| user.name.clone()),
+    })
+    .to_string()
+}
+
+impl<C: Send + Sync + 'static> GraphWalk<C> {
+    /// Decide every agent's identity key before the walk. The first agent of a name keeps it
+    /// (the root always, otherwise the one whose configuration signature ranks first, then the
+    /// earliest reached), and the rest get `name#2`, `name#3`, ... skipping any key another
+    /// agent's literal name already uses. The keys therefore do not depend on the order the
+    /// handoffs were declared in.
+    fn new(root: &Arc<SandboxAgent<C>>) -> Self {
+        let mut ordered: Vec<Arc<SandboxAgent<C>>> = Vec::new();
+        let mut seen = BTreeSet::new();
+        let mut queue = std::collections::VecDeque::from([root.clone()]);
+        while let Some(agent) = queue.pop_front() {
+            if !seen.insert(Arc::as_ptr(&agent) as usize) {
+                continue;
+            }
+            queue.extend(
+                agent
+                    .sandbox_handoffs
+                    .iter()
+                    .filter_map(|target| target.agent().cloned()),
+            );
+            ordered.push(agent);
+        }
+        let literal_names: BTreeSet<&str> = ordered.iter().map(|a| a.name()).collect();
+        let mut groups: Vec<NameGroup<'_, C>> = Vec::new();
+        for (index, agent) in ordered.iter().enumerate() {
+            match groups.iter_mut().find(|(name, _)| *name == agent.name()) {
+                Some((_, group)) => group.push((index, agent)),
+                None => groups.push((agent.name(), vec![(index, agent)])),
+            }
+        }
+        let mut keys = HashMap::new();
+        let mut used: BTreeSet<String> = BTreeSet::new();
+        for (name, mut group) in groups {
+            group.sort_by_cached_key(|(index, agent)| {
+                (
+                    u8::from(!Arc::ptr_eq(agent, root)),
+                    sandbox_agent_signature(agent),
+                    *index,
+                )
+            });
+            let mut members = group.into_iter();
+            if let Some((_, base)) = members.next() {
+                used.insert(name.to_string());
+                keys.insert(Arc::as_ptr(base) as usize, name.to_string());
+            }
+            let mut next = 2usize;
+            for (_, duplicate) in members {
+                let mut candidate = format!("{name}#{next}");
+                while used.contains(&candidate) || literal_names.contains(candidate.as_str()) {
+                    next += 1;
+                    candidate = format!("{name}#{next}");
+                }
+                used.insert(candidate.clone());
+                keys.insert(Arc::as_ptr(duplicate) as usize, candidate);
+                next += 1;
+            }
+        }
+        GraphWalk {
+            nodes: HashMap::new(),
+            order: Vec::new(),
+            keys,
+            visited: BTreeSet::new(),
+        }
+    }
+}
+
+/// The identity key a handoff edge points at: its agent's own key, or the name a named
+/// (cycle-closing) target refers to.
+fn target_key<C: Send + Sync + 'static>(
+    target: &SandboxHandoffTarget<C>,
+    keys: &HashMap<usize, String>,
+) -> String {
+    target
+        .agent()
+        .and_then(|agent| keys.get(&(Arc::as_ptr(agent) as usize)).cloned())
+        .unwrap_or_else(|| target.name().to_string())
+}
+
 /// Walk the sandbox handoff graph depth-first, classifying each edge and producing the
 /// post-order of the spanning tree.
 ///
 /// The first edge to reach a node owns it; an edge to a node already on the stack (a cycle) or
-/// already discovered elsewhere resolves lazily instead.
+/// already discovered elsewhere resolves lazily instead. Agents are told apart by identity, so
+/// two agents may share a name.
 fn collect_graph<C: Send + Sync + 'static>(
     node: &Arc<SandboxAgent<C>>,
-    nodes: &mut HashMap<String, GraphNode<C>>,
-    order: &mut Vec<String>,
+    walk: &mut GraphWalk<C>,
 ) -> Result<()> {
-    let name = node.name().to_string();
-    match nodes.get(&name) {
-        Some(existing) if Arc::ptr_eq(&existing.agent, node) => return Ok(()),
-        Some(_) => {
-            return Err(AgentsError::user(format!(
-                "Sandbox handoff graph contains two agents named `{name}`; agent names must be \
-                 unique so a paused run can resume the right agent"
-            )));
-        }
-        None => {}
-    }
+    let ptr = Arc::as_ptr(node) as usize;
     // Register before recursing so a cycle back to this node is seen as already discovered.
-    nodes.insert(
-        name.clone(),
+    if !walk.visited.insert(ptr) {
+        return Ok(());
+    }
+    let key = walk
+        .keys
+        .get(&ptr)
+        .cloned()
+        .ok_or_else(|| AgentsError::other("sandbox agent has no identity key"))?;
+    walk.nodes.insert(
+        key.clone(),
         GraphNode {
             agent: node.clone(),
             owned_edges: BTreeSet::new(),
@@ -674,16 +844,16 @@ fn collect_graph<C: Send + Sync + 'static>(
             // A named target is resolved after the whole graph is known.
             continue;
         };
-        let first_visit = !nodes.contains_key(agent.name());
-        collect_graph(agent, nodes, order)?;
+        let first_visit = !walk.visited.contains(&(Arc::as_ptr(agent) as usize));
+        collect_graph(agent, walk)?;
         if first_visit {
             owned_edges.insert(index);
         }
     }
-    if let Some(entry) = nodes.get_mut(&name) {
+    if let Some(entry) = walk.nodes.get_mut(&key) {
         entry.owned_edges = owned_edges;
     }
-    order.push(name);
+    walk.order.push(key);
     Ok(())
 }
 

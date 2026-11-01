@@ -49,6 +49,32 @@ impl fmt::Debug for AgentOutputSchema {
     }
 }
 
+/// Drop the module path from every segment of a type name, so
+/// `alloc::vec::Vec<alloc::string::String>` reads `Vec<String>`.
+fn short_type_name(full: &str) -> String {
+    let mut out = String::new();
+    let mut segment = String::new();
+    let mut chars = full.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == ':' && chars.peek() == Some(&':') {
+            chars.next();
+            segment.clear();
+        } else if c.is_alphanumeric() || c == '_' {
+            segment.push(c);
+        } else {
+            out.push_str(&segment);
+            segment.clear();
+            out.push(c);
+        }
+    }
+    out.push_str(&segment);
+    if out.is_empty() {
+        "Output".to_string()
+    } else {
+        out
+    }
+}
+
 impl AgentOutputSchema {
     /// Build a strict output schema for `T`.
     pub fn new<T: JsonSchema + DeserializeOwned + 'static>() -> Result<Self> {
@@ -60,11 +86,7 @@ impl AgentOutputSchema {
         strict: bool,
     ) -> Result<Self> {
         let raw = schemars::schema_for!(T).to_value();
-        let type_name = std::any::type_name::<T>()
-            .rsplit("::")
-            .next()
-            .unwrap_or("Output")
-            .to_string();
+        let type_name = short_type_name(std::any::type_name::<T>());
         let target = format!("output type {type_name}");
         let validator: Validator = Arc::new(move |s: &str| {
             let parsed: T = serde_json::from_str(s)

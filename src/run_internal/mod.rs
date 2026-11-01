@@ -243,6 +243,8 @@ struct RunLoop<C> {
     /// `RunContextWrapper._restored_unbound_approval_call_ids`; empty unless this run resumed
     /// a snapshot that is held to the binding rule.
     unbound_approvals: BTreeSet<String>,
+    /// A pre-1.7 snapshot named approval owners by name only; see `RunState`.
+    legacy_name_owner_fallback: bool,
     /// Call ids still awaiting a decision in the snapshot this run resumed. Within the resumed
     /// turn an undecided one stays pending without consulting its approval rule again.
     /// Mirrors `_function_requires_approval`'s `approval_items_by_call_id` short-circuit.
@@ -309,6 +311,14 @@ struct RunLoop<C> {
     exec_outputs_start: usize,
     /// A recoverable write decides its own completion notice's `has_local_tool_outputs`.
     notice_has_local: Option<bool>,
+    /// The session's completion notice while it runs on its own task. A run cancelled during it
+    /// waits for the notice, so a replacement that already started settles the write's record.
+    inflight_notice: Option<tokio::task::JoinHandle<Result<crate::usage::Usage>>>,
+    /// Shared with the checkpoints this run publishes: set while a pending write settles.
+    write_in_progress: crate::run_state::SessionWriteInProgress,
+    /// This run already left a checkpoint in the caller's slot before a Session append, so a
+    /// run that finishes must take it back.
+    published_checkpoint: bool,
     /// A recoverable write also reports its response to the session before its record is
     /// dropped (a handoff turn, whose compaction decision Python takes per save).
     inline_notice: bool,
@@ -1093,6 +1103,9 @@ pub(crate) async fn run_loop<C: Send + Sync + 'static>(
         withheld_call_ids: Vec::new(),
         exec_outputs_start: 0,
         notice_has_local: None,
+        inflight_notice: None,
+        write_in_progress: Default::default(),
+        published_checkpoint: false,
         inline_notice: false,
         partial_history_rejected: false,
         boundary_unproven: false,
@@ -1137,6 +1150,7 @@ pub(crate) async fn run_loop<C: Send + Sync + 'static>(
         trace_id: None,
         tool_invocations: BTreeMap::new(),
         unbound_approvals: BTreeSet::new(),
+        legacy_name_owner_fallback: false,
         resumed_pending_approvals: BTreeSet::new(),
         resumed_interruptions: Vec::new(),
         reasoning_item_id_policy: ReasoningItemIdPolicy::Preserve,
@@ -1657,6 +1671,7 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
             ));
         }
         self.pending_write = state.pending_session_write.clone();
+        self.write_in_progress = state.session_write_in_progress.clone();
         self.withheld_call_ids = state.withheld_output_call_ids.clone();
         self.boundary_unproven =
             state.current_response_boundary_unproven && !state.interruptions.is_empty();
@@ -1718,6 +1733,7 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
             ));
         }
         self.ctx.import_approvals(&state.approvals);
+        self.legacy_name_owner_fallback = state.legacy_name_owner_snapshot;
         self.ctx
             .import_nested_states(&state.nested_agent_tool_states);
         if restore_usage {
@@ -2105,7 +2121,16 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
         };
         self.dispose_computers().await;
         match outcome {
-            Ok(r) => Ok(r),
+            Ok(r) => {
+                // A checkpoint published ahead of a Session append is for a run that did not
+                // finish; this one did.
+                if self.published_checkpoint
+                    && let Some(slot) = &self.checkpoint
+                {
+                    slot.take();
+                }
+                Ok(r)
+            }
             Err(e) => {
                 // A tripped input guardrail still records the user's turn input in the
                 // session, never the model output. Port of
@@ -2114,6 +2139,14 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
                     && let Err(save_error) = self.persist_input_for_guardrail_trip().await
                 {
                     return Err(save_error);
+                }
+                // A run cancelled while the session was acknowledging its write waits for that
+                // notice: a replacement that committed settles the write, as Python's
+                // shielded compaction does, so a resume does not compact the history again.
+                if let Some(notice) = self.inflight_notice.take()
+                    && matches!(notice.await, Ok(Ok(_)))
+                {
+                    self.pending_write = None;
                 }
                 if let Some(slot) = &self.checkpoint {
                     slot.set(self.failure_checkpoint());
@@ -2803,6 +2836,8 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
             model_responses: self.model_responses.clone(),
             usage: self.ctx.usage(),
             approvals: self.ctx.export_approvals(),
+            agent_owner_names: agent_identity::names_by_identity_key(&self.starting_agent),
+            ambiguous_agent_owners: agent_identity::ambiguous_identity_keys(&self.starting_agent),
             nested_agent_tool_states: self.ctx.nested_states(),
             input_guardrail_results: self.input_guardrail_results.clone(),
             output_guardrail_results: self.output_guardrail_results.clone(),
@@ -2866,9 +2901,11 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
             context_requires_restoration: false,
             // A snapshot this loop builds is written at the current schema, with keyed identities.
             legacy_hook_identity_snapshot: false,
+            legacy_name_owner_snapshot: false,
             hook_identity_ambiguous: agent_identity::has_ambiguous_hook_identities(
                 &self.starting_agent,
             ),
+            session_write_in_progress: self.write_in_progress.clone(),
             tool_result_may_end_run: agent_identity::interruption_may_end_run(
                 &self.current_agent,
                 &interruptions,
@@ -3213,12 +3250,19 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
             omit_reasoning_item_ids,
         };
         // Compaction replaces a stored suffix, so a dropped caller must not leave the store
-        // half-rewritten. Port of `await_session_mutation`.
+        // half-rewritten. Port of `await_session_mutation`; the handle stays on the loop so a
+        // cancelled run can still wait for the notice and settle its pending write.
+        self.inflight_notice = Some(tokio::spawn(async move {
+            session.on_run_completed(&info).await
+        }));
+        let joined = self
+            .inflight_notice
+            .as_mut()
+            .expect("the notice was just spawned")
+            .await;
+        self.inflight_notice = None;
         let usage =
-            crate::memory::await_session_mutation(
-                async move { session.on_run_completed(&info).await },
-            )
-            .await?;
+            joined.map_err(|e| AgentsError::other(format!("session mutation failed: {e}")))??;
         if usage.requests > 0 || usage.total_tokens > 0 {
             self.ctx.add_usage(&usage);
         }
@@ -5349,6 +5393,9 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
         agent: &Arc<Agent<C>>,
         mut processed: ProcessedResponse<C>,
     ) -> Result<NextStep<C>> {
+        // Approval decisions belong to the agent's identity key, so same-named agents of one
+        // graph never share them.
+        let owner_key = agent_identity::identity_key(&self.starting_agent, agent);
         let mut snapshot = processed.snapshot();
         // A resumed call keeps the recipient it was made to, even when the tool it named is no
         // longer offered or is now offered by another server.
@@ -5386,9 +5433,12 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
         let mut guard_batch: Option<InputGuardrailBatch> = None;
         let error_selected = tools::Signal::new();
         let raced = {
+            let agent_key = agent_identity::identity_key(&self.starting_agent, agent);
             let env = ToolEnv {
                 ctx: &self.ctx,
                 agent,
+                agent_key: &agent_key,
+                name_owner_fallback: self.legacy_name_owner_fallback,
                 hooks: self.hooks.as_ref(),
                 config: &self.config,
                 unbound_approvals: &self.unbound_approvals,
@@ -5636,19 +5686,68 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
             let decision = match callback {
                 None if !bindable => None,
                 Some(cb) => {
-                    let r = cb(MCPToolApprovalRequest {
-                        ctx: self.ctx.clone(),
-                        data: request.clone(),
-                    })
-                    .await;
-                    Some((r.approve, r.reason))
+                    // A decision already on the context (recorded by an earlier answer to this
+                    // request, or by the caller) wins: the callback decides a request once.
+                    let stored =
+                        self.ctx
+                            .hosted_mcp_decision(&owner_key, &label, &tool_name, &request_id);
+                    // A restored decision that no ledger entry binds authorizes nothing.
+                    let stored_decision = stored
+                        .approved
+                        .filter(|_| !self.unbound_approvals.contains(&request_id));
+                    if let Some(approved) = stored_decision {
+                        Some((approved, stored.rejection_message))
+                    } else {
+                        // A callback that started without recording its answer is not run a
+                        // second time for the same request.
+                        if self.ctx.invocation_executed_uncommitted(&request_id) {
+                            return Err(AgentsError::model_behavior(
+                                "A Hosted MCP approval callback already ran, but its response \
+                                 was not committed. Start a new request instead of retrying the \
+                                 invocation.",
+                            ));
+                        }
+                        self.ctx.mark_invocation_executed(&request_id);
+                        let r = cb(MCPToolApprovalRequest {
+                            ctx: self.ctx.clone(),
+                            data: request.clone(),
+                        })
+                        .await;
+                        let mut extra = serde_json::Map::new();
+                        extra.insert("type".into(), Value::String("mcp_approval_request".into()));
+                        extra.insert("server_label".into(), Value::String(label.clone()));
+                        let decided = ToolApprovalItem {
+                            agent: owner_key.clone(),
+                            raw_item: FunctionCall {
+                                id: None,
+                                call_id: request_id.clone(),
+                                name: tool_name.clone(),
+                                arguments: request
+                                    .get("arguments")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("{}")
+                                    .to_string(),
+                                status: None,
+                                extra,
+                            },
+                            tool_name: identity.clone(),
+                            tool_origin: None,
+                        };
+                        if r.approve {
+                            self.ctx.approve_tool(&decided, false);
+                        } else {
+                            self.ctx.reject_tool(&decided, false, r.reason.clone());
+                        }
+                        self.ctx.mark_invocation_completed(&request_id);
+                        Some((r.approve, r.reason))
+                    }
                 }
                 // A restored decision without a ledger binding authorizes nothing.
                 None if self.unbound_approvals.contains(&request_id) => None,
                 None => {
                     let status =
                         self.ctx
-                            .hosted_mcp_decision(&agent.name, &label, &tool_name, &request_id);
+                            .hosted_mcp_decision(&owner_key, &label, &tool_name, &request_id);
                     status.approved.map(|a| (a, status.rejection_message))
                 }
             };
@@ -5676,7 +5775,7 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
                     extra.insert("type".into(), Value::String("mcp_approval_request".into()));
                     extra.insert("server_label".into(), Value::String(label));
                     let item = ToolApprovalItem {
-                        agent: agent.name.clone(),
+                        agent: owner_key.clone(),
                         raw_item: FunctionCall {
                             id: None,
                             call_id: request_id,
