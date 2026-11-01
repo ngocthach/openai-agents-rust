@@ -1,5 +1,48 @@
 # Changelog
 
+## 0.13.0 (2026-11-01)
+
+Closes the documented divergences from Python's run-state restore, failure formatters and sandbox resume. 51
+more parity cases are ported. Measured state: 12,641 Python test cases, 8,636 ported, 673 covered, 3,332
+Python-only, 0 not ported, 0 unaccounted. Notes by area: `plans/reports/py-test-parity-core10-*.md`. No live
+model call was made.
+
+Fixes and additions:
+
+- `RunState::from_json` skips, with a redacted warning, an item that has no type or agent, a handoff output
+  missing its source or target, a message without id, role or content, and any payload the typed model rejects;
+  restore also drops items whose agent is not in the graph. A resume whose parked call lost its tool (disabled
+  or removed) carries on: a call nothing waits on is dropped, an undecided approval stays pending, a rejected
+  one still answers the model, and an approved one still fails with `Tool X not found in agent Y`. Schema 1.12
+  snapshots replay a nested handoff's restored items twice, as Python does.
+- Failure and timeout formatters (`tool::ToolErrorFn`) are async and fallible: an `Err` ends the run with that
+  error, in the runner, streamed runs, handoff recovery, agent-as-tool, MCP and the realtime session. New
+  builders `with_failure_error_handler`, `with_timeout_error_handler`, `failure_error_handler` take a
+  `ToolErrorFn` built with `tool::tool_error_fn`, `try_tool_error_fn` or `async_tool_error_fn`; the closure
+  builders keep their shape. `Agent::model_settings_mut()` is the in-place settings write.
+- A paused sandbox run writes a `sandbox` section into its `RunState` (backend id, current agent key and name,
+  session state, per-agent sessions keyed by the identity keys), and a resumed run restores every agent's
+  session from it ahead of `SandboxRunConfig::session_state`; snapshots without the section resume as before.
+  Per-agent resume needs `SandboxSessionMode::PerAgent`. New API: `SandboxRunner::prepare_from_state`,
+  `SandboxStreamedRun::to_state`, `SandboxStreamedRun::sandbox_resume_state`.
+- Docker `shutdown` treats an already-removed container as removed, as Python's `delete` does.
+
+Breaking changes: `RunState` gains public fields (`nested_history_lineage_unknown`), so struct literals need
+`..Default::default()`; `from_json` no longer errors on unreadable items and a resume no longer errors on a lost
+tool that was never approved; `tool::ToolErrorFn` returns a future of `Result<String>` (code that built one with
+`Arc::new(closure)`, called one directly or passed a plain closure to
+`MCPToolPolicy::with_failure_error_function` must switch to the new constructors); `RunResult::to_state()`
+carries the `sandbox` section for a paused sandbox run that uses a client.
+
+Known gaps (real differences): the Docker removal service (about 190 cases) is a root host-side helper that is
+deliberately not part of this library; `HandoffInputFilter` and the run-level `tool_error_formatter` on
+`RunConfig` are still synchronous; Python writes the `sandbox` section after a completed run too, Rust only for
+a suspended one; for two same-named agents in a streamed run the section's current agent is the first of that
+name; a dynamic approval rule is still consulted for arguments that match the schema, because Rust cannot detect
+a custom `Deserialize`; assigning a field of the public `agent.model_settings` directly is untracked; docs.rs
+builds without the `mongodb` feature; the websocket crate logs handshake data at TRACE through the `log` crate;
+the Redis atomic replace has only run against a mock.
+
 ## 0.12.0 (2026-11-01)
 
 Third pass over the parity ledger's Python-only bucket plus the real feature gaps it exposed. The files whose

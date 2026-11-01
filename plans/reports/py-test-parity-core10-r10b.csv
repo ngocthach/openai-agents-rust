@@ -1,0 +1,5 @@
+path,moved_to_ported,moved_to_covered,remaining_python_only
+tests/test_handoff_failure_error_function.py,2,0,2
+tests/test_function_tool.py,1,0,23
+tests/test_run_config.py,6,0,10
+tests/test_native_tool_failure_history.py,0,0,34

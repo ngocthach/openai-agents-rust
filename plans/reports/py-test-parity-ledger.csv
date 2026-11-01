@@ -146,9 +146,9 @@ tests/sandbox/test_compatibility_guards.py,sandbox,pytest-collect,56,29,0,27,0,t
 tests/sandbox/test_dependencies.py,sandbox,pytest-collect,20,17,1,2,0,tests/py_sandbox_a_entries_1.rs,sandbox-a-entries:16,,0,20,0,0,22,cited,20
 tests/sandbox/test_docker.py,sandbox,round6-agent,143,119,1,23,0,tests/py_sandbox_a_docker_1.rs;tests/py_sandbox_a_docker_2.rs;tests/py_sandbox_a_docker_3.rs;tests/py_sandbox_a_docker_4.rs;tests/py_sandbox_a_docker_5.rs;tests/py_core6_modelsrt_docker_grants.rs,py-test-parity-core6-modelsrt.md,,0,108,0,0,86,cited,108
 tests/sandbox/test_docker_network_mode.py,sandbox,pytest-collect,20,9,10,1,0,tests/py_sandbox_a_docker_1.rs;tests/py_sandbox_b_compat.rs,sandbox-b:29,,0,20,0,0,27,cited,20
-tests/sandbox/test_docker_removal.py,sandbox,pytest-collect,74,0,0,74,0,,sandbox-a-docker:13,"whole-file python-only: report counted 35 (def basis), pytest collects 74; every case taken as python-only",0,74,0,0,0,no port claimed,35
+tests/sandbox/test_docker_removal.py,sandbox,pytest-collect,74,10,0,64,0,,sandbox-a-docker:13,"whole-file python-only: report counted 35 (def basis), pytest collects 74; every case taken as python-only",0,74,0,0,0,no port claimed,35
 tests/sandbox/test_docker_removal_client.py,sandbox,pytest-collect,14,0,0,14,0,,sandbox-a-docker:15,"whole-file python-only: report counted 4 (def basis), pytest collects 14; every case taken as python-only",0,14,0,0,0,no port claimed,4
-tests/sandbox/test_docker_removal_worker.py,sandbox,pytest-collect,60,0,0,60,0,,sandbox-a-docker:14,"whole-file python-only: report counted 23 (def basis), pytest collects 60; every case taken as python-only",0,60,0,0,0,no port claimed,23
+tests/sandbox/test_docker_removal_worker.py,sandbox,pytest-collect,60,2,0,58,0,,sandbox-a-docker:14,"whole-file python-only: report counted 23 (def basis), pytest collects 60; every case taken as python-only",0,60,0,0,0,no port claimed,23
 tests/sandbox/test_entries.py,sandbox,round6-agent,48,45,0,3,0,tests/py_sandbox_a_entries_4.rs,py-test-parity-core6-modelsrt.md,,0,39,0,0,33,cited,39
 tests/sandbox/test_errors.py,sandbox,pytest-collect,5,5,0,0,0,tests/py_sandbox_b_misc.rs,sandbox-b:30,,0,5,0,0,25,cited,5
 tests/sandbox/test_exposed_ports.py,sandbox,pytest-collect,6,6,0,0,0,tests/py_sandbox_b_misc.rs,sandbox-b:31,,0,6,0,0,25,cited,6
@@ -171,7 +171,7 @@ tests/sandbox/test_recursive_removal_compatibility.py,sandbox,pytest-collect,17,
 tests/sandbox/test_remote_mount_policy.py,sandbox,pytest-collect,4,4,0,0,0,tests/py_sandbox_b_misc.rs,sandbox-b:40,,0,4,0,0,25,cited,4
 tests/sandbox/test_retry.py,sandbox,pytest-collect,7,5,0,2,0,tests/py_sandbox_b_misc.rs,sandbox-b:41,,0,7,0,0,25,cited,7
 tests/sandbox/test_run_cwd.py,sandbox,pytest-collect,5,5,0,0,0,tests/py_sandbox_b_run_cwd.rs;tests/py_sandbox_b_skills.rs,sandbox-b:42,,0,5,0,0,36,cited,5
-tests/sandbox/test_runtime.py,sandbox,round6-agent,227,139,22,66,0,tests/py_sandbox_a_runtime_1.rs;tests/py_sandbox_a_runtime_2.rs;tests/py_sandbox_a_runtime_3.rs;tests/py_sandbox_a_runtime_4.rs;tests/py_sandbox_a_runtime_5.rs;tests/py_sandbox_a_runtime_6.rs;tests/py_sandbox_a_runtime_7.rs;tests/py_sandbox_a_runtime_tracing.rs;tests/py_sandbox_a_runtime_unix_local.rs;tests/py_sandbox_a_unix_local_3.rs;tests/py_core6_modelsrt_sandbox_limits.rs;tests/py_core6_modelsrt_sandbox_provider_defaults.rs,py-test-parity-core6-modelsrt.md,superseded: sandbox-a-runtime:12 (58/5/21/0),0,166,0,0,134,cited,165
+tests/sandbox/test_runtime.py,sandbox,round6-agent,227,151,22,54,0,tests/py_sandbox_a_runtime_1.rs;tests/py_sandbox_a_runtime_2.rs;tests/py_sandbox_a_runtime_3.rs;tests/py_sandbox_a_runtime_4.rs;tests/py_sandbox_a_runtime_5.rs;tests/py_sandbox_a_runtime_6.rs;tests/py_sandbox_a_runtime_7.rs;tests/py_sandbox_a_runtime_tracing.rs;tests/py_sandbox_a_runtime_unix_local.rs;tests/py_sandbox_a_unix_local_3.rs;tests/py_core6_modelsrt_sandbox_limits.rs;tests/py_core6_modelsrt_sandbox_provider_defaults.rs,py-test-parity-core6-modelsrt.md,superseded: sandbox-a-runtime:12 (58/5/21/0),0,166,0,0,134,cited,165
 tests/sandbox/test_runtime_agent_preparation.py,sandbox,pytest-collect,12,10,1,1,0,tests/py_sandbox_b_runtime.rs,sandbox-b:43,,0,12,0,0,6,cited,12
 tests/sandbox/test_runtime_helpers.py,sandbox,pytest-collect,8,8,0,0,0,tests/py_sandbox_b_runtime_helpers.rs,sandbox-b:44,,0,8,0,0,8,cited,8
 tests/sandbox/test_sandboxes_import.py,sandbox,pytest-collect,3,0,0,3,0,,sandbox-b:45,,0,3,0,0,0,no port claimed,3
@@ -239,7 +239,7 @@ tests/test_default_tool_error_redaction.py,core,pytest-collect,17,12,0,5,0,tests
 tests/test_disabled_trace_provider_flush.py,tracing,pytest-collect,1,1,0,0,0,tests/py_core5_leftover2_logprobs_converter.rs,core5-leftover2:13,superseded: core-a:65 (0/0/0/1),0,1,0,0,12,cited,1
 tests/test_disabled_trace_provider_shutdown.py,tracing,pytest-collect,1,1,0,0,0,tests/py_core3_tracing_small.rs,core3-tracing:18,,0,1,0,0,1,cited,1
 tests/test_doc_parsing.py,core,pytest-collect,4,1,0,3,0,,core-a:66,,0,4,0,0,0,no port claimed,4
-tests/test_error_logging_redaction.py,core,round6-agent,170,84,0,86,0,tests/py_core2_toolerrors_logging.rs;tests/py_core6_streamedleft_logging.rs,py-test-parity-core6-streamedleft.md,,0,170,0,0,31,cited,170
+tests/test_error_logging_redaction.py,core,round6-agent,170,87,0,83,0,tests/py_core2_toolerrors_logging.rs;tests/py_core6_streamedleft_logging.rs,py-test-parity-core6-streamedleft.md,,0,170,0,0,31,cited,170
 tests/test_example_workflows.py,other,pytest-collect,30,0,0,30,0,,core-a:67,,0,30,0,0,0,no port claimed,30
 tests/test_exception_exports.py,core,pytest-collect,3,1,0,2,0,tests/py_core5_leftover3_sweep.rs,core5-leftover3:29,superseded: core-b:118 (0/0/3/0),0,3,0,0,3,cited,3
 tests/test_extension_filters.py,extensions,pytest-collect,55,51,0,4,0,tests/py_core5_leftover3_extension_filters.rs,core5-leftover3:25,superseded: core-a:68 (0/4/0/51),0,55,0,0,41,cited,55
@@ -247,13 +247,13 @@ tests/test_extra_headers.py,core,pytest-collect,2,0,2,0,0,,core3-tracing:20,,0,2
 tests/test_financial_research_budget.py,other,pytest-collect,3,0,0,3,0,,core-a:69,,0,3,0,0,0,no port claimed,3
 tests/test_function_schema.py,core,pytest-collect,70,22,2,46,0,tests/py_core3_functiontools_decorator_schema.rs;tests/py_core5_leftover3_function_schema.rs,"core3-functiontools:37 (15/1/46/8) + core5-leftover3 (13 open rows: 12 ported, 1 covered)","the 13 open rows are not split per file in core5-leftover3; allocation (schema 7 ported+1 covered of its 8 open, decorator 2, identity 1, tracker 2) is inferred from the report text and sums to 12 ported + 1 covered",0,70,0,0,31,cited,
 tests/test_function_schema_logger_restore.py,core,pytest-collect,1,0,0,1,0,,core-b:119,,0,1,0,0,0,no port claimed,1
-tests/test_function_tool.py,core,pytest-collect,91,67,0,24,0,tests/py_core3_functiontools_invoke.rs;tests/py_core3_functiontools_schema.rs,core3-functiontools:31,,0,91,0,0,52,cited,91
+tests/test_function_tool.py,core,pytest-collect,91,68,0,23,0,tests/py_core3_functiontools_invoke.rs;tests/py_core3_functiontools_schema.rs,core3-functiontools:31,,0,91,0,0,52,cited,91
 tests/test_function_tool_approval_arguments.py,core,pytest-collect,108,104,0,4,0,tests/py_core2_scopedapprovals_fn_args.rs;tests/py_core2_scopedapprovals_realtime.rs,core2-scopedapprovals:18,,0,108,0,0,13,cited,108
 tests/test_function_tool_decorator.py,core,pytest-collect,64,14,0,50,0,tests/py_core3_functiontools_decorator_schema.rs;tests/py_core5_leftover3_function_schema.rs,core3-functiontools:38 (12/0/50/2) + core5-leftover3,2 open rows closed by core5-leftover3 (allocation inferred),0,64,0,0,31,cited,
 tests/test_global_hooks.py,core,pytest-collect,4,0,4,0,0,tests/py_core_a_hooks.rs,core-a:72,,0,4,0,0,14,cited,4
 tests/test_guardrails.py,core,pytest-collect,60,40,17,3,0,tests/py_core3_guardrails_cancel.rs;tests/py_core3_guardrails_direct.rs;tests/py_core3_guardrails_parallel.rs;tests/py_core_b_guardrails.rs,core3-guardrails-hooks:20,superseded: core-b:126 (24/0/0/0),0,60,0,0,69,cited,60
-tests/test_handoff_failure_error_function.py,core,pytest-collect,11,7,0,4,0,tests/py_core3_handoffs_failure.rs;tests/py_core3_handoffs_failure_trace.rs,core3-handoffs:24,superseded: core-a:73 (0/7/0/4),0,11,0,0,5,cited,11
-tests/test_handoff_history_duplication.py,core,pytest-collect,94,82,0,12,0,tests/py_core3_handoffs_history_fix.rs;tests/py_core3_handoffs_history_replay.rs;tests/py_core3_handoffs_history_wrappers.rs;tests/py_core3_handoffs_owned_replay.rs,core3-handoffs:22,,0,94,0,0,52,cited,94
+tests/test_handoff_failure_error_function.py,core,pytest-collect,11,9,0,2,0,tests/py_core3_handoffs_failure.rs;tests/py_core3_handoffs_failure_trace.rs,core3-handoffs:24,superseded: core-a:73 (0/7/0/4),0,11,0,0,5,cited,11
+tests/test_handoff_history_duplication.py,core,pytest-collect,94,84,0,10,0,tests/py_core3_handoffs_history_fix.rs;tests/py_core3_handoffs_history_replay.rs;tests/py_core3_handoffs_history_wrappers.rs;tests/py_core3_handoffs_owned_replay.rs,core3-handoffs:22,,0,94,0,0,52,cited,94
 tests/test_handoff_prompt.py,core,pytest-collect,1,0,1,0,0,tests/py_core_a_pure.rs,core3-handoffs:25,superseded: core-a:74 (1/0/0/0),0,1,0,0,83,cited,1
 tests/test_handoff_tool.py,core,pytest-collect,31,7,18,6,0,tests/py_core3_handoffs_tool.rs;tests/py_core_b_handoff_tool.rs,core3-handoffs:23,superseded: core-b:127 (17/0/0/0),0,31,0,0,24,cited,31
 tests/test_hitl_error_scenarios.py,core,round6-agent,88,72,4,12,0,tests/py_core2_approvals_binding.rs;tests/py_core2_scopedapprovals_hitl.rs,py-test-parity-core6-streamedleft.md,superseded: core-a:75 (0/14/0/76),0,88,0,0,47,cited,88
@@ -293,7 +293,7 @@ tests/test_responses_tracing.py,tracing,pytest-collect,12,12,0,0,0,tests/py_core
 tests/test_result_cast.py,core,round6-agent,16,3,2,11,0,tests/py_core_b_tool_output_result.rs;tests/py_core5_leftover2_agent_tool_stream.rs;tests/py_core5_leftover2_agent_tool_config.rs,py-test-parity-core6-streamedleft.md,remainder derived (16 stated); core-b NOT YET PORTED; no later report restates it,0,16,0,0,12,cited,
 tests/test_resume_tool_use_behavior.py,core,pytest-collect,48,48,0,0,0,tests/py_core2_scopedapprovals_resume_behavior.rs,core2-scopedapprovals:22,superseded: core-a:93 (0/4/0/44),0,48,0,0,1,cited,48
 tests/test_run.py,core,pytest-collect,2,2,0,0,0,tests/py_core2_runconfig_lifecycle.rs,core2-runconfig:29,,0,2,0,0,15,cited,2
-tests/test_run_config.py,core,ast,123,103,4,16,0,tests/py_core2_runconfig_settings.rs,core2-runconfig:22,,0,123,0,0,29,cited,123
+tests/test_run_config.py,core,ast,123,109,4,10,0,tests/py_core2_runconfig_settings.rs,core2-runconfig:22,,0,123,0,0,29,cited,123
 tests/test_run_context_approvals.py,core,pytest-collect,31,28,1,2,0,tests/py_core2_approvals_context.rs;tests/py_core_a_approvals.rs,core2-approvals:18,superseded: core-a:94 (10/0/0/21),0,31,0,0,35,cited,31
 tests/test_run_context_wrapper.py,core,pytest-collect,14,11,0,3,0,tests/py_core3_runstatectx_context.rs,core3-runstatectx:11,,0,14,0,0,13,cited,14
 tests/test_run_error_details.py,core,pytest-collect,2,2,0,0,0,tests/py_core_a_hooks.rs,core-a:95,,0,2,0,0,14,cited,2
@@ -304,7 +304,7 @@ tests/test_run_internal_approvals.py,core,pytest-collect,7,4,0,3,0,tests/py_core
 tests/test_run_internal_error_handlers.py,core,pytest-collect,5,5,0,0,0,tests/py_core3_runstatectx_error_handlers.rs,core3-runstatectx:15,,0,5,0,0,3,cited,5
 tests/test_run_internal_items.py,core,round6-agent,54,39,7,8,0,tests/py_core2_runstep_items.rs;tests/py_core4_programmatic_guardrails_approvals.rs;tests/py_core2_runstate_sidecars.rs,py-test-parity-core6-streamedleft.md,superseded: core-a:98 (0/0/0/54),0,54,0,0,37,cited,54
 tests/test_run_serial_tests.py,other,pytest-collect,6,0,0,6,0,,core-b:98,,0,6,0,0,0,no port claimed,6
-tests/test_run_state.py,core,round6-agent,469,307,15,147,0,tests/py_core2_runstate_*.rs;tests/py_core6_streamedleft_legacy_mcp.rs,py-test-parity-core6-streamedleft.md,superseded: core-a:102 (0/60/0/410),0,469,0,0,196,cited,469
+tests/test_run_state.py,core,round6-agent,469,320,15,134,0,tests/py_core2_runstate_*.rs;tests/py_core6_streamedleft_legacy_mcp.rs,py-test-parity-core6-streamedleft.md,superseded: core-a:102 (0/60/0/410),0,469,0,0,196,cited,469
 tests/test_run_state_agent_identity.py,core,pytest-collect,18,0,15,3,0,,core2-approvals:22,superseded: core-a:99 (3/12/0/3),0,18,0,0,0,report-named tests/py_core_a_run_loop.rs exists with duplicate-agent-identity tests (not name-cited),18
 tests/test_run_state_aliases.py,core,pytest-collect,10,10,0,0,0,tests/py_core3_runstatectx_aliases.rs,core3-runstatectx:12,,0,10,0,0,10,cited,10
 tests/test_run_state_compatibility_corpus.py,core,pytest-collect,123,61,0,62,0,tests/py_core2_approvals_corpus.rs,core2-approvals:20,superseded: core-a:100 (0/20/0/64),0,123,0,0,6,cited,123
