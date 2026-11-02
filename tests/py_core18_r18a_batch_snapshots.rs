@@ -12,8 +12,10 @@
 //!   hands a custom tool-use behavior the structured output, not a flattened string.
 //!
 //! The Python halves that mutate the output after publication (an extractor that swallows its
-//! cancellation and writes into `context.output` later) cannot happen here: an abandoned Rust
-//! extractor is a dropped future and the output it saw was borrowed immutably.
+//! cancellation and writes into `context.output` later) cannot happen here: the output an
+//! extractor sees is borrowed immutably. As in Python, a function tool's extractor that is still
+//! running when the sibling failure surfaces keeps running detached and finishes once released
+//! (its result is discarded); a native tool's extractor is cancelled (dropped) after the wait.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -328,10 +330,18 @@ async fn freezes_case(kind: &'static str, approved: bool, streaming: bool) {
     .unwrap_or_else(|_| panic!("{label}: the run must not wait for the blocked extractor"));
     assert_user_error(&outcome.error, "synthetic sibling failure", &label);
     assert_eq!(effects.lock().unwrap().len(), 1, "{label}");
-    assert!(
-        extractor.dropped.is_set(),
-        "{label}: the extractor was abandoned"
-    );
+    if kind == "function" {
+        // Python: `assert not settled.is_set()`; the detached extractor is still waiting.
+        assert!(
+            !extractor.dropped.is_set(),
+            "{label}: the extractor keeps running detached"
+        );
+    } else {
+        assert!(
+            extractor.dropped.is_set(),
+            "{label}: the extractor was abandoned"
+        );
+    }
     assert!(!extractor.release.is_set());
 
     let state = checkpoint.take().expect("a failure checkpoint");
@@ -404,6 +414,13 @@ async fn freezes_case(kind: &'static str, approved: bool, streaming: bool) {
         );
         assert_eq!(effects.lock().unwrap().len(), 1, "{label}");
     }
+
+    // Released, the detached extractor settles; its custom data never reaches the output.
+    extractor.release.set();
+    tokio::time::timeout(Duration::from_secs(2), extractor.dropped.wait())
+        .await
+        .unwrap_or_else(|_| panic!("{label}: the extractor did not settle"));
+    assert_eq!(accepted[0].custom_data(), None, "{label}");
 }
 
 // ===========================================================================
@@ -497,7 +514,8 @@ async fn approved_mutable_snapshot_recovery_uses_publication_value() {
         .await
         .unwrap_or_else(|_| panic!("{label}: the run must not wait for the blocked extractor"));
         assert_user_error(&outcome.error, "synthetic post-output failure", &label);
-        assert!(extractor.dropped.is_set(), "{label}");
+        // The function tool's extractor keeps running detached until released.
+        assert!(!extractor.dropped.is_set(), "{label}");
 
         let state = checkpoint.take().expect("a failure checkpoint");
         let serialized = state.to_json().unwrap();
@@ -516,6 +534,10 @@ async fn approved_mutable_snapshot_recovery_uses_publication_value() {
             "{label}"
         );
         assert_eq!(*effects.lock().unwrap(), vec!["ticket", "audit"], "{label}");
+        extractor.release.set();
+        tokio::time::timeout(Duration::from_secs(2), extractor.dropped.wait())
+            .await
+            .unwrap_or_else(|_| panic!("{label}: the extractor did not settle"));
     }
 }
 

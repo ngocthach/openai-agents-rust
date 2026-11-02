@@ -947,7 +947,7 @@ async fn duplicate_agent_names_get_identity_keys_in_the_handoff_graph() {
 }
 
 #[tokio::test]
-async fn process_context_runs_on_every_turn() {
+async fn a_generated_compaction_item_does_not_truncate_the_next_turn() {
     let model = setup();
     let agent = SandboxAgent::<()>::new("Engineer")
         .with_model_instance(model.clone())
@@ -956,8 +956,9 @@ async fn process_context_runs_on_every_turn() {
             Arc::new(Compaction::new()),
         ]);
 
-    // The first turn's shell call is followed by a compaction item, so the second turn's input
-    // must be truncated to start at that item.
+    // The first turn's shell call is followed by a compaction item. Python applies
+    // `process_context` to the run's original input only, so a compaction item the model
+    // returns during the run is a generated item and does not truncate the next turn's input.
     model.add_turn(vec![
         shell_call("c1", &["echo one"]),
         item(json!({"type": "compaction", "id": "cmp_1"})),
@@ -970,11 +971,12 @@ async fn process_context_runs_on_every_turn() {
 
     let second_input: Vec<Value> = model.calls()[1].input.iter().map(|i| i.0.clone()).collect();
     assert_eq!(
-        second_input.first().map(|i| i["type"].clone()),
-        Some(json!("compaction"))
+        second_input.first().map(|i| i["role"].clone()),
+        Some(json!("user")),
+        "{second_input:?}"
     );
     assert!(
-        !second_input.iter().any(|i| i["role"] == "user"),
+        second_input.iter().any(|i| i["type"] == "compaction"),
         "{second_input:?}"
     );
 }

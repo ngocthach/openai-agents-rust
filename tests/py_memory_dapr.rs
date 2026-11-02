@@ -252,8 +252,8 @@ async fn concurrent_writes_are_all_kept() {
 #[tokio::test]
 async fn ping_reports_connectivity() {
     let (base, _) = mock_dapr().await;
-    assert!(session(&base, "ping").ping().await);
-    assert!(!session("http://127.0.0.1:1", "ping").ping().await);
+    assert!(session(&base, "ping").ping().await.unwrap());
+    assert!(!session("http://127.0.0.1:1", "ping").ping().await.unwrap());
 }
 
 // ---------------------------------------------------------------------------
