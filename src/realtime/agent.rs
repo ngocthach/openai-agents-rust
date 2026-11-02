@@ -280,7 +280,9 @@ impl<C: Send + Sync + 'static> RealtimeAgent<C> {
     /// Every enabled tool the model may call, including the tools of this agent's MCP servers.
     ///
     /// MCP tools come first, as in [`crate::Agent::get_all_tools`]. A hosted tool is an error:
-    /// realtime models accept function tools only.
+    /// realtime models accept function tools only. The function tools' enablement checks run
+    /// concurrently; the first failing [`IsEnabled::Fallible`](crate::tool::IsEnabled) check's
+    /// error is returned unchanged and the checks still in flight are cancelled (dropped).
     pub async fn get_all_tools(
         &self,
         context: &RunContext<C>,
@@ -304,13 +306,61 @@ impl<C: Send + Sync + 'static> RealtimeAgent<C> {
             );
         }
 
-        for tool in self.function_tools() {
-            if tool.is_enabled.evaluate(context, &self.name).await {
-                tools.push(tool);
-            }
-        }
+        tools.extend(filter_enabled_tools(self.function_tools(), context, &self.name).await?);
         Ok(tools)
     }
+
+    /// The handoffs whose enablement check passes, in declaration order. The checks run
+    /// concurrently; the first failing [`IsEnabled::Fallible`](crate::tool::IsEnabled) check's
+    /// error is returned unchanged and the checks still in flight are cancelled (dropped). Port
+    /// of `collect_enabled_handoffs`.
+    pub async fn try_get_enabled_handoffs(
+        &self,
+        context: &RunContext<C>,
+    ) -> Result<Vec<RealtimeHandoff<C>>> {
+        filter_enabled_handoffs(self.handoffs.clone(), context, &self.name).await
+    }
+}
+
+/// Keep the function tools whose enablement check passes. The checks run concurrently; the first
+/// failing check's error is returned unchanged and the checks still in flight are cancelled
+/// (dropped), like Python's `gather_with_cancel`. Port of `filter_enabled_tools`.
+pub(crate) async fn filter_enabled_tools<C>(
+    tools: Vec<Arc<FunctionTool<C>>>,
+    context: &RunContext<C>,
+    agent_name: &str,
+) -> Result<Vec<Arc<FunctionTool<C>>>> {
+    let enabled = futures::future::try_join_all(
+        tools
+            .iter()
+            .map(|tool| tool.is_enabled.try_evaluate(context, agent_name)),
+    )
+    .await?;
+    Ok(tools
+        .into_iter()
+        .zip(enabled)
+        .filter_map(|(tool, on)| on.then_some(tool))
+        .collect())
+}
+
+/// Keep the handoffs whose enablement check passes, with the error and cancellation behaviour of
+/// [`filter_enabled_tools`]. Port of `filter_enabled_handoffs`.
+pub(crate) async fn filter_enabled_handoffs<C>(
+    handoffs: Vec<RealtimeHandoff<C>>,
+    context: &RunContext<C>,
+    agent_name: &str,
+) -> Result<Vec<RealtimeHandoff<C>>> {
+    let enabled = futures::future::try_join_all(
+        handoffs
+            .iter()
+            .map(|handoff| handoff.is_enabled.try_evaluate(context, agent_name)),
+    )
+    .await?;
+    Ok(handoffs
+        .into_iter()
+        .zip(enabled)
+        .filter_map(|(handoff, on)| on.then_some(handoff))
+        .collect())
 }
 
 /// Callbacks for the lifecycle of a realtime session.

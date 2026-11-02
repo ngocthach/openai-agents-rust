@@ -18,7 +18,7 @@ This crate is not affiliated with or endorsed by OpenAI.
 
 ```toml
 [dependencies]
-openai-agents-sdk = "0.22"
+openai-agents-sdk = "0.23"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 

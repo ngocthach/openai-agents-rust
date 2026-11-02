@@ -15,7 +15,9 @@ use crate::agent::Agent;
 use crate::error::{AgentsError, Result};
 use crate::guardrail::{OutputGuardrail, OutputGuardrailResult};
 use crate::items::{FunctionCall, ToolApprovalItem};
-use crate::realtime::agent::{RealtimeAgent, RealtimeHooks};
+use crate::realtime::agent::{
+    RealtimeAgent, RealtimeHooks, filter_enabled_handoffs, filter_enabled_tools,
+};
 use crate::realtime::config::{
     RealtimeAudioStorage, RealtimeFunctionToolSpec, RealtimeModelTracing, RealtimeRunConfig,
     RealtimeSessionModelSettings, RealtimeToolErrorArgs, RealtimeToolErrorKind, RealtimeUserInput,
@@ -683,18 +685,19 @@ async fn build_model_settings_unvalidated<C: Send + Sync + 'static>(
         settings.merge(agent_settings);
     }
 
-    settings.instructions = Some(agent.get_system_prompt(context).await?.unwrap_or_default());
+    // The instructions, the tools (with the agent's MCP tools, as Python's
+    // `agent.get_all_tools(ctx)`) and the enabled handoffs resolve concurrently. The first
+    // failure, a failing `is_enabled` check included, is returned unchanged and the rest are
+    // cancelled (dropped), like Python's `gather_with_cancel`.
+    let (instructions, tools, mut handoffs) = futures::future::try_join3(
+        agent.get_system_prompt(context),
+        agent.get_all_tools(context),
+        agent.try_get_enabled_handoffs(context),
+    )
+    .await?;
+    settings.instructions = Some(instructions.unwrap_or_default());
     if let Some(prompt) = &agent.prompt {
         settings.prompt = Some(prompt.clone());
-    }
-
-    // Includes the agent's MCP tools, as Python's `agent.get_all_tools(ctx)` does.
-    let tools = agent.get_all_tools(context).await?;
-    let mut handoffs = Vec::new();
-    for handoff in &agent.handoffs {
-        if handoff.is_enabled.evaluate(context, &agent.name).await {
-            handoffs.push(handoff.clone());
-        }
     }
 
     let mut specs: Vec<RealtimeFunctionToolSpec> = tools.iter().map(|t| tool_spec(t)).collect();
@@ -784,22 +787,10 @@ async fn apply_initial_overrides<C: Send + Sync + 'static>(
         return validate_tool_names(resolved.settings.tools.as_deref().unwrap_or_default());
     }
     if let Some(tools) = tools {
-        let mut enabled = Vec::new();
-        for tool in tools {
-            if tool.is_enabled.evaluate(context, &agent.name).await {
-                enabled.push(tool.clone());
-            }
-        }
-        resolved.tools = enabled;
+        resolved.tools = filter_enabled_tools(tools.clone(), context, &agent.name).await?;
     }
     if let Some(handoffs) = handoffs {
-        let mut enabled = Vec::new();
-        for handoff in handoffs {
-            if handoff.is_enabled.evaluate(context, &agent.name).await {
-                enabled.push(handoff.clone());
-            }
-        }
-        resolved.handoffs = enabled;
+        resolved.handoffs = filter_enabled_handoffs(handoffs.clone(), context, &agent.name).await?;
     }
     let mut specs: Vec<RealtimeFunctionToolSpec> =
         resolved.tools.iter().map(|t| tool_spec(t)).collect();
@@ -1359,10 +1350,15 @@ impl<C: Send + Sync + 'static> SessionInner<C> {
         handoffs: Vec<RealtimeHandoff<C>>,
     ) -> Result<()> {
         // Enablement can change after the tools were resolved, so a call is routed only to a
-        // tool or handoff that is still enabled when it is dispatched.
+        // tool or handoff that is still enabled when it is dispatched. A failing check fails the
+        // dispatch, as Python's `_filter_enabled_dispatch_snapshot` raises.
         let mut enabled_tool = None;
         for tool in tools.iter().filter(|tool| tool.name == call.name) {
-            if tool.is_enabled.evaluate(&self.context, &agent.name).await {
+            if tool
+                .is_enabled
+                .try_evaluate(&self.context, &agent.name)
+                .await?
+            {
                 enabled_tool = Some(tool.clone());
                 break;
             }
@@ -1372,8 +1368,8 @@ impl<C: Send + Sync + 'static> SessionInner<C> {
             for handoff in handoffs.iter().filter(|h| h.tool_name == call.name) {
                 if handoff
                     .is_enabled
-                    .evaluate(&self.context, &agent.name)
-                    .await
+                    .try_evaluate(&self.context, &agent.name)
+                    .await?
                 {
                     enabled_handoff = Some(handoff.clone());
                     break;

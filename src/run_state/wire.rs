@@ -1603,8 +1603,12 @@ fn run_item_from_wire(value: &Value) -> Result<Option<RunItem>> {
             _ => {}
         }
         // Python-only bookkeeping that has no Rust field.
-        for key in ["input_id", "tool_namespace"] {
-            m.remove(key);
+        m.remove("tool_namespace");
+        // An input occurrence keeps its identity; anything but a string on an input item is
+        // ignored, as Python's reader does.
+        let is_input_item = m.get("type").and_then(Value::as_str) == Some("input_item");
+        if !(is_input_item && m.get("input_id").is_some_and(Value::is_string)) {
+            m.remove("input_id");
         }
         // Read tolerantly like Python: a lookup key must be a mapping and the alias flag is
         // honoured only as a literal `true`.

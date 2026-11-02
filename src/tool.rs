@@ -361,10 +361,18 @@ pub enum ToolTimeoutBehavior {
 pub type IsEnabledFn<C> =
     Arc<dyn Fn(RunContext<C>, String) -> BoxFuture<'static, bool> + Send + Sync>;
 
+/// Dynamic enablement check that may fail. The error aborts whatever resolves the tools or
+/// handoffs (Python lets an `is_enabled` callable raise).
+pub type IsEnabledTryFn<C> =
+    Arc<dyn Fn(RunContext<C>, String) -> BoxFuture<'static, Result<bool>> + Send + Sync>;
+
 /// A boolean or a dynamic check receiving the run context and the agent name.
 pub enum IsEnabled<C> {
     Static(bool),
     Dynamic(IsEnabledFn<C>),
+    /// A dynamic check whose error surfaces unchanged from the run (or from
+    /// `Agent::get_all_tools` / `Agent::try_get_enabled_handoffs`).
+    Fallible(IsEnabledTryFn<C>),
 }
 
 impl<C> Clone for IsEnabled<C> {
@@ -372,6 +380,7 @@ impl<C> Clone for IsEnabled<C> {
         match self {
             IsEnabled::Static(b) => IsEnabled::Static(*b),
             IsEnabled::Dynamic(f) => IsEnabled::Dynamic(f.clone()),
+            IsEnabled::Fallible(f) => IsEnabled::Fallible(f.clone()),
         }
     }
 }
@@ -381,16 +390,33 @@ impl<C> fmt::Debug for IsEnabled<C> {
         match self {
             IsEnabled::Static(b) => write!(f, "IsEnabled::Static({b})"),
             IsEnabled::Dynamic(_) => write!(f, "IsEnabled::Dynamic(..)"),
+            IsEnabled::Fallible(_) => write!(f, "IsEnabled::Fallible(..)"),
         }
     }
 }
 
 impl<C> IsEnabled<C> {
-    /// Evaluate the check.
+    /// Build a fallible dynamic check.
+    pub fn fallible<F, Fut>(f: F) -> Self
+    where
+        F: Fn(RunContext<C>, String) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<bool>> + Send + 'static,
+    {
+        IsEnabled::Fallible(Arc::new(move |ctx, agent| Box::pin(f(ctx, agent))))
+    }
+
+    /// Evaluate the check. A failing [`IsEnabled::Fallible`] check counts as disabled; use
+    /// [`try_evaluate`](Self::try_evaluate) to see the error.
     pub async fn evaluate(&self, ctx: &RunContext<C>, agent_name: &str) -> bool {
+        self.try_evaluate(ctx, agent_name).await.unwrap_or(false)
+    }
+
+    /// Evaluate the check, returning the error of a failing [`IsEnabled::Fallible`] check.
+    pub async fn try_evaluate(&self, ctx: &RunContext<C>, agent_name: &str) -> Result<bool> {
         match self {
-            IsEnabled::Static(b) => *b,
-            IsEnabled::Dynamic(f) => f(ctx.clone(), agent_name.to_string()).await,
+            IsEnabled::Static(b) => Ok(*b),
+            IsEnabled::Dynamic(f) => Ok(f(ctx.clone(), agent_name.to_string()).await),
+            IsEnabled::Fallible(f) => f(ctx.clone(), agent_name.to_string()).await,
         }
     }
 }
@@ -405,10 +431,17 @@ impl<C> From<bool> for IsEnabled<C> {
 pub type NeedsApprovalFn<C> =
     Arc<dyn Fn(RunContext<C>, Value, String) -> BoxFuture<'static, bool> + Send + Sync>;
 
+/// Per-call approval decision that may fail. The error aborts the run before the tool runs
+/// (Python lets a `needs_approval` callable raise).
+pub type NeedsApprovalTryFn<C> =
+    Arc<dyn Fn(RunContext<C>, Value, String) -> BoxFuture<'static, Result<bool>> + Send + Sync>;
+
 /// Whether a tool needs approval.
 pub enum NeedsApproval<C> {
     Static(bool),
     Dynamic(NeedsApprovalFn<C>),
+    /// A per-call decision whose error surfaces unchanged from the run; the tool is not run.
+    Fallible(NeedsApprovalTryFn<C>),
 }
 
 impl<C> Clone for NeedsApproval<C> {
@@ -416,6 +449,7 @@ impl<C> Clone for NeedsApproval<C> {
         match self {
             NeedsApproval::Static(b) => NeedsApproval::Static(*b),
             NeedsApproval::Dynamic(f) => NeedsApproval::Dynamic(f.clone()),
+            NeedsApproval::Fallible(f) => NeedsApproval::Fallible(f.clone()),
         }
     }
 }
@@ -425,23 +459,56 @@ impl<C> fmt::Debug for NeedsApproval<C> {
         match self {
             NeedsApproval::Static(b) => write!(f, "NeedsApproval::Static({b})"),
             NeedsApproval::Dynamic(_) => write!(f, "NeedsApproval::Dynamic(..)"),
+            NeedsApproval::Fallible(_) => write!(f, "NeedsApproval::Fallible(..)"),
         }
     }
 }
 
 impl<C> NeedsApproval<C> {
-    /// Evaluate the rule. A dynamic rule fails closed (requires approval) when the arguments
-    /// are not a JSON object.
+    /// Build a fallible per-call decision.
+    pub fn fallible<F, Fut>(f: F) -> Self
+    where
+        F: Fn(RunContext<C>, Value, String) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<bool>> + Send + 'static,
+    {
+        NeedsApproval::Fallible(Arc::new(move |ctx, args, id| Box::pin(f(ctx, args, id))))
+    }
+
+    /// Whether the rule is a per-call callable (dynamic or fallible) rather than a constant.
+    pub fn is_callable(&self) -> bool {
+        !matches!(self, NeedsApproval::Static(_))
+    }
+
+    /// Evaluate the rule. A callable rule fails closed (requires approval) when the arguments
+    /// are not a JSON object, and a failing [`NeedsApproval::Fallible`] rule requires approval;
+    /// use [`try_evaluate`](Self::try_evaluate) to see the error.
     pub async fn evaluate(&self, ctx: &RunContext<C>, arguments: &str, call_id: &str) -> bool {
+        self.try_evaluate(ctx, arguments, call_id)
+            .await
+            .unwrap_or(true)
+    }
+
+    /// Evaluate the rule, returning the error of a failing [`NeedsApproval::Fallible`] rule.
+    pub async fn try_evaluate(
+        &self,
+        ctx: &RunContext<C>,
+        arguments: &str,
+        call_id: &str,
+    ) -> Result<bool> {
+        let parsed = || match serde_json::from_str::<Value>(arguments).ok() {
+            Some(v @ Value::Object(_)) => Some(v),
+            _ => None,
+        };
         match self {
-            NeedsApproval::Static(b) => *b,
-            NeedsApproval::Dynamic(f) => {
-                let parsed: Option<Value> = serde_json::from_str(arguments).ok();
-                match parsed {
-                    Some(v @ Value::Object(_)) => f(ctx.clone(), v, call_id.to_string()).await,
-                    _ => true,
-                }
-            }
+            NeedsApproval::Static(b) => Ok(*b),
+            NeedsApproval::Dynamic(f) => match parsed() {
+                Some(v) => Ok(f(ctx.clone(), v, call_id.to_string()).await),
+                None => Ok(true),
+            },
+            NeedsApproval::Fallible(f) => match parsed() {
+                Some(v) => f(ctx.clone(), v, call_id.to_string()).await,
+                None => Ok(true),
+            },
         }
     }
 }
@@ -1215,6 +1282,18 @@ impl<C: Send + Sync + 'static> FunctionTool<C> {
         self
     }
 
+    /// Set a dynamic enablement check that may fail. An error aborts tool resolution (and the
+    /// run) unchanged, cancelling the sibling checks still in flight, like a raising
+    /// `is_enabled` callable in Python.
+    pub fn with_is_enabled_fallible<F, Fut>(mut self, f: F) -> Self
+    where
+        F: Fn(RunContext<C>, String) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<bool>> + Send + 'static,
+    {
+        self.is_enabled = IsEnabled::fallible(f);
+        self
+    }
+
     /// Require approval (always, or never).
     pub fn with_needs_approval(mut self, needs_approval: impl Into<NeedsApproval<C>>) -> Self {
         self.needs_approval = needs_approval.into();
@@ -1232,30 +1311,57 @@ impl<C: Send + Sync + 'static> FunctionTool<C> {
         self
     }
 
+    /// Require approval based on a per-call decision that may fail. An error aborts the run
+    /// unchanged before the tool runs, like a raising `needs_approval` callable in Python.
+    pub fn with_needs_approval_fallible<F, Fut>(mut self, f: F) -> Self
+    where
+        F: Fn(RunContext<C>, Value, String) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<bool>> + Send + 'static,
+    {
+        self.needs_approval = NeedsApproval::fallible(f);
+        self
+    }
+
     /// Evaluate the approval rule for one call.
     ///
-    /// A dynamic rule sees only the invocation that can execute: when the arguments of a typed
+    /// A callable rule sees only the invocation that can execute: when the arguments of a typed
     /// tool would not run unchanged (they fail to parse into its argument type, omit a parameter
     /// a default would fill, or carry an undeclared key), the rule is not consulted and the call
-    /// requires approval. Mirrors `evaluate_function_tool_approval`.
+    /// requires approval. Mirrors `evaluate_function_tool_approval`. A failing
+    /// [`NeedsApproval::Fallible`] rule requires approval here; the runner uses
+    /// [`try_evaluate_needs_approval`](Self::try_evaluate_needs_approval).
     pub async fn evaluate_needs_approval(
         &self,
         ctx: &RunContext<C>,
         arguments: &str,
         call_id: &str,
     ) -> bool {
-        if self.args_have_validators && matches!(self.needs_approval, NeedsApproval::Dynamic(_)) {
-            return true;
+        self.try_evaluate_needs_approval(ctx, arguments, call_id)
+            .await
+            .unwrap_or(true)
+    }
+
+    /// [`evaluate_needs_approval`](Self::evaluate_needs_approval), returning the error of a
+    /// failing [`NeedsApproval::Fallible`] rule.
+    pub async fn try_evaluate_needs_approval(
+        &self,
+        ctx: &RunContext<C>,
+        arguments: &str,
+        call_id: &str,
+    ) -> Result<bool> {
+        let callable = self.needs_approval.is_callable();
+        if self.args_have_validators && callable {
+            return Ok(true);
         }
-        if let (NeedsApproval::Dynamic(_), Some(check)) =
-            (&self.needs_approval, &self.approval_args_check)
-        {
+        if let (true, Some(check)) = (callable, &self.approval_args_check) {
             let parsed: Option<Value> = serde_json::from_str(arguments).ok();
             if !parsed.as_ref().is_some_and(|args| check(args)) {
-                return true;
+                return Ok(true);
             }
         }
-        self.needs_approval.evaluate(ctx, arguments, call_id).await
+        self.needs_approval
+            .try_evaluate(ctx, arguments, call_id)
+            .await
     }
 
     /// Declare that the argument type runs application code while it is parsed (a
@@ -1844,11 +1950,19 @@ type MCPApprovalFn<C> = Arc<
     dyn Fn(MCPToolApprovalRequest<C>) -> BoxFuture<'static, MCPToolApprovalResult> + Send + Sync,
 >;
 
+/// A hosted MCP approval callback that may fail.
+pub(crate) type MCPApprovalTryFn<C> = Arc<
+    dyn Fn(MCPToolApprovalRequest<C>) -> BoxFuture<'static, Result<MCPToolApprovalResult>>
+        + Send
+        + Sync,
+>;
+
 /// Hosted MCP server tool, executed by the Responses API.
 pub struct HostedMCPTool<C> {
     /// Raw tool config (`{"type": "mcp", "server_label": ..., "server_url": ..., ...}`).
     pub tool_config: Value,
     on_approval_request: Option<MCPApprovalFn<C>>,
+    on_approval_request_fallible: Option<MCPApprovalTryFn<C>>,
 }
 
 impl<C> Clone for HostedMCPTool<C> {
@@ -1856,6 +1970,7 @@ impl<C> Clone for HostedMCPTool<C> {
         HostedMCPTool {
             tool_config: self.tool_config.clone(),
             on_approval_request: self.on_approval_request.clone(),
+            on_approval_request_fallible: self.on_approval_request_fallible.clone(),
         }
     }
 }
@@ -1877,6 +1992,7 @@ impl<C> HostedMCPTool<C> {
         HostedMCPTool {
             tool_config,
             on_approval_request: None,
+            on_approval_request_fallible: None,
         }
     }
 
@@ -1902,12 +2018,50 @@ impl<C> HostedMCPTool<C> {
         Fut: Future<Output = MCPToolApprovalResult> + Send + 'static,
     {
         self.on_approval_request = Some(Arc::new(move |req| Box::pin(f(req))));
+        self.on_approval_request_fallible = None;
         self
     }
 
-    /// The approval callback, if any.
+    /// Decide approvals in code with a callback that may fail. An error aborts the run
+    /// unchanged and the request is not answered; the callback is not run again for the same
+    /// request (a retry fails with a model behavior error), like a raising Python
+    /// `on_approval_request`.
+    pub fn with_on_approval_request_fallible<F, Fut>(mut self, f: F) -> Self
+    where
+        F: Fn(MCPToolApprovalRequest<C>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<MCPToolApprovalResult>> + Send + 'static,
+    {
+        self.on_approval_request_fallible = Some(Arc::new(move |req| Box::pin(f(req))));
+        self.on_approval_request = None;
+        self
+    }
+
+    /// The approval callback set with
+    /// [`with_on_approval_request`](Self::with_on_approval_request), if any. A callback set with
+    /// [`with_on_approval_request_fallible`](Self::with_on_approval_request_fallible) is not
+    /// returned here; see [`has_on_approval_request`](Self::has_on_approval_request).
     pub fn on_approval_request(&self) -> Option<&MCPApprovalFn<C>> {
         self.on_approval_request.as_ref()
+    }
+
+    /// Whether an approval callback (fallible or not) is set.
+    pub fn has_on_approval_request(&self) -> bool {
+        self.on_approval_request.is_some() || self.on_approval_request_fallible.is_some()
+    }
+
+    /// The approval callback in its fallible form, whichever builder set it.
+    pub(crate) fn approval_callback(&self) -> Option<MCPApprovalTryFn<C>>
+    where
+        C: 'static,
+    {
+        if let Some(f) = &self.on_approval_request_fallible {
+            return Some(f.clone());
+        }
+        let f = self.on_approval_request.clone()?;
+        Some(Arc::new(move |req| {
+            let fut = f(req);
+            Box::pin(async move { Ok(fut.await) })
+        }))
     }
 
     /// The server label.

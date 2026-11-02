@@ -479,8 +479,14 @@ pub(crate) fn completed_tool_step_items(
         let completed = str_of(&v, "status").as_deref() == Some("completed");
         let call_id = str_of(&v, "call_id");
         let keep = if ty == "mcp_approval_request" {
-            // A hosted approval request is a settled decision point; its response is kept below.
-            true
+            // An answered hosted approval request is a settled decision point; its response is
+            // kept below. A request left unanswered (its approval callback failed) is dropped,
+            // as Python's `_completed_tool_step_items` drops every approval request.
+            let id = str_of(&v, "id");
+            outputs.iter().any(|o| {
+                matches!(o.kind, RunItemKind::MCPApprovalResponse { .. })
+                    && str_of(&o.to_input_item().0, "approval_request_id") == id
+            })
         } else if ty == "tool_search_call" || ty == "tool_search_output" {
             str_of(&v, "execution").as_deref() == Some("server") && completed
         } else if is_output_type(&ty) {

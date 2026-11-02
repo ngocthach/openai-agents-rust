@@ -1001,16 +1001,16 @@ impl SandboxClient for VercelSandboxClient {
             envs.insert(key.clone(), value.clone());
         }
         let created = self.create_sandbox(&token, &envs, None).await?;
-        let session = VercelSandboxSession::new(
+        let session = Arc::new(VercelSandboxSession::new(
             self.options.clone(),
             token,
             self.http.clone(),
             created,
             manifest,
             self.snapshot.clone(),
-        );
-        session.wait_until_running().await?;
-        Ok(Arc::new(session))
+        ));
+        wait_until_running_or_stop_on_drop(&session).await?;
+        Ok(session)
     }
 
     async fn resume(
@@ -1118,13 +1118,62 @@ impl SandboxClient for VercelSandboxClient {
         }
         // The original session is gone: create a replacement and hydrate it from the snapshot.
         let created = this.create_sandbox(&token, &envs, None).await?;
-        let session = build(created, manifest);
-        session.wait_until_running().await?;
-        Ok(Arc::new(session))
+        let session = Arc::new(build(created, manifest));
+        wait_until_running_or_stop_on_drop(&session).await?;
+        Ok(session)
     }
 
     async fn delete(&self, session: Arc<dyn SandboxSession>) -> SandboxResult<()> {
         session.shutdown().await
+    }
+}
+
+/// Wait for a sandbox this client just created to reach `running`. If the future is dropped
+/// before the wait ends, the half-created sandbox is stopped on the runtime instead of being
+/// left running: Python shields that cleanup from task cancellation, and a dropped Rust future
+/// runs no further code of its own. A wait that ends, in success or failure, hands the sandbox
+/// back as before.
+async fn wait_until_running_or_stop_on_drop(
+    session: &Arc<VercelSandboxSession>,
+) -> SandboxResult<()> {
+    let guard = StopOnDrop(Some(session.clone()));
+    let running = session.wait_until_running().await;
+    guard.disarm();
+    running
+}
+
+/// Stops the sandbox it holds when dropped while still armed.
+struct StopOnDrop(Option<Arc<VercelSandboxSession>>);
+
+impl StopOnDrop {
+    fn disarm(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        let Some(session) = self.0.take() else {
+            return;
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn(async move {
+                    if let Err(error) = session.stop().await {
+                        log::warn!(
+                            "Failed to stop Vercel session `{}` after its creation was \
+                             cancelled: {error}",
+                            session.provider_session_id()
+                        );
+                    }
+                });
+            }
+            Err(_) => log::warn!(
+                "Vercel session `{}` was left running: its creation was cancelled outside a \
+                 Tokio runtime",
+                session.provider_session_id()
+            ),
+        }
     }
 }
 

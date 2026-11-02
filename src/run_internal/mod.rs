@@ -2243,9 +2243,8 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
             return;
         }
         let tracker = &self.server_conversation;
-        let undelivered = |item: &RunItem| match &item.kind {
-            RunItemKind::Input { raw_item } => !tracker.was_sent(raw_item),
-            _ => false,
+        let undelivered = |item: &RunItem| {
+            matches!(item.kind, RunItemKind::Input { .. }) && !tracker.was_sent_item(item)
         };
         let mut returned: Vec<InputItem> = Vec::new();
         self.generated_items.retain(|item| {
@@ -2463,7 +2462,10 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
                 let agent = self.current_agent.clone();
                 self.process_original_input(&agent);
                 let tools = self.current_agent.get_all_tools(&self.ctx).await?;
-                let handoffs = self.current_agent.get_enabled_handoffs(&self.ctx).await;
+                let handoffs = self
+                    .current_agent
+                    .try_get_enabled_handoffs(&self.ctx)
+                    .await?;
                 let (tools, handoffs) = resolve_tool_name_collisions(
                     tools,
                     handoffs,
@@ -2505,7 +2507,10 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
                 )?;
                 self.prefetched_prompt = Some(prompt);
                 self.prefetched_system_prompt = Some(system_prompt);
-                let handoffs = self.current_agent.get_enabled_handoffs(&self.ctx).await;
+                let handoffs = self
+                    .current_agent
+                    .try_get_enabled_handoffs(&self.ctx)
+                    .await?;
                 let (tools, handoffs) = resolve_tool_name_collisions(
                     tools,
                     handoffs,
@@ -3765,17 +3770,31 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
         // Orphan pruning applies only to runner-generated history: a caller who passes an
         // unanswered call in the run input gets it back verbatim, like Python.
         if self.server_managed() {
-            // Deltas are chosen by server identity and content fingerprint, not by an index
-            // cursor, so a retry or a resumed state cannot resend or skip an item.
+            // Deltas are chosen by server identity, by the identity of each admitted input
+            // occurrence, and by content fingerprint, not by an index cursor, so a retry or a
+            // resumed state cannot resend or skip an item.
             let prefix = self.model_prefix.clone();
             let mut input = self.server_conversation.take_initial_input(&prefix);
+            let mut prepared: Vec<(InputItem, Option<String>)> =
+                input.iter().map(|i| (i.clone(), None)).collect();
             // Decide on the raw item: stripping the reasoning id first would hide the
             // server identity the tracker matches on.
-            let generated: Vec<InputItem> = items_to_input(&self.model_items)
-                .into_iter()
-                .filter(|i| self.server_conversation.needs_send(i))
-                .map(|i| strip_reasoning_id(i, policy))
-                .collect();
+            let mut generated: Vec<InputItem> = Vec::new();
+            for item in &self.model_items {
+                if matches!(item.kind, RunItemKind::ToolApproval { .. }) {
+                    continue;
+                }
+                let converted = item.to_input_item();
+                if !self.server_conversation.needs_send_item(item, &converted) {
+                    continue;
+                }
+                let converted = strip_reasoning_id(converted, policy);
+                if let (RunItemKind::Input { .. }, Some(id)) = (&item.kind, &item.input_id) {
+                    prepared.push((converted.clone(), Some(id.clone())));
+                }
+                generated.push(converted);
+            }
+            self.server_conversation.set_prepared_input(&prepared);
             input.extend(items::drop_orphan_function_calls(generated));
             input
         } else {
@@ -3937,7 +3956,10 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
             let staged = std::mem::take(&mut self.pending_input);
             guardrail_input = Some(staged.clone());
             for item in staged {
-                let ri = RunItem::new(agent.name.clone(), RunItemKind::Input { raw_item: item });
+                let mut ri =
+                    RunItem::new(agent.name.clone(), RunItemKind::Input { raw_item: item });
+                // Each admission is its own occurrence, so identical inputs are told apart.
+                ri.input_id = Some(uuid::Uuid::new_v4().simple().to_string());
                 self.push_item(ri, None);
             }
         }
@@ -6162,7 +6184,7 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
             let bindable = tool_invocation::tool_invocation_identity(&request, None).is_some();
             let callback = tool
                 .as_ref()
-                .and_then(|t| t.on_approval_request().cloned())
+                .and_then(|t| t.approval_callback())
                 .filter(|_| bindable);
             let decision = match callback {
                 None if !bindable => None,
@@ -6193,7 +6215,7 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
                             ctx: self.ctx.clone(),
                             data: request.clone(),
                         })
-                        .await;
+                        .await?;
                         let mut extra = serde_json::Map::new();
                         extra.insert("type".into(), Value::String("mcp_approval_request".into()));
                         extra.insert("server_label".into(), Value::String(label.clone()));

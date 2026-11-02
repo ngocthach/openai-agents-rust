@@ -111,6 +111,11 @@ pub struct ServerConversationTracker {
     /// Whether reasoning item ids are removed before items are sent. A reasoning item sent
     /// without its id is recognised as delivered when it comes up again with the id.
     omit_reasoning_item_ids: bool,
+    /// The items the next model call was prepared with, in order: each one's fingerprint and,
+    /// for an admitted input occurrence, its id. A call's delivered items are matched back to
+    /// these by content, first match first, since a `call_model_input_filter` may rebuild them.
+    /// Mirrors `prepared_item_sources_by_fingerprint`.
+    prepared_sources: Vec<(String, Option<String>)>,
 }
 
 impl ServerConversationTracker {
@@ -315,14 +320,43 @@ impl ServerConversationTracker {
             .is_some_and(|fp| self.state.sent_item_fingerprints.contains(&fp))
     }
 
-    /// Record the items a successful model call delivered. Port of `mark_input_as_sent`.
+    /// Whether the server already holds this generated item. An admitted input occurrence
+    /// that carries an [`input_id`](RunItem::input_id) is held only once a model call
+    /// delivered that occurrence; anything else is matched as [`was_sent`](Self::was_sent).
+    pub fn was_sent_item(&self, item: &RunItem) -> bool {
+        match (&item.kind, &item.input_id) {
+            (RunItemKind::Input { .. }, Some(id)) => self.state.accepted_input_ids.contains(id),
+            _ => self.was_sent(&item.to_input_item()),
+        }
+    }
+
+    /// Record the items the next model call is built from, in order, so
+    /// [`mark_input_as_sent`](Self::mark_input_as_sent) can tell which admitted input
+    /// occurrences it delivered. Each entry is the item and, for an admitted input occurrence,
+    /// its id.
+    pub fn set_prepared_input(&mut self, items: &[(InputItem, Option<String>)]) {
+        self.prepared_sources = items
+            .iter()
+            .filter_map(|(item, id)| fingerprint(&item.0, false).map(|fp| (fp, id.clone())))
+            .collect();
+    }
+
+    /// Record the items a successful model call delivered. Port of `mark_input_as_sent` (and
+    /// of `mark_input_as_accepted` for admitted input occurrences).
     pub fn mark_input_as_sent(&mut self, items: &[InputItem]) {
         let mut delivered = BTreeSet::new();
+        let mut prepared = std::mem::take(&mut self.prepared_sources);
         for item in items {
             if let Some(id) = normalize_server_item_id(item.0.get("id")) {
                 self.state.server_item_ids.insert(id);
             }
             if let Some(fp) = fingerprint(&item.0, false) {
+                // The delivered item stands for the first prepared item with its content.
+                if let Some(index) = prepared.iter().position(|(source, _)| *source == fp)
+                    && let (_, Some(input_id)) = prepared.remove(index)
+                {
+                    self.state.accepted_input_ids.insert(input_id);
+                }
                 self.state.sent_item_fingerprints.insert(fp.clone());
                 delivered.insert(fp);
             }
@@ -333,9 +367,26 @@ impl ServerConversationTracker {
         self.prune_remaining_initial_input(&delivered);
     }
 
-    /// Whether this generated item still has to be sent to the server.
-    /// Port of the filter inside `prepare_input`.
+    /// Whether this generated item still has to be sent to the server. An admitted input
+    /// occurrence with an [`input_id`](RunItem::input_id) is selected by that identity, so an
+    /// identical later input is still sent; any other item is selected as
+    /// [`needs_send`](Self::needs_send) selects it. Port of the filter inside `prepare_input`.
+    pub fn needs_send_item(&self, item: &RunItem, converted: &InputItem) -> bool {
+        match (&item.kind, &item.input_id) {
+            (RunItemKind::Input { .. }, Some(id)) => {
+                !self.state.accepted_input_ids.contains(id) && self.needs_send_by(converted, false)
+            }
+            _ => self.needs_send(converted),
+        }
+    }
+
+    /// Whether this generated item still has to be sent to the server, judged by its server
+    /// identity and content. Port of the filter inside `prepare_input`.
     pub fn needs_send(&self, converted: &InputItem) -> bool {
+        self.needs_send_by(converted, true)
+    }
+
+    fn needs_send_by(&self, converted: &InputItem, match_sent_content: bool) -> bool {
         let raw = &converted.0;
         if let Some(id) = normalize_server_item_id(raw.get("id"))
             && self.state.server_item_ids.contains(&id)
@@ -371,7 +422,7 @@ impl ServerConversationTracker {
         // was taken from) is already on the server. Python skips it by object identity
         // (`sent_items`); the content fingerprint plays that role here.
         for candidate in [&fp, &delivered_fp].into_iter().flatten() {
-            if self.state.sent_item_fingerprints.contains(candidate) {
+            if match_sent_content && self.state.sent_item_fingerprints.contains(candidate) {
                 return false;
             }
         }

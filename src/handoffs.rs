@@ -418,6 +418,18 @@ impl<C: Send + Sync + 'static> Handoff<C> {
         self
     }
 
+    /// Enable the handoff based on a dynamic check that may fail. An error aborts handoff
+    /// resolution (and the run) unchanged, cancelling the sibling checks still in flight, like
+    /// a raising `is_enabled` callable in Python.
+    pub fn with_is_enabled_fallible<F, Fut>(mut self, f: F) -> Self
+    where
+        F: Fn(RunContext<C>, String) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = crate::error::Result<bool>> + Send + 'static,
+    {
+        self.is_enabled = IsEnabled::fallible(f);
+        self
+    }
+
     /// Recover from a failed handoff invocation by sending `f`'s text back to the calling
     /// agent as the handoff tool's output, instead of ending the run with the error.
     ///

@@ -444,8 +444,8 @@ pub(crate) async fn execute_function_tool<C: Send + Sync + 'static>(
         // A call still pending from the resumed snapshot requires approval as it did.
         let needs_approval = env.pending_approvals.contains(&call.call_id)
             || tool
-                .evaluate_needs_approval(env.ctx, &call.arguments, &call.call_id)
-                .await;
+                .try_evaluate_needs_approval(env.ctx, &call.arguments, &call.call_id)
+                .await?;
         status = status_now();
         gated = needs_approval || status.is_some();
     }
@@ -929,30 +929,41 @@ pub(crate) async fn execute_function_tools<C: Send + Sync + 'static>(
     // failures the one with the lowest tool-call order wins (`_select_function_tool_failure`).
     // Siblings that had already committed their output are kept, in call order, so a retry does
     // not run them again.
-    // Enablement is re-checked right before execution: a configured tool that became disabled
-    // since the model saw it fails the batch before any call starts. Port of
-    // `_FunctionToolBatchExecutor.execute`'s `resolve_enabled_function_tools` pass.
-    let mut checked: Vec<Arc<FunctionTool<C>>> = Vec::new();
-    for (_, tool) in &runs {
-        if checked.iter().any(|t| Arc::ptr_eq(t, tool)) {
-            continue;
-        }
-        checked.push(tool.clone());
-        let configured = env
-            .agent
-            .tools
+    // Enablement is re-checked right before execution: every configured function tool is
+    // checked concurrently, a failing check aborts the batch with its own error (cancelling the
+    // checks still in flight), and a called tool that became disabled since the model saw it
+    // fails the batch before any call starts. Port of `_FunctionToolBatchExecutor.execute`'s
+    // `resolve_enabled_function_tools` pass.
+    let configured: Vec<&Arc<FunctionTool<C>>> = env
+        .agent
+        .tools
+        .iter()
+        .filter_map(|t| t.as_function())
+        .collect();
+    let fail = |error: AgentsError| ToolBatchFailure {
+        error,
+        completed: Vec::new(),
+        failure_committed: false,
+        sibling_stopped: false,
+    };
+    let enabled = futures::future::try_join_all(
+        configured
             .iter()
-            .any(|t| t.as_function().is_some_and(|f| Arc::ptr_eq(f, tool)));
-        if configured && !tool.is_enabled.evaluate(env.ctx, &env.agent.name).await {
-            return Err(ToolBatchFailure {
-                error: AgentsError::model_behavior(format!(
-                    "Tool {} is currently disabled for agent {}.",
-                    tool.name, env.agent.name
-                )),
-                completed: Vec::new(),
-                failure_committed: false,
-                sibling_stopped: false,
-            });
+            .map(|tool| tool.is_enabled.try_evaluate(env.ctx, &env.agent.name)),
+    )
+    .await
+    .map_err(fail)?;
+    for (_, tool) in &runs {
+        let mut same = configured
+            .iter()
+            .zip(&enabled)
+            .filter(|(t, _)| Arc::ptr_eq(t, tool));
+        let is_configured = same.clone().next().is_some();
+        if is_configured && !same.any(|(_, on)| *on) {
+            return Err(fail(AgentsError::model_behavior(format!(
+                "Tool {} is currently disabled for agent {}.",
+                tool.name, env.agent.name
+            ))));
         }
     }
     // The in-flight set is refilled by hand so that, once a call fails, draining the siblings

@@ -1691,9 +1691,17 @@ impl WsInner {
                 }
             }
             "session.created" | "session.updated" => {
-                if let Some(format) = event
-                    .pointer("/session/audio/output/format")
-                    .and_then(read_format_type)
+                // Only a realtime session carries the playback format; Python's
+                // `_normalize_session_payload` ignores a transcription (or otherwise typed)
+                // session, so its audio block must not retune the trackers.
+                let realtime_session = event
+                    .pointer("/session/type")
+                    .and_then(Value::as_str)
+                    .is_none_or(|kind| kind == "realtime");
+                if realtime_session
+                    && let Some(format) = event
+                        .pointer("/session/audio/output/format")
+                        .and_then(read_format_type)
                 {
                     self.set_audio_format(&format);
                 }

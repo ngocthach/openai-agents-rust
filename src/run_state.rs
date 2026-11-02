@@ -428,6 +428,11 @@ pub struct ServerConversationState {
     /// Fingerprints of input items already sent to the server.
     #[serde(default)]
     pub sent_item_fingerprints: BTreeSet<String>,
+    /// Ids ([`RunItem::input_id`](crate::items::RunItem::input_id)) of the admitted input
+    /// occurrences a model call delivered. An occurrence is matched by identity, not content,
+    /// so a later input identical to one already delivered is still sent.
+    #[serde(default)]
+    pub accepted_input_ids: BTreeSet<String>,
 }
 
 impl RunState {

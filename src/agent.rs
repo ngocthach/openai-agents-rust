@@ -571,32 +571,80 @@ impl<C: Send + Sync + 'static> Agent<C> {
         }
     }
 
-    /// Enabled handoffs for this run.
+    /// Enabled handoffs for this run. A failing [`IsEnabled::Fallible`](crate::tool::IsEnabled)
+    /// check counts as disabled here; the runner uses
+    /// [`try_get_enabled_handoffs`](Self::try_get_enabled_handoffs).
     pub async fn get_enabled_handoffs(&self, ctx: &RunContext<C>) -> Vec<Handoff<C>> {
-        let mut out = Vec::new();
-        for h in &self.handoffs {
-            if h.is_enabled.evaluate(ctx, &self.name).await {
-                out.push(h.clone());
-            }
-        }
-        out
+        let checks = self
+            .handoffs
+            .iter()
+            .map(|h| h.is_enabled.evaluate(ctx, &self.name));
+        let enabled = futures::future::join_all(checks).await;
+        self.handoffs
+            .iter()
+            .zip(enabled)
+            .filter(|(_, on)| *on)
+            .map(|(h, _)| h.clone())
+            .collect()
+    }
+
+    /// Enabled handoffs for this run. The checks run concurrently; the first failing check's
+    /// error is returned unchanged and the checks still in flight are cancelled (dropped).
+    /// Port of `get_handoffs`.
+    pub async fn try_get_enabled_handoffs(&self, ctx: &RunContext<C>) -> Result<Vec<Handoff<C>>> {
+        let enabled = self.try_handoff_enablement(ctx).await?;
+        Ok(self
+            .handoffs
+            .iter()
+            .zip(enabled)
+            .filter(|(_, on)| *on)
+            .map(|(h, _)| h.clone())
+            .collect())
+    }
+
+    async fn try_handoff_enablement(&self, ctx: &RunContext<C>) -> Result<Vec<bool>> {
+        futures::future::try_join_all(
+            self.handoffs
+                .iter()
+                .map(|h| h.is_enabled.try_evaluate(ctx, &self.name)),
+        )
+        .await
     }
 
     /// The tool names a derived MCP tool must not shadow: this agent's own function tools
     /// plus the tool names of its enabled handoffs. Port of `_get_mcp_tool_reserved_names`.
+    ///
+    /// A failing [`IsEnabled::Fallible`](crate::tool::IsEnabled) check counts as disabled here;
+    /// [`try_mcp_reserved_tool_names`](Self::try_mcp_reserved_tool_names) returns its error.
     #[cfg(feature = "mcp")]
     pub async fn mcp_reserved_tool_names(&self, ctx: &RunContext<C>) -> HashSet<String> {
-        let mut reserved: HashSet<String> = self
-            .tools
-            .iter()
-            .filter_map(|t| t.as_function().map(|f| f.name.clone()))
-            .collect();
-        for h in &self.handoffs {
-            if h.is_enabled.evaluate(ctx, &self.name).await {
-                reserved.insert(h.tool_name.clone());
-            }
+        let mut reserved = self.function_tool_names();
+        for h in self.get_enabled_handoffs(ctx).await {
+            reserved.insert(h.tool_name);
         }
         reserved
+    }
+
+    /// [`mcp_reserved_tool_names`](Self::mcp_reserved_tool_names), returning the error of a
+    /// failing handoff enablement check.
+    #[cfg(feature = "mcp")]
+    pub async fn try_mcp_reserved_tool_names(
+        &self,
+        ctx: &RunContext<C>,
+    ) -> Result<HashSet<String>> {
+        let mut reserved = self.function_tool_names();
+        for h in self.try_get_enabled_handoffs(ctx).await? {
+            reserved.insert(h.tool_name);
+        }
+        Ok(reserved)
+    }
+
+    #[cfg(feature = "mcp")]
+    fn function_tool_names(&self) -> HashSet<String> {
+        self.tools
+            .iter()
+            .filter_map(|t| t.as_function().map(|f| f.name.clone()))
+            .collect()
     }
 
     /// All enabled tools, including MCP tools.
@@ -611,7 +659,7 @@ impl<C: Send + Sync + 'static> Agent<C> {
             // them runs the handoffs' `is_enabled` checks, so skip it otherwise like Python.
             let reserved =
                 if self.mcp_config.include_server_in_tool_names && !self.mcp_servers.is_empty() {
-                    self.mcp_reserved_tool_names(ctx).await
+                    self.try_mcp_reserved_tool_names(ctx).await?
                 } else {
                     HashSet::new()
                 };
@@ -626,10 +674,20 @@ impl<C: Send + Sync + 'static> Agent<C> {
             .await?;
             out.extend(mcp_tools);
         }
-        for t in &self.tools {
+        // Function-tool enablement checks run concurrently; the first failing check's error is
+        // returned unchanged and the checks still in flight are cancelled (dropped), like
+        // Python's `gather_with_cancel`.
+        let enabled = futures::future::try_join_all(self.tools.iter().map(|t| async move {
             match t {
-                Tool::Function(f) => {
-                    if f.is_enabled.evaluate(ctx, &self.name).await {
+                Tool::Function(f) => f.is_enabled.try_evaluate(ctx, &self.name).await,
+                _ => Ok(true),
+            }
+        }))
+        .await?;
+        for (t, on) in self.tools.iter().zip(enabled) {
+            match t {
+                Tool::Function(_) => {
+                    if on {
                         out.push(t.clone());
                     }
                 }
@@ -1072,6 +1130,26 @@ impl<C: Send + Sync + 'static> AgentAsToolOptions<C> {
     }
     pub fn is_enabled(mut self, enabled: impl Into<crate::tool::IsEnabled<C>>) -> Self {
         self.is_enabled = enabled.into();
+        self
+    }
+    /// Require approval based on a per-call decision that may fail; see
+    /// [`FunctionTool::with_needs_approval_fallible`](crate::tool::FunctionTool::with_needs_approval_fallible).
+    pub fn needs_approval_fallible<F, Fut>(mut self, f: F) -> Self
+    where
+        F: Fn(RunContext<C>, Value, String) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Result<bool>> + Send + 'static,
+    {
+        self.needs_approval = crate::tool::NeedsApproval::fallible(f);
+        self
+    }
+    /// Enable the tool based on a dynamic check that may fail; see
+    /// [`FunctionTool::with_is_enabled_fallible`](crate::tool::FunctionTool::with_is_enabled_fallible).
+    pub fn is_enabled_fallible<F, Fut>(mut self, f: F) -> Self
+    where
+        F: Fn(RunContext<C>, String) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Result<bool>> + Send + 'static,
+    {
+        self.is_enabled = crate::tool::IsEnabled::fallible(f);
         self
     }
     /// Use structured input of type `T`.

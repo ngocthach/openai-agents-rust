@@ -624,6 +624,11 @@ pub struct RunItem {
     /// `ToolApprovalItem._allow_bare_name_alias`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub allow_bare_name_alias: bool,
+    /// Identity of one admitted occurrence of staged input ([`RunItemKind::Input`] only). Two
+    /// admitted inputs with the same content are distinct occurrences, so a server-managed
+    /// conversation delivers each exactly once. Mirrors `InputItem.input_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_id: Option<String>,
     /// Run-local lineage key that survives copies, so the loop can tell which items a handoff
     /// input filter kept. Never serialized and never part of equality. Mirrors
     /// `_NESTED_HISTORY_RUN_ITEM_OCCURRENCE_KEY`.
@@ -658,6 +663,7 @@ impl RunItem {
             tool_origin: None,
             tool_lookup_key: None,
             allow_bare_name_alias: false,
+            input_id: None,
             occurrence: OccurrenceKey::default(),
         }
     }

@@ -533,6 +533,10 @@ pub struct OpenAIResponsesCompactionSession {
     max_rollback_items: Option<usize>,
     state: Mutex<CompactionState>,
     mutation_lock: Mutex<()>,
+    /// Held by a detached history replacement (see `replace_history`) until it settles, so a
+    /// mutation started after its caller was dropped still waits for it, as Python's
+    /// `_mutation_lock` stays held across the shielded restore.
+    detached_mutation: Arc<Mutex<()>>,
 }
 
 impl fmt::Debug for OpenAIResponsesCompactionSession {
@@ -596,7 +600,16 @@ impl OpenAIResponsesCompactionSession {
             max_rollback_items: None,
             state: Mutex::new(CompactionState::default()),
             mutation_lock: Mutex::new(()),
+            detached_mutation: Arc::new(Mutex::new(())),
         })
+    }
+
+    /// Take the mutation lock, then wait for a history replacement whose caller was dropped
+    /// to settle.
+    async fn lock_mutations(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        let guard = self.mutation_lock.lock().await;
+        drop(self.detached_mutation.lock().await);
+        guard
     }
 
     /// Bound the size of the complete-history snapshots manual compaction and whole-history
@@ -667,7 +680,7 @@ impl OpenAIResponsesCompactionSession {
     ///
     /// Returns a zero usage when the decision hook declines.
     pub async fn run_compaction(&self, args: OpenAIResponsesCompactionArgs) -> Result<Usage> {
-        let _guard = self.mutation_lock.lock().await;
+        let _guard = self.lock_mutations().await;
         self.run_compaction_locked(args).await
     }
 
@@ -1031,12 +1044,15 @@ impl OpenAIResponsesCompactionSession {
             return Ok(());
         }
         let max_rollback_items = self.max_rollback_items;
-        crate::memory::await_session_mutation(clear_add_restore(
-            store,
-            max_rollback_items,
-            output_items,
-            previous,
-        ))
+        // The detached task owns this guard, so later mutations wait for it even after this
+        // caller (and its `mutation_lock` guard) is gone.
+        let settling = Arc::clone(&self.detached_mutation).lock_owned().await;
+        crate::memory::await_session_mutation(async move {
+            let outcome =
+                clear_add_restore(store, max_rollback_items, output_items, previous).await;
+            drop(settling);
+            outcome
+        })
         .await
     }
 
@@ -1102,13 +1118,13 @@ impl Session for OpenAIResponsesCompactionSession {
 
     async fn add_items(&self, items: Vec<InputItem>) -> Result<()> {
         self.ensure_wrappable()?;
-        let _guard = self.mutation_lock.lock().await;
+        let _guard = self.lock_mutations().await;
         self.underlying.add_items(items).await
     }
 
     async fn pop_item(&self) -> Result<Option<InputItem>> {
         self.ensure_wrappable()?;
-        let _guard = self.mutation_lock.lock().await;
+        let _guard = self.lock_mutations().await;
         // The stored response chain is dropped before the deletion starts: a caller that is
         // dropped while it is in flight (cancelled in Python) may leave the deletion committed,
         // and the chain can no longer be trusted then. Only an empty pop gives it back.
@@ -1126,7 +1142,7 @@ impl Session for OpenAIResponsesCompactionSession {
 
     async fn clear_session(&self) -> Result<()> {
         self.ensure_wrappable()?;
-        let _guard = self.mutation_lock.lock().await;
+        let _guard = self.lock_mutations().await;
         // A failed or abandoned clear may have committed, so the stored response chain is dropped
         // before it starts, whatever its outcome.
         *self.state.lock().await = CompactionState::default();
@@ -1138,7 +1154,7 @@ impl Session for OpenAIResponsesCompactionSession {
         let Some(response_id) = info.response_id.clone() else {
             return Ok(Usage::default());
         };
-        let _guard = self.mutation_lock.lock().await;
+        let _guard = self.lock_mutations().await;
         if info.has_local_tool_outputs {
             self.defer_compaction(&response_id, info.store).await?;
             log::debug!(target: crate::logger::LOG_TARGET, "skip: deferring compaction for response {response_id} (tool outputs)");
