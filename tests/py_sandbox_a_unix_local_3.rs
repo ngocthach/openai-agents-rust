@@ -11,6 +11,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+#[cfg(target_os = "macos")]
 use std::time::Duration;
 
 use async_trait::async_trait;
