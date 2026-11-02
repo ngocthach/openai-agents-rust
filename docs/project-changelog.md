@@ -1,5 +1,44 @@
 # Changelog
 
+## 0.22.0 (2026-11-02)
+
+Closes three known gaps, fixes an approval-binding security bug, and re-reads 49 more files, including an audit of the
+13 large files counted as Python repository tooling or example scripts. 43 more parity cases moved out of the
+Python-only bucket (41 ported, 2 covered). Measured state: 12,641 Python test cases, 9,315 ported, 908 covered,
+2,418 Python-only, 0 not ported, 0 unaccounted. Notes: `plans/reports/py-test-parity-core19-r19a.md`, `-r19b.md`,
+`-r19c.md`. No live model call was made.
+
+- Approvals (security): an approval made for another payload under a pending call's id no longer runs the pending
+  call. `RunState::approve` / `reject` now rebind the call's unstarted invocation record to the decided payload, so
+  the resumed run refuses the pending call ("unique call ID") instead of running it, as Python does.
+- Sandbox `process_context` rewrites the run's original input, as Python's per-turn `prepare_agent` does: the rewrite
+  reaches `RunResult::input`, `to_input_list()` and `to_state()`, never sees items the run generated, leaves a
+  plain-text input alone, and runs once per turn after the agent-start hooks (a resumed run applies it before its
+  approved tools).
+- Sandbox memory: a run resumed from a `RunState` with an SDK session and no server-managed conversation records an
+  empty input in its memory rollout segment, as Python does; neither a handoff filter nor the `process_context`
+  rewrite reaches the segment.
+- Tool batches: a function-tool call still finalizing when the post-invoke wait expires keeps running detached on
+  the tokio runtime (its committed output is kept) instead of being dropped; a late failure is logged.
+- Sessions: `SqliteSession`, `AdvancedSqliteSession` and `DaprSession` gained `close()` and `is_closed()`. After
+  close every operation, including an empty `add_items`, fails with `SQLiteSession is closed` / `DaprSession is
+  closed`; a Dapr session on a caller-supplied HTTP client is left usable. The encrypted session forwards `pop_item`
+  and the compaction hook to its backend.
+- `WebSearchToolImageSettings` is re-exported from the crate root, as Python exports it from `agents`.
+
+Breaking changes: `DaprSession::ping` returns `Result<bool>` (it refuses a closed session; an unreachable sidecar
+is `Ok(false)`), matching `MongoDBSession::ping`; a sandbox capability's `process_context` no longer sees generated
+items or a plain-text run input, and a sandbox run's `RunResult::input` now carries the rewrite; `RunState::approve`
+on an item whose payload differs from the pending call's now makes the resumed run fail instead of running the call.
+
+Known gaps carried forward: with an SDK session the `process_context` rewrite applies to the model input only
+(Python's original input includes the stored history); a resumed state cannot tell that the run input was plain
+text; a later-turn rewrite is not resent to a server-managed conversation; nested handoff history tracks forwarded
+items by value, not by position and identity; `OpenAIProvider::get_model` without an API key succeeds (requests then
+fail with 401) so keyless local endpoints keep working, where Python raises; tool and handoff enablement checks
+cannot fail. Read depth is uneven this round: several realtime, voice, MCP v2 and any-llm files and most tooling
+files were classified from test names plus sampled bodies; each report lists it.
+
 ## 0.21.0 (2026-11-02)
 
 Re-reads 19 more files with Python-only cases and closes the per-turn sandbox preparation gap where it is

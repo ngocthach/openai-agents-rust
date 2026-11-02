@@ -1,5 +1,7 @@
 # Python test suite vs Rust port: reconciled parity ledger
 
+> **Round 19 update (0.22.0).** 12,641 cases = **9,315 ported + 908 covered + 2,418 python-only + 0 not ported + 0 unaccounted.** Round 19 re-read 49 files (`py-test-parity-core19-r19a/b/c.md`), including an audit of the 13 tooling/example files; read depth per file is in each report.
+>
 > **Round 18 update (0.21.0).** 12,641 cases = **9,274 ported + 906 covered + 2,461 python-only + 0 not ported + 0 unaccounted.** Round 18 re-read 19 files (`py-test-parity-core18-r18a/b/c.md`) and ported the MongoDB close cases (`py-test-parity-core18-mongodb-close.csv`); read depth per file is in each report.
 >
 > **Approval fingerprint (0.20.0).** 12,641 cases = **9,240 ported + 897 covered + 2,504 python-only + 0 not ported + 0 unaccounted.** Function-tool approvals bind to a capability fingerprint; 14 cases of `test_agent_scoped_approvals.py` ported (`py-test-parity-core18-approval-fingerprint.md`).
