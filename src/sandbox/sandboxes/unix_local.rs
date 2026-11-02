@@ -1684,6 +1684,12 @@ fn normalize_restorable_archive(raw: &[u8], root: &Path) -> SandboxResult<Vec<u8
     encoder.finish().map_err(unreadable_capture)
 }
 
+/// The mode bits of `stat`. `st_mode` is `u16` on macOS and `u32` on Linux.
+#[allow(clippy::unnecessary_cast)]
+fn stat_mode(stat: &rustix::fs::Stat) -> u32 {
+    stat.st_mode as u32
+}
+
 fn rm_failure(path: &str, error: &std::io::Error) -> SandboxError {
     SandboxError::new(
         ErrorCode::WorkspaceArchiveWriteError,
@@ -2457,9 +2463,9 @@ impl SandboxSession for UnixLocalSandboxSession {
                 path: base.join(&name).to_string_lossy().into_owned(),
                 name,
                 size: Some(stat.st_size as u64),
-                permissions: Some(crate::sandbox::types::Permissions::from_mode(
-                    stat.st_mode as u32,
-                )),
+                permissions: Some(crate::sandbox::types::Permissions::from_mode(stat_mode(
+                    &stat,
+                ))),
                 is_dir: kind == rustix::fs::FileType::Directory,
                 is_symlink: kind == rustix::fs::FileType::Symlink,
             });
