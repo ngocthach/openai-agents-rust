@@ -103,6 +103,11 @@ fn write_canonical(value: &Value, out: &mut String) {
     }
 }
 
+/// SHA-256 (hex) of `payload` as canonical JSON, the digest every invocation identity uses.
+pub(crate) fn canonical_digest(payload: &Value) -> String {
+    digest(payload)
+}
+
 /// Canonical JSON digest. Port of `_fingerprint`.
 fn digest(payload: &Value) -> String {
     let mut encoded = String::new();

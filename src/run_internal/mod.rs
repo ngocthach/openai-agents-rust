@@ -1866,6 +1866,8 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
             }
         }
         self.ctx.import_approvals(&approvals);
+        self.ctx
+            .import_approval_capabilities(&state.approval_capabilities);
         self.legacy_name_owner_fallback = state.legacy_name_owner_snapshot;
         self.ctx
             .import_nested_states(&state.nested_agent_tool_states);
@@ -3101,6 +3103,7 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
             model_responses: self.model_responses.clone(),
             usage: self.ctx.usage(),
             approvals: self.ctx.export_approvals(),
+            approval_capabilities: self.ctx.export_approval_capabilities(),
             agent_owner_names: agent_identity::names_by_identity_key(&self.starting_agent),
             ambiguous_agent_owners: agent_identity::ambiguous_identity_keys(&self.starting_agent),
             restored_function_approval_keys: Default::default(),
@@ -4977,6 +4980,7 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
                                     );
                                     stand_in.mcp_server_name = Some(binding.0.clone());
                                     stand_in.mcp_tool_binding = Some(binding);
+                                    stand_in.resumes_registered_capability = true;
                                     stand_in.needs_approval =
                                         crate::tool::NeedsApproval::Static(true);
                                     let next = processed.call_positions.len();
@@ -5035,6 +5039,7 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
                         // for; a local replacement or another server offering the same name
                         // must not run it. Port of the binding check in
                         // `resolve_interrupted_turn`.
+                        let mut call_tool = (*t).clone();
                         if !append && !skip.contains(&fc.call_id) {
                             let original = self.original_mcp_binding(&fc.call_id);
                             let pending = self
@@ -5063,6 +5068,15 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
                                          run.",
                                     ));
                                 }
+                                // A rejected call whose recipient changed still answers with
+                                // the rejection taken on the original tool's capability.
+                                if approved == Some(false)
+                                    && (missing || original != t.mcp_tool_binding.as_ref())
+                                {
+                                    let mut replaced = FunctionTool::clone(&call_tool);
+                                    replaced.resumes_registered_capability = true;
+                                    call_tool = Arc::new(replaced);
+                                }
                             }
                         }
                         if append {
@@ -5087,7 +5101,7 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
                                 .push((fc.clone(), (*t).clone()));
                         }
                         if !skip.contains(&fc.call_id) {
-                            processed.functions.push((fc.clone(), (*t).clone()));
+                            processed.functions.push((fc.clone(), call_tool));
                         }
                     } else if routes_to_apply_patch(tools, &raw_out) {
                         // A function call to `apply_patch` runs on the apply_patch tool.
@@ -5161,6 +5175,7 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
                                                     ))
                                                 },
                                             );
+                                            stand_in.resumes_registered_capability = true;
                                             stand_in.needs_approval =
                                                 crate::tool::NeedsApproval::Static(true);
                                             let next = processed.call_positions.len();

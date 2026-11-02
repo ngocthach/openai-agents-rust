@@ -262,6 +262,7 @@ impl<C> RunResult<C> {
         let mut s = (*self.state).clone();
         s.usage = self.context_wrapper.usage();
         s.approvals = self.context_wrapper.export_approvals();
+        s.approval_capabilities = self.context_wrapper.export_approval_capabilities();
         s.nested_agent_tool_states = self.context_wrapper.nested_states();
         s
     }

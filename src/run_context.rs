@@ -50,6 +50,84 @@ fn approval_key(agent: &str, tool_name: &str) -> String {
     format!("{agent}\u{1}{tool_name}")
 }
 
+/// Separator between an approval key and the capability fingerprint a decision is bound to. No
+/// agent or tool name contains it, so a bound key never collides with an unbound one.
+const CAPABILITY_SEP: char = '\u{3}';
+
+/// Key of a function-tool decision bound to one capability fingerprint.
+fn bound_approval_key(agent: &str, tool_name: &str, fingerprint: &str) -> String {
+    format!("{agent}\u{1}{tool_name}{CAPABILITY_SEP}{fingerprint}")
+}
+
+/// Split a bound key into its unbound key (`agent \u{1} tool`) and its capability fingerprint;
+/// `None` for an unbound or hosted key.
+pub(crate) fn split_bound_approval_key(key: &str) -> Option<(&str, &str)> {
+    if parse_hosted_key(key).is_some() {
+        return None;
+    }
+    key.rsplit_once(CAPABILITY_SEP)
+}
+
+/// Join an unbound key and a capability fingerprint into a bound key.
+pub(crate) fn join_bound_approval_key(key: &str, fingerprint: &str) -> String {
+    format!("{key}{CAPABILITY_SEP}{fingerprint}")
+}
+
+/// The capability a function-tool approval was raised for: the record owner, the tool key the
+/// decision is filed under, and the fingerprint of the tool the owner exposed at the time.
+///
+/// The runner registers one per call id whenever it pauses a function tool call for approval, so
+/// a decision taken on that interruption (through [`RunContext::approve_tool`],
+/// [`RunState::approve`](crate::run_state::RunState::approve) and their siblings) is bound to
+/// the exact tool that asked. A bound decision authorizes only a tool with the same fingerprint:
+/// a same-named tool with another description, schema, namespace or origin, or the same tool on
+/// an agent with another name, is asked again.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalCapability {
+    /// The owner the decision is recorded under (agent name, or identity key of a same-named
+    /// agent).
+    pub agent: String,
+    /// The tool key the decision is recorded under (see [`approval_tool_key`]).
+    pub tool_key: String,
+    /// SHA-256 (hex) of the tool's capability; see [`function_tool_capability_fingerprint`].
+    pub fingerprint: String,
+}
+
+/// Stable SHA-256 (hex) fingerprint of a function tool as `agent_name` exposes it: the agent
+/// name, tool name, namespace, description, parameter schema and tool origin, hashed as
+/// canonical JSON (sorted keys), so it is the same in every process that builds the same tool.
+///
+/// Closures are not part of it: two tools that differ only in their body cannot be told apart.
+pub fn function_tool_capability_fingerprint<C: Send + Sync + 'static>(
+    agent_name: &str,
+    tool: &crate::tool::FunctionTool<C>,
+) -> String {
+    crate::run_internal::tool_invocation::canonical_digest(&serde_json::json!({
+        "kind": "function_tool_capability",
+        "agent": agent_name,
+        "name": tool.name,
+        "namespace": tool.namespace,
+        "description": tool.description,
+        "parameters": tool.params_json_schema,
+        "origin": tool.tool_origin(),
+    }))
+}
+
+/// The fingerprint registered for `item`'s call, when it was registered for the same owner and
+/// tool key. Hosted MCP requests are never bound.
+fn capability_for<'a>(
+    capabilities: &'a BTreeMap<String, ApprovalCapability>,
+    item: &ToolApprovalItem,
+) -> Option<&'a str> {
+    if hosted_request(item).is_some() {
+        return None;
+    }
+    let capability = capabilities.get(item.call_id())?;
+    (capability.agent == item.agent
+        && capability.tool_key == approval_tool_key(&item.tool_name, &item.raw_item))
+    .then_some(capability.fingerprint.as_str())
+}
+
 /// Tool names whose sticky decisions are scoped by invocation type: the native `apply_patch_call`
 /// tool and a custom tool can both be called `apply_patch`, and approving one must not approve the
 /// other. Mirrors `RunContextWrapper._approval_keys_for_scope`.
@@ -321,7 +399,7 @@ impl ApprovalsState {
 
     /// [`approve`](Self::approve), failing the way Python's `approve_tool` raises.
     pub fn try_approve(&mut self, item: &ToolApprovalItem, always: bool) -> crate::Result<()> {
-        self.decide(item, always, true, None)
+        self.decide(item, always, true, None, None)
     }
 
     /// [`reject`](Self::reject), failing the way Python's `reject_tool` raises.
@@ -331,7 +409,29 @@ impl ApprovalsState {
         always: bool,
         message: Option<String>,
     ) -> crate::Result<()> {
-        self.decide(item, always, false, message)
+        self.decide(item, always, false, message, None)
+    }
+
+    /// Record a decision, bound to the capability registered for the item's call in
+    /// `capabilities` when there is one (see [`ApprovalCapability`]); unbound otherwise.
+    pub(crate) fn try_decide_registered(
+        &mut self,
+        item: &ToolApprovalItem,
+        always: bool,
+        approve: bool,
+        message: Option<String>,
+        capabilities: &BTreeMap<String, ApprovalCapability>,
+    ) -> crate::Result<()> {
+        let fingerprint = capability_for(capabilities, item).map(str::to_string);
+        self.decide(item, always, approve, message, fingerprint.as_deref())
+    }
+
+    /// The key a decision about `item` under `tool_key` is recorded under.
+    fn decision_key(item: &ToolApprovalItem, tool_key: &str, fingerprint: Option<&str>) -> String {
+        match fingerprint {
+            Some(fp) => bound_approval_key(&item.agent, tool_key, fp),
+            None => approval_key(&item.agent, tool_key),
+        }
     }
 
     fn decide(
@@ -340,16 +440,23 @@ impl ApprovalsState {
         always: bool,
         approve: bool,
         message: Option<String>,
+        fingerprint: Option<&str>,
     ) -> crate::Result<()> {
         let Some(request) = hosted_request(item) else {
             let key = approval_tool_key(&item.tool_name, &item.raw_item);
             // A per-call decision about a deferred top-level tool also answers a query by its
             // bare name; a permanent one stays under the deferred key.
             if !always && let Some(bare) = key.strip_prefix(DEFERRED_TOP_LEVEL_PREFIX) {
-                let rec = self.0.entry(approval_key(&item.agent, bare)).or_default();
+                let rec = self
+                    .0
+                    .entry(Self::decision_key(item, bare, fingerprint))
+                    .or_default();
                 apply_decision(rec, item.call_id(), false, approve, message.clone());
             }
-            let rec = self.0.entry(approval_key(&item.agent, &key)).or_default();
+            let rec = self
+                .0
+                .entry(Self::decision_key(item, &key, fingerprint))
+                .or_default();
             apply_decision(rec, item.call_id(), always, approve, message);
             return Ok(());
         };
@@ -413,20 +520,65 @@ impl ApprovalsState {
                 self.0
                     .get(&approval_key(owner, name))
                     .filter(|rec| Self::record_status(rec, call_id).is_some())
+                    .or_else(|| self.unique_bound_record(owner, name, call_id))
             })
         };
         decided(agent).or_else(|| decided(""))
     }
 
+    /// The capability-bound record a name-only query may read for `owner` and `name`. Port of the
+    /// name-only branch of `_approval_records_for_key`: with one bound record it answers; with
+    /// several, only the one holding an exact decision for `call_id` does, so a query never picks
+    /// between the sticky decisions of distinct capabilities.
+    fn unique_bound_record(
+        &self,
+        owner: &str,
+        name: &str,
+        call_id: &str,
+    ) -> Option<&ApprovalRecord> {
+        let prefix = format!("{}{CAPABILITY_SEP}", approval_key(owner, name));
+        let mut records: Vec<&ApprovalRecord> = self
+            .0
+            .range(prefix.clone()..)
+            .take_while(|(key, _)| key.starts_with(&prefix))
+            .map(|(_, rec)| rec)
+            .collect();
+        if records.len() > 1 {
+            records.retain(|rec| per_call_status(rec, call_id).is_some());
+        }
+        match records.as_slice() {
+            [rec] if Self::record_status(rec, call_id).is_some() => Some(rec),
+            _ => None,
+        }
+    }
+
     /// The decision for a function tool call. Port of the function branch of
     /// `_approval_records_for_tool`: an ownerless (pre-1.18) record contributes only its exact
     /// call decisions, never a sticky grant, so an old permanent decision never picks an owner.
+    ///
+    /// A decision bound to `fingerprint` (the capability of the tool about to run) decides
+    /// first. Decisions bound to any other capability are ignored, so the call is asked again;
+    /// unbound decisions apply as they always did.
     pub(crate) fn function_tool_status(
         &self,
         agent: &str,
         tool_name: &str,
         call_id: &str,
+        fingerprint: Option<&str>,
     ) -> ApprovalStatus {
+        let bound = fingerprint.and_then(|fp| {
+            lookup_names(tool_name).find_map(|name| {
+                self.0
+                    .get(&bound_approval_key(agent, name, fp))
+                    .filter(|rec| Self::record_status(rec, call_id).is_some())
+            })
+        });
+        if let Some(rec) = bound {
+            return ApprovalStatus {
+                approved: Self::record_status(rec, call_id),
+                rejection_message: record_rejection_message(rec, call_id),
+            };
+        }
         let owned = lookup_names(tool_name).find_map(|name| {
             self.0
                 .get(&approval_key(agent, name))
@@ -563,8 +715,42 @@ impl ApprovalsState {
     /// canonical invocation, so it is always undecided; only its legacy exact rejection
     /// message stays readable.
     pub fn status_for_item(&self, item: &ToolApprovalItem, call_id: &str) -> ApprovalStatus {
+        self.status_for_item_bound(item, call_id, None)
+    }
+
+    /// [`status_for_item`](Self::status_for_item) for a function call whose capability
+    /// fingerprint is known: a decision bound to it decides first, decisions bound to other
+    /// capabilities never do.
+    fn status_for_item_bound(
+        &self,
+        item: &ToolApprovalItem,
+        call_id: &str,
+        fingerprint: Option<&str>,
+    ) -> ApprovalStatus {
         let Some(request) = hosted_request(item) else {
             let key = approval_tool_key(&item.tool_name, &item.raw_item);
+            if let Some(fp) = fingerprint {
+                let bound = self.function_tool_status(&item.agent, &key, call_id, Some(fp));
+                if bound.approved.is_some() {
+                    return bound;
+                }
+                // Only unbound records may answer now: an unbound sticky or exact decision of
+                // the owner, then an ownerless one.
+                let unbound = |owner: &str| {
+                    lookup_names(&key).find_map(|name| {
+                        self.0
+                            .get(&approval_key(owner, name))
+                            .filter(|rec| Self::record_status(rec, call_id).is_some())
+                    })
+                };
+                return unbound(&item.agent)
+                    .or_else(|| unbound(""))
+                    .map(|rec| ApprovalStatus {
+                        approved: Self::record_status(rec, call_id),
+                        rejection_message: record_rejection_message(rec, call_id),
+                    })
+                    .unwrap_or_default();
+            }
             return ApprovalStatus {
                 approved: self.status(&item.agent, &key, call_id),
                 rejection_message: self.rejection_message(&item.agent, &key, call_id),
@@ -629,6 +815,9 @@ struct Inner {
     /// The invocations decisions were recorded for, keyed by call id. Mirrors
     /// `RunContextWrapper._tool_invocations`: a decision binds the exact call it was made for.
     invocations: BTreeMap<String, crate::run_state::ToolInvocationRecord>,
+    /// The capability each function-tool approval the runner raised was asked for, keyed by
+    /// call id. A decision on that call is bound to it; see [`ApprovalCapability`].
+    approval_capabilities: BTreeMap<String, ApprovalCapability>,
 }
 
 /// The invocation a function-tool decision binds: the call id, the tool it routes to and its
@@ -888,10 +1077,67 @@ impl<C> RunContext<C> {
         item: &ToolApprovalItem,
         always_approve: bool,
     ) -> crate::Result<()> {
+        self.decide_tool(item, always_approve, true, None)
+    }
+
+    fn decide_tool(
+        &self,
+        item: &ToolApprovalItem,
+        always: bool,
+        approve: bool,
+        message: Option<String>,
+    ) -> crate::Result<()> {
         let mut inner = self.lock();
-        inner.approvals.try_approve(item, always_approve)?;
+        let Inner {
+            approvals,
+            approval_capabilities,
+            ..
+        } = &mut *inner;
+        approvals.try_decide_registered(item, always, approve, message, approval_capabilities)?;
         Self::bind(&mut inner, item);
         Ok(())
+    }
+
+    /// Record the capability the runner asked approval for on `call_id`; a decision on that call
+    /// is then bound to it. A later interruption of the same call id replaces it.
+    pub(crate) fn register_approval_capability(
+        &self,
+        call_id: &str,
+        capability: ApprovalCapability,
+    ) {
+        self.lock()
+            .approval_capabilities
+            .insert(call_id.to_string(), capability);
+    }
+
+    /// The fingerprint registered for the approval the runner raised on `call_id`, if any.
+    pub(crate) fn registered_capability(&self, call_id: &str) -> Option<String> {
+        self.lock()
+            .approval_capabilities
+            .get(call_id)
+            .map(|capability| capability.fingerprint.clone())
+    }
+
+    /// The capabilities registered for the function-tool approvals this context raised, keyed by
+    /// call id. [`RunState`](crate::run_state::RunState) carries them so a decision taken after
+    /// a restore is still bound; carry them with
+    /// [`export_approvals`](Self::export_approvals) when moving a context elsewhere.
+    pub fn export_approval_capabilities(&self) -> BTreeMap<String, ApprovalCapability> {
+        self.lock().approval_capabilities.clone()
+    }
+
+    /// Restore capabilities exported with
+    /// [`export_approval_capabilities`](Self::export_approval_capabilities). An imported entry
+    /// replaces what this context knew about the same call id.
+    pub fn import_approval_capabilities(
+        &self,
+        capabilities: &BTreeMap<String, ApprovalCapability>,
+    ) {
+        self.lock().approval_capabilities.extend(
+            capabilities
+                .iter()
+                .map(|(call_id, capability)| (call_id.clone(), capability.clone())),
+        );
     }
 
     fn bind(inner: &mut Inner, item: &ToolApprovalItem) {
@@ -941,12 +1187,7 @@ impl<C> RunContext<C> {
         always_reject: bool,
         rejection_message: Option<String>,
     ) -> crate::Result<()> {
-        let mut inner = self.lock();
-        inner
-            .approvals
-            .try_reject(item, always_reject, rejection_message)?;
-        Self::bind(&mut inner, item);
-        Ok(())
+        self.decide_tool(item, always_reject, false, rejection_message)
     }
 
     /// Approval status for a tool call: `Some(true)` approved, `Some(false)` rejected, `None`
@@ -969,10 +1210,11 @@ impl<C> RunContext<C> {
         agent: &str,
         tool_name: &str,
         call_id: &str,
+        fingerprint: Option<&str>,
     ) -> ApprovalStatus {
         self.lock()
             .approvals
-            .function_tool_status(agent, tool_name, call_id)
+            .function_tool_status(agent, tool_name, call_id, fingerprint)
     }
 
     /// Custom rejection message for a rejected call, if one was provided.
@@ -993,7 +1235,11 @@ impl<C> RunContext<C> {
         item: &ToolApprovalItem,
         call_id: &str,
     ) -> ApprovalStatus {
-        self.lock().approvals.status_for_item(item, call_id)
+        let inner = self.lock();
+        let fingerprint = capability_for(&inner.approval_capabilities, item);
+        inner
+            .approvals
+            .status_for_item_bound(item, call_id, fingerprint)
     }
 
     /// The decision for a hosted MCP request, scoped by its server label and tool name.
@@ -1112,6 +1358,75 @@ impl<C> RunContext<C> {
 
     pub(crate) fn take_nested_interruptions(&self, call_id: &str) -> Option<Vec<ToolApprovalItem>> {
         self.lock().nested_interruptions.remove(call_id)
+    }
+}
+
+impl<C: Send + Sync + 'static> RunContext<C> {
+    /// Approve `item` as a call to the function tool `agent` exposes under `item.tool_name`, bound
+    /// to that tool's capability fingerprint (see [`ApprovalCapability`]): a later call is
+    /// authorized only while the running agent has the same name and exposes a tool with the
+    /// same name, namespace, description, parameter schema and origin. `always_approve` makes
+    /// the decision sticky for that capability.
+    ///
+    /// Use it for approval items built by hand; a decision on an interruption the runner raised
+    /// is bound automatically by [`approve_tool`](Self::approve_tool). Fails, recording nothing,
+    /// when `agent` has no function tool named `item.tool_name` or the item is a hosted MCP
+    /// request.
+    pub fn approve_tool_for_agent(
+        &self,
+        agent: &crate::agent::Agent<C>,
+        item: &ToolApprovalItem,
+        always_approve: bool,
+    ) -> crate::Result<()> {
+        self.decide_for_agent(agent, item, always_approve, true, None)
+    }
+
+    /// Reject `item` bound to the capability of `agent`'s tool; see
+    /// [`approve_tool_for_agent`](Self::approve_tool_for_agent).
+    pub fn reject_tool_for_agent(
+        &self,
+        agent: &crate::agent::Agent<C>,
+        item: &ToolApprovalItem,
+        always_reject: bool,
+        rejection_message: Option<String>,
+    ) -> crate::Result<()> {
+        self.decide_for_agent(agent, item, always_reject, false, rejection_message)
+    }
+
+    fn decide_for_agent(
+        &self,
+        agent: &crate::agent::Agent<C>,
+        item: &ToolApprovalItem,
+        always: bool,
+        approve: bool,
+        message: Option<String>,
+    ) -> crate::Result<()> {
+        if hosted_request(item).is_some() {
+            return Err(crate::AgentsError::user(
+                "Hosted MCP approvals are scoped by server label and tool name, not by an agent's \
+                 function tool.",
+            ));
+        }
+        let tool = agent
+            .tools
+            .iter()
+            .find_map(|tool| match tool {
+                crate::tool::Tool::Function(f) if f.qualified_name() == item.tool_name => Some(f),
+                _ => None,
+            })
+            .ok_or_else(|| {
+                crate::AgentsError::user(format!(
+                    "Agent '{}' has no function tool named '{}' to bind the approval to.",
+                    agent.name, item.tool_name
+                ))
+            })?;
+        let fingerprint = function_tool_capability_fingerprint(&agent.name, tool);
+        let mut inner = self.lock();
+        inner
+            .approvals
+            .decide(item, always, approve, message, Some(&fingerprint))?;
+        Self::bind(&mut inner, item);
+        Ok(())
     }
 }
 

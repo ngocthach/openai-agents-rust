@@ -709,6 +709,10 @@ pub struct FunctionTool<C> {
     pub(crate) mcp_server_name: Option<String>,
     /// The annotations the MCP server declared for this tool, captured when it was converted.
     pub(crate) mcp_annotations: Option<Value>,
+    /// Set on the stand-in the runner builds for a resumed call whose tool is gone. Its
+    /// recorded decision was taken on the original tool, so the call is matched against the
+    /// capability that interruption registered rather than the stand-in's own.
+    pub(crate) resumes_registered_capability: bool,
     /// Which MCP server and raw tool this function tool calls: `(server log name, raw tool
     /// name, index in the agent's server list)`. Persisted per call so an approved call can only
     /// resume on the recipient it was approved for. Mirrors `FunctionTool._mcp_tool_binding`.
@@ -750,6 +754,7 @@ impl<C> Clone for FunctionTool<C> {
             is_agent_tool: self.is_agent_tool,
             mcp_server_name: self.mcp_server_name.clone(),
             mcp_annotations: self.mcp_annotations.clone(),
+            resumes_registered_capability: self.resumes_registered_capability,
             mcp_tool_binding: self.mcp_tool_binding.clone(),
             tool_origin: self.tool_origin.clone(),
             namespace: self.namespace.clone(),
@@ -1154,6 +1159,7 @@ impl<C: Send + Sync + 'static> FunctionTool<C> {
             is_agent_tool: false,
             mcp_server_name: None,
             mcp_annotations: None,
+            resumes_registered_capability: false,
             mcp_tool_binding: None,
             tool_origin: None,
             allowed_callers: None,

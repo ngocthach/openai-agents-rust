@@ -1237,6 +1237,13 @@ fn approvals_to_wire(state: &RunState) -> Value {
             .iter()
             .filter(|(key, _)| crate::run_context::parse_hosted_key(key).is_none())
             .filter_map(|(key, record)| {
+                // A capability-bound decision is written like any agent-owned one, plus the
+                // Rust-only `capability` field: Python reads entries by key and binds the
+                // decision to its owner, Rust restores the binding.
+                let (key, capability) = match crate::run_context::split_bound_approval_key(key) {
+                    Some((unbound, fingerprint)) => (unbound, Some(fingerprint)),
+                    None => (key.as_str(), None),
+                };
                 let (owner, tool_key) = split_approval_key(key);
                 // An owner that only graph order tells from a sibling carries no authority
                 // into a snapshot.
@@ -1247,14 +1254,28 @@ fn approvals_to_wire(state: &RunState) -> Value {
                     .agent_owner_names
                     .get(&owner)
                     .map_or(owner.as_str(), String::as_str);
-                Some(json!({
+                let mut entry = json!({
                     "agent": agent_ref_with_identity(name, Some(&owner)),
                     "tool_key": tool_key,
                     "decision": approval_decision_to_wire(record),
-                }))
+                });
+                if let Some(capability) = capability {
+                    entry["capability"] = Value::String(capability.to_string());
+                }
+                Some(entry)
             })
             .collect(),
     )
+}
+
+/// The capability registry [`RunState::approval_capabilities`] wrote under the `rust` key.
+fn approval_capabilities_from_wire(
+    rust: &Value,
+) -> std::collections::BTreeMap<String, crate::run_context::ApprovalCapability> {
+    rust.get("approval_capabilities")
+        .cloned()
+        .and_then(|v| serde_json::from_value(v).ok())
+        .unwrap_or_default()
 }
 
 fn approvals_from_wire(context: &Value, version: &str) -> ApprovalsState {
@@ -1269,10 +1290,16 @@ fn approvals_from_wire(context: &Value, version: &str) -> ApprovalsState {
                 .and_then(Value::as_str)
                 .unwrap_or_default();
             let decision = entry.get("decision").cloned().unwrap_or(Value::Null);
-            state.0.insert(
-                format!("{agent}\u{1}{tool_key}"),
-                approval_decision_from_wire(&decision),
-            );
+            let mut key = format!("{agent}\u{1}{tool_key}");
+            // A Rust writer's capability-bound decision; see `approvals_to_wire`.
+            if let Some(capability) = entry
+                .get("capability")
+                .and_then(Value::as_str)
+                .filter(|c| !c.is_empty())
+            {
+                key = crate::run_context::join_bound_approval_key(&key, capability);
+            }
+            state.0.insert(key, approval_decision_from_wire(&decision));
         }
     }
     // Python's agent-agnostic bucket. Those decisions apply whichever agent is running, so
@@ -2390,6 +2417,13 @@ pub(super) fn to_wire(state: &RunState, include_tracing_api_key: bool) -> Result
             "withheld_output_call_ids": state.withheld_output_call_ids,
         },
     });
+    // The capabilities pending function-tool approvals were raised for.
+    if let Some(Value::Object(rust)) = envelope.get_mut("rust") {
+        rust.insert(
+            "approval_capabilities".into(),
+            serde_json::to_value(&state.approval_capabilities)?,
+        );
+    }
     // Approvals parked by a duplicate-named current agent record which duplicate owns them.
     if let Some(identity) = state.current_agent_identity.as_deref() {
         stamp_approval_owner_identity(&mut envelope, &state.current_agent_name, identity);
@@ -2650,6 +2684,7 @@ pub(super) fn from_wire(value: &Value, version: &str) -> Result<RunState> {
             .map(usage_from_wire)
             .unwrap_or_default(),
         approvals: approvals_from_wire(&context, version),
+        approval_capabilities: approval_capabilities_from_wire(&rust),
         nested_agent_tool_states: rust
             .get("nested_agent_tool_states")
             .cloned()

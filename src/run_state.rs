@@ -191,6 +191,12 @@ pub struct RunState {
     /// it was given for, so a replay with mutated arguments is rejected rather than reused.
     #[serde(default)]
     pub tool_invocations: BTreeMap<String, ToolInvocationRecord>,
+    /// The capability each pending function-tool approval was raised for, keyed by call id. A
+    /// decision taken with [`approve`](Self::approve) or [`reject`](Self::reject) on such a call
+    /// is bound to it, so it authorizes only that tool. Rust-only: it travels under the
+    /// envelope's `rust` key.
+    #[serde(default)]
+    pub approval_capabilities: BTreeMap<String, crate::run_context::ApprovalCapability>,
     /// What the run loop made of the model response that produced the pending interruptions.
     /// Mirrors `RunState._last_processed_response`; `None` unless the run stopped at an
     /// interruption, which is also when Python writes it.
@@ -507,7 +513,13 @@ impl RunState {
     /// Approve a pending tool call. `always_approve` also approves future calls to the same
     /// tool by the same agent.
     pub fn approve(&mut self, item: &ToolApprovalItem, always_approve: bool) {
-        self.approvals.approve(item, always_approve);
+        let _ = self.approvals.try_decide_registered(
+            item,
+            always_approve,
+            true,
+            None,
+            &self.approval_capabilities,
+        );
         self.bind_decision(item);
         self.restored_unbound_approval_call_ids
             .remove(item.call_id());
@@ -520,8 +532,13 @@ impl RunState {
         always_reject: bool,
         rejection_message: Option<String>,
     ) {
-        self.approvals
-            .reject(item, always_reject, rejection_message);
+        let _ = self.approvals.try_decide_registered(
+            item,
+            always_reject,
+            false,
+            rejection_message,
+            &self.approval_capabilities,
+        );
         self.bind_decision(item);
         self.restored_unbound_approval_call_ids
             .remove(item.call_id());
@@ -548,7 +565,13 @@ impl RunState {
     pub fn try_approve(&mut self, item: &ToolApprovalItem, always_approve: bool) -> Result<()> {
         check_function_decision(item, always_approve)?;
         self.check_unambiguous_pending(item)?;
-        self.approvals.try_approve(item, always_approve)?;
+        self.approvals.try_decide_registered(
+            item,
+            always_approve,
+            true,
+            None,
+            &self.approval_capabilities,
+        )?;
         self.restored_unbound_approval_call_ids
             .remove(item.call_id());
         self.forget_restored_function_decision(item);
@@ -558,11 +581,20 @@ impl RunState {
     /// A fresh decision on `item` replaces what the snapshot said about its owner and tool.
     fn forget_restored_function_decision(&mut self, item: &ToolApprovalItem) {
         let key = crate::run_context::approval_tool_key(&item.tool_name, &item.raw_item);
-        self.restored_function_approval_keys
-            .remove(&format!("{}\u{1}{key}", item.agent));
+        let fingerprint = self
+            .approval_capabilities
+            .get(item.call_id())
+            .map(|capability| capability.fingerprint.clone());
+        let mut forget = |key: String| {
+            if let Some(fp) = &fingerprint {
+                self.restored_function_approval_keys
+                    .remove(&crate::run_context::join_bound_approval_key(&key, fp));
+            }
+            self.restored_function_approval_keys.remove(&key);
+        };
+        forget(format!("{}\u{1}{key}", item.agent));
         if let Some(bare) = key.strip_prefix(crate::run_context::DEFERRED_TOP_LEVEL_PREFIX) {
-            self.restored_function_approval_keys
-                .remove(&format!("{}\u{1}{bare}", item.agent));
+            forget(format!("{}\u{1}{bare}", item.agent));
         }
     }
 
@@ -598,8 +630,13 @@ impl RunState {
     ) -> Result<()> {
         check_function_decision(item, always_reject)?;
         self.check_unambiguous_pending(item)?;
-        self.approvals
-            .try_reject(item, always_reject, rejection_message)?;
+        self.approvals.try_decide_registered(
+            item,
+            always_reject,
+            false,
+            rejection_message,
+            &self.approval_capabilities,
+        )?;
         self.restored_unbound_approval_call_ids
             .remove(item.call_id());
         self.forget_restored_function_decision(item);

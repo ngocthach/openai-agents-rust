@@ -361,19 +361,36 @@ pub(crate) async fn execute_function_tool<C: Send + Sync + 'static>(
     // Decisions are recorded under the invocation-scoped key (`apply_patch:function_call` for a
     // function tool named `apply_patch`), so they are read back under the same key.
     let approval_key = crate::run_context::approval_tool_key(&approval_name, &call);
+    // A decision bound to a capability authorizes only the tool it was taken for: the same
+    // agent name exposing a tool with the same name, namespace, description, schema and origin.
+    // A stand-in for a resumed call whose tool is gone answers with the decision taken on the
+    // original tool, so it is matched against the capability that interruption registered.
+    let capability = tool
+        .resumes_registered_capability
+        .then(|| env.ctx.registered_capability(&call.call_id))
+        .flatten()
+        .unwrap_or_else(|| {
+            crate::run_context::function_tool_capability_fingerprint(&env.agent.name, &tool)
+        });
     // A restored decision that no ledger entry binds authorizes nothing; see
     // [`bound_approval_status`].
     let status_now = || {
         if env.unbound_approvals.contains(&call.call_id) {
             return None;
         }
-        let mut status = env
-            .ctx
-            .function_tool_status(env.agent_key, &approval_key, &call.call_id);
+        let mut status = env.ctx.function_tool_status(
+            env.agent_key,
+            &approval_key,
+            &call.call_id,
+            Some(&capability),
+        );
         if status.approved.is_none() && env.name_owner_fallback && env.agent_key != env.agent.name {
-            status = env
-                .ctx
-                .function_tool_status(&env.agent.name, &approval_key, &call.call_id);
+            status = env.ctx.function_tool_status(
+                &env.agent.name,
+                &approval_key,
+                &call.call_id,
+                Some(&capability),
+            );
         }
         status.approved
     };
@@ -408,6 +425,14 @@ pub(crate) async fn execute_function_tool<C: Send + Sync + 'static>(
         }
         match status {
             None => {
+                env.ctx.register_approval_capability(
+                    &call.call_id,
+                    crate::run_context::ApprovalCapability {
+                        agent: env.agent_key.to_string(),
+                        tool_key: approval_key.clone(),
+                        fingerprint: capability.clone(),
+                    },
+                );
                 let item = ToolApprovalItem {
                     agent: env.agent_key.to_string(),
                     raw_item: call.clone(),
@@ -421,13 +446,19 @@ pub(crate) async fn execute_function_tool<C: Send + Sync + 'static>(
                 ));
             }
             Some(false) => {
-                let mut decided =
-                    env.ctx
-                        .function_tool_status(env.agent_key, &approval_key, &call.call_id);
+                let mut decided = env.ctx.function_tool_status(
+                    env.agent_key,
+                    &approval_key,
+                    &call.call_id,
+                    Some(&capability),
+                );
                 if decided.approved.is_none() && env.name_owner_fallback {
-                    decided =
-                        env.ctx
-                            .function_tool_status(&env.agent.name, &approval_key, &call.call_id);
+                    decided = env.ctx.function_tool_status(
+                        &env.agent.name,
+                        &approval_key,
+                        &call.call_id,
+                        Some(&capability),
+                    );
                 }
                 let message = match decided.rejection_message {
                     Some(message) => message,

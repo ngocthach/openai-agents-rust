@@ -1,6 +1,6 @@
 [package]
 name = "openai-agents-sdk-macros"
-version = "0.19.0"
+version = "0.20.0"
 edition = "2024"
 rust-version = "1.89"
 description = "Procedural macros for openai-agents-sdk (#[function_tool])"
