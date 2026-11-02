@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.20.0 (2026-11-02)
+
+Closes the largest known gap from 0.19.0. 14 more parity cases ported. Measured state: 12,641 Python test cases,
+9,240 ported, 897 covered, 2,504 Python-only, 0 not ported, 0 unaccounted. No live model call was made.
+
+
+- Function-tool approvals are bound to a capability fingerprint, closing the approval-binding known gap listed under 0.19.0: a
+  decision recorded for one tool no longer authorises a different same-named tool on a same-named agent after the
+  context, its exported approvals or a run state is reused or restored. The fingerprint is a SHA-256 of the agent
+  name and the tool's name, namespace, description, parameter schema and origin
+  (`run_context::function_tool_capability_fingerprint`). The runner registers it for every function-tool approval it
+  raises, so `RunContext::approve_tool` / `reject_tool` and `RunState::approve` / `reject` on that interruption bind
+  automatically, also after `RunState::to_json` / `from_json`. A bound decision applies only while the running tool
+  has the same fingerprint; otherwise the call is asked again (sticky and per-call alike). Unbound decisions, including
+  every `ApprovalsState` serialized before this change, behave exactly as before.
+- New API: `RunContext::approve_tool_for_agent` / `reject_tool_for_agent` (bind a hand-built item to an agent's tool),
+  `RunContext::export_approval_capabilities` / `import_approval_capabilities`, the `ApprovalCapability` type and the
+  `RunState::approval_capabilities` field. Bound records are stored under their own `ApprovalsState` keys
+  (`agent \u{1} tool \u{3} fingerprint`); in a run state envelope they are ordinary `function_tool_approvals`
+  entries with an extra `capability` field (ignored by Python), and the capability registry travels under the
+  Rust-only `rust` key.
+- A closure is not part of the fingerprint: two tools that differ only in their body still share decisions, and so do
+  clones of one agent (Python tells them apart by object identity).
+- Ports 14 more cases of `test_agent_scoped_approvals.py` (`tests/py_core18_approval_fingerprint.rs`); notes in
+  `plans/reports/py-test-parity-core18-approval-fingerprint.md`.
+
+Breaking changes: `RunState` gained a public field, so a struct literal without `..Default::default()` no longer
+compiles; an approval the runner raised is now invalidated when the tool's description, schema, namespace or origin changes
+between the interruption and the resume.
+
+Known limit: when one owner holds two records for one tool (two fingerprints, or one bound and one unbound), the run
+state carries two `function_tool_approvals` entries that a Python reader cannot tell apart and it keeps the last.
+
 ## 0.19.0 (2026-11-02)
 
 Re-reads the fourteen files with the most remaining Python-only cases, closes two of the known gaps listed under
