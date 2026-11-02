@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.24.2 (2026-11-02)
+
+- Resume: an in-memory `RunState` (from `to_state()`) now carries its run's starting agent (`RunState::origin_agent`,
+  never serialized). When the graph handed to the resume no longer contains the state's current agent, for example a
+  renamed agent, the run resumes the state's original graph and runs its tools instead of failing with "Run state
+  agent not found in agent map", as Python resumes the state's own agents. A JSON-restored state carries no agent and
+  still resolves in the caller's graph only. Ported: Python's `memory-renamed` probe row
+  (`tests/py_core22_inmemory_resume.rs`).
+
+- Tests: the unix-local create-failure cases run inside one test. One of them lowers the process-wide
+  `RLIMIT_FSIZE`, and when test output went to a large log file the harness could fail to print another test's result
+  and exit with no message.
+
+Breaking changes: `RunState` gained the public field `origin_agent` (struct literals need `..Default::default()`).
+
+Remaining difference: a resume whose graph does contain the state's agent runs that graph's tools, where Python runs
+the original objects; the decision applies either way. A live model call has still not been made.
+
 ## 0.24.1 (2026-11-02)
 
 Tests and documentation only; no library behaviour changed.
