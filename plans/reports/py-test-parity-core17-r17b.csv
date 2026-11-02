@@ -1,0 +1,6 @@
+path,moved_to_ported,moved_to_covered,remaining_python_only
+tests/test_function_tool_decorator.py,0,0,50
+tests/test_function_schema.py,5,1,37
+tests/mcp/test_server_errors.py,0,0,39
+tests/mcp/test_mcp_server_manager.py,0,0,36
+tests/extensions/memory/test_redis_session.py,2,1,41

@@ -1,5 +1,51 @@
 # Changelog
 
+## 0.19.0 (2026-11-02)
+
+Re-reads the fourteen files with the most remaining Python-only cases, closes two of the known gaps listed under
+0.18.0 and fixes six bugs found while porting. 73 more parity cases moved out of the Python-only bucket (60 ported,
+13 covered). Measured state: 12,641 Python test cases, 9,226 ported, 897 covered, 2,518 Python-only, 0 not ported,
+0 unaccounted. Notes by area: `plans/reports/py-test-parity-core17-*.md`. No live model call was made.
+
+- Macros: a NumPy-style docstring entry for `*args` or `**kwargs` now reaches its parameter (the stars are
+  stripped).
+- Redis sessions: with a TTL configured, every write reads the server `TIME` first and refuses a TTL outside Redis's
+  expiration range before any script runs, so an out-of-range TTL no longer appends history and then fails at
+  `PEXPIRE`. One extra round trip per write when a TTL is set.
+
+- Injected sandbox sessions apply capability-changed path grants: `SandboxSession` gained the defaulted methods
+  `live_grants`, `extra_path_grants` and `update_extra_path_grants` (with the `LiveGrants` cell), every built-in
+  session holds one, `Manifest::with_extra_path_grants` replaces the grant list, and the unix-local session re-pins
+  grants on update while an unchanged alias keeps its first pin.
+- Vercel serializes workspace commands, reads, writes, archives and shutdown while S3 mounts are being attached or
+  detached; a session without S3 mounts takes no lock.
+- `InstrumentedSession` forwards `shutdown_after_failed_close`, so a mounted Vercel session is still shut down when
+  an instrumented `aclose` fails.
+- A manifest entry path outside the workspace root no longer hides credentialed mounts from validation: it is refused
+  as an invalid manifest path, with only the fixed protected-mount sentence when a credentialed mount is present. A
+  runner-owned run validates the mount credential boundaries before asking the client for a session.
+- A Blaxel read that fails with a non-404 status whose body says "not found" or "no such file" is a
+  `WorkspaceReadNotFound`.
+
+Breaking changes: `SandboxSession` has three new defaulted methods (an implementor that wraps another session should
+forward them); an invalid entry path now fails runner preparation before the client creates a session.
+
+Known gaps carried forward (all others under 0.18.0 still stand except the two closed here):
+
+- A restored context binds approval decisions by agent name and tool name, so a decision for one tool also
+  authorises a different same-named tool on a same-named agent (about 14 cases of
+  `test_agent_scoped_approvals.py`). Closing it changes the persisted approval shape; deferred.
+- `MCPServerManager::set_connect_timeout(Some(0))` is accepted and refused at the next connect; Python raises at
+  assignment.
+- A third-party `MountStrategy` implementation is trusted; Python rejects custom strategies.
+- `session_state()` serializes the original path grants, not the live ones.
+- Post-invoke sibling work is dropped after the wait; Python leaves it running detached.
+- The Redis TTL check is a separate round trip, so a TTL exactly at the int64 boundary can still fail if the server
+  clock moves between the two commands.
+- Read depth: in `test_run_state.py` and `test_run_step_execution.py` cases whose names matched a Rust test were
+  not re-read; about 70 hostile-exception functions in `test_mount_security.py` were read for their first 25–40
+  lines. Ledger counts have no per-case ids, so the remaining counts are upper bounds.
+
 ## 0.18.0 (2026-11-02)
 
 Closes eight of the nine divergences listed as known gaps in 0.17.0 and re-reads the remaining Python-only files
