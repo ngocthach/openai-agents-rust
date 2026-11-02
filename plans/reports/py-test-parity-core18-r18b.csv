@@ -1,0 +1,8 @@
+path,moved_to_ported,moved_to_covered,remaining_python_only
+tests/realtime/test_app_server_security.py,0,0,29
+tests/realtime/test_session.py,2,2,18
+tests/realtime/test_testing.py,0,0,21
+tests/voice/test_pipeline.py,0,2,24
+tests/extensions/experiemental/codex/test_codex_tool.py,0,0,25
+tests/extensions/memory/test_mongodb_session.py,0,0,21
+tests/test_scripted_model.py,0,0,26

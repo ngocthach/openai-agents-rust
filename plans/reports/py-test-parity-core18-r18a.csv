@@ -1,0 +1,8 @@
+path,moved_to_ported,moved_to_covered,remaining_python_only
+tests/test_error_logging_redaction.py,0,0,81
+tests/test_run_state_compatibility_corpus.py,0,0,61
+tests/test_tool_batch_failure_history.py,7,1,16
+tests/test_function_tool.py,1,0,22
+tests/test_agent_as_tool.py,0,1,20
+tests/models/test_model_retry.py,0,0,21
+tests/models/test_openai_responses.py,0,0,27

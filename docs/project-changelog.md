@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.21.0 (2026-11-02)
+
+Re-reads 19 more files with Python-only cases and closes the per-turn sandbox preparation gap where it is
+observable. 43 more parity cases moved out of the Python-only bucket (34 ported, 9 covered). Measured state: 12,641
+Python test cases, 9,274 ported, 906 covered, 2,461 Python-only, 0 not ported, 0 unaccounted. Notes:
+`plans/reports/py-test-parity-core18-r18a.md`, `-r18b.md`, `-r18c.md`. No live model call was made.
+
+- Sandbox, per turn: capability instructions are rebuilt for every model call, as Python's per-turn
+  `prepare_agent` does, so a memory summary written on one turn reaches the next turn's system prompt.
+  `Capability::caches_instructions()` (default `false`) lets a capability keep one value per run; `Skills` does,
+  matching Python's cached skills index. `process_context` now runs before the caller's `call_model_input_filter`.
+- Sandbox: new `SandboxSession::ls_as(path, user)` (default runs `ls -la` as that user; unix-local checks access
+  under `sudo` and then lists natively); `Skills` lists the runtime skills directory as the run's user; the Modal
+  helper bounds `App.lookup` (10 s) and `Sandbox.from_id`, `poll` and `terminate` (30 s).
+- Resume: a structured tool output (a list of parts) handed again to a custom tool-use behavior after a failed turn
+  is rebuilt as `ToolOutput::Parts` instead of plain JSON.
+- Realtime: a failed interrupt or feedback send after a guardrail tripwire reports `Guardrail task failed: <error>`.
+- MongoDB sessions: `MongoDBSession::close()` releases a client the session created with `from_uri`; the session is
+  terminal from then on (`MongoDBSession is closed`, also for an empty `add_items`), repeated closes are safe, and a
+  session on a caller's client is left untouched. `is_closed()` reports the state.
+
+Breaking changes: `MongoDBSession::ping` returns `Result<bool>` (it refuses a closed session; an unreachable server
+is `Ok(false)`); `SandboxSession` and `Capability` have new defaulted methods (a wrapper should forward `ls_as`); an
+error from a capability's instructions now surfaces at the model call instead of at preparation.
+
+Known gaps carried forward: Python applies `process_context` to the run's original input and keeps the rewrite in
+`RunResult.input`, while Rust rewrites each model call's input and leaves history unchanged; Python re-checks the
+sandbox working directory and opens a `sandbox.prepare_agent` span every turn; tool and handoff enablement checks
+cannot fail in Rust; `MongoDBSession::close` has no failed-release retry path. Read depth this round is uneven
+(`test_openai_responses.py` by test name only, parts of the redaction, compatibility-corpus, model-retry and Modal
+files by head and assertions); each report lists it.
+
 ## 0.20.0 (2026-11-02)
 
 Closes the largest known gap from 0.19.0. 14 more parity cases ported. Measured state: 12,641 Python test cases,

@@ -1,0 +1,2 @@
+path,moved_to_ported,moved_to_covered,remaining_python_only
+tests/extensions/memory/test_mongodb_session.py,5,0,16
