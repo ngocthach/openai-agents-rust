@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.24.1 (2026-11-02)
+
+Tests and documentation only; no library behaviour changed.
+
+- Correction to 0.24.0's known gaps: an in-memory `to_state()` resumed with a rebuilt agent graph does not re-prompt
+  in Python either. A probe of 28 configurations (same, rebuilt or renamed agent; JSON round trip; streamed or not;
+  per-call or sticky; single agent or handoff target) re-prompted 0 times, because Python resumes the state's own
+  current agent and only re-binds owners for context-converted or JSON-restored decisions. Rust already gives the same
+  outcome; `tests/py_core22_inmemory_resume.rs` pins 24 of those rows (`plans/reports/py-test-parity-core22.md`).
+- Live `docker-removal` test for immutable files: the privileged host side sets `chattr +i` on a file inside the
+  sandbox container; recursive removal through the service fails with `EPERM` and leaves the file intact, a
+  single-file `rm` fails inside the sandbox as in Python, and removal succeeds after `chattr -i` (OrbStack, 5/5 live
+  removal tests).
+
+Known differences that remain, kept on purpose: when resuming with a rebuilt graph, Python runs the state's original
+agent objects and ignores the agent passed in, while Rust runs the agent graph it is given (so a renamed agent fails
+with "Run state agent not found in agent map" where Python continues). Matching that would make a `RunState` hold the
+original agent graph in memory and ignore the caller's agent. A live model call has still not been made.
+
 ## 0.24.0 (2026-11-02)
 
 Closes the four behavioural differences from Python that earlier releases kept on purpose. 16 more parity cases

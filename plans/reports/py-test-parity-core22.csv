@@ -1,0 +1,4 @@
+path,moved_to_ported,moved_to_covered,remaining_python_only
+tests/test_agent_scoped_approvals.py,0,0,-1
+tests/test_run_state.py,0,0,-1
+tests/sandbox/test_docker_removal_worker.py,0,0,-1
