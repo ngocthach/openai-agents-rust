@@ -1550,6 +1550,14 @@ impl crate::sandbox::session::SandboxSession for InstrumentedSession {
         self.inner.ls(path).await
     }
 
+    async fn ls_as(
+        &self,
+        path: &str,
+        user: Option<&crate::sandbox::types::User>,
+    ) -> SandboxResult<Vec<crate::sandbox::types::FileEntry>> {
+        self.inner.ls_as(path, user).await
+    }
+
     async fn mkdir(&self, path: &str, parents: bool) -> SandboxResult<()> {
         self.inner.mkdir(path, parents).await
     }

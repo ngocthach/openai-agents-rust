@@ -52,6 +52,12 @@ import sys
 import threading
 from typing import Any
 
+# Bounds on the Modal control-plane calls, matching the Python SDK backend: an app lookup gets
+# ten seconds, and reconnecting to, polling and terminating a sandbox get thirty. A hung call
+# would otherwise hold the helper, and the Rust call waiting on it, forever.
+_DEFAULT_TIMEOUT_S = 30.0
+_APP_LOOKUP_TIMEOUT_S = 10.0
+
 
 def _fail(message: str, retryable: bool | None = None) -> None:
     payload: dict[str, Any] = {"error": message}
@@ -127,7 +133,10 @@ async def _op_create(modal: Any, request: dict[str, Any]) -> dict[str, Any]:
     if builder_version:
         os.environ["MODAL_IMAGE_BUILDER_VERSION"] = builder_version
     try:
-        app = await modal.App.lookup.aio(request["app_name"], create_if_missing=True)
+        app = await asyncio.wait_for(
+            modal.App.lookup.aio(request["app_name"], create_if_missing=True),
+            timeout=_APP_LOOKUP_TIMEOUT_S,
+        )
         image = _build_image(modal, request)
         create = modal.Sandbox.create.aio(
             app=app,
@@ -161,7 +170,9 @@ async def _op_create(modal: Any, request: dict[str, Any]) -> dict[str, Any]:
 
 
 async def _sandbox(modal: Any, request: dict[str, Any]) -> Any:
-    return await modal.Sandbox.from_id.aio(request["sandbox_id"])
+    return await asyncio.wait_for(
+        modal.Sandbox.from_id.aio(request["sandbox_id"]), timeout=_DEFAULT_TIMEOUT_S
+    )
 
 
 async def _op_exec(modal: Any, request: dict[str, Any]) -> dict[str, Any]:
@@ -325,7 +336,8 @@ async def _op_poll(modal: Any, request: dict[str, Any]) -> dict[str, Any]:
     try:
         sandbox = await _sandbox(modal, request)
         # `poll()` returns an exit code once the sandbox is gone, and None while it runs.
-        return {"running": await sandbox.poll.aio() is None}
+        polled = await asyncio.wait_for(sandbox.poll.aio(), timeout=_DEFAULT_TIMEOUT_S)
+        return {"running": polled is None}
     except Exception:
         return {"running": False}
 
@@ -333,7 +345,7 @@ async def _op_poll(modal: Any, request: dict[str, Any]) -> dict[str, Any]:
 async def _op_terminate(modal: Any, request: dict[str, Any]) -> dict[str, Any]:
     try:
         sandbox = await _sandbox(modal, request)
-        await sandbox.terminate.aio()
+        await asyncio.wait_for(sandbox.terminate.aio(), timeout=_DEFAULT_TIMEOUT_S)
     except Exception as error:
         return {"ok": False, "detail": str(error)}
     return {"ok": True}

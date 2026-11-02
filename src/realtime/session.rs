@@ -2028,7 +2028,9 @@ impl<C: Send + Sync + 'static> SessionInner<C> {
                 .send_event(RealtimeModelSendEvent::Interrupt(interrupt))
                 .await
         {
-            self.emit_error(error.to_string());
+            // Python lets the failure escape the guardrail task, whose done callback reports
+            // it as `Guardrail task failed: <error>`.
+            self.emit_error(format!("Guardrail task failed: {error}"));
             return;
         }
         if superseded {
@@ -2056,7 +2058,7 @@ impl<C: Send + Sync + 'static> SessionInner<C> {
             }
         };
         if let Err(error) = result {
-            self.emit_error(error.to_string());
+            self.emit_error(format!("Guardrail task failed: {error}"));
         }
     }
 

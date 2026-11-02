@@ -757,6 +757,35 @@ pub trait SandboxSession: Send + Sync + fmt::Debug {
         Ok(parse_ls_la(&result.stdout_text(), &resolved))
     }
 
+    /// List a directory as `user`.
+    ///
+    /// Mirrors Python's `ls(path, user=...)`: the listing runs as that user, so a directory the
+    /// user may not read fails as it would in their own shell. The default runs `ls -la` through
+    /// [`exec`](Self::exec), which applies the `sudo` wrapper.
+    async fn ls_as(&self, path: &str, user: Option<&User>) -> SandboxResult<Vec<FileEntry>> {
+        let Some(user) = user else {
+            return self.ls(path).await;
+        };
+        let resolved = if self.resolves_paths_remotely() {
+            self.validate_remote_path_access(path, false, false).await?
+        } else {
+            self.normalize_path(path)?
+        };
+        let command = vec![
+            "ls".to_string(),
+            "-la".to_string(),
+            "--".to_string(),
+            resolved.clone(),
+        ];
+        let result = self
+            .exec(ExecRequest::argv(command.clone()).with_user(Some(user.clone())))
+            .await?;
+        if !result.ok() {
+            return Err(SandboxError::exec_nonzero(&command, &result));
+        }
+        Ok(parse_ls_la(&result.stdout_text(), &resolved))
+    }
+
     /// Create a directory.
     async fn mkdir(&self, path: &str, parents: bool) -> SandboxResult<()> {
         let resolved = self.normalize_path_for_write(path)?;

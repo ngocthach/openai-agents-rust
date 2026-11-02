@@ -1938,10 +1938,15 @@ fn active_memory_manager<C: Send + Sync + 'static>(
 
 /// Install the capability `process_context` chain as a per-turn model input filter.
 ///
-/// Python re-prepares a sandbox agent on every turn, which re-applies `process_context` to the
-/// model input. `RunConfig::call_model_input_filter` is the equivalent hook here, and it also
-/// covers handoff targets, because the filter looks the capability set up by agent name. Any
-/// filter the caller already configured still runs first.
+/// Python re-prepares a sandbox agent on every turn, which applies `process_context` before the
+/// caller's `call_model_input_filter` sees the input. `RunConfig::call_model_input_filter` is the
+/// hook here: the chain runs first and any filter the caller configured runs on its result. It
+/// also covers handoff targets, because the chain is looked up by the agent about to be called.
+///
+/// One difference remains. Python applies the chain to the run's original input only and writes
+/// the result back into it, so `RunResult::input` and `to_input_list` carry the rewrite; this
+/// applies it to the whole model input of the call (original input plus the items the run
+/// generated) and leaves the run's own history unchanged.
 fn install_per_turn_preparation<C: Send + Sync + 'static>(
     mut options: RunOptions<C>,
     graph: Arc<std::sync::OnceLock<PreparedSandboxGraph<C>>>,
@@ -1951,28 +1956,27 @@ fn install_per_turn_preparation<C: Send + Sync + 'static>(
         let graph = graph.clone();
         let existing = existing.clone();
         Box::pin(async move {
-            let current_agent = data.agent.clone();
-            let model_data = match existing {
-                None => data.model_data,
-                Some(filter) => {
-                    filter(crate::run_config::CallModelData {
-                        model_data: data.model_data,
-                        agent: data.agent,
-                        context: data.context,
-                    })
-                    .await?
-                }
-            };
             // The graph exists once the sandbox has been prepared, which happens before the
             // first model call.
             let input = match graph.get() {
-                Some(graph) => graph.process_context_for_agent(&current_agent, model_data.input),
-                None => model_data.input,
+                Some(graph) => graph.process_context_for_agent(&data.agent, data.model_data.input),
+                None => data.model_data.input,
             };
-            Ok(ModelInputData {
+            let model_data = ModelInputData {
                 input,
-                instructions: model_data.instructions,
-            })
+                instructions: data.model_data.instructions,
+            };
+            match existing {
+                None => Ok(model_data),
+                Some(filter) => {
+                    filter(crate::run_config::CallModelData {
+                        model_data,
+                        agent: data.agent,
+                        context: data.context,
+                    })
+                    .await
+                }
+            }
         })
     }));
     options

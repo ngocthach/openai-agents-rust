@@ -2,6 +2,7 @@
 //! Mirrors `agents.extensions.memory.mongodb_session`.
 
 use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use futures::TryStreamExt;
@@ -74,6 +75,11 @@ pub struct MongoDBSession {
     messages: Collection<Document>,
     settings: Option<SessionSettings>,
     indexes: OnceCell<()>,
+    /// The client was created by [`MongoDBSession::from_uri`], so [`MongoDBSession::close`]
+    /// releases it.
+    owns_client: bool,
+    /// Set by the first [`MongoDBSession::close`] of a session that owns its client.
+    closed: AtomicBool,
 }
 
 impl fmt::Debug for MongoDBSession {
@@ -99,7 +105,9 @@ impl MongoDBSession {
             options.driver_info = Some(driver_info());
         }
         let client = Client::with_options(options).map_err(mongo_err)?;
-        Ok(Self::with_client(session_id, &client, database))
+        let mut session = Self::with_client(session_id, &client, database);
+        session.owns_client = true;
+        Ok(session)
     }
 
     /// Use a client the application already manages.
@@ -115,6 +123,8 @@ impl MongoDBSession {
             messages: db.collection(DEFAULT_MESSAGES_COLLECTION),
             settings: None,
             indexes: OnceCell::new(),
+            owns_client: false,
+            closed: AtomicBool::new(false),
         }
     }
 
@@ -134,18 +144,57 @@ impl MongoDBSession {
         self
     }
 
-    /// True when the server answers a `ping` command.
-    pub async fn ping(&self) -> bool {
-        let db = self.sessions.namespace().db;
+    /// Close the client this session created with [`MongoDBSession::from_uri`].
+    ///
+    /// The session is terminal from the first call: every later operation fails with
+    /// `MongoDBSession is closed`, and repeated calls are safe. A session built with
+    /// [`MongoDBSession::with_client`] does not own its client, so this does nothing and the
+    /// caller keeps managing the client. Port of `MongoDBSession.close`.
+    pub async fn close(&self) {
+        if !self.owns_client {
+            return;
+        }
+        self.closed.store(true, Ordering::SeqCst);
         self.sessions
+            .client()
+            .clone()
+            .shutdown()
+            .immediate(true)
+            .await;
+    }
+
+    /// True once [`MongoDBSession::close`] closed a session that owns its client.
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
+    }
+
+    fn check_not_closed(&self) -> Result<()> {
+        if self.is_closed() {
+            return Err(AgentsError::other("MongoDBSession is closed"));
+        }
+        Ok(())
+    }
+
+    /// True when the server answers a `ping` command.
+    ///
+    /// # Errors
+    ///
+    /// Fails with `MongoDBSession is closed` after [`MongoDBSession::close`] closed a session
+    /// that owns its client; an unreachable server is `Ok(false)`.
+    pub async fn ping(&self) -> Result<bool> {
+        self.check_not_closed()?;
+        let db = self.sessions.namespace().db;
+        Ok(self
+            .sessions
             .client()
             .database(&db)
             .run_command(doc! {"ping": 1})
             .await
-            .is_ok()
+            .is_ok())
     }
 
     async fn ensure_indexes(&self) -> Result<()> {
+        self.check_not_closed()?;
         self.indexes
             .get_or_try_init(|| async {
                 self.sessions
@@ -230,6 +279,7 @@ impl Session for MongoDBSession {
     }
 
     async fn get_items(&self, limit: Option<usize>) -> Result<Vec<InputItem>> {
+        self.check_not_closed()?;
         let limit = super::resolve_session_limit(limit, self.session_settings().as_ref());
         if limit == Some(0) {
             return Ok(Vec::new());
@@ -279,6 +329,8 @@ impl Session for MongoDBSession {
     }
 
     async fn add_items(&self, items: Vec<InputItem>) -> Result<()> {
+        // The empty fast path still refuses a closed session.
+        self.check_not_closed()?;
         if items.is_empty() {
             return Ok(());
         }

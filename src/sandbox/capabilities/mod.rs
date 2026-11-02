@@ -123,6 +123,17 @@ where
         Ok(None)
     }
 
+    /// Whether the instruction fragment is rendered once per prepared agent.
+    ///
+    /// The fragments are rendered again for every model call by default, as Python renders them
+    /// inside the prepared agent's instructions callable, so a fragment that reads the live
+    /// workspace (the memory summary) shows what an earlier turn wrote. A capability whose
+    /// fragment is stable for the run returns `true` to render it on the first call only, as
+    /// Python's skills capability caches its index.
+    fn caches_instructions(&self) -> bool {
+        false
+    }
+
     /// The memory capability behind this value, when it is one.
     ///
     /// Lets the runner find the memory manager to flush without downcasting trait objects.
@@ -139,7 +150,7 @@ where
         Map::new()
     }
 
-    /// Transform the model input before the run starts.
+    /// Transform the model input before each model call.
     fn process_context(&self, context: Vec<InputItem>) -> Vec<InputItem> {
         context
     }
@@ -260,6 +271,10 @@ where
         manifest: &Manifest,
     ) -> Result<Option<String>> {
         self.inner.bound_instructions(binding, manifest).await
+    }
+
+    fn caches_instructions(&self) -> bool {
+        self.inner.caches_instructions()
     }
 
     fn as_memory(&self) -> Option<&Memory> {

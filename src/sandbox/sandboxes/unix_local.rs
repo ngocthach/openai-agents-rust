@@ -2468,6 +2468,33 @@ impl SandboxSession for UnixLocalSandboxSession {
         Ok(listing)
     }
 
+    /// List a directory for `user`: the user's own `ls` must succeed under `sudo -u`, and the
+    /// entries are then read natively, so a name holding a newline or runs of spaces is reported
+    /// exactly, as Python's user-listing worker reports it.
+    async fn ls_as(
+        &self,
+        path: &str,
+        user: Option<&crate::sandbox::types::User>,
+    ) -> SandboxResult<Vec<crate::sandbox::types::FileEntry>> {
+        let Some(user) = user else {
+            return self.ls(path).await;
+        };
+        let host = self.host_path_for(path, false).await?;
+        let command = vec![
+            "ls".to_string(),
+            "-la".to_string(),
+            "--".to_string(),
+            host.to_string_lossy().into_owned(),
+        ];
+        let result = self
+            .exec(ExecRequest::argv(command.clone()).with_user(Some(user.clone())))
+            .await?;
+        if !result.ok() {
+            return Err(SandboxError::exec_nonzero(&command, &result));
+        }
+        self.ls(path).await
+    }
+
     /// Create a directory for `user`: their permission is probed with the access-check script
     /// under `sudo -u`, and the directory is then created natively.
     ///

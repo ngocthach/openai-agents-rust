@@ -1045,7 +1045,9 @@ impl Skills {
             manifest.root().trim_end_matches('/'),
             self.skills_path
         );
-        let Ok(entries) = binding.session.ls(&root).await else {
+        // Listed as the run's user, as the `SKILL.md` files are read below, so a skills root
+        // that user cannot read yields no runtime skills.
+        let Ok(entries) = binding.session.ls_as(&root, binding.run_as.as_ref()).await else {
             return Vec::new();
         };
         let mut metadata = Vec::new();
@@ -1143,6 +1145,12 @@ impl<C: Send + Sync + 'static> Capability<C> for Skills {
 
     fn required_capability_types(&self) -> Vec<&'static str> {
         vec!["shell"]
+    }
+
+    /// The skills index is resolved once per prepared agent, as Python caches it on the
+    /// capability, so a skill directory a tool creates mid-run is not listed.
+    fn caches_instructions(&self) -> bool {
+        true
     }
 
     fn process_manifest(&self, manifest: Manifest) -> Manifest {

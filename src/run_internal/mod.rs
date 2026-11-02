@@ -6063,6 +6063,15 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
                     call_id: call.call_id.clone(),
                     output: match output {
                         Value::String(text) => ToolOutput::Text(text.clone()),
+                        // The run item keeps typed parts as their JSON list: rebuild them so a
+                        // custom tool-use behavior sees the output type of the first attempt.
+                        Value::Array(list) if !list.is_empty() => {
+                            serde_json::from_value::<Vec<crate::tool::ToolOutputPart>>(
+                                output.clone(),
+                            )
+                            .map(ToolOutput::Parts)
+                            .unwrap_or_else(|_| ToolOutput::Json(output.clone()))
+                        }
                         other => ToolOutput::Json(other.clone()),
                     },
                     run_item: Some(item.clone()),

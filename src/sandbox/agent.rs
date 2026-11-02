@@ -565,16 +565,7 @@ impl<C: Send + Sync + 'static> SandboxAgent<C> {
         }
 
         let manifest = binding.session.manifest().clone();
-        let mut fragments = Vec::new();
-        for capability in &self.capabilities {
-            if let Some(fragment) = capability.instructions(&manifest).await? {
-                fragments.push(fragment);
-            }
-            if let Some(fragment) = capability.bound_instructions(binding, &manifest).await? {
-                fragments.push(fragment);
-            }
-        }
-        let instructions = self.build_instructions(fragments, &manifest, binding);
+        let instructions = self.build_instructions(&manifest, binding);
 
         let mut model_settings = self.agent.model_settings.clone();
         model_settings.extra_args = (!extra_args.is_empty()).then_some(extra_args);
@@ -587,9 +578,15 @@ impl<C: Send + Sync + 'static> SandboxAgent<C> {
         }))
     }
 
+    /// The prepared agent's instructions.
+    ///
+    /// The capability fragments are rendered inside the callable, so every model call sees the
+    /// workspace as it is then (a memory summary an earlier turn wrote, for one), as Python's
+    /// `build_sandbox_instructions` does. The manifest is the one the agent was prepared
+    /// against, also as in Python. A capability that
+    /// [caches its instructions](Capability::caches_instructions) is rendered once.
     fn build_instructions(
         &self,
-        fragments: Vec<String>,
         manifest: &Manifest,
         binding: &CapabilityBinding,
     ) -> Instructions<C> {
@@ -597,19 +594,27 @@ impl<C: Send + Sync + 'static> SandboxAgent<C> {
             .base_instructions
             .clone()
             .unwrap_or_else(|| DEFAULT_SANDBOX_INSTRUCTIONS.trim().to_string());
-        let capability_section = (!fragments.is_empty()).then(|| {
-            instruction_section("Sandbox capability instructions", &fragments.join("\n\n"))
-        });
         let mount_policy_section = build_remote_mount_policy_instructions(manifest)
             .map(|policy| instruction_section("Sandbox remote mount policy", &policy));
         let filesystem_section = filesystem_instructions(manifest, binding);
         let original = self.agent.instructions.clone();
+        let capabilities: Arc<Vec<CachedFragments<C>>> = Arc::new(
+            self.capabilities
+                .iter()
+                .map(|capability| CachedFragments {
+                    capability: capability.clone(),
+                    cached: OnceLock::new(),
+                })
+                .collect(),
+        );
+        let (manifest, binding) = (Arc::new(manifest.clone()), Arc::new(binding.clone()));
         Instructions::Dynamic(Arc::new(move |ctx, agent| {
             let base = base.clone();
-            let capability_section = capability_section.clone();
             let mount_policy_section = mount_policy_section.clone();
             let filesystem_section = filesystem_section.clone();
             let original = original.clone();
+            let (capabilities, manifest, binding) =
+                (capabilities.clone(), manifest.clone(), binding.clone());
             Box::pin(async move {
                 let mut parts = Vec::new();
                 if !base.trim().is_empty() {
@@ -623,6 +628,23 @@ impl<C: Send + Sync + 'static> SandboxAgent<C> {
                 if let Some(additional) = additional.filter(|a| !a.trim().is_empty()) {
                     parts.push(instruction_section("Agent instructions", &additional));
                 }
+                let mut fragments = Vec::new();
+                for entry in capabilities.iter() {
+                    let rendered = match entry.cached.get() {
+                        Some(rendered) => rendered.clone(),
+                        None => {
+                            let rendered = entry.render(&binding, &manifest).await?;
+                            if entry.capability.caches_instructions() {
+                                let _ = entry.cached.set(rendered.clone());
+                            }
+                            rendered
+                        }
+                    };
+                    fragments.extend(rendered);
+                }
+                let capability_section = (!fragments.is_empty()).then(|| {
+                    instruction_section("Sandbox capability instructions", &fragments.join("\n\n"))
+                });
                 if let Some(section) = capability_section {
                     parts.push(section);
                 }
@@ -979,6 +1001,34 @@ fn pascal_case(capability_type: &str) -> String {
             }
         })
         .collect()
+}
+
+/// One capability of a prepared agent, with its rendered fragments once they are cached.
+struct CachedFragments<C> {
+    capability: Arc<dyn Capability<C>>,
+    cached: OnceLock<Vec<String>>,
+}
+
+impl<C: Send + Sync + 'static> CachedFragments<C> {
+    /// The capability's plain fragment followed by its session-bound one.
+    async fn render(
+        &self,
+        binding: &CapabilityBinding,
+        manifest: &Manifest,
+    ) -> Result<Vec<String>> {
+        let mut fragments = Vec::new();
+        if let Some(fragment) = self.capability.instructions(manifest).await? {
+            fragments.push(fragment);
+        }
+        if let Some(fragment) = self
+            .capability
+            .bound_instructions(binding, manifest)
+            .await?
+        {
+            fragments.push(fragment);
+        }
+        Ok(fragments)
+    }
 }
 
 fn instruction_section(title: &str, body: &str) -> String {
