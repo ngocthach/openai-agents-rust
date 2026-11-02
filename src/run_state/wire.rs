@@ -2788,6 +2788,8 @@ pub(super) fn from_wire(value: &Value, version: &str) -> Result<RunState> {
         ambiguous_agent_owners: Default::default(),
         restored_function_approval_keys: Default::default(),
         session_write_in_progress: Default::default(),
+        // A restored state carries no agent: its agents resolve in the caller's graph only.
+        origin_agent: Default::default(),
         tool_result_may_end_run: value
             .get("tool_result_may_end_run")
             .and_then(Value::as_bool)

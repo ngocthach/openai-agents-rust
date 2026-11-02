@@ -271,6 +271,48 @@ pub struct RunState {
     /// concurrently. Mirrors `RunState._session_write_in_progress`; never written.
     #[serde(skip)]
     pub session_write_in_progress: SessionWriteInProgress,
+    /// The starting agent of the run that built this snapshot, held in memory only. A resume
+    /// whose agent graph no longer contains the snapshot's current agent runs this original
+    /// graph instead, as Python resumes the state's own agents. Never serialized, so a state
+    /// restored from JSON resolves its agents in the caller's graph only.
+    #[serde(skip)]
+    pub origin_agent: OriginAgent,
+}
+
+/// The run's original starting agent, carried by an in-memory [`RunState`] (see
+/// [`RunState::origin_agent`]). Opaque; copies compare equal whatever they hold.
+#[derive(Clone, Default)]
+pub struct OriginAgent(Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>);
+
+impl OriginAgent {
+    pub(crate) fn new<C: Send + Sync + 'static>(
+        agent: std::sync::Arc<crate::agent::Agent<C>>,
+    ) -> Self {
+        OriginAgent(Some(agent))
+    }
+
+    /// The original starting agent, when this state was built by a run with context `C`.
+    pub(crate) fn get<C: Send + Sync + 'static>(
+        &self,
+    ) -> Option<std::sync::Arc<crate::agent::Agent<C>>> {
+        self.0.clone()?.downcast::<crate::agent::Agent<C>>().ok()
+    }
+}
+
+impl std::fmt::Debug for OriginAgent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.is_some() {
+            "OriginAgent(Some)"
+        } else {
+            "OriginAgent(None)"
+        })
+    }
+}
+
+impl PartialEq for OriginAgent {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
 }
 
 /// A flag shared by every copy of a [`RunState`] taken from one run (see

@@ -1822,8 +1822,22 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
         } else {
             "Run state agent not found in agent map"
         };
-        let agent = agent_identity::resolve_identity(&self.starting_agent, identity)
-            .ok_or_else(|| AgentsError::user(not_found))?;
+        // A graph that no longer contains the snapshot's agent falls back to the run's own
+        // original graph when the state was taken in memory: Python resumes the state's agents
+        // and ignores the agent it is handed.
+        let agent = match agent_identity::resolve_identity(&self.starting_agent, identity) {
+            Some(agent) => agent,
+            None => {
+                let origin = state
+                    .origin_agent
+                    .get::<C>()
+                    .ok_or_else(|| AgentsError::user(not_found))?;
+                let agent = agent_identity::resolve_identity(&origin, identity)
+                    .ok_or_else(|| AgentsError::user(not_found))?;
+                self.starting_agent = origin;
+                agent
+            }
+        };
         self.current_agent = agent;
         // Items of an agent this graph does not contain are skipped with a warning, as Python's
         // `_deserialize_items` does with its agent map.
@@ -3201,6 +3215,7 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
                 &self.starting_agent,
             ),
             session_write_in_progress: self.write_in_progress.clone(),
+            origin_agent: crate::run_state::OriginAgent::new(self.starting_agent.clone()),
             tool_result_may_end_run: agent_identity::interruption_may_end_run(
                 &self.current_agent,
                 &interruptions,
