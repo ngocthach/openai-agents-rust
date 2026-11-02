@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.23.1 (2026-11-02)
+
+First runs of the Docker sandbox and the `docker-removal` service against a real Docker daemon (OrbStack, Linux
+aarch64 VM, Docker 29.8.2); the full run log is `plans/reports/live-docker-and-removal-run.md`. No bug was found in
+the Docker client, the removal service or its worker.
+
+- New live tests, skipped unless their variable is set: `tests/sandbox_docker_live.rs`
+  (`OPENAI_AGENTS_DOCKER_LIVE=1`: create, manifest apply, exec as a user, large read/write, symlink escape refusal,
+  exec timeout, PTY, both resume branches, `network_disabled` across resume, a published port serving HTTP) and
+  `tests/sandbox_docker_removal_live.rs` (`OPENAI_AGENTS_DOCKER_REMOVAL_LIVE=1`, as root on a Linux Docker host with the
+  real `docker-removal-worker`: sibling-preserving recursive removal, workspace-root and backslash refusals, errno 13 /
+  1 / 7 failures, deeper-than-PATH_MAX trees, read-only host grants, manifest rebinding refusal, ineligible-container
+  refusal, no container left paused).
+- Linux: `clippy -D warnings` is clean again (a same-type `st_mode` cast in the unix-local sandbox, and a test
+  import used only on macOS).
+
+Not covered: `chattr +i` immutable files (an eligible container lacks the capability), a bare Linux Docker host
+(the Linux side ran in a privileged `--pid=host` container), and a live model call.
+
 ## 0.23.0 (2026-11-02)
 
 Reads the body of every remaining Python-only case in the 150 files not revisited since round 16, adds fallible
