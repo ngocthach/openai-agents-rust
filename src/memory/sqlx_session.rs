@@ -2,6 +2,7 @@
 //! Mirrors `agents.extensions.memory.sqlalchemy_session`.
 
 use std::fmt;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use sqlx::AnyPool;
@@ -307,12 +308,22 @@ impl Schema {
 /// BMP), as the Python SDK does with `json.dumps(ensure_ascii=True)`, so rows written by either
 /// SDK read back identically. Call [`SqlxSession::with_ensure_ascii`] with `false` to store
 /// readable UTF-8 instead; both forms round-trip, and either SDK can read both.
+///
+/// # Cancellation
+///
+/// A compaction's suffix replacement runs on its own tokio task, as Python shields it: once
+/// started it commits (or fails) even when the caller's future is dropped. The session holds its
+/// mutation lock until the replacement settles, so a later `add_items`, `pop_item` or
+/// `clear_session` on the same session lands after it. Other mutations run in the caller's
+/// future, and a dropped one rolls back.
 pub struct SqlxSession {
     session_id: String,
     pool: AnyPool,
     schema: Schema,
     settings: Option<SessionSettings>,
     ensure_ascii: bool,
+    /// Serializes this session's writes; a detached replacement keeps it until it settles.
+    mutation_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl fmt::Debug for SqlxSession {
@@ -358,6 +369,7 @@ impl SqlxSession {
             },
             settings: None,
             ensure_ascii: true,
+            mutation_lock: Arc::new(tokio::sync::Mutex::new(())),
         };
         if create_tables {
             session.create_tables().await?;
@@ -493,6 +505,104 @@ impl SqlxSession {
     }
 }
 
+/// A suffix replacement with everything it needs owned, so it can run on its own task.
+struct SuffixReplacement {
+    session_id: String,
+    pool: AnyPool,
+    schema: Schema,
+    handles: Vec<SnapshotHandle>,
+    /// The serialized replacement items.
+    rows: Vec<String>,
+    prune_prefix: super::PrunePrefix,
+}
+
+impl SuffixReplacement {
+    /// Replace the tail and, in the same transaction, delete the leading run of rows
+    /// `prune_prefix` accepts, in bounded batches.
+    async fn run(self) -> Result<bool> {
+        let mut tx = self.pool.begin().await.map_err(sqlx_err)?;
+        let rows = sqlx::query(AssertSqlSafe(self.schema.select_window_ids()))
+            .bind(self.session_id.clone())
+            .bind(self.handles.len() as i64)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(sqlx_err)?;
+        let mut tail: Vec<i64> = rows.iter().filter_map(|r| r.try_get(0).ok()).collect();
+        tail.reverse();
+        if tail.len() != self.handles.len()
+            || tail
+                .iter()
+                .zip(&self.handles)
+                .any(|(id, handle)| id.to_string() != handle.0)
+        {
+            return Ok(false);
+        }
+        if let Some(&first) = tail.first() {
+            // Stops at the first row the predicate rejects or that no longer parses, so a
+            // retained row always keeps everything after it.
+            loop {
+                let rows = sqlx::query(AssertSqlSafe(self.schema.select_prefix()))
+                    .bind(self.session_id.clone())
+                    .bind(first)
+                    .bind(super::PRUNE_PREFIX_BATCH)
+                    .fetch_all(&mut *tx)
+                    .await
+                    .map_err(sqlx_err)?;
+                let batch: Vec<(i64, String)> = rows
+                    .iter()
+                    .filter_map(|r| Some((r.try_get(0).ok()?, r.try_get(1).ok()?)))
+                    .collect();
+                let mut expired_end: Option<i64> = None;
+                for (id, data) in &batch {
+                    let Ok(value) = serde_json::from_str(data) else {
+                        break;
+                    };
+                    if !(self.prune_prefix)(&InputItem(value)) {
+                        break;
+                    }
+                    expired_end = Some(*id);
+                }
+                let Some(expired_end) = expired_end else {
+                    break;
+                };
+                sqlx::query(AssertSqlSafe(self.schema.delete_prefix()))
+                    .bind(self.session_id.clone())
+                    .bind(expired_end)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(sqlx_err)?;
+                if batch.last().map(|(id, _)| *id) != Some(expired_end)
+                    || (batch.len() as i64) < super::PRUNE_PREFIX_BATCH
+                {
+                    break;
+                }
+            }
+        }
+        for id in &tail {
+            sqlx::query(AssertSqlSafe(self.schema.delete_message()))
+                .bind(*id)
+                .execute(&mut *tx)
+                .await
+                .map_err(sqlx_err)?;
+        }
+        for row in &self.rows {
+            sqlx::query(AssertSqlSafe(self.schema.insert_message()))
+                .bind(self.session_id.clone())
+                .bind(row.clone())
+                .execute(&mut *tx)
+                .await
+                .map_err(sqlx_err)?;
+        }
+        sqlx::query(AssertSqlSafe(self.schema.touch_session()))
+            .bind(self.session_id.clone())
+            .execute(&mut *tx)
+            .await
+            .map_err(sqlx_err)?;
+        tx.commit().await.map_err(sqlx_err)?;
+        Ok(true)
+    }
+}
+
 #[async_trait]
 impl Session for SqlxSession {
     fn session_id(&self) -> &str {
@@ -544,6 +654,7 @@ impl Session for SqlxSession {
         if items.is_empty() {
             return Ok(());
         }
+        let _mutation = self.mutation_lock.lock().await;
         let mut tx = self.pool.begin().await.map_err(sqlx_err)?;
         sqlx::query(AssertSqlSafe(self.schema.insert_session()))
             .bind(self.session_id.clone())
@@ -567,6 +678,7 @@ impl Session for SqlxSession {
     }
 
     async fn pop_item(&self) -> Result<Option<InputItem>> {
+        let _mutation = self.mutation_lock.lock().await;
         loop {
             let Some(data) = self.claim_tail().await? else {
                 return Ok(None);
@@ -641,89 +753,37 @@ impl Session for SqlxSession {
         items: Vec<InputItem>,
         prune_prefix: super::PrunePrefix,
     ) -> Result<bool> {
-        let mut tx = self.pool.begin().await.map_err(sqlx_err)?;
-        let rows = sqlx::query(AssertSqlSafe(self.schema.select_window_ids()))
-            .bind(self.session_id.clone())
-            .bind(handles.len() as i64)
-            .fetch_all(&mut *tx)
-            .await
-            .map_err(sqlx_err)?;
-        let mut tail: Vec<i64> = rows.iter().filter_map(|r| r.try_get(0).ok()).collect();
-        tail.reverse();
-        if tail.len() != handles.len()
-            || tail
-                .iter()
-                .zip(handles)
-                .any(|(id, handle)| id.to_string() != handle.0)
-        {
-            return Ok(false);
+        let rows = items
+            .iter()
+            .map(|item| self.serialize_item(item))
+            .collect::<Result<Vec<_>>>()?;
+        let replacement = SuffixReplacement {
+            session_id: self.session_id.clone(),
+            pool: self.pool.clone(),
+            schema: self.schema.clone(),
+            handles: handles.to_vec(),
+            rows,
+            prune_prefix,
+        };
+        // Taking the lock may be cancelled; once it is held, the replacement runs on its own task
+        // and keeps the lock until it settles, so a dropped caller neither rolls it back nor lets
+        // a later write of this session overtake it.
+        let mutation = self.mutation_lock.clone().lock_owned().await;
+        let task = tokio::spawn(async move {
+            let _mutation = mutation;
+            replacement.run().await
+        });
+        match task.await {
+            Ok(outcome) => outcome,
+            Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+            Err(error) => Err(AgentsError::other(format!(
+                "The session replacement task was cancelled: {error}"
+            ))),
         }
-        if let Some(&first) = tail.first() {
-            // Stops at the first row the predicate rejects or that no longer parses, so a
-            // retained row always keeps everything after it.
-            loop {
-                let rows = sqlx::query(AssertSqlSafe(self.schema.select_prefix()))
-                    .bind(self.session_id.clone())
-                    .bind(first)
-                    .bind(super::PRUNE_PREFIX_BATCH)
-                    .fetch_all(&mut *tx)
-                    .await
-                    .map_err(sqlx_err)?;
-                let batch: Vec<(i64, String)> = rows
-                    .iter()
-                    .filter_map(|r| Some((r.try_get(0).ok()?, r.try_get(1).ok()?)))
-                    .collect();
-                let mut expired_end: Option<i64> = None;
-                for (id, data) in &batch {
-                    let Ok(value) = serde_json::from_str(data) else {
-                        break;
-                    };
-                    if !prune_prefix(&InputItem(value)) {
-                        break;
-                    }
-                    expired_end = Some(*id);
-                }
-                let Some(expired_end) = expired_end else {
-                    break;
-                };
-                sqlx::query(AssertSqlSafe(self.schema.delete_prefix()))
-                    .bind(self.session_id.clone())
-                    .bind(expired_end)
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(sqlx_err)?;
-                if batch.last().map(|(id, _)| *id) != Some(expired_end)
-                    || (batch.len() as i64) < super::PRUNE_PREFIX_BATCH
-                {
-                    break;
-                }
-            }
-        }
-        for id in &tail {
-            sqlx::query(AssertSqlSafe(self.schema.delete_message()))
-                .bind(*id)
-                .execute(&mut *tx)
-                .await
-                .map_err(sqlx_err)?;
-        }
-        for item in &items {
-            sqlx::query(AssertSqlSafe(self.schema.insert_message()))
-                .bind(self.session_id.clone())
-                .bind(self.serialize_item(item)?)
-                .execute(&mut *tx)
-                .await
-                .map_err(sqlx_err)?;
-        }
-        sqlx::query(AssertSqlSafe(self.schema.touch_session()))
-            .bind(self.session_id.clone())
-            .execute(&mut *tx)
-            .await
-            .map_err(sqlx_err)?;
-        tx.commit().await.map_err(sqlx_err)?;
-        Ok(true)
     }
 
     async fn clear_session(&self) -> Result<()> {
+        let _mutation = self.mutation_lock.lock().await;
         let mut tx = self.pool.begin().await.map_err(sqlx_err)?;
         sqlx::query(AssertSqlSafe(self.schema.delete_messages()))
             .bind(self.session_id.clone())

@@ -10,11 +10,21 @@ use super::openai_responses::OpenAIResponsesModel;
 use super::{OpenAIApi, default_openai_api, default_openai_client};
 use crate::error::Result;
 
+/// The error the OpenAI client raises when it is built without an API key.
+const MISSING_API_KEY_MESSAGE: &str = "The api_key client option must be set either by passing \
+     api_key to the client or by setting the OPENAI_API_KEY environment variable";
+
 #[cfg(feature = "websocket")]
 type WebsocketModelCache =
     Arc<std::sync::Mutex<std::collections::HashMap<(String, bool), Arc<dyn Model>>>>;
 
 /// Resolves model names to OpenAI Responses (default) or Chat Completions models.
+///
+/// [`get_model`](ModelProvider::get_model) fails with a user error when the provider builds its
+/// own client for the official OpenAI API and no key is set (explicitly, with
+/// [`set_default_openai_key`](super::set_default_openai_key) or `OPENAI_API_KEY`), as Python's
+/// client does. A run resolves the model where Python does: after the blocking input guardrails,
+/// and racing the parallel ones. A client for another base URL may stay keyless.
 #[derive(Debug, Clone, Default)]
 pub struct OpenAIProvider {
     client: Option<OpenAIClient>,
@@ -210,6 +220,22 @@ impl OpenAIProvider {
         self.openai_client()
     }
 
+    /// Python's `_get_client` builds an `AsyncOpenAI`, which refuses to exist without a key.
+    ///
+    /// Only a client the provider builds itself is checked: an explicit client
+    /// ([`with_client`](Self::with_client)) or the process default client
+    /// ([`set_default_openai_client`](super::set_default_openai_client)) is used as given, as in
+    /// Python. A built client aimed at another base URL (a local or self-hosted
+    /// OpenAI-compatible server) may stay keyless, which Python does not allow.
+    fn require_api_key(&self, client: &OpenAIClient) -> Result<()> {
+        let built = self.client.is_none()
+            && (self.has_explicit_client_options() || default_openai_client().is_none());
+        if built && client.is_openai_api() && client.api_key().is_none() {
+            return Err(crate::error::AgentsError::user(MISSING_API_KEY_MESSAGE));
+        }
+        Ok(())
+    }
+
     /// The low-level WebSocket options handed to this provider's models.
     #[cfg(feature = "websocket")]
     pub fn websocket_options(
@@ -260,6 +286,7 @@ impl ModelProvider for OpenAIProvider {
             .map(str::to_string)
             .unwrap_or_else(get_default_model);
         let client = self.client();
+        self.require_api_key(&client)?;
         #[cfg(feature = "websocket")]
         if self.use_responses_websocket() && self.use_responses() {
             let mut cache = self.websocket_models.lock().expect("poisoned");

@@ -294,10 +294,40 @@ pub struct Agent<C> {
     pub tool_use_behavior: ToolUseBehavior<C>,
     /// Reset `tool_choice` to `auto` after a tool call to avoid loops.
     pub reset_tool_choice: bool,
+    /// Which agent this is for function-tool approvals; see [`Agent::clone`].
+    approval_owner: ApprovalOwner,
 }
 
+/// A process-unique identity that function-tool approval decisions are bound to, as Python binds
+/// them to the agent object. Minted for every new agent and every [`Clone::clone`]; kept by the
+/// SDK's own copies of the same agent (a run's starting agent, handoff targets, agents as tools,
+/// sandbox-prepared agents).
+#[derive(Clone, PartialEq, Eq)]
+struct ApprovalOwner(Arc<str>);
+
+impl ApprovalOwner {
+    fn fresh() -> Self {
+        ApprovalOwner(uuid::Uuid::new_v4().simple().to_string().into())
+    }
+}
+
+/// A clone is a different agent for function-tool approvals, as Python's `agent.clone()` and
+/// `copy.copy(agent)` are: a decision bound to the original (by the runner or
+/// [`RunContext::approve_tool_for_agent`](crate::run_context::RunContext::approve_tool_for_agent))
+/// does not authorize the clone's calls, which are asked again. Everything else is copied.
 impl<C> Clone for Agent<C> {
     fn clone(&self) -> Self {
+        let mut agent = self.clone_same_identity();
+        agent.approval_owner = ApprovalOwner::fresh();
+        agent
+    }
+}
+
+impl<C> Agent<C> {
+    /// A copy that is the same agent for function-tool approvals. The SDK uses it wherever it
+    /// copies an agent to stand for the caller's (a run's starting agent, a handoff target, an
+    /// agent run as a tool, a sandbox-prepared agent).
+    pub(crate) fn clone_same_identity(&self) -> Self {
         Agent {
             name: self.name.clone(),
             handoff_description: self.handoff_description.clone(),
@@ -318,7 +348,13 @@ impl<C> Clone for Agent<C> {
             hooks: self.hooks.clone(),
             tool_use_behavior: self.tool_use_behavior.clone(),
             reset_tool_choice: self.reset_tool_choice,
+            approval_owner: self.approval_owner.clone(),
         }
+    }
+
+    /// The identity function-tool approvals of this agent are bound to.
+    pub(crate) fn approval_owner_id(&self) -> &str {
+        &self.approval_owner.0
     }
 }
 
@@ -371,6 +407,7 @@ impl<C: Send + Sync + 'static> Agent<C> {
             hooks: None,
             tool_use_behavior: ToolUseBehavior::RunLlmAgain,
             reset_tool_choice: true,
+            approval_owner: ApprovalOwner::fresh(),
         }
     }
 
@@ -1273,7 +1310,7 @@ impl<C: Send + Sync + 'static> Agent<C> {
                 "on_stream_max_pending_events must be a positive integer or None",
             ));
         }
-        let agent = Arc::new(self.clone());
+        let agent = Arc::new(self.clone_same_identity());
         let name = options
             .tool_name
             .clone()

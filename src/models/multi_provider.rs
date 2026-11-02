@@ -228,7 +228,8 @@ mod tests {
 
     #[test]
     fn routes_prefixes() {
-        let p = MultiProvider::new();
+        let p = MultiProvider::new()
+            .with_openai_provider(OpenAIProvider::new().with_api_key("test_key"));
         assert_eq!(
             p.get_model(Some("openai/gpt-4.1"))
                 .unwrap()
@@ -254,7 +255,9 @@ mod tests {
             Some("openai/gpt-4.1")
         );
         assert!(p.get_model(Some("any-llm/openai/gpt-4.1")).is_ok());
-        let p = MultiProvider::new().with_unknown_prefix_mode(PrefixMode::ModelId);
+        let p = MultiProvider::new()
+            .with_openai_provider(OpenAIProvider::new().with_api_key("test_key"))
+            .with_unknown_prefix_mode(PrefixMode::ModelId);
         assert_eq!(
             p.get_model(Some("foo/bar"))
                 .unwrap()

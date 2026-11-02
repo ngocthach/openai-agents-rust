@@ -1875,9 +1875,15 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
                 }
             }
         }
+        // A resumed state's decisions decide for the agents of the graph it is resumed with that
+        // are filed under their owner key and expose the same capability, as resuming its JSON
+        // would (Python binds them to the owner it resolves); Python keeps an in-memory state
+        // bound to the original agent objects. Only decisions moved through a context keep
+        // their original agent.
+        let (approvals, capabilities) =
+            crate::run_context::detach_capabilities(approvals, &state.approval_capabilities);
         self.ctx.import_approvals(&approvals);
-        self.ctx
-            .import_approval_capabilities(&state.approval_capabilities);
+        self.ctx.import_approval_capabilities(&capabilities);
         self.legacy_name_owner_fallback = state.legacy_name_owner_snapshot;
         self.ctx
             .import_nested_states(&state.nested_agent_tool_states);
@@ -3840,6 +3846,43 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
         outcome
     }
 
+    /// End a turn whose model could not be resolved (for example a provider without an API key).
+    ///
+    /// Python resolves the model inside the task that races the parallel input guardrails, so
+    /// those guardrails still get their first step: one that trips (or fails) without waiting
+    /// wins over the resolution error. A streamed run reports the guardrails' outcome in place of
+    /// a model error, as it does for a failed model call; a non-streamed run drops guardrails
+    /// still running.
+    async fn fail_model_resolution(
+        &mut self,
+        error: AgentsError,
+        parallel: Vec<InputGuardrail<C>>,
+        guardrail_input: Option<Vec<InputItem>>,
+        agent: &Arc<Agent<C>>,
+    ) -> Result<NextStep<C>> {
+        if parallel.is_empty() {
+            return Err(error);
+        }
+        self.settle_pending_input_guard().await?;
+        let mut guard: InputGuardrailFuture = Box::pin(race_input_guardrails(
+            parallel,
+            self.ctx.clone(),
+            agent.clone(),
+            guardrail_input.unwrap_or_default(),
+            self.agent_span.clone(),
+        ));
+        let settled = if self.sink.is_some() {
+            Some((&mut guard).await)
+        } else {
+            futures::FutureExt::now_or_never(&mut guard)
+        };
+        if let Some((results, outcome)) = settled {
+            self.record_input_guardrails(results)?;
+            outcome?;
+        }
+        Err(error)
+    }
+
     fn record_input_guardrails(&mut self, results: Vec<InputGuardrailResult>) -> Result<()> {
         let mut tripped = None;
         for r in results {
@@ -3996,12 +4039,22 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
             Some(prompt) => prompt,
             None => agent.get_prompt(&self.ctx).await?,
         };
-        let model = self.resolve_model(&agent)?;
-        if !self.models_used.iter().any(|m| Arc::ptr_eq(m, &model)) {
-            self.models_used.push(model.clone());
-        }
-        let settings = self.resolve_settings(&agent, &model);
-        self.last_store = settings.store;
+        // Python resolves the model inside the task that races the parallel input guardrails:
+        // a streamed turn before the `call_model_input_filter`, a non-streamed one after it. A
+        // provider that cannot build its client (no API key) therefore fails there, and a
+        // parallel guardrail that trips first still wins.
+        let early_model = if self.sink.is_some() {
+            match self.resolve_model(&agent) {
+                Ok(model) => Some(model),
+                Err(error) => {
+                    return self
+                        .fail_model_resolution(error, parallel, guardrail_input, &agent)
+                        .await;
+                }
+            }
+        } else {
+            None
+        };
 
         let mut input = self.build_model_input();
         let mut instructions = system_prompt;
@@ -4033,6 +4086,22 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
             input = r.input;
             instructions = r.instructions;
         }
+        let model = match early_model {
+            Some(model) => model,
+            None => match self.resolve_model(&agent) {
+                Ok(model) => model,
+                Err(error) => {
+                    return self
+                        .fail_model_resolution(error, parallel, guardrail_input, &agent)
+                        .await;
+                }
+            },
+        };
+        if !self.models_used.iter().any(|m| Arc::ptr_eq(m, &model)) {
+            self.models_used.push(model.clone());
+        }
+        let settings = self.resolve_settings(&agent, &model);
+        self.last_store = settings.store;
         input = items::deduplicate_input_items_preferring_latest(input);
         // Hooks and tools see exactly what the model is about to see.
         self.ctx.set_turn_input(input.clone());

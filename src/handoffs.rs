@@ -499,7 +499,7 @@ impl<C: Send + Sync + 'static> From<Agent<C>> for Handoff<C> {
 
 impl<C: Send + Sync + 'static> From<&Agent<C>> for Handoff<C> {
     fn from(value: &Agent<C>) -> Self {
-        Handoff::new(Arc::new(value.clone()))
+        Handoff::new(Arc::new(value.clone_same_identity()))
     }
 }
 

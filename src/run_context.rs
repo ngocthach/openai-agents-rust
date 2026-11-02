@@ -73,15 +73,85 @@ pub(crate) fn join_bound_approval_key(key: &str, fingerprint: &str) -> String {
     format!("{key}{CAPABILITY_SEP}{fingerprint}")
 }
 
+/// Separator between a capability fingerprint and the identity of the live agent that owns the
+/// decision. Neither a hex fingerprint nor an agent identity contains it.
+const OWNER_SEP: char = '\u{4}';
+
+/// The capability a decision is bound to: the tool's fingerprint as `agent` exposes it, owned by
+/// that very agent. Python binds a function-tool decision to the agent object; an identical
+/// clone has the same fingerprint but another owner, so it is asked again.
+pub(crate) fn owned_capability<C: Send + Sync + 'static>(
+    agent: &crate::agent::Agent<C>,
+    tool: &crate::tool::FunctionTool<C>,
+) -> String {
+    format!(
+        "{}{OWNER_SEP}{}",
+        function_tool_capability_fingerprint(&agent.name, tool),
+        agent.approval_owner_id()
+    )
+}
+
+/// The fingerprint part of a bound capability, without the live owner, as a snapshot stores it:
+/// an owner identity means nothing in another process.
+pub(crate) fn detached_capability(capability: &str) -> &str {
+    capability
+        .split_once(OWNER_SEP)
+        .map_or(capability, |(fingerprint, _)| fingerprint)
+}
+
+/// A resumed snapshot's decisions and capability registry with their live owners removed, so
+/// they decide for the agent of the resumed graph filed under their key.
+pub(crate) fn detach_capabilities(
+    approvals: ApprovalsState,
+    capabilities: &BTreeMap<String, ApprovalCapability>,
+) -> (ApprovalsState, BTreeMap<String, ApprovalCapability>) {
+    // Owned records were decided in a live context after any detached record of the same key,
+    // so they are merged over it, the later decision winning.
+    let (owned, mut detached): (BTreeMap<_, _>, BTreeMap<_, _>) =
+        approvals.0.into_iter().partition(|(key, _)| {
+            split_bound_approval_key(key)
+                .is_some_and(|(_, capability)| capability.contains(OWNER_SEP))
+        });
+    for (key, record) in owned {
+        let (unbound, capability) =
+            split_bound_approval_key(&key).expect("an owned record is bound");
+        let key = join_bound_approval_key(unbound, detached_capability(capability));
+        let sticky = (record.approved_always, record.rejected_always);
+        let mut later = ApprovalsState::default();
+        later.0.insert(key.clone(), record);
+        let mut merged = ApprovalsState(std::mem::take(&mut detached));
+        merged.merge(&later);
+        detached = merged.0;
+        let rec = detached.get_mut(&key).expect("just merged");
+        match sticky {
+            (true, _) => rec.rejected_always = false,
+            (_, true) => rec.approved_always = false,
+            _ => {}
+        }
+    }
+    let detached = ApprovalsState(detached);
+    let capabilities = capabilities
+        .iter()
+        .map(|(call_id, capability)| {
+            let mut capability = capability.clone();
+            capability.fingerprint = detached_capability(&capability.fingerprint).to_string();
+            (call_id.clone(), capability)
+        })
+        .collect();
+    (detached, capabilities)
+}
+
 /// The capability a function-tool approval was raised for: the record owner, the tool key the
 /// decision is filed under, and the fingerprint of the tool the owner exposed at the time.
 ///
 /// The runner registers one per call id whenever it pauses a function tool call for approval, so
 /// a decision taken on that interruption (through [`RunContext::approve_tool`],
 /// [`RunState::approve`](crate::run_state::RunState::approve) and their siblings) is bound to
-/// the exact tool that asked. A bound decision authorizes only a tool with the same fingerprint:
-/// a same-named tool with another description, schema, namespace or origin, or the same tool on
-/// an agent with another name, is asked again.
+/// the exact tool that asked. A bound decision authorizes only a tool with the same fingerprint,
+/// on the same agent: a same-named tool with another description, schema, namespace or origin,
+/// the same tool on an agent with another name, or the same tool on a clone of the agent
+/// ([`Agent`](crate::agent::Agent)'s `Clone` makes a different agent, as Python's `agent.clone()`
+/// does) is asked again.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApprovalCapability {
     /// The owner the decision is recorded under (agent name, or identity key of a same-named
@@ -89,7 +159,14 @@ pub struct ApprovalCapability {
     pub agent: String,
     /// The tool key the decision is recorded under (see [`approval_tool_key`]).
     pub tool_key: String,
-    /// SHA-256 (hex) of the tool's capability; see [`function_tool_capability_fingerprint`].
+    /// SHA-256 (hex) of the tool's capability (see [`function_tool_capability_fingerprint`]),
+    /// followed in a live context by `\u{4}` and an identity of the agent that owns the
+    /// decision. The identity is process-local: a resumed [`RunState`](crate::run_state::RunState)
+    /// (and its JSON) keeps the fingerprint alone, which decides for the agent of the resumed
+    /// graph filed under [`agent`](Self::agent) with that fingerprint. A context's decisions
+    /// moved by
+    /// [`RunContext::export_approvals`] / [`RunContext::import_approvals`] keep their owner, so
+    /// they authorize only that same agent object in this process.
     pub fingerprint: String,
 }
 
@@ -557,7 +634,8 @@ impl ApprovalsState {
     /// call decisions, never a sticky grant, so an old permanent decision never picks an owner.
     ///
     /// A decision bound to `fingerprint` (the capability of the tool about to run) decides
-    /// first. Decisions bound to any other capability are ignored, so the call is asked again;
+    /// first, then one bound to its fingerprint without a live owner (read from a snapshot).
+    /// Decisions bound to any other capability or owner are ignored, so the call is asked again;
     /// unbound decisions apply as they always did.
     pub(crate) fn function_tool_status(
         &self,
@@ -566,11 +644,15 @@ impl ApprovalsState {
         call_id: &str,
         fingerprint: Option<&str>,
     ) -> ApprovalStatus {
+        // A decision owned by the running agent decides first; one read from a snapshot has no
+        // live owner and decides for any agent filed under this key with the same fingerprint.
         let bound = fingerprint.and_then(|fp| {
-            lookup_names(tool_name).find_map(|name| {
-                self.0
-                    .get(&bound_approval_key(agent, name, fp))
-                    .filter(|rec| Self::record_status(rec, call_id).is_some())
+            [fp, detached_capability(fp)].into_iter().find_map(|fp| {
+                lookup_names(tool_name).find_map(|name| {
+                    self.0
+                        .get(&bound_approval_key(agent, name, fp))
+                        .filter(|rec| Self::record_status(rec, call_id).is_some())
+                })
             })
         });
         if let Some(rec) = bound {
@@ -1363,9 +1445,10 @@ impl<C> RunContext<C> {
 
 impl<C: Send + Sync + 'static> RunContext<C> {
     /// Approve `item` as a call to the function tool `agent` exposes under `item.tool_name`, bound
-    /// to that tool's capability fingerprint (see [`ApprovalCapability`]): a later call is
-    /// authorized only while the running agent has the same name and exposes a tool with the
-    /// same name, namespace, description, parameter schema and origin. `always_approve` makes
+    /// to that tool's capability fingerprint and to `agent` itself (see [`ApprovalCapability`]):
+    /// a later call is authorized only while the running agent is `agent` (the agent the run
+    /// was started with, a handoff target or an agent run as a tool, not a clone) and exposes a
+    /// tool with the same name, namespace, description, parameter schema and origin. `always_approve` makes
     /// the decision sticky for that capability.
     ///
     /// Use it for approval items built by hand; a decision on an interruption the runner raised
@@ -1420,7 +1503,7 @@ impl<C: Send + Sync + 'static> RunContext<C> {
                     agent.name, item.tool_name
                 ))
             })?;
-        let fingerprint = function_tool_capability_fingerprint(&agent.name, tool);
+        let fingerprint = owned_capability(agent, tool);
         let mut inner = self.lock();
         inner
             .approvals

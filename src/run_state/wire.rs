@@ -1259,8 +1259,12 @@ fn approvals_to_wire(state: &RunState) -> Value {
                     "tool_key": tool_key,
                     "decision": approval_decision_to_wire(record),
                 });
+                // The live owner is not written: it means nothing in another process, and the
+                // resumed run binds the decision to the agent the entry names.
                 if let Some(capability) = capability {
-                    entry["capability"] = Value::String(capability.to_string());
+                    entry["capability"] = Value::String(
+                        crate::run_context::detached_capability(capability).to_string(),
+                    );
                 }
                 Some(entry)
             })
@@ -2423,9 +2427,19 @@ pub(super) fn to_wire(state: &RunState, include_tracing_api_key: bool) -> Result
     });
     // The capabilities pending function-tool approvals were raised for.
     if let Some(Value::Object(rust)) = envelope.get_mut("rust") {
+        let detached: std::collections::BTreeMap<_, _> = state
+            .approval_capabilities
+            .iter()
+            .map(|(call_id, capability)| {
+                let mut capability = capability.clone();
+                capability.fingerprint =
+                    crate::run_context::detached_capability(&capability.fingerprint).to_string();
+                (call_id, capability)
+            })
+            .collect();
         rust.insert(
             "approval_capabilities".into(),
-            serde_json::to_value(&state.approval_capabilities)?,
+            serde_json::to_value(&detached)?,
         );
     }
     // Approvals parked by a duplicate-named current agent record which duplicate owns them.

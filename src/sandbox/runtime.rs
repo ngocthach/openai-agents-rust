@@ -1866,13 +1866,13 @@ async fn begin_preparation<C: Send + Sync + 'static>(
         .await?;
         return Ok((options, starting, deferred));
     }
-    let (hook_agent, hook_config) = (agent.clone(), config.clone());
+    let (hook_agent, hook_config) = (agent.clone_same_identity(), config.clone());
     let options = options.prepare_agent(move |_| {
         let ready_tx = ready_tx.clone();
         let (slot, guard_slot, agent, config, graph, rollout) = (
             slot.clone(),
             guard_slot.clone(),
-            hook_agent.clone(),
+            hook_agent.clone_same_identity(),
             hook_config.clone(),
             graph.clone(),
             rollout_override.clone(),
@@ -1905,7 +1905,11 @@ async fn begin_preparation<C: Send + Sync + 'static>(
             }
         }
     });
-    Ok((options, Arc::new(agent.agent.clone()), deferred))
+    Ok((
+        options,
+        Arc::new(agent.agent.clone_same_identity()),
+        deferred,
+    ))
 }
 
 /// The memory manager that follows the agent active when the run ended.

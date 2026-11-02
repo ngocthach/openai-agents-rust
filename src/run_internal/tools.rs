@@ -403,16 +403,15 @@ pub(crate) async fn execute_function_tool<C: Send + Sync + 'static>(
     // function tool named `apply_patch`), so they are read back under the same key.
     let approval_key = crate::run_context::approval_tool_key(&approval_name, &call);
     // A decision bound to a capability authorizes only the tool it was taken for: the same
-    // agent name exposing a tool with the same name, namespace, description, schema and origin.
+    // agent (not a clone) exposing a tool with the same name, namespace, description, schema
+    // and origin.
     // A stand-in for a resumed call whose tool is gone answers with the decision taken on the
     // original tool, so it is matched against the capability that interruption registered.
     let capability = tool
         .resumes_registered_capability
         .then(|| env.ctx.registered_capability(&call.call_id))
         .flatten()
-        .unwrap_or_else(|| {
-            crate::run_context::function_tool_capability_fingerprint(&env.agent.name, &tool)
-        });
+        .unwrap_or_else(|| crate::run_context::owned_capability(env.agent, &tool));
     // A restored decision that no ledger entry binds authorizes nothing; see
     // [`bound_approval_status`].
     let status_now = || {

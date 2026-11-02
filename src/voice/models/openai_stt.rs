@@ -139,6 +139,8 @@ pub struct OpenAISTTModel {
     client: OpenAIClient,
     http: reqwest::Client,
     websocket: VoiceWebSocketOptions,
+    /// A provider configuration error every operation reports instead of running.
+    config_error: Option<&'static str>,
 }
 
 impl OpenAISTTModel {
@@ -149,6 +151,20 @@ impl OpenAISTTModel {
             client,
             http: crate::util::http_client(),
             websocket: VoiceWebSocketOptions::default(),
+            config_error: None,
+        }
+    }
+
+    /// Make every operation fail with `error` (a provider configuration error).
+    pub(crate) fn with_config_error(mut self, error: Option<&'static str>) -> Self {
+        self.config_error = error;
+        self
+    }
+
+    fn check_config(&self) -> Result<()> {
+        match self.config_error {
+            Some(message) => Err(AgentsError::user(message)),
+            None => Ok(()),
         }
     }
 
@@ -183,6 +199,7 @@ impl STTModel for OpenAISTTModel {
         trace_include_sensitive_data: bool,
         trace_include_sensitive_audio_data: bool,
     ) -> Result<String> {
+        self.check_config()?;
         let span = transcription_span(
             Some(self.model.clone()),
             Some(json!({
@@ -239,6 +256,7 @@ impl STTModel for OpenAISTTModel {
         trace_include_sensitive_data: bool,
         trace_include_sensitive_audio_data: bool,
     ) -> Result<Box<dyn StreamedTranscriptionSession>> {
+        self.check_config()?;
         let audio = input.take_receiver().await.ok_or_else(|| {
             AgentsError::user("This StreamedAudioInput is already consumed by another session")
         })?;

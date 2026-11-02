@@ -16,6 +16,8 @@ pub struct OpenAITTSModel {
     model: String,
     client: OpenAIClient,
     http: reqwest::Client,
+    /// A provider configuration error every operation reports instead of running.
+    config_error: Option<&'static str>,
 }
 
 impl OpenAITTSModel {
@@ -25,7 +27,14 @@ impl OpenAITTSModel {
             model: model.into(),
             client,
             http: crate::util::http_client(),
+            config_error: None,
         }
+    }
+
+    /// Make every operation fail with `error` (a provider configuration error).
+    pub(crate) fn with_config_error(mut self, error: Option<&'static str>) -> Self {
+        self.config_error = error;
+        self
     }
 
     /// Use a custom `reqwest::Client` for the audio request.
@@ -61,6 +70,9 @@ impl TTSModel for OpenAITTSModel {
     }
 
     async fn run(&self, text: &str, settings: &TTSModelSettings) -> Result<AudioByteStream> {
+        if let Some(message) = self.config_error {
+            return Err(crate::error::AgentsError::user(message));
+        }
         // Goes through the shared client so the `RequestAuth` hook, the default query and
         // the OpenAI error mapping apply here as they do to every other request.
         let (stream, _request_id) = self

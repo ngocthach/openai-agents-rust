@@ -248,7 +248,7 @@ impl<C> IntoAgentArc<C> for Agent<C> {
 
 impl<C> IntoAgentArc<C> for &Agent<C> {
     fn into_agent_arc(self) -> Arc<Agent<C>> {
-        Arc::new(self.clone())
+        Arc::new(self.clone_same_identity())
     }
 }
 

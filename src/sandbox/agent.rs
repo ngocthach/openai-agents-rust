@@ -100,10 +100,22 @@ impl<C: Send + Sync + 'static> SandboxHandoffTarget<C> {
     }
 }
 
+/// A clone is a different agent for function-tool approvals, as [`Agent`]'s clone is.
 impl<C> Clone for SandboxAgent<C> {
     fn clone(&self) -> Self {
         SandboxAgent {
             agent: self.agent.clone(),
+            ..self.clone_same_identity()
+        }
+    }
+}
+
+impl<C> SandboxAgent<C> {
+    /// A copy that is the same agent for function-tool approvals; see
+    /// [`Agent::clone_same_identity`].
+    pub(crate) fn clone_same_identity(&self) -> Self {
+        SandboxAgent {
+            agent: self.agent.clone_same_identity(),
             default_manifest: self.default_manifest.clone(),
             base_instructions: self.base_instructions.clone(),
             capabilities: self.capabilities.clone(),
@@ -180,9 +192,9 @@ impl<C: Send + Sync + 'static> SandboxAgent<C> {
         options: crate::agent::AgentAsToolOptions<C>,
         config: crate::sandbox::SandboxRunConfig,
     ) -> crate::tool::FunctionTool<C> {
-        let sandbox_agent = self.clone();
+        let sandbox_agent = self.clone_same_identity();
         let runner: crate::agent::NestedRunFn<C> = Arc::new(move |input, run_opts| {
-            let (agent, config) = (sandbox_agent.clone(), config.clone());
+            let (agent, config) = (sandbox_agent.clone_same_identity(), config.clone());
             Box::pin(async move {
                 crate::sandbox::SandboxRunner::run_with_options(&agent, input, &config, run_opts)
                     .await
@@ -376,7 +388,7 @@ impl<C: Send + Sync + 'static> SandboxAgent<C> {
 
     /// One agent of this agent's sandbox handoff graph, by name.
     pub fn graph_agent(&self, name: &str) -> Option<Arc<SandboxAgent<C>>> {
-        let root = Arc::new(self.clone());
+        let root = Arc::new(self.clone_same_identity());
         let mut walk = GraphWalk::new(&root);
         collect_graph(&root, &mut walk).ok()?;
         walk.nodes.remove(name).map(|node| node.agent)
@@ -387,7 +399,7 @@ impl<C: Send + Sync + 'static> SandboxAgent<C> {
     /// A caller that wants one session per agent needs the names before it can create the
     /// sessions, which is why this is separate from preparation.
     pub fn graph_agent_names(&self) -> Result<Vec<String>> {
-        let root = Arc::new(self.clone());
+        let root = Arc::new(self.clone_same_identity());
         let mut walk = GraphWalk::new(&root);
         collect_graph(&root, &mut walk)?;
         Ok(walk.order)
@@ -403,7 +415,7 @@ impl<C: Send + Sync + 'static> SandboxAgent<C> {
         binding: &CapabilityBinding,
         by_name: &HashMap<String, CapabilityBinding>,
     ) -> Result<PreparedSandboxGraph<C>> {
-        let root = Arc::new(self.clone());
+        let root = Arc::new(self.clone_same_identity());
         let mut walk = GraphWalk::new(&root);
         collect_graph(&root, &mut walk)?;
         let GraphWalk {
@@ -570,12 +582,13 @@ impl<C: Send + Sync + 'static> SandboxAgent<C> {
         let mut model_settings = self.agent.model_settings.clone();
         model_settings.extra_args = (!extra_args.is_empty()).then_some(extra_args);
 
-        Ok(self.agent.clone_with(|agent| {
-            agent.instructions = Some(instructions);
-            agent.model_settings = model_settings;
-            agent.tools.extend(capability_tools);
-            agent.handoffs.extend(extra_handoffs);
-        }))
+        // The prepared agent stands for this one, so approvals stay bound to it.
+        let mut agent = self.agent.clone_same_identity();
+        agent.instructions = Some(instructions);
+        agent.model_settings = model_settings;
+        agent.tools.extend(capability_tools);
+        agent.handoffs.extend(extra_handoffs);
+        Ok(agent)
     }
 
     /// The prepared agent's instructions.

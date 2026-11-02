@@ -13,6 +13,10 @@ pub const DEFAULT_STT_MODEL: &str = "gpt-transcribe";
 /// The text-to-speech model used when none is given.
 pub const DEFAULT_TTS_MODEL: &str = "gpt-4o-mini-tts";
 
+/// The error Python's constructor raises for an explicit client combined with client options.
+const CONFLICTING_CLIENT_OPTIONS: &str =
+    "Don't provide api_key, base_url, organization, or project if you provide openai_client";
+
 /// The options that build the provider's own client, as Python's constructor stores them.
 #[derive(Debug, Clone, Default)]
 struct ClientOptions {
@@ -23,14 +27,19 @@ struct ClientOptions {
 }
 
 impl ClientOptions {
+    fn any(&self) -> bool {
+        self.api_key.is_some()
+            || self.base_url.is_some()
+            || self.organization.is_some()
+            || self.project.is_some()
+    }
+
     /// Python's `_get_client`: with no explicit option the process default client wins;
     /// otherwise a client is built from the environment and the explicit options.
     fn resolve(&self) -> OpenAIClient {
-        let explicit = self.api_key.is_some()
-            || self.base_url.is_some()
-            || self.organization.is_some()
-            || self.project.is_some();
-        if !explicit && let Some(client) = crate::models::get_default_openai_client() {
+        if !self.any()
+            && let Some(client) = crate::models::get_default_openai_client()
+        {
             return client;
         }
         let mut client = OpenAIClient::from_env();
@@ -57,6 +66,14 @@ impl ClientOptions {
 /// `set_default_openai_client`, or builds one from the environment, the explicit options and the
 /// default key. Python resolves this lazily on first use; Rust resolves it when the provider is
 /// built, so set the defaults first.
+///
+/// An explicit client ([`with_client`](Self::with_client)) cannot be combined with
+/// [`with_api_key`](Self::with_api_key), [`with_base_url`](Self::with_base_url),
+/// [`with_organization`](Self::with_organization) or [`with_project`](Self::with_project), in
+/// either order. Python's constructor rejects the combination; the Rust builders cannot fail, so
+/// the conflict is remembered: [`validate`](Self::validate) reports it, and the first operation
+/// of a model the provider hands out (`transcribe`, `create_session`, `run`) fails with it. The
+/// explicit client is left unchanged.
 #[derive(Debug, Clone)]
 pub struct OpenAIVoiceModelProvider {
     client: OpenAIClient,
@@ -96,10 +113,8 @@ impl OpenAIVoiceModelProvider {
 
     /// Use an explicit API key.
     pub fn with_api_key(mut self, api_key: impl Into<String>) -> Self {
-        if self.explicit_client {
-            self.client = self.client.with_api_key(api_key);
-        } else {
-            self.options.api_key = Some(api_key.into());
+        self.options.api_key = Some(api_key.into());
+        if !self.explicit_client {
             self.client = self.options.resolve();
         }
         self
@@ -107,10 +122,8 @@ impl OpenAIVoiceModelProvider {
 
     /// Use an explicit base URL.
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
-        if self.explicit_client {
-            self.client = self.client.with_base_url(base_url);
-        } else {
-            self.options.base_url = Some(base_url.into());
+        self.options.base_url = Some(base_url.into());
+        if !self.explicit_client {
             self.client = self.options.resolve();
         }
         self
@@ -118,10 +131,8 @@ impl OpenAIVoiceModelProvider {
 
     /// Use an explicit organization.
     pub fn with_organization(mut self, organization: impl Into<String>) -> Self {
-        if self.explicit_client {
-            self.client = self.client.with_organization(organization);
-        } else {
-            self.options.organization = Some(organization.into());
+        self.options.organization = Some(organization.into());
+        if !self.explicit_client {
             self.client = self.options.resolve();
         }
         self
@@ -129,10 +140,8 @@ impl OpenAIVoiceModelProvider {
 
     /// Use an explicit project.
     pub fn with_project(mut self, project: impl Into<String>) -> Self {
-        if self.explicit_client {
-            self.client = self.client.with_project(project);
-        } else {
-            self.options.project = Some(project.into());
+        self.options.project = Some(project.into());
+        if !self.explicit_client {
             self.client = self.options.resolve();
         }
         self
@@ -161,6 +170,20 @@ impl OpenAIVoiceModelProvider {
         &self.client
     }
 
+    /// Fail when an explicit client was combined with an API key, base URL, organization or
+    /// project, as Python's constructor does. Models from a provider that fails here fail their
+    /// first operation with the same error.
+    pub fn validate(&self) -> crate::error::Result<()> {
+        match self.conflict() {
+            Some(message) => Err(crate::error::AgentsError::user(message)),
+            None => Ok(()),
+        }
+    }
+
+    fn conflict(&self) -> Option<&'static str> {
+        (self.explicit_client && self.options.any()).then_some(CONFLICTING_CLIENT_OPTIONS)
+    }
+
     /// The resolved agent harness id: this provider's, the global default, then
     /// `OPENAI_AGENT_HARNESS_ID`.
     ///
@@ -182,7 +205,8 @@ impl VoiceModelProvider for OpenAIVoiceModelProvider {
     fn get_stt_model(&self, model_name: Option<&str>) -> Arc<dyn STTModel> {
         let model =
             OpenAISTTModel::new(model_name.unwrap_or(DEFAULT_STT_MODEL), self.client.clone())
-                .with_websocket_options(self.websocket);
+                .with_websocket_options(self.websocket)
+                .with_config_error(self.conflict());
         Arc::new(match &self.http {
             Some(http) => model.with_http_client(http.clone()),
             None => model,
@@ -191,7 +215,8 @@ impl VoiceModelProvider for OpenAIVoiceModelProvider {
 
     fn get_tts_model(&self, model_name: Option<&str>) -> Arc<dyn TTSModel> {
         let model =
-            OpenAITTSModel::new(model_name.unwrap_or(DEFAULT_TTS_MODEL), self.client.clone());
+            OpenAITTSModel::new(model_name.unwrap_or(DEFAULT_TTS_MODEL), self.client.clone())
+                .with_config_error(self.conflict());
         Arc::new(match &self.http {
             Some(http) => model.with_http_client(http.clone()),
             None => model,
