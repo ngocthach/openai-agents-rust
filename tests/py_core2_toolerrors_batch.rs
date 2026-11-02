@@ -760,8 +760,8 @@ async fn fresh_guarded_terminal_failure_keeps_output_private() {
 
 #[tokio::test]
 async fn completed_history_at_failure_boundaries() {
-    // `mcp_callback` (the hosted MCP approval callback cannot fail) and `tool_cancel` /
-    // `native_cancel` (asyncio cancellation) are Python-only.
+    // `mcp_callback` is ported in `py_core20_fallible_callbacks.rs` (fallible hosted MCP
+    // approval callback); `tool_cancel` / `native_cancel` (asyncio cancellation) are Python-only.
     for boundary in [
         "provider",
         "provider_final_hook",

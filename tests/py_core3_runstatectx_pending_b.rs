@@ -627,35 +627,6 @@ async fn terminal_state_rejects_pending_input_without_mutation() {
     assert_eq!(snapshot(&state), before);
 }
 
-/// Run a streamed resume until its first tool output, then cancel after that turn.
-async fn cancel_after_first_tool_output(
-    agent: &Arc<Agent<()>>,
-    state: RunState,
-    auto_previous_response_id: bool,
-) -> RunState {
-    let mut streamed = Runner::run_streamed_with_options(
-        agent,
-        RunInput::from(state),
-        options(None, auto_previous_response_id),
-    );
-    let handle = streamed.cancel_handle();
-    {
-        let mut events = std::pin::pin!(streamed.stream_events());
-        while let Some(event) = events.next().await {
-            if let StreamEvent::RunItem {
-                name: RunItemStreamEventName::ToolOutput,
-                ..
-            } = event.unwrap()
-            {
-                handle.cancel(CancelMode::AfterTurn);
-            }
-        }
-    }
-    streamed
-        .to_state()
-        .expect("a cancelled run leaves its state")
-}
-
 #[tokio::test]
 async fn server_filter_omission_survives_streamed_cancel_and_round_trip() {
     // Python keeps staged input pending while the filter withholds it from the request.
@@ -708,41 +679,10 @@ async fn server_filter_omission_survives_streamed_cancel_and_round_trip() {
     );
 }
 
-/// Rust-specific behaviour, documented as a difference: delta selection is by content
-/// fingerprint (`ServerConversationTracker::needs_send`), chosen so a retry or resumed state can
-/// neither resend nor skip an item. An identical later occurrence of an input already delivered
-/// is therefore not sent again. Python sends it, because it selects by object identity.
-async fn identical_late_input_is_not_resent_by_fingerprint(streamed_second_resume: bool) {
-    let mut at = after_turn_state(None, true).await;
-    at.state.add_input("Repeat").unwrap();
-    at.model
-        .add_turn(vec![destination_call("Rome", "call-second-destination")]);
-    let parked = cancel_after_first_tool_output(&at.agent, at.state.clone(), true).await;
-    let mut state = RunState::from_json(parked.to_json().unwrap()).unwrap();
-    state.add_input("Repeat").unwrap();
-    at.model.add_turn(vec![assistant_message("Done")]);
-
-    let agent = at.agent.clone();
-    let result = run_to_end_server(&agent, state, streamed_second_resume).await;
-
-    assert_eq!(result.final_output_text().as_deref(), Some("Done"));
-    assert_eq!(
-        *at.calls.lock().unwrap(),
-        vec!["Paris".to_string(), "Rome".to_string()]
-    );
-    assert_eq!(
-        count_text(&at.model.last_call().unwrap().input, "Repeat"),
-        0
-    );
-    // Both occurrences are still admitted into the run's own history.
-    assert_eq!(
-        admitted_inputs(&result.to_state())
-            .iter()
-            .filter(|t| t.as_deref() == Some("Repeat"))
-            .count(),
-        2
-    );
-}
+// `test_server_managed_resume_sends_identical_late_input_in_later_occurrence` and
+// `test_server_tracker_distinguishes_identical_input_occurrences_after_restore` are ported in
+// `py_core20_followup_pending_input.rs`: each admitted input is its own occurrence, so an
+// identical later input is sent again.
 
 /// Rust-specific behaviour, documented as a difference: staged input is admitted into the run
 /// history at turn start, before the model call, so a failed request leaves it admitted rather
@@ -812,30 +752,6 @@ async fn accepted_response_refused_on_retry_without_model_call(streamed_failure:
     assert_eq!(*at.calls.lock().unwrap(), vec!["Paris".to_string()]);
 }
 
-/// Run to the end, streamed or not, and return the result.
-async fn run_to_end_server(
-    agent: &Arc<Agent<()>>,
-    state: RunState,
-    streamed: bool,
-) -> RunResult<()> {
-    if streamed {
-        let mut result =
-            Runner::run_streamed_with_options(agent, RunInput::from(state), options(None, true));
-        {
-            let mut events = std::pin::pin!(result.stream_events());
-            while let Some(event) = events.next().await {
-                event.unwrap();
-            }
-        }
-        return result
-            .into_result()
-            .expect("completed stream holds its result");
-    }
-    Runner::run_with_options(agent, RunInput::from(state), options(None, true))
-        .await
-        .unwrap()
-}
-
 /// The error of a streamed run that is expected to fail.
 async fn run_streamed_error(
     agent: &Arc<Agent<()>>,
@@ -853,16 +769,6 @@ async fn run_streamed_error(
         }
     }
     error.expect("the streamed run must fail")
-}
-
-#[tokio::test]
-async fn identical_late_input_is_not_resent_by_fingerprint_blocking() {
-    identical_late_input_is_not_resent_by_fingerprint(false).await;
-}
-
-#[tokio::test]
-async fn identical_late_input_is_not_resent_by_fingerprint_streamed() {
-    identical_late_input_is_not_resent_by_fingerprint(true).await;
 }
 
 #[tokio::test]
