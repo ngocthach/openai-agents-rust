@@ -156,6 +156,68 @@ def _read_file(helper) -> dict:
     }
 
 
+def _call_timeouts(helper) -> dict:
+    """The bound each control-plane call is awaited under, per operation."""
+
+    calls: list[str] = []
+    timeouts: list[float | None] = []
+    real_wait_for = asyncio.wait_for
+
+    async def spy_wait_for(awaitable, timeout=None):
+        timeouts.append(timeout)
+        return await real_wait_for(awaitable, timeout=timeout)
+
+    def recorded(name: str, value=None):
+        async def run(*args, **kwargs):
+            calls.append(name)
+            return value
+
+        return types.SimpleNamespace(aio=run)
+
+    class Image:
+        def cmd(self, _argv):
+            return self
+
+    class Sandbox:
+        object_id = "sb-new"
+
+        def __init__(self) -> None:
+            self.poll = recorded("poll")
+            self.terminate = recorded("terminate")
+
+    sandbox = Sandbox()
+    modal = types.SimpleNamespace(
+        App=types.SimpleNamespace(lookup=recorded("App.lookup", object())),
+        Image=types.SimpleNamespace(
+            from_id=lambda image_id: calls.append(f"Image.from_id:{image_id}") or Image(),
+            from_registry=lambda tag: calls.append(f"Image.from_registry:{tag}") or Image(),
+        ),
+        Sandbox=types.SimpleNamespace(
+            from_id=recorded("Sandbox.from_id", sandbox),
+            create=recorded("Sandbox.create", sandbox),
+        ),
+    )
+
+    def run(request: dict) -> dict:
+        calls.clear()
+        timeouts.clear()
+        response = asyncio.run(helper._OPS[request["op"]](modal, request))
+        return {"response": response, "calls": list(calls), "timeouts": list(timeouts)}
+
+    helper.asyncio.wait_for = spy_wait_for
+    try:
+        return {
+            "create": run({"op": "create", "app_name": "sandbox-tests"}),
+            "create_from_image": run(
+                {"op": "create", "app_name": "sandbox-tests", "image_id": "im-existing"}
+            ),
+            "poll": run({"op": "poll", "sandbox_id": "sb-existing"}),
+            "terminate": run({"op": "terminate", "sandbox_id": "sb-existing"}),
+        }
+    finally:
+        helper.asyncio.wait_for = real_wait_for
+
+
 def _main() -> None:
     helper = _load_helper(sys.argv[1])
     case = sys.argv[2]
@@ -163,6 +225,7 @@ def _main() -> None:
         "write_chunks": _write_chunks,
         "retryability": _retryability,
         "read_file": _read_file,
+        "call_timeouts": _call_timeouts,
     }[case](helper)
     json.dump(result, sys.stdout)
     sys.stdout.write("\n")

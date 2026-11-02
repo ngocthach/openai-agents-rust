@@ -763,7 +763,7 @@ async fn indexes_are_created_once_per_session_and_again_for_a_new_client() {
 #[tokio::test]
 async fn ping_succeeds_against_a_live_server_and_fails_without_one() {
     let mock = MockMongo::start().await;
-    assert!(mock.session("ping").await.ping().await);
+    assert!(mock.session("ping").await.ping().await.unwrap());
 
     let dead = Client::with_uri_str(
         "mongodb://127.0.0.1:1/?directConnection=true&serverSelectionTimeoutMS=300&connectTimeoutMS=300",
@@ -774,6 +774,7 @@ async fn ping_succeeds_against_a_live_server_and_fails_without_one() {
         !MongoDBSession::with_client("ping", &dead, "testdb")
             .ping()
             .await
+            .unwrap()
     );
 }
 
@@ -835,4 +836,52 @@ async fn an_external_client_stays_usable_across_sessions() {
     drop(first);
     let second = MongoDBSession::with_client("shared", &client, "testdb");
     assert_eq!(texts(&second.get_items(None).await.unwrap()), vec!["one"]);
+}
+
+/// `test_close_external_client_not_closed`: closing a session built on a caller's client leaves
+/// that client, and the session, usable.
+#[tokio::test]
+async fn close_leaves_an_injected_client_open() {
+    let mock = MockMongo::start().await;
+    let client = mock.client().await;
+    let session = MongoDBSession::with_client("external", &client, "testdb");
+    session.close().await;
+    assert!(!session.is_closed());
+    session.add_items(vec![user("still open")]).await.unwrap();
+    assert_eq!(session.get_items(None).await.unwrap().len(), 1);
+    assert!(
+        MongoDBSession::with_client("other", &client, "testdb")
+            .ping()
+            .await
+            .unwrap()
+    );
+}
+
+fn assert_closed(result: openai_agents_sdk::Result<impl std::fmt::Debug>) {
+    let error = result.expect_err("a closed session refuses the operation");
+    assert!(
+        error.to_string().contains("MongoDBSession is closed"),
+        "{error}"
+    );
+}
+
+/// `test_closed_operations_raise_runtime_error`, `test_closed_rejects_empty_add_items`,
+/// `test_close_before_use_is_terminal` and `test_repeated_close_remains_safe`: a session that
+/// owns its client is terminal from the first close, also for the empty `add_items` fast path,
+/// and closing again is safe.
+#[tokio::test]
+async fn closing_an_owned_client_makes_the_session_terminal() {
+    let mock = MockMongo::start().await;
+    let session = MongoDBSession::from_uri("owned", &mock.uri, "testdb")
+        .await
+        .unwrap();
+    session.close().await;
+    session.close().await;
+    assert!(session.is_closed());
+    assert_closed(session.get_items(None).await);
+    assert_closed(session.add_items(vec![user("after close")]).await);
+    assert_closed(session.add_items(Vec::new()).await);
+    assert_closed(session.pop_item().await);
+    assert_closed(session.clear_session().await);
+    assert_closed(session.ping().await);
 }

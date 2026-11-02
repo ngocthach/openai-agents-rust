@@ -116,7 +116,7 @@ async fn a_session_built_from_a_uri_identifies_the_sdk_in_the_handshake() {
     let session = MongoDBSession::from_uri("uri-test", &uri, "t")
         .await
         .unwrap();
-    assert!(session.ping().await);
+    assert!(session.ping().await.unwrap());
     assert!(names_the_sdk(&handshakes));
 }
 
@@ -126,6 +126,6 @@ async fn an_injected_client_receives_the_sdk_identity_before_it_connects() {
     let (uri, handshakes) = recording_server().await;
     let client = Client::with_uri_str(&uri).await.unwrap();
     let session = MongoDBSession::with_client("meta-test", &client, "agents_test");
-    assert!(session.ping().await);
+    assert!(session.ping().await.unwrap());
     assert!(names_the_sdk(&handshakes));
 }
