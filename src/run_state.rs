@@ -547,9 +547,30 @@ impl RunState {
     /// Bind a decision to the exact function call it was made for, as Python's
     /// `_apply_approval_decision` registers the invocation: the resumed run then refuses the
     /// call id if the model reuses it for different arguments.
+    ///
+    /// A decision made for another payload under a pending call's id replaces that call's
+    /// unstarted record, so the pending call no longer matches what was approved and the resumed
+    /// run refuses it instead of running it. A record that belongs to some other call sharing
+    /// the id (an outer agent-tool call whose nested run raised the approval) is kept.
     fn bind_decision(&mut self, item: &ToolApprovalItem) {
-        if let Some((call_id, record)) = crate::run_context::approval_binding(item) {
-            self.tool_invocations.entry(call_id).or_insert(record);
+        let Some((call_id, record)) = crate::run_context::approval_binding(item) else {
+            return;
+        };
+        let Some(existing) = self.tool_invocations.get(&call_id) else {
+            self.tool_invocations.insert(call_id, record);
+            return;
+        };
+        if existing.executed || existing.completed || existing.fingerprint == record.fingerprint {
+            return;
+        }
+        let pending_holds_record = self.interruptions.iter().any(|pending| {
+            pending.agent == item.agent
+                && crate::run_context::approval_binding(pending).is_some_and(|(id, bound)| {
+                    id == call_id && bound.fingerprint == existing.fingerprint
+                })
+        });
+        if pending_holds_record {
+            self.tool_invocations.insert(call_id, record);
         }
     }
 

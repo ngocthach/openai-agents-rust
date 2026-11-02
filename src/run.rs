@@ -29,6 +29,17 @@ use crate::util::BoxFuture;
 pub type PrepareAgentFn<C> =
     Arc<dyn Fn(Arc<Agent<C>>) -> BoxFuture<'static, Result<Arc<Agent<C>>>> + Send + Sync>;
 
+/// Rewrites the run's original input before each turn for the agent about to be called.
+///
+/// A sandbox run applies its capabilities' `process_context` chain through it. The result
+/// replaces the run's original input, so it reaches `RunResult::input` and `to_input_list`, as
+/// Python's per-turn `prepare_agent` writes `prepared.input` back into `original_input`.
+pub(crate) type ProcessInputFn<C> = Arc<
+    dyn Fn(&Arc<Agent<C>>, Vec<crate::items::InputItem>) -> Vec<crate::items::InputItem>
+        + Send
+        + Sync,
+>;
+
 /// Default maximum number of model turns per run.
 pub const DEFAULT_MAX_TURNS: usize = 10;
 
@@ -60,6 +71,8 @@ pub struct RunOptions<C> {
     pub(crate) checkpoint: Option<RunCheckpoint>,
     /// Prepares the starting agent after the blocking input guardrails.
     pub(crate) prepare_agent: Option<PrepareAgentFn<C>>,
+    /// Rewrites the original input before each turn (see [`ProcessInputFn`]).
+    pub(crate) process_input: Option<ProcessInputFn<C>>,
 }
 
 /// A slot a failed run leaves its checkpoint in.
@@ -148,6 +161,7 @@ impl<C: Send + Sync + 'static> RunOptions<C> {
             agent_tool_invocation: None,
             checkpoint: None,
             prepare_agent: None,
+            process_input: None,
         }
     }
 

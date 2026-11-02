@@ -120,7 +120,7 @@ pub use stream_events::{RunItemStreamEventName, StreamEvent};
 pub use tool::{
     CodeInterpreterTool, FileSearchTool, FunctionTool, FunctionToolResult, HostedMCPTool,
     ImageGenerationTool, Tool, ToolOrigin, ToolOriginType, ToolOutput, ToolOutputPart,
-    WebSearchTool, function_tool,
+    WebSearchTool, WebSearchToolImageSettings, function_tool,
 };
 pub use tool_context::ToolContext;
 pub use tool_guardrails::{

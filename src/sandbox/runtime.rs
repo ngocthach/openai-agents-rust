@@ -10,7 +10,6 @@ use crate::error::{AgentsError, Result};
 use crate::items::RunInput;
 use crate::result::{RunResult, RunResultStreaming};
 use crate::run::{RunOptions, Runner};
-use crate::run_config::ModelInputData;
 use crate::sandbox::agent::{PreparedSandboxGraph, SandboxAgent};
 use crate::sandbox::capabilities::CapabilityBinding;
 use crate::sandbox::entries::{Entry, EntryKind};
@@ -915,6 +914,7 @@ impl SandboxRunner {
         let tracing_disabled = options.run_config.tracing_disabled;
         let model_provider = options.run_config.model_provider.clone();
         let input = input.into();
+        let memory_input = sandbox_memory_input(&input, &options);
         let resume = match &input {
             RunInput::State(state) => Some(resume_source_for(state)),
             _ => None,
@@ -961,7 +961,11 @@ impl SandboxRunner {
         };
         if let (Some(manager), Ok(result)) = (&memory, &result)
             && let Err(error) = manager
-                .enqueue_result(guard.session().as_ref(), &prepared.rollout_id, result)
+                .enqueue_rollout_payload(
+                    guard.session().as_ref(),
+                    &prepared.rollout_id,
+                    &memory_payload(result, &memory_input),
+                )
                 .await
         {
             // The error can carry model or tool data, so both logging policies apply.
@@ -1102,6 +1106,7 @@ impl SandboxRunner {
         let tracing_disabled = options.run_config.tracing_disabled;
         let model_provider = options.run_config.model_provider.clone();
         let input = input.into();
+        let memory_input = sandbox_memory_input(&input, &options);
         let resume = match &input {
             RunInput::State(state) => Some(resume_source_for(state)),
             _ => None,
@@ -1145,6 +1150,7 @@ impl SandboxRunner {
             let prepared_slot = prepared_slot.clone();
             let model_provider = model_provider.clone();
             let starting_name = starting_name.clone();
+            let memory_input = memory_input.clone();
             Box::pin(async move {
                 // A run stopped before preparation (a rejected input) holds no session.
                 let Some(prepared) = prepared_slot.lock().expect("poisoned").take() else {
@@ -1174,7 +1180,7 @@ impl SandboxRunner {
                     && let Some(manager) = &memory_manager
                 {
                     let payload = build_rollout_payload(
-                        &completion.input,
+                        &memory_input,
                         &completion.new_items,
                         completion.final_output.as_ref(),
                         completion.interruptions,
@@ -1936,48 +1942,67 @@ fn active_memory_manager<C: Send + Sync + 'static>(
     }
 }
 
-/// Install the capability `process_context` chain as a per-turn model input filter.
+/// The input a run's memory rollout segment records. Port of Python's `_sandbox_memory_input`:
+/// with an SDK session it is the turn's session delta (none for a run resumed from its state,
+/// whose input the paused run already recorded), otherwise the input the caller passed (a
+/// resumed state's saved input). It is taken before the run, so neither a handoff filter nor a
+/// capability `process_context` rewrite of `RunResult::input` reaches it.
+fn sandbox_memory_input<C>(
+    input: &RunInput,
+    options: &RunOptions<C>,
+) -> Vec<crate::items::InputItem> {
+    match input {
+        RunInput::State(_)
+            if options.session.is_some()
+                && options.conversation_id.is_none()
+                && options.previous_response_id.is_none()
+                && !options.auto_previous_response_id =>
+        {
+            Vec::new()
+        }
+        other => other.to_items(),
+    }
+}
+
+/// The rollout segment of a finished (or paused) run, recording `input` as its input.
+fn memory_payload<C>(
+    result: &RunResult<C>,
+    input: &[crate::items::InputItem],
+) -> serde_json::Value {
+    let terminal_metadata = if result.final_output.is_some() {
+        RolloutTerminalMetadata::new(TerminalState::Completed, true)
+    } else if !result.interruptions.is_empty() {
+        RolloutTerminalMetadata::new(TerminalState::Interrupted, false)
+    } else {
+        RolloutTerminalMetadata::new(TerminalState::Failed, false)
+    };
+    crate::sandbox::memory::rollouts::build_rollout_payload_with_interruptions(
+        input,
+        &result.new_items,
+        result.final_output.as_ref(),
+        &result.interruptions,
+        &terminal_metadata,
+    )
+}
+
+/// Install the capability `process_context` chain as the run's per-turn input rewrite.
 ///
-/// Python re-prepares a sandbox agent on every turn, which applies `process_context` before the
-/// caller's `call_model_input_filter` sees the input. `RunConfig::call_model_input_filter` is the
-/// hook here: the chain runs first and any filter the caller configured runs on its result. It
-/// also covers handoff targets, because the chain is looked up by the agent about to be called.
-///
-/// One difference remains. Python applies the chain to the run's original input only and writes
-/// the result back into it, so `RunResult::input` and `to_input_list` carry the rewrite; this
-/// applies it to the whole model input of the call (original input plus the items the run
-/// generated) and leaves the run's own history unchanged.
+/// Python re-prepares a sandbox agent on every turn, which applies `process_context` to the
+/// run's original input (never to the items the run generated) and writes the result back, so
+/// `RunResult::input` and `to_input_list` carry the rewrite and the caller's
+/// `call_model_input_filter` sees the processed input. The chain is looked up by the agent about
+/// to be called, so handoff targets apply their own capabilities.
 fn install_per_turn_preparation<C: Send + Sync + 'static>(
     mut options: RunOptions<C>,
     graph: Arc<std::sync::OnceLock<PreparedSandboxGraph<C>>>,
 ) -> RunOptions<C> {
-    let existing = options.run_config.call_model_input_filter.take();
-    options.run_config.call_model_input_filter = Some(Arc::new(move |data| {
-        let graph = graph.clone();
-        let existing = existing.clone();
-        Box::pin(async move {
-            // The graph exists once the sandbox has been prepared, which happens before the
-            // first model call.
-            let input = match graph.get() {
-                Some(graph) => graph.process_context_for_agent(&data.agent, data.model_data.input),
-                None => data.model_data.input,
-            };
-            let model_data = ModelInputData {
-                input,
-                instructions: data.model_data.instructions,
-            };
-            match existing {
-                None => Ok(model_data),
-                Some(filter) => {
-                    filter(crate::run_config::CallModelData {
-                        model_data,
-                        agent: data.agent,
-                        context: data.context,
-                    })
-                    .await
-                }
-            }
-        })
+    options.process_input = Some(Arc::new(move |agent, input| {
+        // The graph exists once the sandbox has been prepared, which happens before the
+        // first model call.
+        match graph.get() {
+            Some(graph) => graph.process_context_for_agent(agent, input),
+            None => input,
+        }
     }));
     options
 }

@@ -8,7 +8,9 @@ use async_trait::async_trait;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::Value;
 
-use super::sqlite_session::{SqliteSession, snapshot_from_rows, window_limit};
+use super::sqlite_session::{
+    SqliteSession, snapshot_from_rows, window_limit, with_open_connection,
+};
 use super::{CompactionSnapshot, Session, SessionSettings, SnapshotHandle};
 use crate::error::{AgentsError, Result};
 use crate::items::InputItem;
@@ -767,6 +769,17 @@ impl AdvancedSqliteSession {
         self
     }
 
+    /// Close the database connection; see [`SqliteSession::close`]. Every later operation fails
+    /// with `SQLiteSession is closed`, as Python's inherited `close` does.
+    pub fn close(&self) {
+        self.base.close();
+    }
+
+    /// True once [`AdvancedSqliteSession::close`] closed the connection.
+    pub fn is_closed(&self) -> bool {
+        self.base.is_closed()
+    }
+
     /// The branch and clear generation as of this call.
     fn branch_snapshot(&self) -> (String, i64) {
         let state = self.branch.lock().expect("branch poisoned");
@@ -784,8 +797,9 @@ impl AdvancedSqliteSession {
 
     fn init_structure_tables(&self, create_tables: bool) -> Result<()> {
         let ctx = self.ctx();
-        let conn = self.base.connection().lock().expect("sqlite poisoned");
-        Self::init_structure_tables_on(&conn, &ctx, create_tables)
+        with_open_connection(self.base.connection(), |conn| {
+            Self::init_structure_tables_on(conn, &ctx, create_tables)
+        })
     }
 
     /// Create the base and structure tables in one write transaction, so a pair rejected by the
@@ -793,19 +807,20 @@ impl AdvancedSqliteSession {
     /// fresh file at the same moment.
     fn init_all_tables_atomically(&self) -> Result<()> {
         let ctx = self.ctx();
-        let conn = self.base.connection().lock().expect("sqlite poisoned");
-        conn.execute_batch("BEGIN IMMEDIATE").map_err(sql_err)?;
-        let created = self
-            .base
-            .create_tables_on(&conn)
-            .and_then(|()| Self::init_structure_tables_on(&conn, &ctx, true));
-        match created {
-            Ok(()) => conn.execute_batch("COMMIT").map_err(sql_err),
-            Err(error) => {
-                let _ = conn.execute_batch("ROLLBACK");
-                Err(error)
+        with_open_connection(self.base.connection(), |conn| {
+            conn.execute_batch("BEGIN IMMEDIATE").map_err(sql_err)?;
+            let created = self
+                .base
+                .create_tables_on(conn)
+                .and_then(|()| Self::init_structure_tables_on(conn, &ctx, true));
+            match created {
+                Ok(()) => conn.execute_batch("COMMIT").map_err(sql_err),
+                Err(error) => {
+                    let _ = conn.execute_batch("ROLLBACK");
+                    Err(error)
+                }
             }
-        }
+        })
     }
 
     fn init_structure_tables_on(conn: &Connection, ctx: &Ctx, create_tables: bool) -> Result<()> {
@@ -872,12 +887,9 @@ impl AdvancedSqliteSession {
     {
         let conn = self.base.connection().clone();
         let ctx = self.ctx();
-        tokio::task::spawn_blocking(move || {
-            let conn = conn.lock().expect("sqlite poisoned");
-            f(&conn, &ctx)
-        })
-        .await
-        .map_err(|e| AgentsError::other(format!("SQLite task failed: {e}")))?
+        tokio::task::spawn_blocking(move || with_open_connection(&conn, |conn| f(conn, &ctx)))
+            .await
+            .map_err(|e| AgentsError::other(format!("SQLite task failed: {e}")))?
     }
 
     /// History of one branch, the current branch when `branch_id` is `None`.
@@ -1643,6 +1655,9 @@ impl Session for AdvancedSqliteSession {
         self.get_items_for_branch(limit, None).await
     }
     async fn add_items(&self, items: Vec<InputItem>) -> Result<()> {
+        // Checked before the empty-list fast path, which would otherwise succeed on a closed
+        // session.
+        self.base.check_not_closed()?;
         if items.is_empty() {
             return Ok(());
         }

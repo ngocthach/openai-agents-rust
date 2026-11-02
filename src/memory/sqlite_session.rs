@@ -19,10 +19,29 @@ use crate::items::InputItem;
 #[derive(Debug, Clone)]
 pub struct SqliteSession {
     session_id: String,
-    conn: Arc<Mutex<Connection>>,
+    conn: SharedConnection,
     sessions_table: String,
     messages_table: String,
     settings: Option<SessionSettings>,
+}
+
+/// The connection a session and its clones share; `None` once [`SqliteSession::close`] ran.
+pub(super) type SharedConnection = Arc<Mutex<Option<Connection>>>;
+
+/// Run `f` on the shared connection, or fail with `SQLiteSession is closed` after a close.
+pub(super) fn with_open_connection<T>(
+    conn: &Mutex<Option<Connection>>,
+    f: impl FnOnce(&Connection) -> Result<T>,
+) -> Result<T> {
+    let guard = conn.lock().expect("sqlite poisoned");
+    match guard.as_ref() {
+        Some(conn) => f(conn),
+        None => Err(closed_error()),
+    }
+}
+
+fn closed_error() -> AgentsError {
+    AgentsError::other("SQLiteSession is closed")
 }
 
 fn sql_err(e: rusqlite::Error) -> AgentsError {
@@ -114,7 +133,7 @@ impl SqliteSession {
         let conn = Connection::open(db_path).map_err(sql_err)?;
         let s = SqliteSession {
             session_id: session_id.into(),
-            conn: Arc::new(Mutex::new(conn)),
+            conn: Arc::new(Mutex::new(Some(conn))),
             sessions_table: sessions_table.to_string(),
             messages_table: messages_table.to_string(),
             settings: None,
@@ -126,7 +145,7 @@ impl SqliteSession {
     fn from_connection(session_id: impl Into<String>, conn: Connection) -> Result<Self> {
         let s = SqliteSession {
             session_id: session_id.into(),
-            conn: Arc::new(Mutex::new(conn)),
+            conn: Arc::new(Mutex::new(Some(conn))),
             sessions_table: "agent_sessions".into(),
             messages_table: "agent_messages".into(),
             settings: None,
@@ -164,7 +183,7 @@ impl SqliteSession {
         enable_wal(&conn)?;
         Ok(SqliteSession {
             session_id: session_id.into(),
-            conn: Arc::new(Mutex::new(conn)),
+            conn: Arc::new(Mutex::new(Some(conn))),
             sessions_table: sessions_table.to_string(),
             messages_table: messages_table.to_string(),
             settings: None,
@@ -172,9 +191,10 @@ impl SqliteSession {
     }
 
     fn init(&self) -> Result<()> {
-        let conn = self.conn.lock().expect("sqlite poisoned");
-        enable_wal(&conn)?;
-        self.create_tables_on(&conn)
+        with_open_connection(&self.conn, |conn| {
+            enable_wal(conn)?;
+            self.create_tables_on(conn)
+        })
     }
 
     /// Create the session and message tables on `conn`.
@@ -201,8 +221,33 @@ impl SqliteSession {
     }
 
     /// The shared connection, for sessions in this module that extend the base schema.
-    pub(super) fn connection(&self) -> &Arc<Mutex<Connection>> {
+    pub(super) fn connection(&self) -> &SharedConnection {
         &self.conn
+    }
+
+    /// Close the database connection. Port of `SQLiteSession.close`.
+    ///
+    /// The session is terminal from the first call: every later operation, including
+    /// `add_items` with no items, fails with `SQLiteSession is closed`, and repeated calls are
+    /// safe. Clones and the sessions [`SqliteSession::for_session`] made share the connection,
+    /// so they are closed with it. An in-memory database is lost.
+    pub fn close(&self) {
+        // Dropping the connection closes it; a failed close is only possible while a statement
+        // is still open, which cannot happen outside the lock.
+        drop(self.conn.lock().expect("sqlite poisoned").take());
+    }
+
+    /// True once [`SqliteSession::close`] closed the connection.
+    pub fn is_closed(&self) -> bool {
+        self.conn.lock().expect("sqlite poisoned").is_none()
+    }
+
+    /// Fail with `SQLiteSession is closed` after [`SqliteSession::close`].
+    pub(super) fn check_not_closed(&self) -> Result<()> {
+        if self.is_closed() {
+            return Err(closed_error());
+        }
+        Ok(())
     }
 
     /// The name of the session metadata table.
@@ -221,12 +266,9 @@ impl SqliteSession {
         F: FnOnce(&Connection, &SqliteSession) -> Result<T> + Send + 'static,
     {
         let this = self.clone();
-        tokio::task::spawn_blocking(move || {
-            let conn = this.conn.lock().expect("sqlite poisoned");
-            f(&conn, &this)
-        })
-        .await
-        .map_err(|e| AgentsError::other(format!("SQLite task failed: {e}")))?
+        tokio::task::spawn_blocking(move || with_open_connection(&this.conn, |conn| f(conn, &this)))
+            .await
+            .map_err(|e| AgentsError::other(format!("SQLite task failed: {e}")))?
     }
 }
 
@@ -299,6 +341,9 @@ impl Session for SqliteSession {
     }
 
     async fn add_items(&self, items: Vec<InputItem>) -> Result<()> {
+        // Checked before the empty-list fast path, which would otherwise succeed on a closed
+        // session.
+        self.check_not_closed()?;
         if items.is_empty() {
             return Ok(());
         }

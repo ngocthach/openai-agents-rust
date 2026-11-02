@@ -42,6 +42,47 @@ pub(crate) struct ToolEnv<'a, C> {
     pub pending_approvals: &'a BTreeSet<String>,
 }
 
+/// An owned copy of a [`ToolEnv`], so a function tool call can outlive the batch that started
+/// it: a call abandoned in its post-invoke phase keeps running on its own task.
+struct OwnedToolEnv<C> {
+    ctx: RunContext<C>,
+    agent: Arc<Agent<C>>,
+    agent_key: String,
+    name_owner_fallback: bool,
+    hooks: Option<Arc<dyn RunHooks<C>>>,
+    config: Arc<RunConfig<C>>,
+    unbound_approvals: BTreeSet<String>,
+    pending_approvals: BTreeSet<String>,
+}
+
+impl<C> OwnedToolEnv<C> {
+    fn from_env(env: &ToolEnv<'_, C>) -> Self {
+        OwnedToolEnv {
+            ctx: env.ctx.clone(),
+            agent: env.agent.clone(),
+            agent_key: env.agent_key.to_string(),
+            name_owner_fallback: env.name_owner_fallback,
+            hooks: env.hooks.cloned(),
+            config: env.config.clone(),
+            unbound_approvals: env.unbound_approvals.clone(),
+            pending_approvals: env.pending_approvals.clone(),
+        }
+    }
+
+    fn as_env(&self) -> ToolEnv<'_, C> {
+        ToolEnv {
+            ctx: &self.ctx,
+            agent: &self.agent,
+            agent_key: &self.agent_key,
+            name_owner_fallback: self.name_owner_fallback,
+            hooks: self.hooks.as_ref(),
+            config: &self.config,
+            unbound_approvals: &self.unbound_approvals,
+            pending_approvals: &self.pending_approvals,
+        }
+    }
+}
+
 /// A one-way latch that tasks can wait on: set once, observed by any number of waiters.
 pub(crate) struct Signal(tokio::sync::watch::Sender<bool>);
 
@@ -919,13 +960,17 @@ pub(crate) async fn execute_function_tools<C: Send + Sync + 'static>(
     let mut queue = runs.into_iter().enumerate();
     let ctls: std::sync::Mutex<Vec<(usize, Arc<FunctionTaskCtl>)>> =
         std::sync::Mutex::new(Vec::new());
+    // Each call owns its environment, so a call still finalizing when the batch gives up on it
+    // can be handed to its own task instead of being dropped.
     let start = |(order, (call, tool)): (usize, (FunctionCall, Arc<FunctionTool<C>>))| {
         let ctl = Arc::new(FunctionTaskCtl::new());
         ctls.lock().expect("ctls").push((order, ctl.clone()));
+        let owned = OwnedToolEnv::from_env(env);
         Box::pin(async move {
+            let env = owned.as_env();
             let end = tokio::select! {
                 biased;
-                r = execute_function_tool(env, call, tool, &ctl) => TaskEnd::Done(r),
+                r = execute_function_tool(&env, call, tool, &ctl) => TaskEnd::Done(r),
                 _ = ctl.cancel.wait() => TaskEnd::Cancelled,
             };
             (order, ctl, end)
@@ -993,10 +1038,12 @@ pub(crate) async fn execute_function_tools<C: Send + Sync + 'static>(
             ctl.cancel.set();
         }
     }
+    let mut settled: std::collections::HashSet<usize> = std::collections::HashSet::new();
     let mut absorb = |order: usize,
                       ctl: Arc<FunctionTaskCtl>,
                       end: TaskEnd,
                       results: &mut Vec<(usize, ToolExecResult)>| {
+        settled.insert(order);
         match end {
             TaskEnd::Done(Ok(result)) => results.push((order, result)),
             TaskEnd::Done(Err(other)) => {
@@ -1016,11 +1063,41 @@ pub(crate) async fn execute_function_tools<C: Send + Sync + 'static>(
     })
     .await;
     if drained.is_err() {
-        for ctl in &live {
-            ctl.cancel.set();
+        // Every call still in flight was finalizing when the batch cancelled the rest (the
+        // cancelled ones end at their next poll). They keep the output they committed and
+        // keep running detached, as Python leaves its post-invoke tasks running once the
+        // failure propagates; a late failure is only logged.
+        let abandoned: Vec<(usize, Arc<FunctionTaskCtl>)> = ctls
+            .lock()
+            .expect("ctls")
+            .iter()
+            .filter(|(order, _)| !settled.contains(order))
+            .map(|(order, ctl)| (*order, ctl.clone()))
+            .collect();
+        for (order, ctl) in abandoned {
+            results.extend(ctl.take_committed().map(|c| (order, c)));
         }
-        while let Some((order, ctl, end)) = in_flight.next().await {
-            absorb(order, ctl, end, &mut results);
+        let scope = scope::ScopeSnapshot::capture();
+        let owner = crate::models::run_context::get_model_run_owner();
+        for task in in_flight {
+            let detached = scope.clone().enter(async move {
+                let (_, _, end) = match owner {
+                    Some(owner) => {
+                        crate::models::run_context::model_run_context(owner, task).await
+                    }
+                    None => task.await,
+                };
+                if let TaskEnd::Done(Err(failure)) = end {
+                    const MESSAGE: &str =
+                        "Background function tool post-invoke task raised after failure propagation.";
+                    if crate::debug::dont_log_tool_data() {
+                        log::error!(target: crate::logger::LOG_TARGET, "{MESSAGE}");
+                    } else {
+                        log::error!(target: crate::logger::LOG_TARGET, "{MESSAGE} {}", failure.error);
+                    }
+                }
+            });
+            drop(tokio::spawn(detached));
         }
     }
     let (error, failure_committed) = match chosen {

@@ -355,6 +355,11 @@ struct RunLoop<C: Send + Sync + 'static> {
     checkpoint: Option<crate::run::RunCheckpoint>,
     /// Prepares the starting agent once the first turn's blocking input guardrails passed.
     prepare_agent: Option<crate::run::PrepareAgentFn<C>>,
+    /// Rewrites the original input before each turn (a sandbox run's `process_context`).
+    process_input: Option<crate::run::ProcessInputFn<C>>,
+    /// The original input is still the caller's plain text. Python keeps a string input as a
+    /// string, and its sandbox preparation leaves a string untouched, so no rewrite applies.
+    original_input_is_text: bool,
     /// The first turn's blocking input guardrails already ran (ahead of `prepare_agent`).
     first_blocking_guardrails_done: bool,
     /// The run resumed a parked turn (an approval or failure checkpoint): calls that already
@@ -1113,6 +1118,7 @@ pub(crate) async fn run_loop<C: Send + Sync + 'static>(
         agent_tool_invocation,
         checkpoint,
         prepare_agent,
+        process_input,
     } = options;
     // Python rejects an input type whose schema is not strict while the handoff is built. The
     // builder here cannot return that error, so the first run that uses the agent raises it,
@@ -1183,6 +1189,8 @@ pub(crate) async fn run_loop<C: Send + Sync + 'static>(
         failed_after_output: false,
         checkpoint,
         prepare_agent,
+        process_input,
+        original_input_is_text: false,
         first_blocking_guardrails_done: false,
         resumed_from_failure: false,
         resumed_pre_count: None,
@@ -1302,6 +1310,8 @@ pub(crate) async fn run_loop<C: Send + Sync + 'static>(
             lp.restore(*state, !shares_parent_context)?
         }
         other => {
+            // With a session the prepared input is history plus the new input, a list.
+            lp.original_input_is_text = matches!(other, RunInput::Text(_)) && lp.session.is_none();
             let items = other.to_items();
             lp.original_input = items.clone();
             lp.session_input = items.clone();
@@ -2448,6 +2458,10 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
                 self.resume_pending_tools = false;
                 // An edited parked call is refused before any tool inventory callback runs.
                 self.validate_parked_response()?;
+                // Python prepares the agent (and rewrites the input) before resolving the
+                // interrupted turn, so a run that ends on the resumed tools carries it too.
+                let agent = self.current_agent.clone();
+                self.process_original_input(&agent);
                 let tools = self.current_agent.get_all_tools(&self.ctx).await?;
                 let handoffs = self.current_agent.get_enabled_handoffs(&self.ctx).await;
                 let (tools, handoffs) = resolve_tool_name_collisions(
@@ -3717,6 +3731,35 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
         s
     }
 
+    /// Rewrite the original input for the agent about to be called, as Python's per-turn
+    /// sandbox `prepare_agent` does: the rewrite replaces the run's original input (so it
+    /// reaches `RunResult::input` and `to_input_list`), never touches the items the run
+    /// generated, and runs once per turn. A plain-text input stays as it is, as Python leaves a
+    /// string input alone.
+    ///
+    /// With a session the model input is the stored history plus the run input while
+    /// `original_input` holds the run input alone; the rewrite then applies to the model input
+    /// only, since that is what Python's `original_input` holds there.
+    fn process_original_input(&mut self, agent: &Arc<Agent<C>>) {
+        let Some(process) = self.process_input.clone() else {
+            return;
+        };
+        if self.original_input_is_text {
+            return;
+        }
+        if self.model_prefix == self.original_input {
+            let rewritten = process(agent, std::mem::take(&mut self.original_input));
+            self.model_prefix = rewritten.clone();
+            self.original_input = rewritten;
+        } else if self.session.is_some() {
+            self.model_prefix = process(agent, std::mem::take(&mut self.model_prefix));
+        } else {
+            // A resumed input whose unanswered calls the model input leaves out.
+            self.original_input = process(agent, std::mem::take(&mut self.original_input));
+            self.model_prefix = items::drop_orphan_function_calls(self.original_input.clone());
+        }
+    }
+
     fn build_model_input(&mut self) -> Vec<InputItem> {
         let policy = self.reasoning_item_id_policy;
         // Orphan pruning applies only to runner-generated history: a caller who passes an
@@ -3882,6 +3925,7 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
             // `save_result_to_session(session, input, [])` of the run loop.
             self.persist_input_for_guardrail_trip().await?;
         }
+        self.process_original_input(&agent);
 
         // Input guardrails apply to the first turn and to staged input on resume.
         let mut guardrail_input: Option<Vec<InputItem>> = None;
@@ -6573,6 +6617,11 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
                 self.nested_history_owned_items
                     .push(crate::result::NestedOwnedRef { key, input });
             }
+            // A filter that hands back the caller's text unchanged keeps it text, as Python's
+            // filters pass a string history through.
+            if filtered.input_history != self.original_input {
+                self.original_input_is_text = false;
+            }
             self.original_input = filtered.input_history.clone();
             self.model_prefix = filtered.input_history;
             let mut generated = filtered.pre_handoff_items.clone();
@@ -6639,6 +6688,7 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
                 // The nested history is the next agent's input, as Python's
                 // `original_input = nested.input_history`.
                 self.original_input = self.model_prefix.clone();
+                self.original_input_is_text = false;
                 self.model_items.clear();
                 self.nested_model_start = Some(self.generated_items.len());
                 self.model_history_diverged = true;

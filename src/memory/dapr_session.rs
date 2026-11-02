@@ -2,6 +2,7 @@
 //! Mirrors `agents.extensions.memory.dapr_session`.
 
 use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -78,6 +79,9 @@ pub struct DaprSession {
     metadata_key: String,
     settings: Option<SessionSettings>,
     lock: Mutex<()>,
+    /// False for a client supplied with [`DaprSession::with_http_client`].
+    owns_client: bool,
+    closed: AtomicBool,
 }
 
 impl fmt::Debug for DaprSession {
@@ -120,6 +124,8 @@ impl DaprSession {
             metadata_key,
             settings: None,
             lock: Mutex::new(()),
+            owns_client: true,
+            closed: AtomicBool::new(false),
         }
     }
 
@@ -160,9 +166,47 @@ impl DaprSession {
     }
 
     /// Use a custom `reqwest::Client` (proxies, timeouts, TLS settings).
+    ///
+    /// The caller keeps managing this client, so [`DaprSession::close`] does nothing.
     pub fn with_http_client(mut self, http: reqwest::Client) -> Self {
         self.http = http;
+        self.owns_client = false;
         self
+    }
+
+    /// Close a session that owns its HTTP client. Port of `DaprSession.close`.
+    ///
+    /// The session is terminal from the first call: every later operation, including
+    /// `add_items` with no items and [`DaprSession::ping`], fails with `DaprSession is closed`
+    /// without a request, and repeated or concurrent calls are safe. The call
+    /// waits for an operation in progress, and operations queued behind it fail. A session
+    /// built with [`DaprSession::with_http_client`] does not own its client, so this does
+    /// nothing and the session stays usable. The pooled connections are released when the
+    /// session is dropped (`reqwest` has no explicit shutdown).
+    pub async fn close(&self) {
+        let _guard = self.lock.lock().await;
+        if self.owns_client {
+            self.closed.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// True once [`DaprSession::close`] closed a session that owns its client.
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
+    }
+
+    fn check_not_closed(&self) -> Result<()> {
+        if self.is_closed() {
+            return Err(AgentsError::other("DaprSession is closed"));
+        }
+        Ok(())
+    }
+
+    /// Take the session lock, failing when a close ran first.
+    async fn open_guard(&self) -> Result<tokio::sync::MutexGuard<'_, ()>> {
+        let guard = self.lock.lock().await;
+        self.check_not_closed()?;
+        Ok(guard)
     }
 
     /// The state key holding the conversation history.
@@ -187,12 +231,22 @@ impl DaprSession {
     }
 
     /// True when the sidecar answers the metadata endpoint.
-    pub async fn ping(&self) -> bool {
+    ///
+    /// # Errors
+    ///
+    /// Fails with `DaprSession is closed`, without sending a request, after
+    /// [`DaprSession::close`] closed a session that owns its client; an unreachable sidecar is
+    /// `Ok(false)`.
+    pub async fn ping(&self) -> Result<bool> {
+        if self.is_closed() {
+            return Err(AgentsError::other("DaprSession is closed"));
+        }
         let url = format!("{}/v1.0/metadata", self.endpoint);
-        self.with_token(self.http.get(url))
+        Ok(self
+            .with_token(self.http.get(url))
             .send()
             .await
-            .is_ok_and(|r| r.status().is_success())
+            .is_ok_and(|r| r.status().is_success()))
     }
 
     async fn get_state(&self, key: &str) -> Result<StateRead> {
@@ -445,7 +499,7 @@ impl Session for DaprSession {
 
     async fn get_items(&self, limit: Option<usize>) -> Result<Vec<InputItem>> {
         let limit = super::resolve_session_limit(limit, self.session_settings().as_ref());
-        let _guard = self.lock.lock().await;
+        let _guard = self.open_guard().await?;
         if limit == Some(0) {
             return Ok(Vec::new());
         }
@@ -458,6 +512,9 @@ impl Session for DaprSession {
     }
 
     async fn add_items(&self, items: Vec<InputItem>) -> Result<()> {
+        // Checked before the empty-list fast path, which would otherwise succeed on a closed
+        // session.
+        self.check_not_closed()?;
         if items.is_empty() {
             return Ok(());
         }
@@ -465,7 +522,7 @@ impl Session for DaprSession {
             .iter()
             .map(|i| serde_json::to_string(i.as_value()))
             .collect::<std::result::Result<_, _>>()?;
-        let _guard = self.lock.lock().await;
+        let _guard = self.open_guard().await?;
         self.with_retries(|| async {
             let (mut raw, etag) = self.read_messages_for_update().await?;
             raw.extend(serialized.iter().cloned());
@@ -478,7 +535,7 @@ impl Session for DaprSession {
     }
 
     async fn pop_item(&self) -> Result<Option<InputItem>> {
-        let _guard = self.lock.lock().await;
+        let _guard = self.open_guard().await?;
         loop {
             let claimed = self
                 .with_retries(|| async {
@@ -503,7 +560,7 @@ impl Session for DaprSession {
     }
 
     async fn clear_session(&self) -> Result<()> {
-        let _guard = self.lock.lock().await;
+        let _guard = self.open_guard().await?;
         self.delete_state(&self.messages_key).await?;
         self.delete_state(&self.metadata_key).await
     }
@@ -514,7 +571,7 @@ impl Session for DaprSession {
     /// item's exact serialized form as its handle lets the replacement verify that the tail is
     /// unchanged, and the ETag makes the read-modify-write itself atomic.
     async fn compaction_snapshot(&self, limit: usize) -> Result<Option<CompactionSnapshot>> {
-        let _guard = self.lock.lock().await;
+        let _guard = self.open_guard().await?;
         let (raw, _) = self.read_messages().await?;
         let start = raw.len().saturating_sub(limit);
         let window = &raw[start..];
@@ -552,7 +609,7 @@ impl Session for DaprSession {
             .iter()
             .map(|i| serde_json::to_string(i.as_value()))
             .collect::<std::result::Result<_, _>>()?;
-        let _guard = self.lock.lock().await;
+        let _guard = self.open_guard().await?;
         self.with_retries(|| async {
             let (raw, etag) = self.read_messages_for_update().await?;
             if raw.len() < handles.len() {
