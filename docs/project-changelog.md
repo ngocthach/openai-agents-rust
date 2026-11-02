@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.24.0 (2026-11-02)
+
+Closes the four behavioural differences from Python that earlier releases kept on purpose. 16 more parity cases
+ported. Measured state: 12,641 Python test cases, 9,366 ported, 922 covered, 2,353 Python-only, 0 not ported, 0
+unaccounted. Notes: `plans/reports/py-test-parity-core21-divergences.md`. No live model call was made.
+
+- Missing API key: `OpenAIProvider::get_model` fails with Python's message ("The api_key client option must be set
+  either by passing api_key to the client or by setting the OPENAI_API_KEY environment variable") when the provider
+  builds its own client for the official OpenAI URL and no key resolves. The run now resolves the model where Python
+  does, inside the turn after the blocking input guardrails and agent-start hooks, so a parallel guardrail that trips
+  at once still wins and `on_llm_start` never runs. A client for another base URL, or an explicit client, may still be
+  keyless (local OpenAI-compatible servers).
+- Voice provider: an explicit client combined with an API key, base URL, organization or project is remembered as a
+  conflict instead of being applied; `OpenAIVoiceModelProvider::validate()` and the models' first `transcribe`,
+  `create_session` or `run` fail with Python's error.
+- sqlx sessions: the suffix replacement runs on a spawned task under a new per-session mutation lock, so dropping the
+  caller no longer rolls it back (Python shields the write).
+- Approvals on agent clones: every `Agent` carries an identity; `Clone` and `clone_with` mint a new one while the SDK's
+  own internal copies keep it. A live decision is bound to the capability fingerprint and the owning agent, so a clone,
+  copy or rebuilt agent receiving exported approvals is asked again, as in Python. `RunState` snapshots keep binding by
+  fingerprint only.
+- Tests: a flaky tracing test that released its lock before tearing down its trace setup is fixed.
+
+Breaking changes: `get_model` without any key for the official endpoint errors; a cloned `Agent` no longer inherits
+approval decisions; live approval keys carry an owner suffix; the voice provider's option builders no longer modify an
+explicit client.
+
+Known gaps carried forward: an in-memory `to_state()` resumed with a rebuilt agent graph still applies the decision
+(Python re-prompts), the same as resuming its JSON; sqlx `add_items` / `pop_item` / `clear_session` are serialized but
+not shielded from a dropped caller; a live model call and `chattr +i` immutable files remain unexercised.
+
 ## 0.23.1 (2026-11-02)
 
 First runs of the Docker sandbox and the `docker-removal` service against a real Docker daemon (OrbStack, Linux

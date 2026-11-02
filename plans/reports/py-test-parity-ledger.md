@@ -1,5 +1,7 @@
 # Python test suite vs Rust port: reconciled parity ledger
 
+> **Divergences closed (0.24.0).** 12,641 cases = **9,366 ported + 922 covered + 2,353 python-only + 0 not ported + 0 unaccounted.** The four documented differences were closed (`py-test-parity-core21-divergences.md`).
+>
 > **Round 20 update (0.23.0).** 12,641 cases = **9,350 ported + 922 covered + 2,369 python-only + 0 not ported + 0 unaccounted.** Round 20 read the body of every python-only case in the 150 files not revisited in rounds 17–19 (`py-test-parity-core20-*.md`), with exceptions listed in each report (body extractor truncation in r20b, assertion-only reads of some already-matched names in r20c, inferred name mapping where the ledger count is smaller than the candidate set).
 >
 > **Round 19 update (0.22.0).** 12,641 cases = **9,315 ported + 908 covered + 2,418 python-only + 0 not ported + 0 unaccounted.** Round 19 re-read 49 files (`py-test-parity-core19-r19a/b/c.md`), including an audit of the 13 tooling/example files; read depth per file is in each report.
