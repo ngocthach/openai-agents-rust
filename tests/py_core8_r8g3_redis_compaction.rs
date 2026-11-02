@@ -192,6 +192,10 @@ impl MockRedis {
         let mut store = self.store.lock().unwrap();
         match name.as_str() {
             "PING" => Reply::Bulk("PONG".into()).into_simple_pong(),
+            "TIME" => Reply::Array(vec![
+                self.clock.load(Ordering::SeqCst).to_string(),
+                "0".into(),
+            ]),
             "EVALSHA" => Reply::Error("NOSCRIPT No matching script. Please use EVAL.".into()),
             "EVAL" => self.eval(&mut store, args),
             "LRANGE" => {
