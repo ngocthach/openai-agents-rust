@@ -1024,6 +1024,8 @@ pub struct ModalSandboxSession {
     sandbox_id: std::sync::Mutex<String>,
     session_id: String,
     manifest: Manifest,
+    /// Path grants a capability changed after the session started.
+    live_grants: crate::sandbox::session::LiveGrants,
     options: ModalSandboxClientOptions,
     image_id: std::sync::Mutex<Option<String>>,
     started: AtomicBool,
@@ -1056,6 +1058,7 @@ impl ModalSandboxSession {
             session_id,
             sandbox_id: std::sync::Mutex::new(sandbox_id),
             manifest,
+            live_grants: Default::default(),
             options,
             image_id: std::sync::Mutex::new(None),
             started: AtomicBool::new(false),
@@ -1609,6 +1612,10 @@ impl SandboxSession for ModalSandboxSession {
 
     fn manifest(&self) -> &Manifest {
         &self.manifest
+    }
+
+    fn live_grants(&self) -> Option<&crate::sandbox::session::LiveGrants> {
+        Some(&self.live_grants)
     }
 
     fn backend_id(&self) -> &str {

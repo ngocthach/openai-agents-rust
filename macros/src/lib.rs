@@ -196,7 +196,14 @@ fn parse_numpy_docs(lines: &[String], header: usize) -> (String, Vec<(String, St
                 last.1.push_str(t);
             }
         } else {
-            let name = t.split(':').next().unwrap_or(t).trim();
+            // A variadic parameter is written with its stars (`*args`, `**kwargs`); the
+            // description belongs to the bare name.
+            let name = t
+                .split(':')
+                .next()
+                .unwrap_or(t)
+                .trim()
+                .trim_start_matches('*');
             args.push((name.to_string(), String::new()));
         }
         i += 1;

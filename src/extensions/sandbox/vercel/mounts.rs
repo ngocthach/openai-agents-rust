@@ -757,6 +757,9 @@ impl MountStrategy for VercelCloudBucketMountStrategy {
         mount_path: &str,
     ) -> SandboxResult<()> {
         let vercel = vercel_session(session)?;
+        // The mount sequence runs alone: a command that raced it would see a half-mounted
+        // workspace.
+        let _operation = vercel.s3_mount_operation(true).await;
         // Vercel applies its mount topology while the sandbox starts; a manifest applied later
         // would hand a credential to a sandbox that has already run model-controlled code.
         if !vercel.s3_mount_activation_allowed() {

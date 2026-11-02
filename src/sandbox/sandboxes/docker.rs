@@ -661,6 +661,8 @@ impl SandboxClient for DockerSandboxClient {
 pub struct DockerSandboxSession {
     container_id: String,
     manifest: Manifest,
+    /// Path grants a capability changed after the session started.
+    live_grants: crate::sandbox::session::LiveGrants,
     started: AtomicBool,
     /// Whether the manifest finished materializing, so a resume can trust the workspace.
     materialized: AtomicBool,
@@ -710,6 +712,7 @@ impl DockerSandboxSession {
             snapshot_id: container_id.clone(),
             container_id,
             manifest,
+            live_grants: Default::default(),
             started: AtomicBool::new(false),
             materialized: AtomicBool::new(false),
             mount_transition: crate::sandbox::mounts::MountTransition::new(),
@@ -1142,6 +1145,10 @@ impl SandboxSession for DockerSandboxSession {
 
     fn manifest(&self) -> &Manifest {
         &self.manifest
+    }
+
+    fn live_grants(&self) -> Option<&crate::sandbox::session::LiveGrants> {
+        Some(&self.live_grants)
     }
 
     fn backend_id(&self) -> &str {
@@ -2118,7 +2125,12 @@ fn is_known_mount_strategy(strategy_type: &str) -> bool {
 /// one), or when a Docker volume driver is handed a credential-looking `volume-opt` — the
 /// credential then goes to the daemon on the host, which Python treats as protected too.
 pub fn manifest_has_protected_mounts(manifest: &Manifest) -> bool {
-    manifest.mount_targets().into_iter().any(|(mount, path)| {
+    // An invalid entry path hides every mount from `mount_targets`; the unvalidated walk still
+    // finds them, so a manifest with a bad path and a credentialed mount stays protected.
+    let targets = manifest
+        .try_mount_targets()
+        .unwrap_or_else(|_| manifest.mounts_unvalidated());
+    targets.into_iter().any(|(mount, path)| {
         if mount.strategy.carries_credentials(mount)
             || !is_known_mount_strategy(mount.strategy.strategy_type())
         {

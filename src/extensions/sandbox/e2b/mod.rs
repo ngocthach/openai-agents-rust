@@ -855,6 +855,8 @@ struct RemoteHandle {
 pub struct E2BSandboxSession {
     session_id: String,
     manifest: Manifest,
+    /// Path grants a capability changed after the session started.
+    live_grants: crate::sandbox::session::LiveGrants,
     options: E2BSandboxClientOptions,
     api_key: String,
     api_base: String,
@@ -915,6 +917,7 @@ impl E2BSandboxSession {
                 access_token: created.envd_access_token,
             }),
             manifest,
+            live_grants: Default::default(),
             snapshot_id: session_id.clone(),
             session_id,
             started: AtomicBool::new(false),
@@ -1498,6 +1501,10 @@ impl SandboxSession for E2BSandboxSession {
 
     fn manifest(&self) -> &Manifest {
         &self.manifest
+    }
+
+    fn live_grants(&self) -> Option<&crate::sandbox::session::LiveGrants> {
+        Some(&self.live_grants)
     }
 
     fn backend_id(&self) -> &str {

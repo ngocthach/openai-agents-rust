@@ -1252,6 +1252,8 @@ fn split_provider_id(provider_id: &str) -> SandboxResult<(String, String)> {
 pub struct VercelSandboxSession {
     session_key: String,
     manifest: Manifest,
+    /// Path grants a capability changed after the session started.
+    live_grants: crate::sandbox::session::LiveGrants,
     options: VercelSandboxClientOptions,
     token: String,
     api_base: String,
@@ -1283,8 +1285,29 @@ pub struct VercelSandboxSession {
     detached_s3_mounts: std::sync::Mutex<BTreeSet<String>>,
     /// Whether the fixed S3 mount topology has already been applied once.
     s3_mounts_started: AtomicBool,
+    /// The task running [`start`](SandboxSession::start) while its mount window is open. Only
+    /// that task may attach a mount, as Python's per-task context variable has it.
+    s3_start_task: std::sync::Mutex<Option<Option<tokio::task::Id>>>,
+    /// Serializes workspace operations while S3 mounts are attached, detached or being attached.
+    s3_operation_lock: tokio::sync::Mutex<()>,
+    /// The task inside an S3 mount operation, which may re-enter it without waiting.
+    s3_operation_owner: std::sync::Mutex<Option<Option<tokio::task::Id>>>,
     /// Workspace paths registered at runtime that a workspace archive leaves out.
     persist_skips: std::sync::Mutex<BTreeSet<String>>,
+}
+
+/// Holds the S3 mount operation lock, when the operation needed it, until it is dropped.
+pub(crate) struct S3MountOperation<'a> {
+    _guard: Option<tokio::sync::MutexGuard<'a, ()>>,
+    owner: Option<&'a std::sync::Mutex<Option<Option<tokio::task::Id>>>>,
+}
+
+impl Drop for S3MountOperation<'_> {
+    fn drop(&mut self) {
+        if let Some(owner) = self.owner {
+            *owner.lock().expect("poisoned") = None;
+        }
+    }
 }
 
 /// The mutable provider identity: a snapshot restore replaces both halves.
@@ -1335,6 +1358,7 @@ impl VercelSandboxSession {
                     .collect(),
             }),
             manifest,
+            live_grants: Default::default(),
             snapshot_id: session_key.clone(),
             session_key,
             started: AtomicBool::new(false),
@@ -1350,6 +1374,9 @@ impl VercelSandboxSession {
             active_s3_mounts: std::sync::Mutex::new(BTreeSet::new()),
             detached_s3_mounts: std::sync::Mutex::new(BTreeSet::new()),
             s3_mounts_started: AtomicBool::new(false),
+            s3_start_task: std::sync::Mutex::new(None),
+            s3_operation_lock: tokio::sync::Mutex::new(()),
+            s3_operation_owner: std::sync::Mutex::new(None),
             persist_skips: std::sync::Mutex::new(BTreeSet::new()),
         }
     }
@@ -1375,6 +1402,45 @@ impl VercelSandboxSession {
     /// to hand a fresh credential to a sandbox that has already run model-controlled code.
     pub(crate) fn s3_mount_activation_allowed(&self) -> bool {
         self.s3_mounts_startable.load(Ordering::SeqCst)
+            && *self.s3_start_task.lock().expect("poisoned") == Some(tokio::task::try_id())
+    }
+
+    /// Enter an S3 mount operation: with mounts attached or detached (or `force_lock`), only one
+    /// task at a time may run a workspace command, read, write, archive or shutdown, so none of
+    /// them sees a half-mounted workspace.
+    ///
+    /// Mirrors Python's `_s3_mount_operation`. The task that already owns the operation, or that
+    /// is moving the mounts for a snapshot, re-enters without waiting; a session with no S3
+    /// mounts, or one still in its start with nothing attached yet, takes no lock at all.
+    pub(crate) async fn s3_mount_operation(&self, force_lock: bool) -> S3MountOperation<'_> {
+        let unlocked = S3MountOperation {
+            _guard: None,
+            owner: None,
+        };
+        if !self.has_s3_mounts() {
+            return unlocked;
+        }
+        if self.s3_mount_activation_allowed()
+            && self.active_s3_mounts.lock().expect("poisoned").is_empty()
+            && self.detached_s3_mounts.lock().expect("poisoned").is_empty()
+            && !force_lock
+        {
+            return unlocked;
+        }
+        let current = tokio::task::try_id();
+        // A caller outside any task (a `block_on` body) is its own owner, so it re-enters too.
+        if *self.s3_operation_owner.lock().expect("poisoned") == Some(current) {
+            return unlocked;
+        }
+        if self.mount_transition.current_task_owns() {
+            return unlocked;
+        }
+        let guard = self.s3_operation_lock.lock().await;
+        *self.s3_operation_owner.lock().expect("poisoned") = Some(current);
+        S3MountOperation {
+            _guard: Some(guard),
+            owner: Some(&self.s3_operation_owner),
+        }
     }
 
     /// Fail unless `mount_path` is one of the mount targets this session was created with.
@@ -2052,6 +2118,10 @@ impl SandboxSession for VercelSandboxSession {
         &self.manifest
     }
 
+    fn live_grants(&self) -> Option<&crate::sandbox::session::LiveGrants> {
+        Some(&self.live_grants)
+    }
+
     fn backend_id(&self) -> &str {
         BACKEND_ID
     }
@@ -2129,6 +2199,7 @@ impl SandboxSession for VercelSandboxSession {
         self.started.store(true, Ordering::SeqCst);
         // The S3 mount topology is applied here and nowhere else, so the window in which a mount
         // may attach is exactly the manifest application below.
+        *self.s3_start_task.lock().expect("poisoned") = Some(tokio::task::try_id());
         self.s3_mounts_startable.store(true, Ordering::SeqCst);
         let result = if self.resuming {
             match self.restore_deferring_mounts().await {
@@ -2140,6 +2211,7 @@ impl SandboxSession for VercelSandboxSession {
             self.apply_deferring_mounts(false).await
         };
         self.s3_mounts_startable.store(false, Ordering::SeqCst);
+        *self.s3_start_task.lock().expect("poisoned") = None;
         // Python closes the window on success, and on failure only once a mount actually
         // attached: a start that failed before any credential reached the sandbox is safe to
         // retry, and must not leave the session permanently unstartable.
@@ -2159,6 +2231,7 @@ impl SandboxSession for VercelSandboxSession {
     }
 
     async fn shutdown(&self) -> SandboxResult<()> {
+        let _operation = self.s3_mount_operation(false).await;
         self.redacted(self.shutdown_with_s3_mounts().await)
     }
 
@@ -2171,6 +2244,7 @@ impl SandboxSession for VercelSandboxSession {
     }
 
     async fn exec(&self, request: ExecRequest) -> SandboxResult<ExecResult> {
+        let _operation = self.s3_mount_operation(false).await;
         let cwd = self.resolve_cwd(&request.cwd)?;
         let sudo = Self::resolve_sudo(request.user.as_ref())?;
         // The API takes the privilege escalation out of band, so no `sudo` wrapper is built here.
@@ -2187,6 +2261,7 @@ impl SandboxSession for VercelSandboxSession {
     }
 
     async fn read_file(&self, path: &str) -> SandboxResult<Vec<u8>> {
+        let _operation = self.s3_mount_operation(false).await;
         // The in-sandbox resolver sees a symlink the lexical check cannot.
         let resolved = self.redacted(self.validate_remote_path_access(path, false, false).await)?;
         self.redacted(self.download_at(&resolved, None).await)
@@ -2196,6 +2271,7 @@ impl SandboxSession for VercelSandboxSession {
         if max_bytes == 0 {
             return Err(bounded_read_zero());
         }
+        let _operation = self.s3_mount_operation(false).await;
         // A bounded read stays on the lexical check: the in-sandbox resolver costs extra
         // commands per read, and the bounded-read contract tests drive it without one.
         let resolved = self.normalize_path(path)?;
@@ -2231,6 +2307,7 @@ impl SandboxSession for VercelSandboxSession {
     }
 
     async fn write_file(&self, path: &str, contents: &[u8]) -> SandboxResult<()> {
+        let _operation = self.s3_mount_operation(false).await;
         let resolved = self.redacted(self.validate_remote_path_access(path, true, false).await)?;
         // `fs/write` only accepts a gzipped tar whose entry names are relative to `x-cwd`.
         let relative = resolved.trim_start_matches('/');
@@ -2262,6 +2339,7 @@ impl SandboxSession for VercelSandboxSession {
     }
 
     async fn persist_workspace(&self) -> SandboxResult<Vec<u8>> {
+        let _operation = self.s3_mount_operation(false).await;
         let result: SandboxResult<Vec<u8>> = async {
             if self.options.workspace_persistence == WorkspacePersistence::Snapshot {
                 let snapshot_id = self.create_native_snapshot().await?;
@@ -2350,6 +2428,7 @@ impl SandboxSession for VercelSandboxSession {
     }
 
     async fn hydrate_workspace(&self, archive: &[u8]) -> SandboxResult<()> {
+        let _operation = self.s3_mount_operation(false).await;
         if let Some(snapshot_id) = decode_snapshot_ref(archive) {
             // A native snapshot restore replaces the sandbox, and a replacement has none of the
             // mounts this session attached at creation.

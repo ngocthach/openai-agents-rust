@@ -540,7 +540,8 @@ fn resolve_host_source(
 ) -> SandboxResult<PathBuf> {
     let base = lexical_absolute(base_dir);
     let input = lexical_absolute(&base.join(src));
-    let grants = session.manifest().extra_path_grants();
+    let grants = session.extra_path_grants();
+    let grants = grants.as_slice();
     let granted = grants
         .iter()
         .any(|grant| input.starts_with(lexical_absolute(Path::new(grant.host_source()))));

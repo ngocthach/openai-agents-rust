@@ -315,6 +315,13 @@ impl Manifest {
         self
     }
 
+    /// Replace every extra path grant, as a capability that reconfigures the workspace's reach
+    /// does when it hands back the manifest it processed.
+    pub fn with_extra_path_grants(mut self, grants: Vec<SandboxPathGrant>) -> Self {
+        self.extra_path_grants = grants;
+        self
+    }
+
     /// Export an environment variable to every command in the session.
     pub fn with_env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.environment.insert(key.into(), value.into());
@@ -581,6 +588,32 @@ impl Manifest {
             .unwrap_or_default()
     }
 
+    /// Every mount with the path its entry names, whether or not the manifest's paths are valid.
+    ///
+    /// Only for deciding whether a manifest holds a mount worth protecting: the paths are the raw
+    /// entry names and must not be used to place anything.
+    pub(crate) fn mounts_unvalidated(&self) -> Vec<(&Mount, String)> {
+        fn walk<'a>(out: &mut Vec<(&'a Mount, String)>, dest: String, entry: &'a Entry) {
+            if let Some(mount) = entry.as_mount() {
+                out.push((mount, dest.clone()));
+            }
+            if let EntryKind::Dir { children } = &entry.kind {
+                for (name, child) in children {
+                    walk(
+                        out,
+                        format!("{}/{}", dest.trim_end_matches('/'), name),
+                        child,
+                    );
+                }
+            }
+        }
+        let mut out = Vec::new();
+        for (path, entry) in self.entries_in_order() {
+            walk(&mut out, path.clone(), entry);
+        }
+        out
+    }
+
     /// Like [`mount_targets`](Self::mount_targets), but a mount path that is absolute in
     /// Windows syntax, or that climbs out of the workspace root, is an error rather than a
     /// silent omission. Mirrors Python's `mount_targets`, which raises
@@ -594,6 +627,11 @@ impl Manifest {
     }
 
     fn collect_mount_targets(&self, strict: bool) -> SandboxResult<Vec<(&Entry, &Mount, String)>> {
+        if strict {
+            // `iter_entries_ordered` drops every entry when one path is invalid, which would
+            // read as "no mounts" here rather than as the invalid path it is.
+            self.validate_top_level(true)?;
+        }
         let mut mounts: Vec<(&Entry, &Mount, String)> = Vec::new();
         for (dest, entry) in self.iter_entries_ordered() {
             let Some(mount) = entry.as_mount() else {
@@ -791,8 +829,13 @@ impl Manifest {
     /// [`ErrorCode::MountConfigInvalid`] and, as with activation, never carries the mount
     /// configuration.
     pub fn validate_mount_credential_boundaries(&self) -> SandboxResult<()> {
+        // An invalid entry path is refused, and with a protected mount anywhere in the manifest
+        // the refusal carries no path, so it cannot be a channel for the configuration.
+        let targets = self.try_mount_targets().map_err(|error| {
+            crate::sandbox::sandboxes::docker::redact_for_protected_mounts(self, error)
+        })?;
         self.validate_mount_credential_files()?;
-        for (mount, path) in self.mount_targets() {
+        for (mount, path) in targets {
             self.authorize_mount_activation(mount, &path)?;
         }
         Ok(())

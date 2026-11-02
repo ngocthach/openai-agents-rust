@@ -33,6 +33,7 @@ use crate::sandbox::state::{
     SandboxSessionState, SnapshotFingerprint, is_sdk_owned_workspace_root,
 };
 use crate::sandbox::types::{ExecResult, SandboxArchiveLimits};
+use crate::sandbox::workspace_paths::SandboxPathGrant;
 
 /// Prefix of the temporary workspace directories created for Unix-local sessions.
 const WORKSPACE_PREFIX: &str = "openai-agents-sandbox-";
@@ -330,6 +331,8 @@ fn path_to_posix(path: &Path) -> String {
 pub struct UnixLocalSandboxSession {
     id: String,
     manifest: Manifest,
+    /// Path grants a capability changed after the session started.
+    live_grants: crate::sandbox::session::LiveGrants,
     root: PathBuf,
     owned_root: bool,
     inherit_host_environment: bool,
@@ -340,7 +343,7 @@ pub struct UnixLocalSandboxSession {
     pinned_root: std::sync::OnceLock<PathBuf>,
     /// The real directories this manifest's extra path grants named when the session was built,
     /// with each grant's write policy. Re-pointing a grant alias afterwards widens nothing.
-    pinned_grants: Vec<(PathBuf, bool)>,
+    pinned_grants: std::sync::RwLock<Vec<PinnedGrant>>,
     /// The manifest's start-up environment lookups, performed once when the session starts.
     resolved_environment: std::sync::OnceLock<std::collections::BTreeMap<String, String>>,
     /// Whether the manifest finished materializing, so a resume can trust the workspace.
@@ -370,6 +373,16 @@ pub struct UnixLocalSandboxSession {
 }
 
 impl UnixLocalSandboxSession {
+    /// The real directory and write policy of every extra path grant in force.
+    fn pinned_grants(&self) -> Vec<(PathBuf, bool)> {
+        self.pinned_grants
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|(_, real, read_only)| (real.clone(), *read_only))
+            .collect()
+    }
+
     /// Create a session over an existing or to-be-created host directory.
     ///
     /// `owned_root` marks the directory for removal when the session shuts down.
@@ -390,15 +403,7 @@ impl UnixLocalSandboxSession {
         if let Ok(canonical) = root.canonicalize() {
             let _ = pinned_root.set(canonical);
         }
-        let pinned_grants = manifest
-            .extra_path_grants()
-            .iter()
-            .map(|grant| {
-                // A grant may name a file that does not exist yet — a move destination, say — so
-                // the deepest existing ancestor is what gets pinned.
-                (pin_existing_prefix(Path::new(&grant.path)), grant.read_only)
-            })
-            .collect();
+        let pinned_grants = pin_grants(manifest.extra_path_grants(), &[]);
         Ok(UnixLocalSandboxSession {
             snapshot_id: id.clone(),
             id,
@@ -408,7 +413,8 @@ impl UnixLocalSandboxSession {
             inherit_host_environment: true,
             host_environment_allowlist: None,
             pinned_root,
-            pinned_grants,
+            pinned_grants: std::sync::RwLock::new(pinned_grants),
+            live_grants: Default::default(),
             resolved_environment: std::sync::OnceLock::new(),
             materialized: AtomicBool::new(false),
             mount_transition: crate::sandbox::mounts::MountTransition::new(),
@@ -573,7 +579,8 @@ impl UnixLocalSandboxSession {
         path: &str,
     ) -> SandboxResult<()> {
         let real = resolve_existing_prefix(host).await;
-        for (grant_root, read_only) in &self.pinned_grants {
+        let pinned = self.pinned_grants();
+        for (grant_root, read_only) in &pinned {
             // Inside the workspace the root always wins over a grant that also covers it.
             let in_workspace = self
                 .pinned_root
@@ -582,8 +589,7 @@ impl UnixLocalSandboxSession {
             if !*read_only || in_workspace || !grant_root.starts_with(&real) {
                 continue;
             }
-            let effective_read_only = self
-                .pinned_grants
+            let effective_read_only = pinned
                 .iter()
                 .filter(|(root, _)| grant_root.starts_with(root))
                 .fold(None::<(&PathBuf, bool)>, |best, (root, ro)| match best {
@@ -708,8 +714,9 @@ impl UnixLocalSandboxSession {
         // has already refused a write through a read-only grant.
         // The most specific grant decides, and the first declared wins a tie, as in Python: a
         // writable grant nested in a read-only one has to stay writable.
+        let pinned = self.pinned_grants();
         let mut effective: Option<(&PathBuf, bool)> = None;
-        for (grant_root, read_only) in &self.pinned_grants {
+        for (grant_root, read_only) in &pinned {
             if real.starts_with(grant_root)
                 && effective.is_none_or(|(best, _)| {
                     grant_root.components().count() > best.components().count()
@@ -1001,6 +1008,7 @@ impl UnixLocalSandboxSession {
             .host_environment_allowlist
             .as_ref()
             .is_none_or(|allowlist| allowlist.iter().any(|name| name == "PATH"));
+        let grants = self.extra_path_grants();
         confinement::confined_exec_command(&confinement::ConfinementInputs {
             is_darwin: host.is_darwin,
             platform: host.platform,
@@ -1010,7 +1018,7 @@ impl UnixLocalSandboxSession {
             host_path: host.host_path,
             host_path_inherited,
             host_home: host.host_home,
-            extra_path_grants: self.manifest.extra_path_grants(),
+            extra_path_grants: &grants,
             which: host.which,
         })
     }
@@ -1792,6 +1800,31 @@ fn file_identity(metadata: &std::fs::Metadata) -> (u64, u64) {
 }
 
 /// The synchronous twin of [`resolve_existing_prefix`], used while a session is being built.
+/// One extra path grant resolved against the filesystem: the grant's spelling, the real
+/// directory it named when it was pinned, and its write policy.
+type PinnedGrant = (String, PathBuf, bool);
+
+/// Pin every grant to the real directory it names now. A grant whose spelling is already in
+/// `previous` keeps that pin, so re-pointing an alias between two capability updates widens
+/// nothing; a read-only change on an unchanged alias still takes effect.
+fn pin_grants(grants: &[SandboxPathGrant], previous: &[PinnedGrant]) -> Vec<PinnedGrant> {
+    grants
+        .iter()
+        .map(|grant| {
+            let real = previous
+                .iter()
+                .find(|(path, _, _)| *path == grant.path)
+                // A grant may name a file that does not exist yet — a move destination, say — so
+                // the deepest existing ancestor is what gets pinned.
+                .map_or_else(
+                    || pin_existing_prefix(Path::new(&grant.path)),
+                    |(_, real, _)| real.clone(),
+                );
+            (grant.path.clone(), real, grant.read_only)
+        })
+        .collect()
+}
+
 fn pin_existing_prefix(path: &Path) -> PathBuf {
     let mut existing = path.to_path_buf();
     let mut tail: Vec<std::ffi::OsString> = Vec::new();
@@ -1911,6 +1944,21 @@ impl SandboxSession for UnixLocalSandboxSession {
 
     fn manifest(&self) -> &Manifest {
         &self.manifest
+    }
+
+    fn live_grants(&self) -> Option<&crate::sandbox::session::LiveGrants> {
+        Some(&self.live_grants)
+    }
+
+    fn update_extra_path_grants(&self, grants: &[SandboxPathGrant]) {
+        self.live_grants.replace(grants.to_vec());
+        // Unchanged aliases stay pinned to the directory they named first, so an occupant
+        // re-pointing one between updates cannot widen what the sandbox reaches.
+        let mut pinned = self
+            .pinned_grants
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        *pinned = pin_grants(grants, &pinned);
     }
 
     fn backend_id(&self) -> &str {

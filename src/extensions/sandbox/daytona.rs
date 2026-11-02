@@ -730,6 +730,8 @@ impl SandboxClient for DaytonaSandboxClient {
 pub struct DaytonaSandboxSession {
     session_id: String,
     manifest: Manifest,
+    /// Path grants a capability changed after the session started.
+    live_grants: crate::sandbox::session::LiveGrants,
     options: DaytonaSandboxClientOptions,
     api_key: String,
     api_base: String,
@@ -779,6 +781,7 @@ impl DaytonaSandboxSession {
         let toolbox_base = toolbox_base_url(&api_base, &sandbox);
         DaytonaSandboxSession {
             manifest,
+            live_grants: Default::default(),
             options,
             api_key,
             api_base,
@@ -1232,6 +1235,10 @@ impl SandboxSession for DaytonaSandboxSession {
 
     fn manifest(&self) -> &Manifest {
         &self.manifest
+    }
+
+    fn live_grants(&self) -> Option<&crate::sandbox::session::LiveGrants> {
+        Some(&self.live_grants)
     }
 
     fn backend_id(&self) -> &str {

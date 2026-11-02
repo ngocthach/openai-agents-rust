@@ -257,6 +257,8 @@ fn script_error(kind: &str, message: String) -> SandboxError {
 pub struct ScriptedSandboxSession {
     id: String,
     manifest: Manifest,
+    /// Path grants a capability changed after the session started.
+    live_grants: crate::sandbox::session::LiveGrants,
     steps: Mutex<Vec<SandboxStep>>,
     calls: Mutex<Vec<SandboxCall>>,
     /// Whether the script configures a PTY method; fixed when the script is built.
@@ -278,6 +280,7 @@ impl ScriptedSandboxSession {
         ScriptedSandboxSession {
             id: "scripted".to_string(),
             manifest: Manifest::new(),
+            live_grants: Default::default(),
             steps: Mutex::new(steps),
             calls: Mutex::new(Vec::new()),
             pty,
@@ -424,6 +427,10 @@ impl SandboxSession for ScriptedSandboxSession {
 
     fn manifest(&self) -> &Manifest {
         &self.manifest
+    }
+
+    fn live_grants(&self) -> Option<&crate::sandbox::session::LiveGrants> {
+        Some(&self.live_grants)
     }
 
     fn backend_id(&self) -> &str {

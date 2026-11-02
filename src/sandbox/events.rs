@@ -1225,6 +1225,25 @@ impl crate::sandbox::session::SandboxSession for InstrumentedSession {
         self.inner.manifest()
     }
 
+    fn live_grants(&self) -> Option<&crate::sandbox::session::LiveGrants> {
+        self.inner.live_grants()
+    }
+
+    fn shutdown_after_failed_close(&self) -> bool {
+        self.inner.shutdown_after_failed_close()
+    }
+
+    fn extra_path_grants(&self) -> Vec<crate::sandbox::workspace_paths::SandboxPathGrant> {
+        self.inner.extra_path_grants()
+    }
+
+    fn update_extra_path_grants(
+        &self,
+        grants: &[crate::sandbox::workspace_paths::SandboxPathGrant],
+    ) {
+        self.inner.update_extra_path_grants(grants)
+    }
+
     fn workspace_root(&self) -> &str {
         self.inner.workspace_root()
     }

@@ -180,6 +180,10 @@ impl Connection {
     }
 }
 
+fn ttl_out_of_range() -> AgentsError {
+    AgentsError::user("ttl is outside Redis's supported expiration range")
+}
+
 fn redis_err(e: redis::RedisError) -> AgentsError {
     AgentsError::other(format!("Redis error: {e}"))
 }
@@ -351,11 +355,31 @@ impl RedisSession {
     /// The TTL in milliseconds, or 0 when the session does not expire.
     fn ttl_millis(&self) -> Result<i64> {
         match self.ttl {
-            Some(ttl) => i64::try_from(ttl.saturating_mul(1000)).map_err(|_| {
-                AgentsError::user("ttl is outside Redis's supported expiration range")
-            }),
+            Some(ttl) => i64::try_from(ttl.saturating_mul(1000)).map_err(|_| ttl_out_of_range()),
             None => Ok(0),
         }
+    }
+
+    /// Reject a TTL whose absolute expiration (server time plus the TTL) Redis cannot store.
+    ///
+    /// `PEXPIRE` fails on such a value inside the write script, after the script has already
+    /// appended history, so a retry would duplicate it. Python validates the absolute
+    /// expiration against the server clock before writing; this reads the same clock first.
+    async fn ensure_expiration_in_range(conn: &mut Connection, ttl_ms: i64) -> Result<()> {
+        if ttl_ms == 0 {
+            return Ok(());
+        }
+        let (seconds, micros): (String, String) = conn.run(&redis::cmd("TIME")).await?;
+        let now_ms = seconds
+            .parse::<i128>()
+            .ok()
+            .zip(micros.parse::<i128>().ok())
+            .map(|(seconds, micros)| seconds * 1000 + micros / 1000)
+            .ok_or_else(|| AgentsError::other("Redis error: malformed TIME reply"))?;
+        if now_ms + i128::from(ttl_ms) > i128::from(i64::MAX) {
+            return Err(ttl_out_of_range());
+        }
+        Ok(())
     }
 
     /// Decode a window of raw list entries, skipping corrupted ones.
@@ -417,6 +441,7 @@ impl Session for RedisSession {
             .collect::<Result<Vec<_>>>()?;
         let ttl_ms = self.ttl_millis()?;
         let mut conn = self.connection.lock().await;
+        Self::ensure_expiration_in_range(&mut conn, ttl_ms).await?;
         let mut cmd = self.script(ADD_ITEMS_SCRIPT);
         cmd.arg(ttl_ms).arg(&self.session_id);
         for entry in &serialized {
@@ -496,6 +521,7 @@ impl Session for RedisSession {
             .collect::<Result<Vec<_>>>()?;
         let ttl_ms = self.ttl_millis()?;
         let mut conn = self.connection.lock().await;
+        Self::ensure_expiration_in_range(&mut conn, ttl_ms).await?;
         let mut cmd = self.script(REPLACE_SUFFIX_SCRIPT);
         cmd.arg(ttl_ms).arg(handles.len());
         for handle in handles {
@@ -517,6 +543,7 @@ impl Session for RedisSession {
             .collect::<Result<Vec<_>>>()?;
         let ttl_ms = self.ttl_millis()?;
         let mut conn = self.connection.lock().await;
+        Self::ensure_expiration_in_range(&mut conn, ttl_ms).await?;
         let mut cmd = self.script(REPLACE_ALL_SCRIPT);
         cmd.arg(ttl_ms).arg(&self.session_id);
         for entry in &replacement {

@@ -698,7 +698,7 @@ impl LazySkillSource for LocalDirLazySkillSource {
         skills_path: &str,
         user: Option<&User>,
     ) -> SandboxResult<LoadedSkill> {
-        let grants = session.manifest().extra_path_grants().to_vec();
+        let grants = session.extra_path_grants();
         let Some(src_root) = self.src_root(&grants) else {
             return Err(config_error("lazy skill source directory is unavailable")
                 .with_context("skill_name", skill_name));

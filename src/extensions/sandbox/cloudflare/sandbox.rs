@@ -456,6 +456,8 @@ pub struct CloudflareSandboxSession {
     connection: Arc<CloudflareConnection>,
     session_id: String,
     manifest: Manifest,
+    /// Path grants a capability changed after the session started.
+    live_grants: crate::sandbox::session::LiveGrants,
     started: AtomicBool,
     deleted: tokio::sync::Mutex<bool>,
     snapshot: Option<SnapshotSpec>,
@@ -495,6 +497,7 @@ impl CloudflareSandboxSession {
             connection,
             session_id,
             manifest,
+            live_grants: Default::default(),
             started: AtomicBool::new(false),
             deleted: tokio::sync::Mutex::new(false),
             snapshot: None,
@@ -908,6 +911,10 @@ impl SandboxSession for CloudflareSandboxSession {
 
     fn manifest(&self) -> &Manifest {
         &self.manifest
+    }
+
+    fn live_grants(&self) -> Option<&crate::sandbox::session::LiveGrants> {
+        Some(&self.live_grants)
     }
 
     fn backend_id(&self) -> &str {

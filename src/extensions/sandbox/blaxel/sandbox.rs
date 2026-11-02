@@ -889,6 +889,8 @@ pub struct BlaxelSandboxSession {
     connection: Arc<BlaxelConnection>,
     session_id: String,
     manifest: Manifest,
+    /// Path grants a capability changed after the session started.
+    live_grants: crate::sandbox::session::LiveGrants,
     base_env_vars: BTreeMap<String, String>,
     started: AtomicBool,
     deleted: tokio::sync::Mutex<bool>,
@@ -912,6 +914,7 @@ impl BlaxelSandboxSession {
             connection,
             session_id,
             manifest,
+            live_grants: Default::default(),
             base_env_vars: BTreeMap::new(),
             started: AtomicBool::new(false),
             deleted: tokio::sync::Mutex::new(false),
@@ -1203,6 +1206,15 @@ impl BlaxelSandboxSession {
         }
         if !status.is_success() {
             let body = response.bytes().await.unwrap_or_default();
+            // Python classifies a failed read by the SDK error's text as well as its status, so a
+            // server error that says the file is missing is still a missing file.
+            let lowered = String::from_utf8_lossy(&body).to_lowercase();
+            if lowered.contains("not found") || lowered.contains("no such file") {
+                return Err(SandboxError::new(
+                    ErrorCode::WorkspaceReadNotFound,
+                    format!("`{resolved}` does not exist in the sandbox workspace"),
+                ));
+            }
             let detail = blaxel_error_detail(&body)
                 .map(|detail| format!(": {detail}"))
                 .unwrap_or_default();
@@ -1329,6 +1341,10 @@ impl SandboxSession for BlaxelSandboxSession {
 
     fn manifest(&self) -> &Manifest {
         &self.manifest
+    }
+
+    fn live_grants(&self) -> Option<&crate::sandbox::session::LiveGrants> {
+        Some(&self.live_grants)
     }
 
     fn backend_id(&self) -> &str {

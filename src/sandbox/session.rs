@@ -24,7 +24,9 @@ use crate::sandbox::types::{
     ExecResult, ExposedPortEndpoint, ExposedPortUnavailable, FileEntry, SandboxArchiveLimits, User,
     exposed_port_unavailable, parse_ls_la,
 };
-use crate::sandbox::workspace_paths::{WorkspacePathPolicy, is_provider_scratch_path};
+use crate::sandbox::workspace_paths::{
+    SandboxPathGrant, WorkspacePathPolicy, is_provider_scratch_path,
+};
 
 /// How a command is handed to the sandbox.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -206,6 +208,28 @@ pub fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
+/// The extra path grants a capability applied to a live session after it started.
+///
+/// Empty until a capability changes them; once set, the stored list (even an empty one) replaces
+/// the manifest's grants for every path check the session makes.
+#[derive(Debug, Default)]
+pub struct LiveGrants(std::sync::RwLock<Option<Vec<SandboxPathGrant>>>);
+
+impl LiveGrants {
+    /// The grants in force: the last applied list, else the manifest's.
+    pub fn current(&self, manifest: &Manifest) -> Vec<SandboxPathGrant> {
+        match &*self.0.read().unwrap_or_else(|e| e.into_inner()) {
+            Some(grants) => grants.clone(),
+            None => manifest.extra_path_grants().to_vec(),
+        }
+    }
+
+    /// Replace the grants in force.
+    pub fn replace(&self, grants: Vec<SandboxPathGrant>) {
+        *self.0.write().unwrap_or_else(|e| e.into_inner()) = Some(grants);
+    }
+}
+
 /// A live sandbox workspace: a place to run commands and read and write files.
 ///
 /// Implementations are shared behind an `Arc` and must be safe to use concurrently. All paths
@@ -219,6 +243,32 @@ pub trait SandboxSession: Send + Sync + fmt::Debug {
 
     /// The manifest materialized into this workspace.
     fn manifest(&self) -> &Manifest;
+
+    /// The cell holding the path grants a capability changed after the session started, for a
+    /// backend that supports it. `None` means the manifest's grants are final.
+    fn live_grants(&self) -> Option<&LiveGrants> {
+        None
+    }
+
+    /// The extra path grants in force: the ones a capability last applied to this live session,
+    /// else the manifest's.
+    fn extra_path_grants(&self) -> Vec<SandboxPathGrant> {
+        match self.live_grants() {
+            Some(live) => live.current(self.manifest()),
+            None => self.manifest().extra_path_grants().to_vec(),
+        }
+    }
+
+    /// Replace the extra path grants of a running session, so a capability's change to what the
+    /// workspace may reach takes effect on an injected session.
+    ///
+    /// Mirrors Python replacing `session.state.manifest` with the processed manifest. A backend
+    /// with no [`live_grants`](Self::live_grants) cell ignores the call.
+    fn update_extra_path_grants(&self, grants: &[SandboxPathGrant]) {
+        if let Some(live) = self.live_grants() {
+            live.replace(grants.to_vec());
+        }
+    }
 
     /// The absolute workspace root inside the sandbox.
     fn workspace_root(&self) -> &str {
@@ -661,7 +711,7 @@ pub trait SandboxSession: Send + Sync + fmt::Debug {
     /// Like [`normalize_path`](Self::normalize_path), refusing a read-only grant.
     ///
     /// Every write a backend performs goes through this, so a read-only
-    /// [`SandboxPathGrant`](crate::sandbox::workspace_paths::SandboxPathGrant) is enforced by the
+    /// [`SandboxPathGrant`] is enforced by the
     /// SDK and not only by whatever the backend's own filesystem does.
     fn normalize_path_for_write(&self, path: &str) -> SandboxResult<String> {
         self.workspace_path_policy()?
@@ -670,10 +720,7 @@ pub trait SandboxSession: Send + Sync + fmt::Debug {
 
     /// The path policy for this session's workspace root and grants.
     fn workspace_path_policy(&self) -> SandboxResult<WorkspacePathPolicy> {
-        WorkspacePathPolicy::with_grants(
-            self.workspace_root(),
-            self.manifest().extra_path_grants().to_vec(),
-        )
+        WorkspacePathPolicy::with_grants(self.workspace_root(), self.extra_path_grants())
     }
 
     /// Resolve a path the SDK itself placed, which may sit outside the workspace root.

@@ -596,7 +596,11 @@ impl SandboxRunner {
                 // the session was *started with*, not the agent's default: the session owns the
                 // workspace root, the accounts and the mounts, and the capabilities only add
                 // entries to them. Mirrors Python's `_process_live_session_manifest`.
-                let mut processed = agent.resolved_manifest(Some(session.manifest().clone()));
+                let live_manifest = session
+                    .manifest()
+                    .clone()
+                    .with_extra_path_grants(session.extra_path_grants());
+                let mut processed = agent.resolved_manifest(Some(live_manifest));
                 // The limits govern the entries the capabilities add to the live workspace.
                 if let Some(limits) = config.concurrency_limits {
                     processed = processed.with_concurrency_limits(limits)?;
@@ -618,6 +622,8 @@ impl SandboxRunner {
             }
             (None, Some(client)) => {
                 let manifest = Self::effective_manifest(agent, config)?;
+                // An unsafe manifest is refused before the client is asked for a session.
+                validate_mount_credential_boundaries(&manifest)?;
                 let span_data = serde_json::json!({
                     "agent_name": agent.name(),
                     "backend_id": client.backend_id(),
@@ -1497,14 +1503,22 @@ fn log_sandbox_failure(protected: bool, message: &str, error: &dyn std::fmt::Dis
 /// not, and is refused with the reason, because a running session has already handed its
 /// workspace, its mounts and its accounts to the model.
 ///
-/// The session keeps its original manifest object: nothing the update may add carries a path
-/// grant or a mount, so no consumer of the stored manifest sees a different answer afterwards.
+/// A change to the non-host extra path grants is applied to the session afterwards through
+/// [`SandboxSession::update_extra_path_grants`], as Python replaces the session's manifest with
+/// the processed one; the session keeps its original manifest object because nothing else the
+/// update may add carries a mount.
 pub async fn apply_live_session_manifest(
     session: &dyn SandboxSession,
     processed: &Manifest,
 ) -> Result<()> {
-    let current = session.manifest();
-    if entry_signature_map(current) == entry_signature_map(processed)
+    let current_manifest = session
+        .manifest()
+        .clone()
+        .with_extra_path_grants(session.extra_path_grants());
+    let current = &current_manifest;
+    let grants_changed = current.extra_path_grants() != processed.extra_path_grants();
+    if !grants_changed
+        && entry_signature_map(current) == entry_signature_map(processed)
         && manifest_topology_matches(current, processed)
     {
         session.validate_manifest_application(current, None).await?;
@@ -1518,6 +1532,7 @@ pub async fn apply_live_session_manifest(
     if !running {
         // A session that has not started yet materializes the manifest it was built with, so
         // there is nothing to patch into a live workspace.
+        session.update_extra_path_grants(processed.extra_path_grants());
         return Ok(());
     }
     validate_running_live_session_manifest_update(current, processed)?;
@@ -1537,6 +1552,9 @@ pub async fn apply_live_session_manifest(
         let entry =
             entry.with_copy_concurrency(processed.concurrency_limits().local_dir_file_width());
         entry.apply(session, &dest).await?;
+    }
+    if grants_changed {
+        session.update_extra_path_grants(processed.extra_path_grants());
     }
     Ok(())
 }
@@ -1562,9 +1580,7 @@ fn manifest_topology_matches(current: &Manifest, processed: &Manifest) -> bool {
 ///
 /// Mirrors Python's `validate_manifest_mount_credential_boundaries`.
 fn validate_mount_credential_boundaries(manifest: &Manifest) -> Result<()> {
-    for (mount, path) in manifest.mount_targets() {
-        manifest.authorize_mount_activation(mount, &path)?;
-    }
+    manifest.validate_mount_credential_boundaries()?;
     Ok(())
 }
 
