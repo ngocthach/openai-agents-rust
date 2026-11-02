@@ -4,13 +4,16 @@
 //! Python injects the faults by monkeypatching `os.open`, `shutil.copyfileobj` and `os.fdopen`.
 //! Here a creator that appears between validation and open comes from the session's
 //! `with_after_validate_hook`, and a failure in the middle of the write comes from the kernel:
-//! a tiny `RLIMIT_FSIZE` makes the second `write(2)` fail with `EFBIG`. Both tests take the same
-//! lock because the limit is process-wide.
-#![allow(clippy::await_holding_lock)] // the lock serializes process-wide state for the whole test
+//! a tiny `RLIMIT_FSIZE` makes the second `write(2)` fail with `EFBIG`.
+//!
+//! The limit is process-wide, so it also applies to the test harness: when its output goes to a
+//! large regular file (a CI log), printing another test's result while the limit is lowered
+//! fails with `EFBIG` and aborts the binary. The cases therefore run one after another inside a
+//! single test, so the harness prints nothing until the limit is restored.
 #![cfg(all(unix, feature = "sandbox"))]
 
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use openai_agents_sdk::editor::{ApplyPatchEditor, ApplyPatchOperation, ApplyPatchOperationType};
 use openai_agents_sdk::sandbox::editor::SandboxEditor;
@@ -18,8 +21,6 @@ use openai_agents_sdk::sandbox::errors::ErrorCode;
 use openai_agents_sdk::sandbox::events::{CallbackSink, InstrumentedSession};
 use openai_agents_sdk::sandbox::sandboxes::unix_local::UnixLocalSandboxSession;
 use openai_agents_sdk::sandbox::{Manifest, SandboxSession};
-
-static PROCESS_STATE: Mutex<()> = Mutex::new(());
 
 fn session_at(root: &Path) -> UnixLocalSandboxSession {
     UnixLocalSandboxSession::new(
@@ -80,9 +81,7 @@ fn restore_file_size(previous: libc::rlimit) {
 
 /// Python: `test_create_preserves_a_creator_between_validation_and_open` (the `direct` and
 /// `wrapped` fixtures; `bound-user` runs Python's `sudo` worker).
-#[tokio::test]
 async fn a_creator_between_validation_and_open_keeps_its_file() {
-    let _serial = PROCESS_STATE.lock().unwrap_or_else(|e| e.into_inner());
     for fixture in ["direct", "wrapped"] {
         let dir = tempfile::tempdir().expect("temp dir");
         let root = std::fs::canonicalize(dir.path()).expect("canonical root");
@@ -119,9 +118,7 @@ async fn a_creator_between_validation_and_open_keeps_its_file() {
 
 /// Python: `test_failed_create_requires_inspection_and_never_deletes_a_replacement`
 /// (`replace_target=False`, the `direct` and `wrapped` fixtures).
-#[tokio::test]
 async fn a_failed_create_requires_inspection_and_keeps_what_was_written() {
-    let _serial = PROCESS_STATE.lock().unwrap_or_else(|e| e.into_inner());
     for fixture in ["direct", "wrapped"] {
         let dir = tempfile::tempdir().expect("temp dir");
         let root = std::fs::canonicalize(dir.path()).expect("canonical root");
@@ -170,9 +167,7 @@ async fn a_failed_create_requires_inspection_and_keeps_what_was_written() {
 }
 
 /// The error a failed create reports is not retryable, whatever the caller does with it.
-#[tokio::test]
 async fn an_incomplete_create_is_not_retryable() {
-    let _serial = PROCESS_STATE.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempfile::tempdir().expect("temp dir");
     let root = std::fs::canonicalize(dir.path()).expect("canonical root");
     let session = session_at(&root);
@@ -185,4 +180,11 @@ async fn an_incomplete_create_is_not_retryable() {
     assert_eq!(error.code, ErrorCode::WorkspaceArchiveWriteError);
     assert_eq!(error.retryable, Some(false));
     assert!(error.message.contains("Inspect the destination"));
+}
+
+#[tokio::test]
+async fn unix_local_create_failures() {
+    a_creator_between_validation_and_open_keeps_its_file().await;
+    a_failed_create_requires_inspection_and_keeps_what_was_written().await;
+    an_incomplete_create_is_not_retryable().await;
 }

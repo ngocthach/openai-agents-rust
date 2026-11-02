@@ -8,9 +8,10 @@
 //! cases an approved call runs without asking again (checked against the Python SDK for every
 //! row below, streamed and not, per-call and sticky, single agent and handoff target).
 //!
-//! A Rust `RunState` holds no agent: every resume runs the graph it is given, found by name, so
-//! a rebuilt graph runs its own tool where Python runs the original one. The decision still
-//! applies and nothing is asked again, which is the outcome Python shows.
+//! A Rust resume runs the graph it is given, found by name, so a rebuilt graph runs its own tool
+//! where Python runs the original one. The decision still applies and nothing is asked again,
+//! which is the outcome Python shows. When the given graph no longer has the state's agent, an
+//! in-memory state falls back to the starting agent of the run that took it, as Python does.
 
 use std::sync::{Arc, Mutex};
 
@@ -146,6 +147,47 @@ async fn an_approved_in_memory_state_runs_without_asking_again() {
                     assert_eq!(entries(&executed), vec![ran.to_string(); calls], "{label}");
                 }
             }
+        }
+    }
+}
+
+/// Python's `memory-renamed` row: the agent handed to the resume no longer has the state's
+/// agent, so Python resumes the state's own agent and runs the original tool. An in-memory Rust
+/// state carries its run's starting agent and falls back to it; a JSON-restored state carries no
+/// agent, so it still fails to find one.
+#[tokio::test]
+async fn a_renamed_agent_resumes_the_state_s_original_agent() {
+    for streamed in [false, true] {
+        for json in [false, true] {
+            let executed: Log = Arc::default();
+            let original = build("orig", &executed, false, false, true);
+            let first = Runner::run(&original, "go").await.unwrap();
+            assert_eq!(first.interruptions.len(), 1);
+            let mut state = first.to_state();
+            state.approve(&first.interruptions[0], false);
+            if json {
+                state = RunState::from_json(state.to_json().unwrap()).unwrap();
+            }
+            let renamed = Arc::new(
+                Agent::<()>::new("renamed")
+                    .with_tool(operate("renamed", &executed))
+                    .with_model_instance(Arc::new(FakeModel::new())),
+            );
+            if json {
+                let error = Runner::run(&renamed, state)
+                    .await
+                    .expect_err("no agent to resume");
+                assert!(
+                    error.to_string().contains("not found in agent map"),
+                    "{error}"
+                );
+                assert!(entries(&executed).is_empty());
+                continue;
+            }
+            let (interruptions, final_output) = run(&renamed, state, streamed).await;
+            assert_eq!(interruptions, 0, "streamed={streamed}");
+            assert_eq!(final_output.as_deref(), Some("done"), "streamed={streamed}");
+            assert_eq!(entries(&executed), vec!["orig".to_string()]);
         }
     }
 }
