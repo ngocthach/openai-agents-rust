@@ -1,5 +1,44 @@
 # Changelog
 
+## 0.23.0 (2026-11-02)
+
+Reads the body of every remaining Python-only case in the 150 files not revisited since round 16, adds fallible
+enablement and approval callbacks, and fixes three bugs. 49 more parity cases moved out of the Python-only bucket
+(35 ported, 14 covered). Measured state: 12,641 Python test cases, 9,350 ported, 922 covered, 2,369 Python-only, 0
+not ported, 0 unaccounted. Notes: `plans/reports/py-test-parity-core20-*.md`. No live model call was made.
+
+- Fallible callbacks: `FunctionTool::with_is_enabled_fallible` / `with_needs_approval_fallible` /
+  `try_evaluate_needs_approval`, `Handoff::with_is_enabled_fallible`, `AgentAsToolOptions::is_enabled_fallible` /
+  `needs_approval_fallible`, `HostedMCPTool::with_on_approval_request_fallible` / `has_on_approval_request`,
+  `Agent::try_get_enabled_handoffs` / `try_mcp_reserved_tool_names` and `RealtimeAgent::try_get_enabled_handoffs`.
+  An error ends the run unchanged where Python raises it: enablement checks run concurrently and the first error
+  cancels the rest; a failing `needs_approval` never runs the tool body; a failed hosted MCP approval callback marks
+  the request executed and drops its unanswered request from failed-turn history; realtime `connect`,
+  `update_agent` and tool dispatch fail instead of treating the tool as disabled. Before execution the runner now
+  re-checks every configured function tool's enablement, as Python does.
+- Server-managed conversations: each input staged with `add_input` carries an `input_id`
+  (`RunItem::input_id`), and `ServerConversationState::accepted_input_ids` records which were delivered, so a later
+  input identical to one already sent is sent again (it used to be dropped by content matching) while a retry or
+  resume still neither resends nor skips an item.
+- Vercel: a `create`, or a `resume` that replaces the sandbox, dropped while waiting for the new sandbox to reach
+  `running` stops that sandbox on the runtime instead of leaving it running.
+- Compaction session: a dropped compaction whose failed replacement is being restored keeps newer `add_items` /
+  `pop_item` / `clear_session` calls waiting until the restore finishes.
+- Realtime: only a `realtime` session in `session.created` / `session.updated` changes the playback audio format; a
+  transcription session no longer does.
+
+Breaking changes: `IsEnabled` and `NeedsApproval` gained a `Fallible` variant (an exhaustive `match` needs an arm);
+`RunItem` and `ServerConversationState` gained public fields (struct literals need `..Default::default()`); a
+failing realtime enablement check now fails the session operation; the pre-execution enablement re-check calls
+`is_enabled` for tools the model did not call.
+
+Known gaps carried forward: a Vercel sandbox created by a request dropped before its id is known is not cleaned up
+(Python looks it up by name); a failed Vercel `running` wait does not stop the sandbox (as Python); the sqlx session's
+suffix replacement rolls back when its caller is dropped, where Python's finishes; an explicit voice-provider
+client combined with key/base URL/organization/project is accepted where Python rejects it; Python's
+`validate_pending_input_filter` check is not ported; local-tool approval callbacks and local MCP dynamic approval
+stay infallible (no Python test makes them raise).
+
 ## 0.22.0 (2026-11-02)
 
 Closes three known gaps, fixes an approval-binding security bug, and re-reads 49 more files, including an audit of the
