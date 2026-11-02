@@ -340,6 +340,131 @@ async fn live_removal_service_enforces_the_entry_visit_budget() {
     service.close().await.expect("close");
 }
 
+/// `chattr` run as root on the Docker host against a path inside a container's root file system
+/// (`/proc/<pid>/root/...`): the sandbox itself lacks `CAP_LINUX_IMMUTABLE`.
+fn host_chattr(pid: u64, path: &str, flag: &str) -> std::process::Output {
+    std::process::Command::new("chattr")
+        .args([flag, &format!("/proc/{pid}/root{path}")])
+        .output()
+        .expect("`chattr` (e2fsprogs) on the Docker host")
+}
+
+/// Makes a file mutable again when the test ends, however it ends, so the container's file
+/// system can be removed. Declared after [`Containers`], so it drops first.
+struct Mutable {
+    pid: u64,
+    path: &'static str,
+}
+
+impl Drop for Mutable {
+    fn drop(&mut self) {
+        // Nothing to do once the test has deleted the container itself.
+        if !std::path::Path::new(&format!("/proc/{}/root{}", self.pid, self.path)).exists() {
+            return;
+        }
+        let output = host_chattr(self.pid, self.path, "-i");
+        if !output.status.success() {
+            eprintln!(
+                "chattr -i {} failed: {}",
+                self.path,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+}
+
+/// An immutable file cannot be unlinked by anyone, root included: the removal stops with
+/// `PermissionError` and `EPERM`, leaves the file intact and the workload running, and once the
+/// flag is cleared the same removal succeeds.
+///
+/// Python: the `PermissionError` rows of `test_child_failure_reaches_structured_session_error`
+/// (a worker `OSError` reaches the session error as `worker_reason` plus `errno`), with the
+/// failure raised by the kernel instead of a scripted child.
+#[tokio::test]
+async fn live_removal_service_stops_at_an_immutable_file() {
+    let Some(image) = live_image().await else {
+        return;
+    };
+    let containers = Containers::default();
+    let service = service(100_000);
+    let client = DockerSandboxClient::with_options(
+        DockerSandboxClientOptions::new(&image)
+            .with_label(TEST_LABEL, "1")
+            .with_label("oars-live-test", "1"),
+    )
+    .with_removal_service(service.clone());
+    let session = create(
+        &client,
+        Manifest::new().with_root("/workspace"),
+        &containers,
+    )
+    .await;
+    let (code, out) = sh(
+        &session,
+        "mkdir -p frozen && echo keep > frozen/file && echo s > frozen/sibling",
+    )
+    .await;
+    assert_eq!(code, 0, "{out}");
+    let pid = inspect(session.id()).unwrap()["State"]["Pid"]
+        .as_u64()
+        .expect("a running container has a host pid");
+    const FILE: &str = "/workspace/frozen/file";
+    let output = host_chattr(pid, FILE, "+i");
+    let _mutable = Mutable { pid, path: FILE };
+    assert!(
+        output.status.success(),
+        "chattr +i: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let (code, out) = sh(&session, "rm -f /workspace/frozen/file").await;
+    assert_ne!(code, 0, "the sandbox cannot unlink it either: {out}");
+
+    // A recursive removal goes through the service.
+    let error = session.rm("frozen", true).await.unwrap_err();
+    assert_eq!(
+        context(&error, "reason"),
+        Some("docker_removal_failed"),
+        "{error:?}"
+    );
+    assert_eq!(
+        context(&error, "worker_reason"),
+        Some("PermissionError"),
+        "{error:?}"
+    );
+    assert_eq!(context(&error, "errno"), Some("1"), "EPERM: {error:?}");
+    let (code, content) = sh(&session, "cat /workspace/frozen/file").await;
+    assert_eq!((code, content.trim()), (0, "keep"), "intact");
+    assert_running_unpaused(&session);
+
+    // A single-file removal does not use the service (Python's `DockerSandboxSession.rm` passes
+    // `recursive=False` to the base `rm`): it is an `rm` in the sandbox, which fails the same way.
+    let error = session.rm("frozen/file", false).await.unwrap_err();
+    assert!(
+        context(&error, "stderr").is_some_and(|e| e.contains("Operation not permitted")),
+        "{error:?}"
+    );
+    assert!(context(&error, "reason").is_none(), "{error:?}");
+    let (code, content) = sh(&session, "cat /workspace/frozen/file").await;
+    assert_eq!((code, content.trim()), (0, "keep"), "intact");
+    assert_running_unpaused(&session);
+
+    let output = host_chattr(pid, FILE, "-i");
+    assert!(
+        output.status.success(),
+        "chattr -i: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    session
+        .rm("frozen", true)
+        .await
+        .expect("removal once mutable");
+    assert!(!exists(&session, "/workspace/frozen").await);
+    assert_running_unpaused(&session);
+
+    client.delete(session).await.expect("delete");
+    service.close().await.expect("close");
+}
+
 /// A read-only host bind mount outside the workspace keeps its protection, and the binding is
 /// the one the manifest was created with.
 ///
