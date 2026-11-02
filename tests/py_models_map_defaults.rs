@@ -36,6 +36,14 @@ use openai_agents_sdk::{Agent, RunConfig, RunOptions, Runner};
 use serde_json::{Map, Value};
 
 const DEFAULT_MODEL_ENV: &str = "OPENAI_DEFAULT_MODEL";
+
+/// Python's conftest provides `OPENAI_API_KEY=test_key`; the OpenAI provider needs a key to
+/// build its client, so these tests hand one to the provider.
+const TEST_KEY: &str = "test_key";
+
+fn keyed_multi_provider() -> MultiProvider {
+    MultiProvider::new().with_openai_provider(OpenAIProvider::new().with_api_key(TEST_KEY))
+}
 const HARNESS_ENV: &str = "OPENAI_AGENT_HARNESS_ID";
 
 // ---------------------------------------------------------------------------
@@ -563,14 +571,14 @@ async fn explicit_empty_dictionary_settings_are_preserved() {
 
 #[test]
 fn no_prefix_is_openai() {
-    let model = MultiProvider::new().get_model(Some("gpt-4o")).unwrap();
+    let model = keyed_multi_provider().get_model(Some("gpt-4o")).unwrap();
     assert_eq!(kind(&model), "OpenAIResponsesModel");
     assert_eq!(model.model_name().as_deref(), Some("gpt-4o"));
 }
 
 #[test]
 fn openai_prefix_is_openai() {
-    let model = MultiProvider::new()
+    let model = keyed_multi_provider()
         .get_model(Some("openai/gpt-4o"))
         .unwrap();
     assert_eq!(kind(&model), "OpenAIResponsesModel");
@@ -581,13 +589,13 @@ fn openai_prefix_is_openai() {
 fn litellm_prefix_is_litellm() {
     // Python uses `litellm/foo/bar`; Rust's `LitellmProvider` validates the inner provider name
     // at construction, so the port names a real provider (see the parity report).
-    let model = MultiProvider::new()
+    let model = keyed_multi_provider()
         .get_model(Some("litellm/openai/gpt-4o"))
         .unwrap();
     assert_eq!(kind(&model), "LitellmModel");
     assert_eq!(model.model_name().as_deref(), Some("openai/gpt-4o"));
 
-    let error = MultiProvider::new()
+    let error = keyed_multi_provider()
         .get_model(Some("litellm/foo/bar"))
         .unwrap_err();
     assert!(
@@ -598,7 +606,7 @@ fn litellm_prefix_is_litellm() {
 
 #[test]
 fn any_llm_prefix_uses_any_llm_provider() {
-    let model = MultiProvider::new()
+    let model = keyed_multi_provider()
         .get_model(Some("any-llm/openrouter/openai/gpt-5.4-mini"))
         .unwrap();
     assert_eq!(kind(&model), "AnyLLMModel");
@@ -611,8 +619,11 @@ fn any_llm_prefix_uses_any_llm_provider() {
 #[cfg(feature = "websocket")]
 #[test]
 fn no_prefix_can_use_openai_responses_websocket() {
-    let provider = MultiProvider::new()
-        .with_openai_provider(OpenAIProvider::new().with_responses_websocket(true));
+    let provider = MultiProvider::new().with_openai_provider(
+        OpenAIProvider::new()
+            .with_api_key(TEST_KEY)
+            .with_responses_websocket(true),
+    );
     let model = provider.get_model(Some("gpt-4o")).unwrap();
     assert_eq!(kind(&model), "OpenAIResponsesWSModel");
 }
@@ -620,8 +631,11 @@ fn no_prefix_can_use_openai_responses_websocket() {
 #[cfg(feature = "websocket")]
 #[test]
 fn openai_prefix_can_use_openai_responses_websocket() {
-    let provider = MultiProvider::new()
-        .with_openai_provider(OpenAIProvider::new().with_responses_websocket(true));
+    let provider = MultiProvider::new().with_openai_provider(
+        OpenAIProvider::new()
+            .with_api_key(TEST_KEY)
+            .with_responses_websocket(true),
+    );
     let model = provider.get_model(Some("openai/gpt-4o")).unwrap();
     assert_eq!(kind(&model), "OpenAIResponsesWSModel");
     assert_eq!(model.model_name().as_deref(), Some("gpt-4o"));
@@ -631,7 +645,9 @@ fn openai_prefix_can_use_openai_responses_websocket() {
 #[test]
 fn multi_provider_passes_websocket_base_url_to_openai_provider() {
     let provider = MultiProvider::new().with_openai_provider(
-        OpenAIProvider::new().with_websocket_base_url("wss://proxy.example.test/v1"),
+        OpenAIProvider::new()
+            .with_api_key(TEST_KEY)
+            .with_websocket_base_url("wss://proxy.example.test/v1"),
     );
     assert_eq!(
         provider.openai_provider().websocket_base_url().as_deref(),
@@ -657,7 +673,7 @@ fn multi_provider_forwards_openai_buffer_streamed_tool_calls_to_chat_model() {
 
 #[test]
 fn openai_prefix_defaults_to_alias_mode() {
-    let model = MultiProvider::new()
+    let model = keyed_multi_provider()
         .get_model(Some("openai/gpt-4o"))
         .unwrap();
     assert_eq!(model.model_name().as_deref(), Some("gpt-4o"));
@@ -665,7 +681,7 @@ fn openai_prefix_defaults_to_alias_mode() {
 
 #[test]
 fn openai_prefix_can_be_preserved_as_literal_model_id() {
-    let model = MultiProvider::new()
+    let model = keyed_multi_provider()
         .with_openai_prefix_mode(PrefixMode::ModelId)
         .get_model(Some("openai/gpt-4o"))
         .unwrap();
@@ -674,7 +690,7 @@ fn openai_prefix_can_be_preserved_as_literal_model_id() {
 
 #[test]
 fn unknown_prefix_defaults_to_error() {
-    let error = MultiProvider::new()
+    let error = keyed_multi_provider()
         .get_model(Some("openrouter/openai/gpt-4o"))
         .unwrap_err();
     assert!(
@@ -685,7 +701,7 @@ fn unknown_prefix_defaults_to_error() {
 
 #[test]
 fn unknown_prefix_can_be_preserved_for_openai_compatible_model_ids() {
-    let model = MultiProvider::new()
+    let model = keyed_multi_provider()
         .with_unknown_prefix_mode(PrefixMode::ModelId)
         .get_model(Some("openrouter/openai/gpt-4o"))
         .unwrap();

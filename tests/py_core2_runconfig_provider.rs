@@ -23,6 +23,8 @@ async fn lock() -> tokio::sync::MutexGuard<'static, ()> {
         .lock()
         .await;
     clear_default_openai_client();
+    // Python's conftest provides a key; the provider needs one to build its client.
+    set_default_openai_key("test_key");
     set_default_openai_api(OpenAIApi::Responses);
     set_default_openai_responses_transport(OpenAIResponsesTransport::Http);
     for key in ["OPENAI_BASE_URL", "OPENAI_WEBSOCKET_BASE_URL"] {

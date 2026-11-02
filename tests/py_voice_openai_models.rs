@@ -539,34 +539,85 @@ async fn voice_provider_streamed_default_transcription_config() {
 }
 
 #[test]
-fn voice_provider_accepts_the_configured_client() {
-    // Python also rejects a client combined with `api_key`/`base_url` kwargs; the Rust builder
-    // takes the client as the one source of configuration, so only the accepting half applies.
+fn voice_provider_accepts_client_without_conflicting_args() {
     let client = OpenAIClient::new("test_key").with_base_url("https://example.test/v1");
     let provider = OpenAIVoiceModelProvider::new().with_client(client);
+    provider.validate().unwrap();
     assert_eq!(provider.client().base_url(), "https://example.test/v1");
     assert_eq!(provider.client().api_key().as_deref(), Some("test_key"));
 }
 
-#[test]
-fn voice_provider_explicit_options_override_the_default_client() {
-    let default = OpenAIClient::new("sk-default").with_base_url("https://default.example.test/v1");
-    for value in ["sk-voice", ""] {
-        let provider = OpenAIVoiceModelProvider::new()
-            .with_client(default.clone())
-            .with_api_key(value);
-        assert_eq!(provider.client().api_key().as_deref(), Some(value));
-        assert_eq!(
-            provider.client().base_url(),
-            "https://default.example.test/v1"
-        );
-    }
-    for value in ["https://voice.example.test/v1", ""] {
-        let provider = OpenAIVoiceModelProvider::new()
-            .with_client(default.clone())
-            .with_base_url(value);
-        assert_eq!(provider.client().base_url(), value);
-        assert_eq!(provider.client().api_key().as_deref(), Some("sk-default"));
+/// `test_voice_provider_rejects_client_with_conflicting_args`: Python's constructor raises for an
+/// explicit client combined with a key, base URL, organization or project. The Rust builders
+/// cannot fail, so the conflict is remembered (in either builder order): `validate` reports it,
+/// the explicit client is left unchanged, and the models' first operation fails with it. The
+/// explicit options overriding the *process default* client are ported in
+/// `py_core15_r15c_voice_provider.rs`.
+#[tokio::test]
+async fn voice_provider_rejects_client_with_conflicting_args() {
+    let client = || OpenAIClient::new("test_key").with_base_url("https://example.test/v1");
+    type Conflict = fn(OpenAIVoiceModelProvider) -> OpenAIVoiceModelProvider;
+    let conflicts: [(&str, Conflict); 5] = [
+        ("api_key", |p| p.with_api_key("other_key")),
+        ("base_url", |p| p.with_base_url("https://example.com")),
+        ("organization", |p| p.with_organization("org_test")),
+        ("project", |p| p.with_project("proj_test")),
+        ("api_key+base_url", |p| {
+            p.with_api_key("other_key")
+                .with_base_url("https://example.com")
+        }),
+    ];
+    for (label, conflict) in conflicts {
+        let after = conflict(OpenAIVoiceModelProvider::new().with_client(client()));
+        let before = conflict(OpenAIVoiceModelProvider::new()).with_client(client());
+        for (order, provider) in [("client first", after), ("client last", before)] {
+            let message = provider.validate().unwrap_err().to_string();
+            assert!(
+                message.contains("Don't provide"),
+                "{label}, {order}: {message}"
+            );
+            assert_eq!(provider.client().api_key().as_deref(), Some("test_key"));
+            assert_eq!(provider.client().base_url(), "https://example.test/v1");
+
+            let stt = provider.get_stt_model(None);
+            let error = stt
+                .transcribe(
+                    &AudioInput::new(vec![0i16; 240]),
+                    &STTModelSettings::default(),
+                    false,
+                    false,
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("Don't provide"),
+                "{label}: {error}"
+            );
+            let input = StreamedAudioInput::new();
+            let error = match stt
+                .create_session(&input, &STTModelSettings::default(), false, false)
+                .await
+            {
+                Ok(_) => panic!("{label}: a conflicting provider opened a session"),
+                Err(error) => error,
+            };
+            assert!(
+                error.to_string().contains("Don't provide"),
+                "{label}: {error}"
+            );
+            let error = match provider
+                .get_tts_model(None)
+                .run("hello", &TTSModelSettings::default())
+                .await
+            {
+                Ok(_) => panic!("{label}: a conflicting provider ran speech"),
+                Err(error) => error,
+            };
+            assert!(
+                error.to_string().contains("Don't provide"),
+                "{label}: {error}"
+            );
+        }
     }
 }
 

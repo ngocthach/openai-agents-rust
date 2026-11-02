@@ -459,6 +459,9 @@ fn disabled_runner_sync_preserves_caller_context() {
             .await;
     }));
     assert_eq!(names_of(&rec), vec!["caller-parent"]);
+    // The pipeline resets the global processors when dropped, so it must go before the lock is
+    // released, or it would clear the recorder of the next test that takes the lock.
+    drop(_pipeline);
     drop(lock);
 }
 

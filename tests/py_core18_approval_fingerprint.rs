@@ -478,7 +478,11 @@ async fn runner_executes_converted_context_decisions() {
                 let label =
                     format!("converter={converter} decision={decision} streamed={streamed}");
                 let executed = log();
-                let source = agent("owner", operate(PUBLIC, "executed", "result", &executed));
+                // Python's `configured = source; configured.model = ...`: the very agent the
+                // decision was bound to runs it (a clone would be asked again).
+                let model = model();
+                let source = agent("owner", operate(PUBLIC, "executed", "result", &executed))
+                    .with_model_instance(model.clone());
                 let ctx = RunContext::new(());
                 let approved = decision.ends_with("approve");
                 let always = decision.starts_with("always_");
@@ -496,15 +500,13 @@ async fn runner_executes_converted_context_decisions() {
                     .unwrap();
                 }
                 let restored = convert(&convert(&ctx, converter), converter);
-                let model = model();
                 model.add_turn(vec![function_call_with_id("operate", "{}", "first")]);
                 if always {
                     model.add_turn(vec![function_call_with_id("operate", "{}", "next")]);
                 }
                 model.add_turn(vec![assistant_message("done")]);
-                let configured = source.clone().with_model_instance(model);
                 let result = run_mode(
-                    &configured,
+                    &source,
                     "start",
                     RunOptions::with_run_context(restored),
                     streamed,
@@ -650,10 +652,15 @@ fn bound_approvals_round_trip_through_json() {
             "rejection_messages": {},
         })
     );
-    assert_eq!(
-        text[format!("owner\u{1}operate\u{3}{fp}")]["approved_always"],
-        json!(true)
-    );
+    // In a live context the bound key also names the owning agent (`\u{4}` and its identity),
+    // so only that agent object is authorized.
+    let live_key = approvals
+        .0
+        .keys()
+        .find(|k| k.starts_with(&format!("owner\u{1}operate\u{3}{fp}\u{4}")))
+        .expect("an owner-bound key")
+        .clone();
+    assert_eq!(text[&live_key]["approved_always"], json!(true));
     let back: ApprovalsState = serde_json::from_value(text).unwrap();
     assert_eq!(back, approvals);
 
@@ -691,8 +698,15 @@ fn bound_approvals_round_trip_through_json() {
         wire["rust"]["approval_capabilities"]["pending"]["fingerprint"],
         json!(fp)
     );
+    // A snapshot stores the fingerprint without the process-local owner; the resumed run binds
+    // it to the agent the entry names.
     let restored = RunState::from_json(wire).unwrap();
-    assert_eq!(restored.approvals, state.approvals);
+    let mut detached = state.approvals.clone();
+    let record = detached.0.remove(&live_key).unwrap();
+    detached
+        .0
+        .insert(format!("owner\u{1}operate\u{3}{fp}"), record);
+    assert_eq!(restored.approvals, detached);
     assert_eq!(restored.approval_capabilities, state.approval_capabilities);
 
     // A decision on the registered call after the round trip is bound to its capability.
