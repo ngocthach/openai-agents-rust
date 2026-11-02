@@ -278,7 +278,9 @@ async fn a_snapshot_names_same_named_owners_and_accepts_name_only_owners() {
             .approvals
             .0
             .keys()
-            .filter(|key| key.ends_with("operate"))
+            // A decision taken on a runner interruption is bound to the tool's capability:
+            // its key carries the fingerprint after `\u{3}`.
+            .filter(|key| key.split('\u{3}').next().unwrap().ends_with("operate"))
             .count(),
         1,
         "both decisions fold onto the one owner a name-only reference can name"
