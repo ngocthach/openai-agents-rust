@@ -28,8 +28,10 @@ Last updated: 2026-11-03.
 - MCP legacy HTTP+SSE transport
 - Extensions: tool output trimmer, Codex tool, hosted multi-agent (experimental)
 
-## 0.24.3 (released)
+## 0.24.3 and 0.24.4 (released)
 
+- 0.24.4: `RunResult::input` after a session run follows handoff filters, nested handoff history and sandbox
+  input rewrites (review follow-up to the 0.24.3 session fix)
 - Parity harness (`parity/`, `docs/parity-harness.md`): the same scenarios run through the Python SDK 0.24.0
   and this crate. Capture mode diffs the request payloads against a local server (18 scenarios, no API call);
   live mode compares behaviour shape on a real model (12 scenarios on `gpt-6-luna`). Three divergences found

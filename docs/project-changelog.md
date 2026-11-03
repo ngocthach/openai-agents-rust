@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.24.4 (2026-11-03)
+
+- Sessions: 0.24.3 made `RunResult::input` report the session-prepared input, but kept reporting it after a handoff
+  input filter or nested handoff history (`nest_handoff_history`) had rewritten the run input, and after a sandbox
+  `process_input` rewrite. The result now reports the rewritten history in those cases, as Python's
+  `original_input = filtered.input_history` / `nested.input_history` / `prepared_sandbox.input`, so
+  `to_input_list()` replays the filtered or nested conversation rather than the raw stored history. Found by an
+  independent review of 0.24.3; pinned by `tests/py_parity_session_result_input.rs`.
+
 ## 0.24.3 (2026-11-03)
 
 Two request-payload differences found by the new parity harness (`parity/`, `docs/parity-harness.md`), which runs

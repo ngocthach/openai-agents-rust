@@ -57,6 +57,15 @@ calls; the final pass alone used 16 requests per SDK, 10,015 / 18,050 input toke
 1,354 / 1,119 output tokens (py / rs; web search dominates the input side). Dashboard total
 to be read by the user; the per-pass estimate (≈70 calls) was not exceeded.
 
+## Review follow-up (0.24.4)
+
+An independent review of the 0.24.3 session fix found that the prepared input stayed in
+`RunResult::input` even after a handoff input filter, nested handoff history or a sandbox
+`process_input` rewrite had replaced the run input, where Python reports the rewritten history.
+Fixed in 0.24.4 (the rewrite sites clear or refresh the prepared input) and pinned by a
+session + nested-handoff test. Consequence to know: anything reading `RunResult::input` after a
+session run, including `MemoryManager::enqueue_result`, now sees the stored history there.
+
 ## Remaining differences (kept, documented)
 
 - An object returned by a function tool reaches the model as Python's `str()` of it (pydantic
