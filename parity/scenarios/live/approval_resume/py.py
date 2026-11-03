@@ -27,7 +27,7 @@ async def main() -> None:
         name="Weather assistant",
         instructions="Always use the get_temperature tool to answer temperature questions. Be concise.",
         model=os.environ["PARITY_MODEL"],
-        model_settings=ModelSettings(max_tokens=400),
+        model_settings=ModelSettings(max_tokens=2000),
         tools=[get_temperature],
     )
     interruptions: list[int] = []

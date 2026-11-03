@@ -6,5 +6,5 @@
     "participants_sorted": ["alice", "bob"],
     "usage.requests": 1
   },
-  "across": ["error", "usage.requests", "new_item_types", "participants_sorted"]
+  "across": ["error", "usage.requests", "new_item_types_stable", "participants_sorted"]
 }

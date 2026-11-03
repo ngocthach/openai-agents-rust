@@ -5,5 +5,5 @@
     "handoffs": ["Triage->Spanish Assistant"],
     "usage.requests": 2
   },
-  "across": ["error", "last_agent", "handoffs", "usage.requests", "new_item_types"]
+  "across": ["error", "last_agent", "handoffs", "usage.requests", "new_item_types_stable"]
 }

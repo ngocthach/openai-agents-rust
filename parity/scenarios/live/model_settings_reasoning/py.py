@@ -20,7 +20,7 @@ async def main() -> None:
         instructions="Answer in one short sentence.",
         model=os.environ["PARITY_MODEL"],
         model_settings=ModelSettings(
-            max_tokens=400, reasoning=Reasoning(effort="low", summary="auto"), verbosity="low"
+            max_tokens=2000, reasoning=Reasoning(effort="low", summary="auto"), verbosity="low"
         ),
     )
     try:

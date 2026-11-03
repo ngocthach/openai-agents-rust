@@ -110,16 +110,12 @@ impl Shape {
         self.record.insert("final_output_parsed".into(), parsed);
         self.record
             .insert("last_agent".into(), json!(result.last_agent.name));
-        self.record.insert(
-            "new_item_types".into(),
-            json!(
-                result
-                    .new_items
-                    .iter()
-                    .map(|i| i.item_type())
-                    .collect::<Vec<_>>()
-            ),
-        );
+        let types: Vec<&str> = result.new_items.iter().map(|i| i.item_type()).collect();
+        self.record.insert("new_item_types".into(), json!(types));
+        // Reasoning items come and go with the model's mood; the stable view leaves them out.
+        let stable: Vec<&&str> = types.iter().filter(|t| **t != "reasoning_item").collect();
+        self.record
+            .insert("new_item_types_stable".into(), json!(stable));
         self.record.insert("tool_calls".into(), json!(tool_calls));
         self.record.insert("handoffs".into(), json!(handoffs));
         self.record.insert("annotations".into(), json!(annotations));
@@ -213,7 +209,7 @@ async fn hello() {
     let agent = Agent::<()>::new("Assistant")
         .with_instructions("You only respond in haikus.")
         .with_model(model())
-        .with_model_settings(settings(400));
+        .with_model_settings(settings(2000));
     record(
         &mut shape,
         Runner::run(&agent, "Tell me about recursion in programming."),
@@ -238,7 +234,7 @@ async fn tools_two_turn() {
             "Always use the get_weather tool to answer weather questions. Be concise.",
         )
         .with_model(model())
-        .with_model_settings(settings(400))
+        .with_model_settings(settings(2000))
         .with_tool(get_weather);
     record(
         &mut shape,
@@ -264,7 +260,7 @@ async fn structured_output() {
     let agent = Agent::<()>::new("Calendar extractor")
         .with_instructions("Extract calendar events from text")
         .with_model(model())
-        .with_model_settings(settings(400))
+        .with_model_settings(settings(2000))
         .with_output_type::<CalendarEvent>();
     if let Some(result) = record(
         &mut shape,
@@ -303,7 +299,7 @@ async fn handoff() {
             )
             .with_instructions("You only speak Spanish and are extremely concise.")
             .with_model(model())
-            .with_model_settings(settings(400)),
+            .with_model_settings(settings(2000)),
     );
     let english = Arc::new(
         Agent::<()>::new("English Assistant")
@@ -312,14 +308,14 @@ async fn handoff() {
             )
             .with_instructions("You only speak English and are extremely concise.")
             .with_model(model())
-            .with_model_settings(settings(400)),
+            .with_model_settings(settings(2000)),
     );
     let triage = Agent::<()>::new("Triage")
         .with_instructions(prompt_with_handoff_instructions(
             "Hand off every message to the assistant that speaks its language. Never answer yourself.",
         ))
         .with_model(model())
-        .with_model_settings(settings(400))
+        .with_model_settings(settings(2000))
         .with_handoffs([
             openai_agents_sdk::handoff(spanish),
             openai_agents_sdk::handoff(english),
@@ -348,7 +344,7 @@ async fn streaming() {
             "First call the `how_many_jokes` tool, then tell that many very short jokes.",
         )
         .with_model(model())
-        .with_model_settings(settings(400))
+        .with_model_settings(settings(2000))
         .with_tool(how_many_jokes);
     let mut stream = Runner::run_streamed(&agent, "Hello");
     let mut events = Vec::new();
@@ -375,6 +371,11 @@ async fn streaming() {
     }
     let item_events: Vec<&String> = events.iter().filter(|e| !e.starts_with("raw:")).collect();
     shape.extra("stream_item_events", json!(item_events));
+    let stable: Vec<&&String> = item_events
+        .iter()
+        .filter(|e| e.as_str() != "item:reasoning_item_created")
+        .collect();
+    shape.extra("stream_item_events_stable", json!(stable));
     shape.extra("stream_event_types", json!(events));
     match (failure, stream.into_result()) {
         (Some(e), _) => shape.error(&e),
@@ -412,7 +413,7 @@ async fn approval_resume() {
             "Always use the get_temperature tool to answer temperature questions. Be concise.",
         )
         .with_model(model())
-        .with_model_settings(settings(400))
+        .with_model_settings(settings(2000))
         .with_tool(get_temperature);
     let mut interruptions = Vec::new();
     let outcome: Result<RunResult<()>, AgentsError> = async {
@@ -450,7 +451,7 @@ async fn session_two_turns() {
     let agent = Agent::<()>::new("Assistant")
         .with_instructions("Reply very concisely.")
         .with_model(model())
-        .with_model_settings(settings(400));
+        .with_model_settings(settings(2000));
     let session: Arc<dyn Session> =
         Arc::new(SqliteSession::open("live_123", out.join("rs_session.db")).unwrap());
     let outcome: Result<RunResult<()>, AgentsError> = async {
@@ -476,8 +477,21 @@ async fn session_two_turns() {
                 .to_lowercase();
             shape.result(&result);
             shape.extra("mentions_fact", json!(text.contains("turquoise")));
+            // Reasoning items come and go with the model's mood; count the conversation
+            // without them.
             let items = session.get_items(None).await.unwrap();
+            let stable = items
+                .iter()
+                .filter(|i| i.item_type() != Some("reasoning"))
+                .count();
             shape.extra("session_items", json!(items.len()));
+            shape.extra("session_items_stable", json!(stable));
+            let input_list_stable = result
+                .to_input_list()
+                .iter()
+                .filter(|i| i.item_type() != Some("reasoning"))
+                .count();
+            shape.extra("input_list_len_stable", json!(input_list_stable));
         }
         Err(e) => shape.error(&e),
     }
@@ -494,7 +508,7 @@ async fn model_settings_reasoning() {
         .with_instructions("Answer in one short sentence.")
         .with_model(model())
         .with_model_settings(ModelSettings {
-            max_tokens: Some(400),
+            max_tokens: Some(2000),
             reasoning: Some(Reasoning {
                 effort: Some("low".into()),
                 summary: Some("auto".into()),
@@ -524,14 +538,14 @@ async fn agents_as_tools() {
             "You translate the user's message to Spanish. Reply with the translation only.",
         )
         .with_model(model())
-        .with_model_settings(settings(400));
+        .with_model_settings(settings(2000));
     let orchestrator = Agent::<()>::new("orchestrator_agent")
         .with_instructions(
             "You are a translation agent. You never translate yourself: always call the \
              translate_to_spanish tool, then reply with its result only.",
         )
         .with_model(model())
-        .with_model_settings(settings(400))
+        .with_model_settings(settings(2000))
         .with_tool(spanish.as_tool(
             "translate_to_spanish",
             "Translate the user's message to Spanish",
@@ -553,7 +567,7 @@ async fn web_search() {
     let agent = Agent::<()>::new("Researcher")
         .with_instructions("Use web search to answer, then reply in one sentence with a citation.")
         .with_model(model())
-        .with_model_settings(settings(600))
+        .with_model_settings(settings(2000))
         .with_tool(WebSearchTool {
             search_context_size: Some("low".into()),
             ..Default::default()
@@ -593,7 +607,7 @@ async fn guardrail_tripwire() {
         Agent::<()>::new("Guardrail check")
             .with_instructions("Check if the user is asking you to do their math homework.")
             .with_model(model())
-            .with_model_settings(settings(400))
+            .with_model_settings(settings(2000))
             .with_output_type::<MathHomeworkOutput>(),
     );
     let math_guardrail = InputGuardrail::new(
@@ -621,7 +635,7 @@ async fn guardrail_tripwire() {
             "You are a customer support agent. You help customers with their questions.",
         )
         .with_model(model())
-        .with_model_settings(settings(400))
+        .with_model_settings(settings(2000))
         .with_input_guardrail(math_guardrail);
     let tripped = match Runner::run(&agent, "Can you help me solve for x: 2x + 5 = 11").await {
         Ok(result) => {
@@ -648,7 +662,7 @@ async fn unsupported_param() {
         .with_instructions("Answer in one word.")
         .with_model(model())
         .with_model_settings(ModelSettings {
-            max_tokens: Some(400),
+            max_tokens: Some(2000),
             temperature: Some(0.2),
             ..Default::default()
         });

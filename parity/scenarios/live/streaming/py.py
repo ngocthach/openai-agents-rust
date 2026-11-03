@@ -24,7 +24,7 @@ async def main() -> None:
         name="Joker",
         instructions="First call the `how_many_jokes` tool, then tell that many very short jokes.",
         model=os.environ["PARITY_MODEL"],
-        model_settings=ModelSettings(max_tokens=400),
+        model_settings=ModelSettings(max_tokens=2000),
         tools=[how_many_jokes],
     )
     events: list[str] = []
@@ -43,6 +43,9 @@ async def main() -> None:
             result,
             stream_event_types=events,
             stream_item_events=[e for e in events if not e.startswith("raw:")],
+            stream_item_events_stable=[
+                e for e in events if not e.startswith("raw:") and e != "item:reasoning_item_created"
+            ],
         )
     except Exception as e:  # noqa: BLE001
         shape.write("streaming", started, error=e, stream_event_types=events)

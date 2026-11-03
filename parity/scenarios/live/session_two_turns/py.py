@@ -18,18 +18,24 @@ async def main() -> None:
         name="Assistant",
         instructions="Reply very concisely.",
         model=os.environ["PARITY_MODEL"],
-        model_settings=ModelSettings(max_tokens=400),
+        model_settings=ModelSettings(max_tokens=2000),
     )
     session = SQLiteSession("live_123", Path(os.environ["PARITY_OUT"]) / "py_session.db")
     try:
         await Runner.run(agent, "My favourite colour is turquoise. Just acknowledge it.", session=session)
         result = await Runner.run(agent, "What is my favourite colour? Answer with the colour only.", session=session)
+        # Reasoning items come and go with the model's mood; count the conversation without them.
+        stored = await session.get_items()
         shape.write(
             "session_two_turns",
             started,
             result,
             mentions_fact="turquoise" in result.final_output.lower(),
-            session_items=len(await session.get_items()),
+            session_items=len(stored),
+            session_items_stable=len([i for i in stored if i.get("type") != "reasoning"]),
+            input_list_len_stable=len(
+                [i for i in result.to_input_list() if i.get("type") != "reasoning"]
+            ),
         )
     except Exception as e:  # noqa: BLE001
         shape.write("session_two_turns", started, error=e)

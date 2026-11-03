@@ -24,7 +24,7 @@ async def main() -> None:
         name="Calendar extractor",
         instructions="Extract calendar events from text",
         model=os.environ["PARITY_MODEL"],
-        model_settings=ModelSettings(max_tokens=400),
+        model_settings=ModelSettings(max_tokens=2000),
         output_type=CalendarEvent,
     )
     try:

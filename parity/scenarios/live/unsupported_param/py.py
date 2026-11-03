@@ -17,7 +17,7 @@ async def main() -> None:
         name="Assistant",
         instructions="Answer in one word.",
         model=os.environ["PARITY_MODEL"],
-        model_settings=ModelSettings(max_tokens=400, temperature=0.2),
+        model_settings=ModelSettings(max_tokens=2000, temperature=0.2),
     )
     try:
         result = await Runner.run(agent, "What colour is the sky on a clear day?")

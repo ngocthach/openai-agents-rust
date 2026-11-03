@@ -24,7 +24,7 @@ async def main() -> None:
         name="Weather agent",
         instructions="Always use the get_weather tool to answer weather questions. Be concise.",
         model=os.environ["PARITY_MODEL"],
-        model_settings=ModelSettings(max_tokens=400),
+        model_settings=ModelSettings(max_tokens=2000),
         tools=[get_weather],
     )
     try:

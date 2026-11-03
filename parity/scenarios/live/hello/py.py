@@ -16,7 +16,7 @@ async def main() -> None:
         name="Assistant",
         instructions="You only respond in haikus.",
         model=os.environ["PARITY_MODEL"],
-        model_settings=ModelSettings(max_tokens=400),
+        model_settings=ModelSettings(max_tokens=2000),
     )
     try:
         result = await Runner.run(agent, "Tell me about recursion in programming.")

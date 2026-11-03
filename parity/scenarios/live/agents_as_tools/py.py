@@ -13,7 +13,7 @@ from agents import Agent, ModelSettings, Runner  # noqa: E402
 
 async def main() -> None:
     started = shape.start()
-    settings = ModelSettings(max_tokens=400)
+    settings = ModelSettings(max_tokens=2000)
     model = os.environ["PARITY_MODEL"]
     spanish = Agent(
         name="spanish_agent",

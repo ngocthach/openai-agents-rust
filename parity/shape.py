@@ -53,6 +53,8 @@ def from_result(result: Any) -> dict[str, Any]:
         "final_output_parsed": parsed,
         "last_agent": result.last_agent.name,
         "new_item_types": [item.type for item in items],
+        # Reasoning items come and go with the model's mood; the stable view leaves them out.
+        "new_item_types_stable": [item.type for item in items if item.type != "reasoning_item"],
         "tool_calls": tool_calls,
         "handoffs": [
             f"{item.source_agent.name}->{item.target_agent.name}"

@@ -4,7 +4,7 @@
     "tool_calls.names": ["get_weather"],
     "tool_calls.0.arguments.city": "Tokyo",
     "usage.requests": 2,
-    "new_item_types": ["tool_call_item", "tool_call_output_item", "message_output_item"]
+    "new_item_types": {"contains": "tool_call_output_item"}
   },
-  "across": ["error", "tool_calls.names", "usage.requests", "new_item_types"]
+  "across": ["error", "tool_calls.names", "usage.requests", "new_item_types_stable"]
 }

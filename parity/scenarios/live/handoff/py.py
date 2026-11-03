@@ -13,7 +13,7 @@ from agents.extensions.handoff_prompt import prompt_with_handoff_instructions  #
 
 async def main() -> None:
     started = shape.start()
-    settings = ModelSettings(max_tokens=400)
+    settings = ModelSettings(max_tokens=2000)
     model = os.environ["PARITY_MODEL"]
     spanish = Agent(
         name="Spanish Assistant",

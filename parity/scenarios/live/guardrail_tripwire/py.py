@@ -20,7 +20,7 @@ from agents import (  # noqa: E402
 )
 
 MODEL = os.environ["PARITY_MODEL"]
-SETTINGS = ModelSettings(max_tokens=400)
+SETTINGS = ModelSettings(max_tokens=2000)
 
 
 class MathHomeworkOutput(BaseModel):

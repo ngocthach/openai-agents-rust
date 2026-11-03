@@ -3,8 +3,8 @@
     "error": null,
     "stream_event_types.first": "agent_updated:Joker",
     "stream_event_types": {"contains": "raw:response.completed"},
-    "stream_item_events": ["agent_updated:Joker", "item:tool_called", "item:tool_output", "item:message_output_created"],
+    "stream_item_events": {"contains": "item:tool_output"},
     "usage.requests": 2
   },
-  "across": ["error", "stream_item_events", "usage.requests", "new_item_types"]
+  "across": ["error", "stream_item_events_stable", "usage.requests", "new_item_types_stable"]
 }

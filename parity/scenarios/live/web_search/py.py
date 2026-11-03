@@ -16,7 +16,7 @@ async def main() -> None:
         name="Researcher",
         instructions="Use web search to answer, then reply in one sentence with a citation.",
         model=os.environ["PARITY_MODEL"],
-        model_settings=ModelSettings(max_tokens=600),
+        model_settings=ModelSettings(max_tokens=2000),
         tools=[WebSearchTool(search_context_size="low")],
     )
     try:
