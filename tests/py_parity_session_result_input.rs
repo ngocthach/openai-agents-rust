@@ -75,8 +75,10 @@ async fn a_nested_handoff_after_a_session_run_reports_the_nested_history() {
         ])
         .await
         .unwrap();
-    let mut config = RunConfig::default();
-    config.nest_handoff_history = true;
+    let config = RunConfig {
+        nest_handoff_history: true,
+        ..Default::default()
+    };
     let result = Runner::run_with_options(
         triage,
         "user_message",
