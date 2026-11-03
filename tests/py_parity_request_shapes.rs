@@ -7,7 +7,7 @@ use openai_agents_sdk::tool::{CodeInterpreterTool, FileSearchTool, Tool, WebSear
 use openai_agents_sdk::{Agent, FunctionTool};
 use serde_json::json;
 
-/// Python derives the default schema from its `AgentToolInput` model, whose docstring becomes
+/// Python derives the default schema from its `AgentAsToolInput` model, whose docstring becomes
 /// the schema description the model can see.
 #[test]
 fn the_default_agent_tool_schema_matches_python() {

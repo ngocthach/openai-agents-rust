@@ -1325,7 +1325,7 @@ impl<C: Send + Sync + 'static> Agent<C> {
             || options.input_builder.is_some()
             || options.input_items_builder.is_some();
         let schema = options.parameters.clone().unwrap_or_else(|| {
-            // The same schema Python derives from its `AgentToolInput` model, docstring
+            // The same schema Python derives from its `AgentAsToolInput` model, docstring
             // included, so the model sees identical tool definitions.
             serde_json::json!({
                 "type": "object",

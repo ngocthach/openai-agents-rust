@@ -3794,6 +3794,9 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
             self.original_input = rewritten;
         } else if self.session.is_some() {
             self.model_prefix = process(agent, std::mem::take(&mut self.model_prefix));
+            // The rewritten prepared input is what the result reports, as Python's
+            // `original_input = prepared_sandbox.input`.
+            self.prepared_input = Some(self.model_prefix.clone());
         } else {
             // A resumed input whose unanswered calls the model input leaves out.
             self.original_input = process(agent, std::mem::take(&mut self.original_input));
@@ -6744,6 +6747,9 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
                 self.original_input_is_text = false;
             }
             self.original_input = filtered.input_history.clone();
+            // The filtered history is now the run input a result reports, as Python's
+            // `original_input = filtered.input_history`, also after a session run.
+            self.prepared_input = None;
             self.model_prefix = filtered.input_history;
             let mut generated = filtered.pre_handoff_items.clone();
             generated.extend(filtered.new_items.clone());
@@ -6809,6 +6815,7 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
                 // The nested history is the next agent's input, as Python's
                 // `original_input = nested.input_history`.
                 self.original_input = self.model_prefix.clone();
+                self.prepared_input = None;
                 self.original_input_is_text = false;
                 self.model_items.clear();
                 self.nested_model_start = Some(self.generated_items.len());

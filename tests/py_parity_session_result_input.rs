@@ -6,8 +6,10 @@
 use std::sync::Arc;
 
 use openai_agents_sdk::memory::InMemorySession;
-use openai_agents_sdk::testing::{FakeModel, assistant_message};
-use openai_agents_sdk::{Agent, RunOptions, Runner, Session};
+use openai_agents_sdk::run_config::RunConfig;
+use openai_agents_sdk::testing::{FakeModel, assistant_message, function_call};
+use openai_agents_sdk::{Agent, InputItem, RunOptions, Runner, Session, handoff};
+use serde_json::Value;
 
 #[tokio::test]
 async fn a_session_run_reports_the_prepared_input() {
@@ -45,4 +47,48 @@ async fn a_session_run_reports_the_prepared_input() {
     );
     assert_eq!(second.to_input_list().len(), 4);
     assert_eq!(session.get_items(None).await.unwrap().len(), 4);
+}
+
+/// A handoff with nested history rewrites the run input; after a session run the result
+/// reports that nested history (Python's `original_input = nested.input_history`), not the
+/// input the session prepared.
+#[tokio::test]
+async fn a_nested_handoff_after_a_session_run_reports_the_nested_history() {
+    openai_agents_sdk::tracing::set_tracing_disabled(true);
+    let model = Arc::new(FakeModel::new());
+    let delegate = Arc::new(Agent::<()>::new("delegate").with_model_instance(model.clone()));
+    let triage = Arc::new(
+        Agent::<()>::new("triage")
+            .with_model_instance(model.clone())
+            .with_handoff(handoff(delegate)),
+    );
+    model.add_turn(vec![
+        assistant_message("triage summary"),
+        function_call("transfer_to_delegate", "{}"),
+    ]);
+    model.add_turn(vec![assistant_message("resolution")]);
+    let session: Arc<dyn Session> = Arc::new(InMemorySession::new("conversation"));
+    session
+        .add_items(vec![
+            InputItem::user("earlier question"),
+            InputItem::assistant("earlier answer"),
+        ])
+        .await
+        .unwrap();
+    let mut config = RunConfig::default();
+    config.nest_handoff_history = true;
+    let result = Runner::run_with_options(
+        triage,
+        "user_message",
+        RunOptions::new(()).run_config(config).session(session),
+    )
+    .await
+    .unwrap();
+    let input: Vec<Value> = result.input.iter().map(|i| i.0.clone()).collect();
+    assert_eq!(input.len(), 3, "{input:?}");
+    let summary = input[0]["content"].as_str().unwrap();
+    assert!(summary.contains("<CONVERSATION HISTORY>"), "{summary}");
+    assert!(summary.contains("earlier question"), "{summary}");
+    assert!(summary.contains("user_message"), "{summary}");
+    assert_eq!(result.last_agent.name, "delegate");
 }
