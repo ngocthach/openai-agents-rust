@@ -11,8 +11,11 @@ behaviour-shape record is compared.
 
 Results: 18/18 capture scenarios identical after normalization; 12/12 live scenarios match
 across SDKs. Three Rust fixes shipped in 0.24.3 (agent-as-tool schema description, no
-`code_interpreter_call.outputs` include, `RunResult::input` after a session run). Both crates
-published, docs.rs build pending at the time of writing, tag `v0.24.3` local only.
+`code_interpreter_call.outputs` include, `RunResult::input` after a session run). An
+independent review of 0.24.3 then found the session fix ignored later rewrites of the run
+input (handoff input filters, nested handoff history, sandbox `process_input`); 0.24.4 fixes
+that with a session + nested-handoff test. Both crates published at 0.24.3 and 0.24.4, tags
+`v0.24.3`/`v0.24.4` local only, docs.rs builds pending at the time of writing.
 
 ## What was hard
 
