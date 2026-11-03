@@ -2215,10 +2215,8 @@ impl<C> Tool<C> {
                 };
                 (t.to_responses_param(), includes)
             }
-            Tool::CodeInterpreter(t) => (
-                t.to_responses_param(),
-                vec!["code_interpreter_call.outputs".to_string()],
-            ),
+            // Python requests no extra `include` entry for the code interpreter.
+            Tool::CodeInterpreter(t) => (t.to_responses_param(), Vec::new()),
             Tool::ImageGeneration(t) => (t.to_responses_param(), Vec::new()),
             Tool::HostedMCP(t) => (t.to_responses_param(), Vec::new()),
             Tool::Computer(_) => (json!({"type": "computer"}), Vec::new()),

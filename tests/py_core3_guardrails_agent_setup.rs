@@ -535,10 +535,31 @@ async fn agent_as_tool_custom_input_builder_replaces_the_input() {
 
 #[tokio::test]
 async fn agent_as_tool_input_builder_without_descriptions_sees_no_summary() {
-    // The default parameters carry no descriptions, so there is no summary, and the schema is
-    // only passed on when `include_input_schema` is set.
-    let (summary, schema, _) = structured_builder_view(None, false, r#"{"input": "x"}"#).await;
+    // Parameters without any description give no summary, and the schema is only passed on
+    // when `include_input_schema` is set.
+    let parameters = json!({
+        "type": "object",
+        "properties": {"input": {"type": "string"}},
+        "required": ["input"],
+        "additionalProperties": false,
+    });
+    let (summary, schema, _) =
+        structured_builder_view(Some(parameters), false, r#"{"input": "x"}"#).await;
     assert!(summary.is_none());
+    assert!(schema.is_none());
+}
+
+#[tokio::test]
+async fn agent_as_tool_input_builder_sees_the_default_schema_summary() {
+    // The default parameters are Python's `AgentAsToolInput` model, whose docstring is the
+    // schema description, so the builder sees a summary built from it.
+    let (summary, schema, _) = structured_builder_view(None, false, r#"{"input": "x"}"#).await;
+    assert_eq!(
+        summary.as_deref(),
+        Some(
+            "Description: Default input schema for agent-as-tool calls.\n- input (string, required)"
+        )
+    );
     assert!(schema.is_none());
 }
 
