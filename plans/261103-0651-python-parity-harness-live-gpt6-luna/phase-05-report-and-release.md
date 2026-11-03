@@ -1,9 +1,10 @@
 ---
 phase: 5
-title: "Report and release"
-status: pending
+title: Report and release
+status: in-progress
 priority: P2
-dependencies: [4]
+dependencies:
+  - 4
 ---
 
 # Phase 5: Report and release

@@ -12,6 +12,10 @@ requests they send.
   (`Description: … \n- input (string, required)`) instead of `None`.
 - Hosted code interpreter: no `code_interpreter_call.outputs` entry is added to `include` any more; the Python SDK
   never requests it.
+- Sessions: after a run with a client-managed session, `RunResult::input` (and the error handlers' `run_data.input`)
+  is the input the session prepared, the stored history followed by the new message, as Python keeps
+  `original_input_for_state` in `RunResult.input`; `to_input_list()` therefore carries the whole conversation.
+  Found by the live run `session_two_turns` on `gpt-6-luna`; previously only the new message was reported.
 
 Capture matrix: 18 scenarios (default model, explicit `gpt-6-luna`, model settings, function tools, structured
 output, handoffs, agents as tools, guardrails, human in the loop, sessions, streaming, hosted tools, media inputs,

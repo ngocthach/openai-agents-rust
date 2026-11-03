@@ -84,8 +84,8 @@ settings should appear for it in either; `gpt-5.6-luna` maps to effort `none` in
 | 1 | [Harness setup](./phase-01-harness-setup.md) | Completed |
 | 2 | [Payload parity matrix](./phase-02-payload-parity-matrix.md) | Completed |
 | 3 | [Fix divergences](./phase-03-fix-divergences.md) | Completed |
-| 4 | [Live behaviour runs](./phase-04-live-behaviour-runs.md) | In Progress |
-| 5 | [Report and release](./phase-05-report-and-release.md) | Pending |
+| 4 | [Live behaviour runs](./phase-04-live-behaviour-runs.md) | Completed |
+| 5 | [Report and release](./phase-05-report-and-release.md) | In Progress |
 
 Phases run in order. Phase 4 is gated on phase 3's sign-off.
 

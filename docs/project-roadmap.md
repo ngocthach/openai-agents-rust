@@ -1,6 +1,6 @@
 # Project roadmap
 
-Last updated: 2026-10-29.
+Last updated: 2026-11-03.
 
 ## 0.1.0 (released)
 
@@ -27,6 +27,16 @@ Last updated: 2026-10-29.
 - Sessions: advanced SQLite, OpenAI Responses compaction, encrypted, Redis, MongoDB, sqlx, Dapr
 - MCP legacy HTTP+SSE transport
 - Extensions: tool output trimmer, Codex tool, hosted multi-agent (experimental)
+
+## 0.24.3 (released)
+
+- Parity harness (`parity/`, `docs/parity-harness.md`): the same scenarios run through the Python SDK 0.24.0
+  and this crate. Capture mode diffs the request payloads against a local server (18 scenarios, no API call);
+  live mode compares behaviour shape on a real model (12 scenarios on `gpt-6-luna`). Three divergences found
+  and fixed (agent-as-tool schema description, code interpreter `include`, `RunResult::input` after a session
+  run); results in `plans/reports/parity-live-and-capture-261103-0651-python-vs-rust-report.md`
+- Still open: `RunState::original_input` after a session run keeps the caller's input (Python stores the
+  prepared input); object tool results are `str()` in Python and JSON here
 
 ## 0.11.0 (released)
 
