@@ -4,7 +4,7 @@ description: >-
   Compare the Rust port against the Python SDK feature by feature: first the
   exact request each SDK sends (no tokens spent), then a curated set of live
   runs on gpt-6-luna.
-status: in-progress
+status: completed
 priority: P2
 branch: feat/rust-port-of-agents-sdk
 tags:
@@ -85,7 +85,7 @@ settings should appear for it in either; `gpt-5.6-luna` maps to effort `none` in
 | 2 | [Payload parity matrix](./phase-02-payload-parity-matrix.md) | Completed |
 | 3 | [Fix divergences](./phase-03-fix-divergences.md) | Completed |
 | 4 | [Live behaviour runs](./phase-04-live-behaviour-runs.md) | Completed |
-| 5 | [Report and release](./phase-05-report-and-release.md) | In Progress |
+| 5 | [Report and release](./phase-05-report-and-release.md) | Completed |
 
 Phases run in order. Phase 4 is gated on phase 3's sign-off.
 

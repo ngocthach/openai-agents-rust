@@ -1,7 +1,7 @@
 ---
 phase: 5
 title: Report and release
-status: in-progress
+status: completed
 priority: P2
 dependencies:
   - 4
