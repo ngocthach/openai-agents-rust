@@ -217,6 +217,9 @@ struct RunLoop<C: Send + Sync + 'static> {
     model_prefix: Vec<InputItem>,
     /// The run input items to persist to the session.
     session_input: Vec<InputItem>,
+    /// The input a client-managed session prepared (its history plus the run input): what
+    /// Python keeps as `original_input_for_state`, so `RunResult::input` reports it.
+    prepared_input: Option<Vec<InputItem>>,
     generated_items: Vec<RunItem>,
     /// Items forwarded to the model (differs from `generated_items` after handoff filters).
     model_items: Vec<RunItem>,
@@ -1158,6 +1161,7 @@ pub(crate) async fn run_loop<C: Send + Sync + 'static>(
         original_input: Vec::new(),
         model_prefix: Vec::new(),
         session_input: Vec::new(),
+        prepared_input: None,
         generated_items: Vec::new(),
         model_items: Vec::new(),
         agent_tool_invocation,
@@ -2189,7 +2193,7 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
             }
         }
         RunErrorDetails {
-            input: self.original_input.clone(),
+            input: self.result_input(),
             new_items,
             raw_responses: self.model_responses.clone(),
             last_agent: self.current_agent.name.clone(),
@@ -2289,6 +2293,14 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
         self.conversation_id.is_some()
             || self.previous_response_id.is_some()
             || self.auto_previous_response_id
+    }
+
+    /// The input a result reports: with a client-managed session the prepared input (history
+    /// plus the run input), as Python's `RunResult.input`; otherwise the run input.
+    fn result_input(&self) -> Vec<InputItem> {
+        self.prepared_input
+            .clone()
+            .unwrap_or_else(|| self.original_input.clone())
     }
 
     async fn run(&mut self) -> Result<RunResult<C>> {
@@ -2681,10 +2693,10 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
             error: Arc::new(clone_simple_error(&err)),
             context: self.ctx.clone(),
             run_data: RunErrorData {
-                input: self.original_input.clone(),
+                input: self.result_input(),
                 new_items: self.generated_items.clone(),
                 history: {
-                    let mut h = self.original_input.clone();
+                    let mut h = self.result_input();
                     h.extend(items_to_input(&self.generated_items));
                     h
                 },
@@ -3243,7 +3255,7 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
                 }),
         };
         RunResult {
-            input: self.original_input.clone(),
+            input: self.result_input(),
             new_items: self.generated_items.clone(),
             raw_responses: self.model_responses.clone(),
             final_output,
@@ -3703,6 +3715,9 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
         );
         self.model_prefix = items::deduplicate_input_items_preferring_latest(pruned);
         self.session_input = appended;
+        if !self.server_managed() {
+            self.prepared_input = Some(self.model_prefix.clone());
+        }
         Ok(())
     }
 
@@ -6535,10 +6550,10 @@ impl<C: Send + Sync + 'static> RunLoop<C> {
             error: Arc::new(clone_simple_error(err)),
             context: self.ctx.clone(),
             run_data: RunErrorData {
-                input: self.original_input.clone(),
+                input: self.result_input(),
                 new_items: self.generated_items.clone(),
                 history: {
-                    let mut h = self.original_input.clone();
+                    let mut h = self.result_input();
                     h.extend(items_to_input(&self.generated_items));
                     h
                 },
