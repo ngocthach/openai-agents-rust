@@ -1,0 +1,936 @@
+//! Conversion of JSON schemas to the strict subset accepted by OpenAI structured outputs.
+//! Port of `agents.strict_schema`.
+
+use serde_json::{Map, Value};
+
+use crate::error::{AgentsError, Result};
+
+const MAX_SCHEMA_NODES: usize = 100_000;
+const MAX_SCHEMA_DEPTH: usize = 100;
+
+const ADDITIONAL_PROPERTIES_ERROR: &str = "additionalProperties should not be set for object types. \
+If you really need this, update the function or output tool to not use a strict schema.";
+
+const OPEN_OBJECT_ERROR: &str = "JSON schema contains an object that permits undeclared properties and cannot be converted \
+to a strict schema without changing its accepted values.";
+
+const UNVALIDATED_REF_ERROR: &str =
+    "JSON schema contains a reference whose target was not validated for strict mode.";
+
+const NESTED_RESOURCE_REF_ERROR: &str = "JSON schema contains a reference owned by or crossing a nested `$id` resource that cannot \
+be resolved against the document root.";
+
+const REF_NON_CONSTRAINING_SIBLINGS: &[&str] = &[
+    "$anchor",
+    "$comment",
+    "$defs",
+    "$schema",
+    "contentEncoding",
+    "contentMediaType",
+    "contentSchema",
+    "default",
+    "definitions",
+    "deprecated",
+    "description",
+    "examples",
+    "readOnly",
+    "title",
+    "writeOnly",
+];
+
+const ROOT_REF_NON_CONSTRAINING_SIBLINGS: &[&str] = &[
+    "$anchor",
+    "$comment",
+    "$defs",
+    "$id",
+    "$schema",
+    "contentEncoding",
+    "contentMediaType",
+    "contentSchema",
+    "default",
+    "definitions",
+    "deprecated",
+    "description",
+    "examples",
+    "readOnly",
+    "title",
+    "writeOnly",
+];
+
+/// String formats accepted by OpenAI structured outputs.
+const SUPPORTED_STRING_FORMATS: &[&str] = &[
+    "date-time",
+    "time",
+    "date",
+    "duration",
+    "email",
+    "hostname",
+    "ipv4",
+    "ipv6",
+    "uuid",
+];
+
+/// Remove `format` values that OpenAI strict mode rejects. schemars emits formats such as
+/// `uint32`, `int64` and `double` for Rust numeric types; Pydantic never does.
+fn strip_unsupported_format(obj: &mut Map<String, Value>) {
+    let Some(Value::String(fmt)) = obj.get("format") else {
+        return;
+    };
+    let is_string = match obj.get("type") {
+        Some(Value::String(t)) => t == "string",
+        Some(Value::Array(ts)) => ts.iter().any(|t| t == "string"),
+        _ => false,
+    };
+    if !(is_string && SUPPORTED_STRING_FORMATS.contains(&fmt.as_str())) {
+        obj.remove("format");
+    }
+}
+
+/// Convert `schema` to the strict JSON schema format expected by the OpenAI API.
+///
+/// Objects get `additionalProperties: false` and every property becomes required, `oneOf` turns
+/// into `anyOf`, single-entry `allOf` is merged, `$ref`s with siblings are inlined, and
+/// `default: null` is dropped.
+pub fn ensure_strict_json_schema(schema: &Value) -> Result<Value> {
+    ensure_strict_json_schema_with(schema, false)
+}
+
+/// [`ensure_strict_json_schema`] that, with `reject_open_objects`, refuses instead of closing an
+/// object schema that allows undeclared properties, and any `$ref` it did not inline. Python's
+/// `_reject_open_objects`: MCP tool schemas are served as-is when converting them would change
+/// the arguments they accept.
+pub(crate) fn ensure_strict_json_schema_with(
+    schema: &Value,
+    reject_open_objects: bool,
+) -> Result<Value> {
+    validate_depth(schema, 1)?;
+    let Value::Object(obj) = schema else {
+        return Err(AgentsError::user("Expected JSON schema to be an object"));
+    };
+    if obj.is_empty() {
+        return Ok(serde_json::json!({
+            "additionalProperties": false,
+            "type": "object",
+            "properties": {},
+            "required": []
+        }));
+    }
+    let root = schema.clone();
+    let mut budget = Budget {
+        remaining: MAX_SCHEMA_NODES,
+        reject_open_objects,
+    };
+    let strict = ensure_strict(schema.clone(), &root, &mut budget, 1, true, false)?;
+    ensure_strict_root(strict)
+}
+
+fn validate_depth(value: &Value, depth: usize) -> Result<()> {
+    if depth > MAX_SCHEMA_DEPTH {
+        return Err(AgentsError::user(
+            "JSON schema is too deeply nested to process safely. Simplify or flatten the schema.",
+        ));
+    }
+    match value {
+        Value::Object(m) => m.values().try_for_each(|v| validate_depth(v, depth + 1)),
+        Value::Array(a) => a.iter().try_for_each(|v| validate_depth(v, depth + 1)),
+        _ => Ok(()),
+    }
+}
+
+fn ensure_strict_root(mut schema: Value) -> Result<Value> {
+    let Value::Object(obj) = &mut schema else {
+        return Ok(schema);
+    };
+    if obj.get("anyOf").map(Value::is_array).unwrap_or(false) {
+        return Err(AgentsError::user(
+            "The root of a strict JSON schema must not use `anyOf`.",
+        ));
+    }
+    if let Some(Value::Array(types)) = obj.get("type").cloned() {
+        let has_object = types.iter().any(|t| t == "object");
+        if has_object {
+            if types.len() == 1 {
+                obj.insert("type".into(), Value::String("object".into()));
+            } else {
+                return Err(AgentsError::user(format!(
+                    "The root of a strict JSON schema must be a non-nullable object, but its type is {types:?}."
+                )));
+            }
+        }
+    }
+    Ok(schema)
+}
+
+/// Conversion state shared across the recursion: the remaining node allowance and whether open
+/// objects are an error.
+struct Budget {
+    remaining: usize,
+    reject_open_objects: bool,
+}
+
+fn spend(budget: &mut Budget) -> Result<()> {
+    if budget.remaining == 0 {
+        return Err(AgentsError::user(
+            "JSON schema is too large to convert to strict mode.",
+        ));
+    }
+    budget.remaining -= 1;
+    Ok(())
+}
+
+/// Whether a schema node declares its own `$id` resource, as `_declares_schema_resource` does.
+fn declares_schema_resource(obj: &Map<String, Value>) -> bool {
+    matches!(obj.get("$id"), Some(Value::String(_)))
+}
+
+/// JSON-level equality: booleans never equal numbers, and integers equal equal floats.
+fn json_values_equal(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::Bool(_), _) | (_, Value::Bool(_)) => left == right,
+        (Value::Number(a), Value::Number(b)) => match (a.as_f64(), b.as_f64()) {
+            (Some(a), Some(b)) => a == b,
+            _ => a == b,
+        },
+        (Value::Array(a), Value::Array(b)) => {
+            a.len() == b.len() && a.iter().zip(b).all(|(x, y)| json_values_equal(x, y))
+        }
+        (Value::Object(a), Value::Object(b)) => {
+            a.len() == b.len()
+                && a.iter()
+                    .all(|(k, v)| b.get(k).is_some_and(|other| json_values_equal(v, other)))
+        }
+        _ => left == right,
+    }
+}
+
+/// Follow a chain of `$ref`s that only carry non-constraining siblings, as
+/// `_resolve_non_constraining_ref_chain` does.
+fn resolve_non_constraining_ref_chain(
+    root: &Value,
+    schema: &Map<String, Value>,
+    budget: &mut Budget,
+) -> Result<Value> {
+    let mut resolved = schema.clone();
+    let mut seen_refs: Vec<String> = Vec::new();
+    let mut carried: Map<String, Value> = Map::new();
+    loop {
+        let Some(Value::String(reference)) = resolved.get("$ref").cloned() else {
+            break;
+        };
+        if resolved
+            .keys()
+            .any(|k| k != "$ref" && !REF_NON_CONSTRAINING_SIBLINGS.contains(&k.as_str()))
+        {
+            break;
+        }
+        if seen_refs.contains(&reference) {
+            return Err(AgentsError::user(
+                "JSON schema contains a circular `$ref` chain.",
+            ));
+        }
+        seen_refs.push(reference.clone());
+        for (key, value) in &resolved {
+            if key != "$ref" && !carried.contains_key(key) {
+                carried.insert(key.clone(), value.clone());
+            }
+        }
+        spend(budget)?;
+        let target = resolve_ref(root, &reference)?;
+        let Value::Object(target) = target else {
+            return Err(AgentsError::user(format!(
+                "Expected `$ref: {reference}` to resolve to an object"
+            )));
+        };
+        resolved = target;
+    }
+    for (key, value) in carried {
+        resolved.insert(key, value);
+    }
+    Ok(Value::Object(resolved))
+}
+
+fn ensure_strict(
+    schema: Value,
+    root: &Value,
+    budget: &mut Budget,
+    depth: usize,
+    is_root: bool,
+    inside_nested_resource: bool,
+) -> Result<Value> {
+    if depth > MAX_SCHEMA_DEPTH {
+        return Err(AgentsError::user(
+            "JSON schema is too deeply nested to process safely.",
+        ));
+    }
+    let Value::Object(mut obj) = schema else {
+        // `true` is the unconstrained schema schemars emits for `serde_json::Value`; Python's
+        // pydantic emits `{}` for `Any`, which strict conversion also leaves as it is.
+        if schema == Value::Bool(true) {
+            return Ok(schema);
+        }
+        return Err(AgentsError::user(format!(
+            "Expected a JSON schema object, got {schema}"
+        )));
+    };
+    let explicitly_closed = obj.get("additionalProperties") == Some(&Value::Bool(false));
+    spend(budget)?;
+    strip_unsupported_format(&mut obj);
+    if is_root {
+        obj.remove("$schema");
+    }
+    let next = depth + 1;
+    let inside_nested_resource =
+        inside_nested_resource || (!is_root && declares_schema_resource(&obj));
+
+    if obj.contains_key("$ref") {
+        if inside_nested_resource {
+            return Err(AgentsError::user(NESTED_RESOURCE_REF_ERROR));
+        }
+        let allowed: &[&str] = if is_root {
+            ROOT_REF_NON_CONSTRAINING_SIBLINGS
+        } else {
+            REF_NON_CONSTRAINING_SIBLINGS
+        };
+        let incompatible: Vec<&String> = obj
+            .keys()
+            .filter(|k| k.as_str() != "$ref" && !allowed.contains(&k.as_str()))
+            .collect();
+        if !incompatible.is_empty() {
+            return Err(AgentsError::user(format!(
+                "JSON schema contains a `$ref` with incompatible sibling keyword(s) ({}) that cannot be merged without changing its accepted values.",
+                incompatible
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+        }
+    }
+
+    for defs_key in ["$defs", "definitions"] {
+        if let Some(Value::Object(defs)) = obj.get(defs_key).cloned() {
+            let mut new_defs = Map::new();
+            for (name, def) in defs {
+                new_defs.insert(
+                    name,
+                    ensure_strict(def, root, budget, next, false, inside_nested_resource)?,
+                );
+            }
+            obj.insert(defs_key.into(), Value::Object(new_defs));
+        }
+    }
+
+    let mut typ = obj.get("type").cloned();
+    let has_props_obj = obj.get("properties").map(Value::is_object).unwrap_or(false);
+    if typ.is_none() && has_props_obj {
+        obj.insert("type".into(), Value::String("object".into()));
+        typ = Some(Value::String("object".into()));
+    } else if typ.is_none()
+        && obj
+            .get("additionalProperties")
+            .map(|v| v != &Value::Bool(false))
+            .unwrap_or(false)
+    {
+        return Err(AgentsError::user(ADDITIONAL_PROPERTIES_ERROR));
+    }
+    let is_object = match &typ {
+        Some(Value::String(s)) => s == "object",
+        Some(Value::Array(a)) => a.iter().any(|t| t == "object"),
+        _ => false,
+    };
+    if budget.reject_open_objects
+        && is_object
+        && obj
+            .get("properties")
+            .is_none_or(|p| p.as_object().is_some_and(|m| m.is_empty()))
+        && obj.get("additionalProperties") != Some(&Value::Bool(false))
+    {
+        return Err(AgentsError::user(OPEN_OBJECT_ERROR));
+    }
+    if is_object {
+        match obj.get("additionalProperties") {
+            None => {
+                obj.insert("additionalProperties".into(), Value::Bool(false));
+            }
+            Some(Value::Bool(false)) => {}
+            Some(_) => return Err(AgentsError::user(ADDITIONAL_PROPERTIES_ERROR)),
+        }
+    }
+
+    if let Some(Value::Object(props)) = obj.get("properties").cloned() {
+        let keys: Vec<Value> = props.keys().map(|k| Value::String(k.clone())).collect();
+        obj.insert("required".into(), Value::Array(keys));
+        let mut new_props = Map::new();
+        for (k, v) in props {
+            new_props.insert(
+                k,
+                ensure_strict(v, root, budget, next, false, inside_nested_resource)?,
+            );
+        }
+        obj.insert("properties".into(), Value::Object(new_props));
+    }
+
+    if let Some(items) = obj.get("items").cloned()
+        && items.is_object()
+    {
+        obj.insert(
+            "items".into(),
+            ensure_strict(items, root, budget, next, false, inside_nested_resource)?,
+        );
+    }
+
+    if let Some(Value::Array(any_of)) = obj.get("anyOf").cloned() {
+        let mut out = Vec::with_capacity(any_of.len());
+        for v in any_of {
+            out.push(ensure_strict(
+                v,
+                root,
+                budget,
+                next,
+                false,
+                inside_nested_resource,
+            )?);
+        }
+        obj.insert("anyOf".into(), Value::Array(out));
+    }
+
+    if let Some(Value::Array(one_of)) = obj.get("oneOf").cloned() {
+        let mut existing = match obj.get("anyOf") {
+            Some(Value::Array(a)) => a.clone(),
+            _ => Vec::new(),
+        };
+        for v in one_of {
+            existing.push(ensure_strict(
+                v,
+                root,
+                budget,
+                next,
+                false,
+                inside_nested_resource,
+            )?);
+        }
+        obj.insert("anyOf".into(), Value::Array(existing));
+        obj.remove("oneOf");
+    }
+
+    if let Some(Value::Array(all_of)) = obj.get("allOf").cloned() {
+        if all_of.len() == 1 {
+            let entry = all_of[0].clone();
+            let pure_ref_entry = match &entry {
+                Value::Object(e) => {
+                    e.contains_key("$ref")
+                        && !e.keys().any(|k| {
+                            k != "$ref" && !REF_NON_CONSTRAINING_SIBLINGS.contains(&k.as_str())
+                        })
+                }
+                _ => false,
+            };
+            let strict_entry = if pure_ref_entry {
+                if inside_nested_resource {
+                    return Err(AgentsError::user(NESTED_RESOURCE_REF_ERROR));
+                }
+                spend(budget)?;
+                let Value::Object(e) = &entry else {
+                    unreachable!("checked above");
+                };
+                resolve_non_constraining_ref_chain(root, e, budget)?
+            } else {
+                ensure_strict(entry, root, budget, next, false, inside_nested_resource)?
+            };
+            obj.remove("allOf");
+            if !explicitly_closed {
+                obj.remove("additionalProperties");
+            }
+            let merged = merge_single_all_of(&strict_entry, &obj)?;
+            return ensure_strict(
+                Value::Object(merged),
+                root,
+                budget,
+                next,
+                false,
+                inside_nested_resource,
+            );
+        } else {
+            let mut out = Vec::with_capacity(all_of.len());
+            for v in all_of {
+                out.push(ensure_strict(
+                    v,
+                    root,
+                    budget,
+                    next,
+                    false,
+                    inside_nested_resource,
+                )?);
+            }
+            obj.insert("allOf".into(), Value::Array(out));
+        }
+    }
+
+    if obj.get("default") == Some(&Value::Null) {
+        obj.remove("default");
+    }
+
+    if let Some(Value::String(r)) = obj.get("$ref").cloned()
+        && obj.len() > 1
+    {
+        let resolved = resolve_ref(root, &r)?;
+        let Value::Object(resolved_obj) = resolved else {
+            return Err(AgentsError::user(format!(
+                "Expected `$ref: {r}` to resolve to an object"
+            )));
+        };
+        obj.remove("$ref");
+        let mut merged = resolved_obj;
+        for (k, v) in obj {
+            merged.insert(k, v);
+        }
+        return ensure_strict(
+            Value::Object(merged),
+            root,
+            budget,
+            next,
+            false,
+            inside_nested_resource,
+        );
+    }
+
+    if budget.reject_open_objects && obj.contains_key("$ref") {
+        return Err(AgentsError::user(UNVALIDATED_REF_ERROR));
+    }
+
+    Ok(Value::Object(obj))
+}
+
+fn merge_single_all_of(entry: &Value, parent: &Map<String, Value>) -> Result<Map<String, Value>> {
+    let Value::Object(entry_obj) = entry else {
+        return Err(AgentsError::user("allOf entry must be an object"));
+    };
+    let mut merged = entry_obj.clone();
+    let mut incompatible: Vec<String> = Vec::new();
+
+    let parent_properties_empty = match parent.get("properties") {
+        None => true,
+        Some(Value::Object(p)) => p.is_empty(),
+        Some(_) => false,
+    };
+    let entry_has_properties =
+        matches!(entry_obj.get("properties"), Some(Value::Object(p)) if !p.is_empty());
+    if parent.get("additionalProperties") == Some(&Value::Bool(false))
+        && parent_properties_empty
+        && entry_has_properties
+    {
+        // `additionalProperties` only sees properties declared in its own schema, not in `allOf`.
+        incompatible.push("properties".into());
+    }
+
+    for (key, parent_value) in parent {
+        match merged.get(key) {
+            None => {
+                merged.insert(key.clone(), parent_value.clone());
+            }
+            Some(existing) => {
+                if REF_NON_CONSTRAINING_SIBLINGS.contains(&key.as_str()) {
+                    merged.insert(key.clone(), parent_value.clone());
+                } else if !(json_values_equal(parent_value, existing)
+                    || (key == "properties" && parent_value == &Value::Object(Map::new()))
+                    || (key == "required" && parent_value == &Value::Array(Vec::new())))
+                {
+                    incompatible.push(key.clone());
+                }
+            }
+        }
+    }
+
+    if !incompatible.is_empty() {
+        incompatible.sort();
+        incompatible.dedup();
+        return Err(AgentsError::user(format!(
+            "JSON schema contains a singleton `allOf` entry with incompatible parent keyword(s) \
+({}) that cannot be merged without changing its accepted values.",
+            incompatible.join(", ")
+        )));
+    }
+    Ok(merged)
+}
+
+/// Resolve a local `#/...` JSON pointer against the schema root.
+pub fn resolve_ref(root: &Value, reference: &str) -> Result<Value> {
+    // The fragment is percent-decoded before it is split into JSON pointer segments, as Python's
+    // `unquote` does; `%2F` therefore separates segments too.
+    let decoded = percent_decode_ref(reference)?;
+    let Some(path) = decoded.strip_prefix("#/") else {
+        return Err(AgentsError::user(format!(
+            "Unexpected $ref format {reference:?}; does not start with #/"
+        )));
+    };
+    let mut current = root;
+    for raw in path.split('/') {
+        let key = raw.replace("~1", "/").replace("~0", "~");
+        current = match current {
+            Value::Object(m) => m.get(&key).ok_or_else(|| {
+                AgentsError::user(format!(
+                    "Encountered missing key {key} while resolving {reference}"
+                ))
+            })?,
+            Value::Array(a) => {
+                let idx: usize = key.parse().map_err(|_| {
+                    AgentsError::user(format!(
+                        "Invalid array index {key} while resolving {reference}"
+                    ))
+                })?;
+                a.get(idx).ok_or_else(|| {
+                    AgentsError::user(format!(
+                        "Index {idx} out of range while resolving {reference}"
+                    ))
+                })?
+            }
+            _ => {
+                return Err(AgentsError::user(format!(
+                    "Cannot resolve {reference}: encountered a non-container value"
+                )));
+            }
+        };
+        if let Value::Object(obj) = current
+            && declares_schema_resource(obj)
+        {
+            return Err(AgentsError::user(NESTED_RESOURCE_REF_ERROR));
+        }
+    }
+    Ok(current.clone())
+}
+
+/// Percent-decode a `$ref`. A `%` not followed by two hex digits is kept as-is, as `unquote`
+/// does. Bytes that do not form UTF-8 are an error, like Python's `UnicodeDecodeError`.
+fn percent_decode_ref(reference: &str) -> Result<String> {
+    let bytes = reference.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let hex = |b: u8| (b as char).to_digit(16);
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(hi), Some(lo)) = (hex(bytes[i + 1]), hex(bytes[i + 2]))
+        {
+            out.push((hi * 16 + lo) as u8);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).map_err(|_| {
+        AgentsError::user(format!(
+            "$ref {reference:?} does not percent-decode to valid UTF-8"
+        ))
+    })
+}
+
+/// Check a tool-argument object against the value constraints its JSON schema declares.
+///
+/// Python validates arguments with the pydantic model built from the function signature, so a
+/// `Field(ge=0, le=100)` or `min_length` bound rejects a bad model call. Rust deserializes with
+/// serde, which ignores those bounds, so this enforces the same keywords the schema emits:
+/// `minimum`, `maximum`, `exclusiveMinimum`, `exclusiveMaximum`, `multipleOf`, `minLength`,
+/// `maxLength`, `pattern`, `minItems`, `maxItems`, `uniqueItems`, `enum` and `const`, through
+/// `$ref`, `allOf`, `anyOf`, `oneOf`, `properties`, `additionalProperties` and `items`. Shape
+/// errors (types, required fields) stay with serde. Returns the first violation, prefixed with
+/// the path to the offending value.
+pub(crate) fn validate_value_constraints(
+    root: &Value,
+    value: &Value,
+) -> std::result::Result<(), String> {
+    validate_node(root, root, value, "", 0)
+}
+
+fn validate_node(
+    root: &Value,
+    schema: &Value,
+    value: &Value,
+    path: &str,
+    depth: usize,
+) -> std::result::Result<(), String> {
+    let at = |message: String| {
+        if path.is_empty() {
+            message
+        } else {
+            format!("{path}: {message}")
+        }
+    };
+    let Value::Object(schema) = schema else {
+        return match schema {
+            Value::Bool(false) => Err(at("Input is not allowed".to_string())),
+            _ => Ok(()),
+        };
+    };
+    if depth > MAX_SCHEMA_DEPTH {
+        return Ok(());
+    }
+    if let Some(reference) = schema.get("$ref").and_then(Value::as_str)
+        && let Ok(target) = resolve_ref(root, reference)
+    {
+        validate_node(root, &target, value, path, depth + 1)?;
+    }
+    if let Some(all) = schema.get("allOf").and_then(Value::as_array) {
+        for sub in all {
+            validate_node(root, sub, value, path, depth + 1)?;
+        }
+    }
+    for keyword in ["anyOf", "oneOf"] {
+        if let Some(options) = schema.get(keyword).and_then(Value::as_array) {
+            let mut first_error = None;
+            let matched = options.iter().any(|option| {
+                match validate_node(root, option, value, path, depth + 1) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        first_error.get_or_insert(e);
+                        false
+                    }
+                }
+            });
+            if !matched && let Some(error) = first_error {
+                return Err(error);
+            }
+        }
+    }
+    if let Some(allowed) = schema.get("enum").and_then(Value::as_array)
+        && !allowed.contains(value)
+    {
+        return Err(at("Input should be one of the allowed values".to_string()));
+    }
+    if let Some(expected) = schema.get("const")
+        && expected != value
+    {
+        return Err(at(format!("Input should be {expected}")));
+    }
+    match value {
+        Value::Number(n) => {
+            let Some(x) = n.as_f64() else { return Ok(()) };
+            let bound = |key: &str| schema.get(key).and_then(Value::as_f64);
+            if let Some(b) = bound("minimum")
+                && x < b
+            {
+                return Err(at(format!("Input should be greater than or equal to {b}")));
+            }
+            if let Some(b) = bound("maximum")
+                && x > b
+            {
+                return Err(at(format!("Input should be less than or equal to {b}")));
+            }
+            if let Some(b) = bound("exclusiveMinimum")
+                && x <= b
+            {
+                return Err(at(format!("Input should be greater than {b}")));
+            }
+            if let Some(b) = bound("exclusiveMaximum")
+                && x >= b
+            {
+                return Err(at(format!("Input should be less than {b}")));
+            }
+            if let Some(m) = bound("multipleOf")
+                && m > 0.0
+                && ((x / m).round() * m - x).abs() > f64::EPSILON * x.abs().max(1.0)
+            {
+                return Err(at(format!("Input should be a multiple of {m}")));
+            }
+        }
+        Value::String(text) => {
+            let length = text.chars().count() as u64;
+            if let Some(b) = schema.get("minLength").and_then(Value::as_u64)
+                && length < b
+            {
+                return Err(at(format!("String should have at least {b} characters")));
+            }
+            if let Some(b) = schema.get("maxLength").and_then(Value::as_u64)
+                && length > b
+            {
+                return Err(at(format!("String should have at most {b} characters")));
+            }
+            if let Some(pattern) = schema.get("pattern").and_then(Value::as_str)
+                && let Ok(re) = regex::Regex::new(pattern)
+                && !re.is_match(text)
+            {
+                return Err(at(format!("String should match pattern '{pattern}'")));
+            }
+        }
+        Value::Array(items) => {
+            if let Some(b) = schema.get("minItems").and_then(Value::as_u64)
+                && (items.len() as u64) < b
+            {
+                return Err(at(format!("List should have at least {b} items")));
+            }
+            if let Some(b) = schema.get("maxItems").and_then(Value::as_u64)
+                && items.len() as u64 > b
+            {
+                return Err(at(format!("List should have at most {b} items")));
+            }
+            if schema.get("uniqueItems") == Some(&Value::Bool(true))
+                && items
+                    .iter()
+                    .enumerate()
+                    .any(|(i, a)| items[..i].contains(a))
+            {
+                return Err(at("Items should be unique".to_string()));
+            }
+            let prefix = schema
+                .get("prefixItems")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len);
+            for (i, item) in items.iter().enumerate() {
+                let item_path = format!("{path}[{i}]");
+                let item_schema = if i < prefix {
+                    schema.get("prefixItems").and_then(|p| p.get(i))
+                } else {
+                    schema
+                        .get("items")
+                        .filter(|s| s.is_object() || s.is_boolean())
+                };
+                if let Some(item_schema) = item_schema {
+                    validate_node(root, item_schema, item, &item_path, depth + 1)?;
+                }
+            }
+        }
+        Value::Object(map) => {
+            let properties = schema.get("properties").and_then(Value::as_object);
+            for (key, item) in map {
+                let item_path = if path.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{path}.{key}")
+                };
+                match properties.and_then(|p| p.get(key)) {
+                    Some(property) => validate_node(root, property, item, &item_path, depth + 1)?,
+                    None => {
+                        if let Some(extra) =
+                            schema.get("additionalProperties").filter(|a| a.is_object())
+                        {
+                            validate_node(root, extra, item, &item_path, depth + 1)?;
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn closes_objects_and_requires_all_properties() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "a": {"type": "string"},
+                "b": {"type": "integer", "default": null}
+            }
+        });
+        let strict = ensure_strict_json_schema(&schema).unwrap();
+        assert_eq!(strict["additionalProperties"], false);
+        assert_eq!(strict["required"], serde_json::json!(["a", "b"]));
+        assert!(strict["properties"]["b"].get("default").is_none());
+    }
+
+    #[test]
+    fn inlines_refs_with_siblings_and_converts_one_of() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "loc": {"$ref": "#/$defs/Loc", "description": "where"},
+                "u": {"oneOf": [{"type": "string"}, {"type": "integer"}]}
+            },
+            "$defs": {"Loc": {"type": "object", "properties": {"lat": {"type": "number"}}}}
+        });
+        let strict = ensure_strict_json_schema(&schema).unwrap();
+        let loc = &strict["properties"]["loc"];
+        assert_eq!(loc["type"], "object");
+        assert_eq!(loc["description"], "where");
+        assert_eq!(loc["additionalProperties"], false);
+        assert!(strict["properties"]["u"].get("oneOf").is_none());
+        assert!(strict["properties"]["u"]["anyOf"].is_array());
+    }
+
+    #[test]
+    fn strips_numeric_formats_but_keeps_string_formats() {
+        let schema = serde_json::json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+                "n": {"type": "integer", "format": "uint32", "minimum": 0},
+                "d": {"type": "string", "format": "date-time"},
+                "x": {"type": "string", "format": "binary"}
+            }
+        });
+        let strict = ensure_strict_json_schema(&schema).unwrap();
+        assert!(strict.get("$schema").is_none());
+        assert!(strict["properties"]["n"].get("format").is_none());
+        assert_eq!(strict["properties"]["n"]["minimum"], 0);
+        assert_eq!(strict["properties"]["d"]["format"], "date-time");
+        assert!(strict["properties"]["x"].get("format").is_none());
+    }
+
+    #[test]
+    fn rejects_open_objects() {
+        let schema = serde_json::json!({"type": "object", "additionalProperties": true});
+        assert!(ensure_strict_json_schema(&schema).is_err());
+    }
+
+    #[test]
+    fn open_object_rejection_is_opt_in() {
+        let schema = serde_json::json!({"type": "object", "properties": {}});
+        let closed = ensure_strict_json_schema_with(&schema, false).unwrap();
+        assert_eq!(closed["additionalProperties"], false);
+        let err = ensure_strict_json_schema_with(&schema, true).unwrap_err();
+        assert!(
+            err.to_string().contains("permits undeclared properties"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn open_object_rejection_rejects_preserved_pure_refs() {
+        for (reference, name) in [("#/$defs/value", "value"), ("#/$defs/a%20b", "a b")] {
+            let schema = serde_json::json!({
+                "$defs": {name: {"type": "string"}},
+                "type": "object",
+                "properties": {"value": {"$ref": reference}},
+            });
+            let default = ensure_strict_json_schema_with(&schema, false).unwrap();
+            assert_eq!(
+                default["properties"]["value"],
+                serde_json::json!({"$ref": reference})
+            );
+            let err = ensure_strict_json_schema_with(&schema, true).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("reference whose target was not validated"),
+                "{err}"
+            );
+        }
+    }
+
+    /// A singleton `allOf` reference chain spends the node budget on every hop.
+    #[test]
+    fn a_singleton_all_of_ref_chain_spends_the_node_budget() {
+        let mut schemas = serde_json::Map::new();
+        for i in 0..=MAX_SCHEMA_NODES {
+            schemas.insert(
+                format!("S{i}"),
+                serde_json::json!({"$ref": format!("#/components/schemas/S{}", i + 1)}),
+            );
+        }
+        schemas.insert(
+            format!("S{}", MAX_SCHEMA_NODES + 1),
+            serde_json::json!({"type": "object", "properties": {}}),
+        );
+        let schema = serde_json::json!({
+            "components": {"schemas": schemas},
+            "type": "object",
+            "allOf": [{"$ref": "#/components/schemas/S0"}],
+        });
+        let err = ensure_strict_json_schema(&schema).unwrap_err();
+        assert!(err.to_string().contains("too large"), "{err}");
+    }
+}

@@ -1,0 +1,7 @@
+{
+  "each": {
+    "tripped": true,
+    "error.type": "InputGuardrailTripwireTriggered"
+  },
+  "across": ["tripped", "error.type"]
+}

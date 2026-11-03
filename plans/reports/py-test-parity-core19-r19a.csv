@@ -1,0 +1,11 @@
+path,moved_to_ported,moved_to_covered,remaining_python_only
+tests/test_agent_runner.py,0,0,16
+tests/test_agent_runner_streamed.py,2,0,9
+tests/test_run_impl_resume_paths.py,0,0,8
+tests/test_hitl_error_scenarios.py,0,0,7
+tests/test_handoff_history_duplication.py,0,0,10
+tests/test_run_config.py,0,0,10
+tests/test_result_cast.py,0,0,7
+tests/test_tool_context.py,0,0,7
+tests/test_agent_tool_state.py,0,0,6
+tests/test_agent_config.py,0,0,7

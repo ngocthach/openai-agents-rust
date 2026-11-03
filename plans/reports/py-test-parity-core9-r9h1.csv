@@ -1,0 +1,15 @@
+path,moved_to_ported,moved_to_covered,remaining_python_only
+tests/test_run_state.py,1,0,149
+tests/test_native_tool_failure_history.py,0,0,34
+tests/test_run_impl_resume_paths.py,13,0,11
+tests/test_live_example.py,0,0,16
+tests/test_handoff_history_duplication.py,1,0,12
+tests/test_human_in_the_loop_server_example.py,0,0,13
+tests/test_redis_session_example.py,0,0,8
+tests/test_handoff_failure_error_function.py,0,0,4
+tests/test_items_helpers.py,0,0,4
+tests/test_run_context_wrapper.py,0,0,3
+tests/test_pretty_print.py,0,0,2
+tests/test_process_model_response.py,0,0,2
+tests/test_function_schema_logger_restore.py,0,0,1
+tests/test_provider_span_errors.py,0,0,1

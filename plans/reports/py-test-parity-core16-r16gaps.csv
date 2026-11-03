@@ -1,0 +1,10 @@
+path,moved_to_ported,moved_to_covered,remaining_python_only
+tests/test_doc_parsing.py,2,0,0
+tests/mcp/test_mcp_util.py,2,0,0
+tests/test_tool_approval_call_id_reuse.py,3,0,0
+tests/sandbox/test_session_sinks.py,1,0,0
+tests/sandbox/capabilities/test_apply_patch_tool.py,2,0,0
+tests/extensions/sandbox/test_vercel.py,2,0,0
+tests/realtime/test_openai_realtime.py,1,0,0
+tests/voice/test_openai_stt.py,1,0,0
+tests/test_agent_scoped_approvals.py,0,0,2

@@ -1,0 +1,14 @@
+path,moved_to_ported,moved_to_covered,remaining_python_only
+tests/test_released_api_contract.py,0,0,126
+tests/test_function_tool_decorator.py,0,0,50
+tests/test_function_tool.py,0,0,24
+tests/test_run_config.py,2,4,16
+tests/test_hitl_error_scenarios.py,3,0,12
+tests/test_run_internal_items.py,2,3,8
+tests/test_handoff_tool.py,0,0,6
+tests/test_run_serial_tests.py,0,0,6
+tests/test_guardrails.py,0,0,3
+tests/test_output_tool.py,3,0,0
+tests/test_run_hooks.py,0,0,3
+tests/test_release_please.py,0,0,2
+tests/test_hitl_utils.py,0,0,1

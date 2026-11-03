@@ -1,0 +1,6 @@
+path,moved_to_ported,moved_to_covered,remaining_python_only
+tests/test_run_state.py,29,0,59
+tests/test_run_step_execution.py,12,7,25
+tests/test_agent_scoped_approvals.py,0,0,36
+tests/test_native_tool_failure_history.py,0,0,30
+tests/test_start_hook_tool_concurrency.py,0,0,35

@@ -1,0 +1,4 @@
+path,moved_to_ported,moved_to_covered,remaining_python_only
+tests/sandbox/test_docker_removal.py,62,0,2
+tests/sandbox/test_docker_removal_client.py,14,0,0
+tests/sandbox/test_docker_removal_worker.py,56,0,2

@@ -1,0 +1,10 @@
+{
+  "each": {
+    "error": null,
+    "final_output": "nonempty",
+    "usage.requests": 1,
+    "usage.output_tokens": {"gt": 0},
+    "new_item_types": {"contains": "message_output_item"}
+  },
+  "across": ["error", "usage.requests", "new_item_types_stable", "last_agent"]
+}

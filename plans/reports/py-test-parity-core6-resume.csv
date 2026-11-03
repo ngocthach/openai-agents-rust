@@ -1,0 +1,3 @@
+path,total,ported,covered,python_only,not_ported,rust_files
+tests/test_run_impl_resume_paths.py,198,159,10,24,5,"tests/py_core6_resume_session_append.rs;tests/py_core6_resume_terminal.rs;tests/py_core6_resume_callback_retry.rs;tests/py_core6_resume_callback_guardrail.rs;tests/py_core6_resume_legacy.rs;tests/py_core6_resume_handoff.rs;tests/py_core6_resume_name_fallback.rs;tests/py_core6_resume_compaction.rs;tests/py_core2_runstep_resume.rs"
+tests/test_native_tool_failure_history.py,72,2,0,20,50,tests/py_core2_toolerrors_batch.rs

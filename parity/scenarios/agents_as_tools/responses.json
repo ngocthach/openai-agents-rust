@@ -1,0 +1,32 @@
+[
+  {
+    "when": {"instructions_contains": "You are a translation agent"},
+    "output": [
+      {
+        "type": "function_call",
+        "name": "translate_to_spanish",
+        "arguments": "{\"input\":\"Hello, how are you?\"}"
+      }
+    ]
+  },
+  {
+    "when": {"instructions_contains": "to Spanish"},
+    "output": [
+      {
+        "type": "message",
+        "content": [{"type": "output_text", "text": "Hola, ¿cómo estás?", "annotations": []}]
+      }
+    ]
+  },
+  {
+    "when": {"instructions_contains": "You are a translation agent"},
+    "output": [
+      {
+        "type": "message",
+        "content": [
+          {"type": "output_text", "text": "In Spanish: Hola, ¿cómo estás?", "annotations": []}
+        ]
+      }
+    ]
+  }
+]

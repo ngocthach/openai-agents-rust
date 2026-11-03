@@ -1,0 +1,7 @@
+path,moved_to_ported,moved_to_covered,remaining_python_only
+tests/test_function_tool.py,1,0,-1
+tests/test_handoff_tool.py,1,0,-1
+tests/test_run_step_execution.py,1,0,-1
+tests/test_tool_failure_boundaries.py,2,0,-1
+tests/test_decisions_examples.py,1,0,-1
+tests/test_hitl_error_scenarios.py,0,0,-1

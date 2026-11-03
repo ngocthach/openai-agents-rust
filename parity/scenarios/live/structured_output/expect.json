@@ -1,0 +1,10 @@
+{
+  "each": {
+    "error": null,
+    "final_output_parsed": "nonnull",
+    "final_output_parsed.name": "nonempty",
+    "participants_sorted": ["alice", "bob"],
+    "usage.requests": 1
+  },
+  "across": ["error", "usage.requests", "new_item_types_stable", "participants_sorted"]
+}

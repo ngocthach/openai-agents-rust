@@ -1,0 +1,119 @@
+"""Minimal MCP stdio server (stdlib only) used by the Rust MCP integration test."""
+import json
+import sys
+
+TOOLS = [
+    {
+        "name": "add",
+        "description": "Add two numbers",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"a": {"type": "number"}, "b": {"type": "number"}},
+            "required": ["a", "b"],
+        },
+    },
+    {
+        "name": "danger_delete",
+        "description": "Delete everything",
+        "inputSchema": {"type": "object"},
+    },
+    # No description: the client must fall back to the display title.
+    {
+        "name": "titled_only",
+        "title": "Titled Only",
+        "inputSchema": {"type": "object"},
+    },
+    # Echoes the protocol-level request metadata back as text.
+    {
+        "name": "echo_meta",
+        "description": "Echo the _meta of the request",
+        "inputSchema": {"type": "object"},
+    },
+    # Always returns a JSON-RPC error, so the client's failure formatter is exercised.
+    {
+        "name": "fail",
+        "description": "Always fails",
+        "inputSchema": {"type": "object"},
+    },
+    # Emits a server notification before replying, so message handlers are exercised.
+    {
+        "name": "notify",
+        "description": "Send a notification, then reply",
+        "inputSchema": {"type": "object"},
+    },
+]
+
+RESOURCES = [
+    {"uri": "file:///notes.txt", "name": "notes", "mimeType": "text/plain"},
+]
+
+RESOURCE_TEMPLATES = [
+    {"uriTemplate": "file:///{path}", "name": "any file", "mimeType": "text/plain"},
+]
+
+
+def notify(method, params):
+    payload = {"jsonrpc": "2.0", "method": method, "params": params}
+    sys.stdout.write(json.dumps(payload) + "\n")
+    sys.stdout.flush()
+
+
+def reply(msg_id, result=None, error=None):
+    payload = {"jsonrpc": "2.0", "id": msg_id}
+    if error is not None:
+        payload["error"] = error
+    else:
+        payload["result"] = result
+    sys.stdout.write(json.dumps(payload) + "\n")
+    sys.stdout.flush()
+
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    msg = json.loads(line)
+    method = msg.get("method")
+    msg_id = msg.get("id")
+    if msg_id is None:
+        continue  # notification
+    params = msg.get("params") or {}
+    if method == "initialize":
+        reply(msg_id, {
+            "protocolVersion": params.get("protocolVersion", "2025-06-18"),
+            "capabilities": {"tools": {}, "prompts": {}, "resources": {}},
+            "serverInfo": {"name": "mock", "version": "1.0.0"},
+        })
+    elif method == "tools/list":
+        reply(msg_id, {"tools": TOOLS})
+    elif method == "tools/call":
+        args = params.get("arguments") or {}
+        if params.get("name") == "add":
+            total = args.get("a", 0) + args.get("b", 0)
+            reply(msg_id, {"content": [{"type": "text", "text": str(total)}], "isError": False})
+        elif params.get("name") == "fail":
+            reply(msg_id, error={"code": -32000, "message": "tool exploded"})
+        elif params.get("name") == "notify":
+            notify("notifications/resources/updated", {"uri": "file:///notes.txt"})
+            reply(msg_id, {"content": [{"type": "text", "text": "notified"}], "isError": False})
+        elif params.get("name") == "echo_meta":
+            meta = json.dumps(params.get("_meta") or {}, sort_keys=True)
+            reply(msg_id, {"content": [{"type": "text", "text": meta}], "isError": False})
+        else:
+            reply(msg_id, {"content": [{"type": "text", "text": "deleted"}], "isError": False})
+    elif method == "prompts/list":
+        reply(msg_id, {"prompts": [{"name": "review", "description": "Review code"}]})
+    elif method == "prompts/get":
+        reply(msg_id, {"messages": [{"role": "user", "content": {"type": "text", "text": "Review carefully"}}]})
+    elif method == "resources/list":
+        reply(msg_id, {"resources": RESOURCES})
+    elif method == "resources/templates/list":
+        reply(msg_id, {"resourceTemplates": RESOURCE_TEMPLATES})
+    elif method == "resources/read":
+        reply(msg_id, {"contents": [
+            {"uri": params.get("uri"), "mimeType": "text/plain", "text": "hello resource"},
+        ]})
+    elif method == "ping":
+        reply(msg_id, {})
+    else:
+        reply(msg_id, error={"code": -32601, "message": f"Method not found: {method}"})

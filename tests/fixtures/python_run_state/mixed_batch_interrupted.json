@@ -1,0 +1,502 @@
+{
+  "$schemaVersion": "1.21",
+  "auto_previous_response_id": false,
+  "context": {
+    "approvals": {},
+    "context": null,
+    "context_meta": {
+      "omitted": false,
+      "original_type": "none",
+      "requires_deserializer": false,
+      "serialized_via": "none"
+    },
+    "tool_invocations": {
+      "call_delete_3": {
+        "approval_scope": "1f7953a6d493b5ba202ce0159596ce6f6324ae8f0af83dacc42ea570f1623f18",
+        "completed": false,
+        "executed": false,
+        "fingerprint": "2c2e1289df12dcc7af612784f5be9888261d85a79b69b7549d55013b7125d23d",
+        "type": "function_call"
+      },
+      "call_weather_4": {
+        "approval_scope": "ebfaafc0dd470214bab3421e81676cb703ed4adbebb486804c7298f6ed89cf6a",
+        "completed": true,
+        "executed": true,
+        "fingerprint": "cbe10a4c7582957f7e1968926765d28f3bfaf9ff6f6e321c0bbc66641b3edd94",
+        "type": "function_call"
+      }
+    },
+    "usage": {
+      "input_tokens": 17,
+      "input_tokens_details": [
+        {
+          "cache_write_tokens": 0,
+          "cached_tokens": 0
+        }
+      ],
+      "output_tokens": 12,
+      "output_tokens_details": [
+        {
+          "reasoning_tokens": 0
+        }
+      ],
+      "request_usage_entries": [
+        {
+          "input_tokens": 17,
+          "input_tokens_details": {
+            "cache_write_tokens": 0,
+            "cached_tokens": 0
+          },
+          "output_tokens": 12,
+          "output_tokens_details": {
+            "reasoning_tokens": 0
+          },
+          "total_tokens": 29
+        }
+      ],
+      "requests": 1,
+      "total_tokens": 29
+    }
+  },
+  "conversation_id": null,
+  "current_agent": {
+    "name": "File Agent"
+  },
+  "current_response_generated_item_ownership": {
+    "end": 4,
+    "interruptions": [
+      3
+    ],
+    "start": 0
+  },
+  "current_step": {
+    "data": {
+      "interruptions": [
+        {
+          "agent": {
+            "name": "File Agent"
+          },
+          "raw_item": {
+            "arguments": "{\"path\":\"/tmp/porto.txt\"}",
+            "call_id": "call_delete_3",
+            "id": "fc_delete_3",
+            "name": "delete_file",
+            "type": "function_call"
+          },
+          "tool_lookup_key": {
+            "kind": "bare",
+            "name": "delete_file"
+          },
+          "tool_name": "delete_file",
+          "tool_origin": {
+            "type": "function"
+          },
+          "type": "tool_approval_item"
+        }
+      ],
+      "llm_end_hooks_started": true,
+      "response_accepted": false
+    },
+    "type": "next_step_interruption"
+  },
+  "current_turn": 1,
+  "current_turn_persisted_item_count": 0,
+  "generated_items": [
+    {
+      "agent": {
+        "name": "File Agent"
+      },
+      "description": "Look up the weather for a city.",
+      "raw_item": {
+        "arguments": "{\"city\":\"Porto\"}",
+        "call_id": "call_weather_4",
+        "id": "fc_weather_4",
+        "name": "get_weather",
+        "type": "function_call"
+      },
+      "tool_name": "get_weather",
+      "tool_origin": {
+        "type": "function"
+      },
+      "type": "tool_call_item"
+    },
+    {
+      "agent": {
+        "name": "File Agent"
+      },
+      "description": "Delete a file. Always needs approval.",
+      "raw_item": {
+        "arguments": "{\"path\":\"/tmp/porto.txt\"}",
+        "call_id": "call_delete_3",
+        "id": "fc_delete_3",
+        "name": "delete_file",
+        "type": "function_call"
+      },
+      "tool_name": "delete_file",
+      "tool_origin": {
+        "type": "function"
+      },
+      "type": "tool_call_item"
+    },
+    {
+      "agent": {
+        "name": "File Agent"
+      },
+      "output": "The weather in Porto is sunny.",
+      "raw_item": {
+        "call_id": "call_weather_4",
+        "output": "The weather in Porto is sunny.",
+        "type": "function_call_output"
+      },
+      "tool_origin": {
+        "type": "function"
+      },
+      "type": "tool_call_output_item"
+    },
+    {
+      "agent": {
+        "name": "File Agent"
+      },
+      "raw_item": {
+        "arguments": "{\"path\":\"/tmp/porto.txt\"}",
+        "call_id": "call_delete_3",
+        "id": "fc_delete_3",
+        "name": "delete_file",
+        "type": "function_call"
+      },
+      "tool_lookup_key": {
+        "kind": "bare",
+        "name": "delete_file"
+      },
+      "tool_name": "delete_file",
+      "tool_origin": {
+        "type": "function"
+      },
+      "type": "tool_approval_item"
+    }
+  ],
+  "generated_prompt_cache_key": null,
+  "generated_session_item_indexes": [
+    0,
+    1,
+    2,
+    3
+  ],
+  "input_guardrail_results": [],
+  "last_model_response": {
+    "output": [
+      {
+        "arguments": "{\"city\":\"Porto\"}",
+        "call_id": "call_weather_4",
+        "id": "fc_weather_4",
+        "name": "get_weather",
+        "type": "function_call"
+      },
+      {
+        "arguments": "{\"path\":\"/tmp/porto.txt\"}",
+        "call_id": "call_delete_3",
+        "id": "fc_delete_3",
+        "name": "delete_file",
+        "type": "function_call"
+      }
+    ],
+    "request_id": null,
+    "response_id": "resp_mixed_1",
+    "usage": {
+      "input_tokens": 17,
+      "input_tokens_details": [
+        {
+          "cache_write_tokens": 0,
+          "cached_tokens": 0
+        }
+      ],
+      "output_tokens": 12,
+      "output_tokens_details": [
+        {
+          "reasoning_tokens": 0
+        }
+      ],
+      "request_usage_entries": [],
+      "requests": 1,
+      "total_tokens": 29
+    }
+  },
+  "last_processed_response": {
+    "apply_patch_actions": [],
+    "computer_actions": [],
+    "custom_tool_actions": [],
+    "functions": [
+      {
+        "tool": {
+          "description": "Look up the weather for a city.",
+          "lookupKey": {
+            "kind": "bare",
+            "name": "get_weather"
+          },
+          "name": "get_weather",
+          "paramsJsonSchema": {
+            "additionalProperties": false,
+            "properties": {
+              "city": {
+                "title": "City",
+                "type": "string"
+              }
+            },
+            "required": [
+              "city"
+            ],
+            "title": "get_weather_args",
+            "type": "object"
+          }
+        },
+        "tool_call": {
+          "arguments": "{\"city\":\"Porto\"}",
+          "call_id": "call_weather_4",
+          "id": "fc_weather_4",
+          "name": "get_weather",
+          "type": "function_call"
+        }
+      },
+      {
+        "tool": {
+          "description": "Delete a file. Always needs approval.",
+          "lookupKey": {
+            "kind": "bare",
+            "name": "delete_file"
+          },
+          "name": "delete_file",
+          "paramsJsonSchema": {
+            "additionalProperties": false,
+            "properties": {
+              "path": {
+                "title": "Path",
+                "type": "string"
+              }
+            },
+            "required": [
+              "path"
+            ],
+            "title": "delete_file_args",
+            "type": "object"
+          }
+        },
+        "tool_call": {
+          "arguments": "{\"path\":\"/tmp/porto.txt\"}",
+          "call_id": "call_delete_3",
+          "id": "fc_delete_3",
+          "name": "delete_file",
+          "type": "function_call"
+        }
+      }
+    ],
+    "handoffs": [],
+    "interruptions": [
+      {
+        "agent": {
+          "name": "File Agent"
+        },
+        "raw_item": {
+          "arguments": "{\"path\":\"/tmp/porto.txt\"}",
+          "call_id": "call_delete_3",
+          "id": "fc_delete_3",
+          "name": "delete_file",
+          "type": "function_call"
+        },
+        "tool_lookup_key": {
+          "kind": "bare",
+          "name": "delete_file"
+        },
+        "tool_name": "delete_file",
+        "tool_origin": {
+          "type": "function"
+        },
+        "type": "tool_approval_item"
+      }
+    ],
+    "local_shell_actions": [],
+    "mcp_approval_requests": [],
+    "mcp_tool_bindings": {},
+    "new_items": [
+      {
+        "agent": {
+          "name": "File Agent"
+        },
+        "description": "Look up the weather for a city.",
+        "raw_item": {
+          "arguments": "{\"city\":\"Porto\"}",
+          "call_id": "call_weather_4",
+          "id": "fc_weather_4",
+          "name": "get_weather",
+          "type": "function_call"
+        },
+        "tool_name": "get_weather",
+        "tool_origin": {
+          "type": "function"
+        },
+        "type": "tool_call_item"
+      },
+      {
+        "agent": {
+          "name": "File Agent"
+        },
+        "description": "Delete a file. Always needs approval.",
+        "raw_item": {
+          "arguments": "{\"path\":\"/tmp/porto.txt\"}",
+          "call_id": "call_delete_3",
+          "id": "fc_delete_3",
+          "name": "delete_file",
+          "type": "function_call"
+        },
+        "tool_name": "delete_file",
+        "tool_origin": {
+          "type": "function"
+        },
+        "type": "tool_call_item"
+      }
+    ],
+    "shell_actions": [],
+    "tools_used": [
+      "get_weather",
+      "delete_file"
+    ]
+  },
+  "max_turns": 10,
+  "model_responses": [
+    {
+      "output": [
+        {
+          "arguments": "{\"city\":\"Porto\"}",
+          "call_id": "call_weather_4",
+          "id": "fc_weather_4",
+          "name": "get_weather",
+          "type": "function_call"
+        },
+        {
+          "arguments": "{\"path\":\"/tmp/porto.txt\"}",
+          "call_id": "call_delete_3",
+          "id": "fc_delete_3",
+          "name": "delete_file",
+          "type": "function_call"
+        }
+      ],
+      "request_id": null,
+      "response_id": "resp_mixed_1",
+      "usage": {
+        "input_tokens": 17,
+        "input_tokens_details": [
+          {
+            "cache_write_tokens": 0,
+            "cached_tokens": 0
+          }
+        ],
+        "output_tokens": 12,
+        "output_tokens_details": [
+          {
+            "reasoning_tokens": 0
+          }
+        ],
+        "request_usage_entries": [],
+        "requests": 1,
+        "total_tokens": 29
+      }
+    }
+  ],
+  "nested_history_owned_session_item_refs": [],
+  "no_active_agent_run": true,
+  "original_input": "Weather in Porto, then delete it",
+  "output_guardrail_results": [],
+  "pending_input": [],
+  "previous_response_id": null,
+  "reasoning_item_id_policy": null,
+  "session_items": [
+    {
+      "agent": {
+        "name": "File Agent"
+      },
+      "description": "Look up the weather for a city.",
+      "raw_item": {
+        "arguments": "{\"city\":\"Porto\"}",
+        "call_id": "call_weather_4",
+        "id": "fc_weather_4",
+        "name": "get_weather",
+        "type": "function_call"
+      },
+      "tool_name": "get_weather",
+      "tool_origin": {
+        "type": "function"
+      },
+      "type": "tool_call_item"
+    },
+    {
+      "agent": {
+        "name": "File Agent"
+      },
+      "description": "Delete a file. Always needs approval.",
+      "raw_item": {
+        "arguments": "{\"path\":\"/tmp/porto.txt\"}",
+        "call_id": "call_delete_3",
+        "id": "fc_delete_3",
+        "name": "delete_file",
+        "type": "function_call"
+      },
+      "tool_name": "delete_file",
+      "tool_origin": {
+        "type": "function"
+      },
+      "type": "tool_call_item"
+    },
+    {
+      "agent": {
+        "name": "File Agent"
+      },
+      "output": "The weather in Porto is sunny.",
+      "raw_item": {
+        "call_id": "call_weather_4",
+        "output": "The weather in Porto is sunny.",
+        "type": "function_call_output"
+      },
+      "tool_origin": {
+        "type": "function"
+      },
+      "type": "tool_call_output_item"
+    },
+    {
+      "agent": {
+        "name": "File Agent"
+      },
+      "raw_item": {
+        "arguments": "{\"path\":\"/tmp/porto.txt\"}",
+        "call_id": "call_delete_3",
+        "id": "fc_delete_3",
+        "name": "delete_file",
+        "type": "function_call"
+      },
+      "tool_lookup_key": {
+        "kind": "bare",
+        "name": "delete_file"
+      },
+      "tool_name": "delete_file",
+      "tool_origin": {
+        "type": "function"
+      },
+      "type": "tool_approval_item"
+    }
+  ],
+  "tool_input_guardrail_results": [],
+  "tool_output_guardrail_results": [],
+  "tool_use_tracker": {
+    "File Agent": [
+      "get_weather",
+      "delete_file"
+    ]
+  },
+  "trace": {
+    "group_id": "fixture-group",
+    "id": "trace_0123456789abcdef0123456789abcd",
+    "metadata": {
+      "fixture": "python_run_state"
+    },
+    "object": "trace",
+    "workflow_name": "fixture-workflow"
+  }
+}

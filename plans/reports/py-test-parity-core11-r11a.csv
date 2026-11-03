@@ -1,0 +1,7 @@
+path,moved_to_ported,moved_to_covered,remaining_python_only
+tests/test_handoff_failure_error_function.py,1,0,1
+tests/test_tool_exception_formatter.py,3,0,4
+tests/test_error_logging_redaction.py,2,0,81
+tests/realtime/test_session_approvals.py,1,0,1
+tests/sandbox/test_runtime.py,3,0,51
+tests/test_function_tool_approval_arguments.py,0,0,4

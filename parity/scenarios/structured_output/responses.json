@@ -1,0 +1,16 @@
+[
+  {
+    "output": [
+      {
+        "type": "message",
+        "content": [
+          {
+            "type": "output_text",
+            "text": "{\"name\":\"Science fair\",\"date\":\"Friday\",\"participants\":[\"Alice\",\"Bob\"]}",
+            "annotations": []
+          }
+        ]
+      }
+    ]
+  }
+]

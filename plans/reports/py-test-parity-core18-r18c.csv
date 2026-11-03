@@ -1,0 +1,6 @@
+path,moved_to_ported,moved_to_covered,remaining_python_only
+tests/sandbox/test_compatibility_guards.py,0,2,25
+tests/extensions/sandbox/test_modal.py,2,0,22
+tests/test_scripted_sandbox.py,1,1,22
+tests/sandbox/test_docker.py,0,0,20
+tests/sandbox/test_unix_local_user_file_io.py,16,0,3

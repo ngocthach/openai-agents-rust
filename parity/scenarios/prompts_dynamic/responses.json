@@ -1,0 +1,18 @@
+[
+  {
+    "output": [
+      {
+        "type": "message",
+        "content": [{"type": "output_text", "text": "Functions call themselves.", "annotations": []}]
+      }
+    ]
+  },
+  {
+    "output": [
+      {
+        "type": "message",
+        "content": [{"type": "output_text", "text": "Hello, Sora!", "annotations": []}]
+      }
+    ]
+  }
+]

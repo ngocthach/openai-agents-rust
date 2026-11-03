@@ -1,0 +1,316 @@
+{
+  "$schemaVersion": "1.21",
+  "auto_previous_response_id": false,
+  "context": {
+    "approvals": {},
+    "context": null,
+    "context_meta": {
+      "omitted": false,
+      "original_type": "none",
+      "requires_deserializer": false,
+      "serialized_via": "none"
+    },
+    "tool_invocations": {
+      "call_weather_1": {
+        "approval_scope": "ebfaafc0dd470214bab3421e81676cb703ed4adbebb486804c7298f6ed89cf6a",
+        "completed": true,
+        "executed": true,
+        "fingerprint": "d5dcb7a532b03b844b43bb688e45d9eece371a9f88530c2cf8c23584f6eca2b2",
+        "type": "function_call"
+      }
+    },
+    "usage": {
+      "input_tokens": 30,
+      "input_tokens_details": [
+        {
+          "cache_write_tokens": 0,
+          "cached_tokens": 0
+        }
+      ],
+      "output_tokens": 12,
+      "output_tokens_details": [
+        {
+          "reasoning_tokens": 0
+        }
+      ],
+      "request_usage_entries": [
+        {
+          "input_tokens": 11,
+          "input_tokens_details": {
+            "cache_write_tokens": 0,
+            "cached_tokens": 0
+          },
+          "output_tokens": 7,
+          "output_tokens_details": {
+            "reasoning_tokens": 0
+          },
+          "total_tokens": 18
+        },
+        {
+          "input_tokens": 19,
+          "input_tokens_details": {
+            "cache_write_tokens": 0,
+            "cached_tokens": 0
+          },
+          "output_tokens": 5,
+          "output_tokens_details": {
+            "reasoning_tokens": 0
+          },
+          "total_tokens": 24
+        }
+      ],
+      "requests": 2,
+      "total_tokens": 42
+    }
+  },
+  "conversation_id": null,
+  "current_agent": {
+    "name": "Weather Agent"
+  },
+  "current_step": null,
+  "current_turn": 2,
+  "current_turn_persisted_item_count": 0,
+  "generated_items": [
+    {
+      "agent": {
+        "name": "Weather Agent"
+      },
+      "description": "Look up the weather for a city.",
+      "raw_item": {
+        "arguments": "{\"city\":\"Hanoi\"}",
+        "call_id": "call_weather_1",
+        "id": "fc_weather_1",
+        "name": "get_weather",
+        "type": "function_call"
+      },
+      "tool_name": "get_weather",
+      "tool_origin": {
+        "type": "function"
+      },
+      "type": "tool_call_item"
+    },
+    {
+      "agent": {
+        "name": "Weather Agent"
+      },
+      "output": "The weather in Hanoi is sunny.",
+      "raw_item": {
+        "call_id": "call_weather_1",
+        "output": "The weather in Hanoi is sunny.",
+        "type": "function_call_output"
+      },
+      "tool_origin": {
+        "type": "function"
+      },
+      "type": "tool_call_output_item"
+    },
+    {
+      "agent": {
+        "name": "Weather Agent"
+      },
+      "raw_item": {
+        "content": [
+          {
+            "annotations": [],
+            "logprobs": [],
+            "text": "It is sunny in Hanoi.",
+            "type": "output_text"
+          }
+        ],
+        "id": "msg_completed_1",
+        "role": "assistant",
+        "status": "completed",
+        "type": "message"
+      },
+      "type": "message_output_item"
+    }
+  ],
+  "generated_prompt_cache_key": null,
+  "generated_session_item_indexes": [
+    0,
+    1,
+    2
+  ],
+  "input_guardrail_results": [],
+  "last_model_response": {
+    "output": [
+      {
+        "content": [
+          {
+            "annotations": [],
+            "logprobs": [],
+            "text": "It is sunny in Hanoi.",
+            "type": "output_text"
+          }
+        ],
+        "id": "msg_completed_1",
+        "role": "assistant",
+        "status": "completed",
+        "type": "message"
+      }
+    ],
+    "request_id": null,
+    "response_id": "resp_completed_2",
+    "usage": {
+      "input_tokens": 19,
+      "input_tokens_details": [
+        {
+          "cache_write_tokens": 0,
+          "cached_tokens": 0
+        }
+      ],
+      "output_tokens": 5,
+      "output_tokens_details": [
+        {
+          "reasoning_tokens": 0
+        }
+      ],
+      "request_usage_entries": [],
+      "requests": 1,
+      "total_tokens": 24
+    }
+  },
+  "last_processed_response": null,
+  "max_turns": 10,
+  "model_responses": [
+    {
+      "output": [
+        {
+          "arguments": "{\"city\":\"Hanoi\"}",
+          "call_id": "call_weather_1",
+          "id": "fc_weather_1",
+          "name": "get_weather",
+          "type": "function_call"
+        }
+      ],
+      "request_id": null,
+      "response_id": "resp_completed_1",
+      "usage": {
+        "input_tokens": 11,
+        "input_tokens_details": [
+          {
+            "cache_write_tokens": 0,
+            "cached_tokens": 0
+          }
+        ],
+        "output_tokens": 7,
+        "output_tokens_details": [
+          {
+            "reasoning_tokens": 0
+          }
+        ],
+        "request_usage_entries": [],
+        "requests": 1,
+        "total_tokens": 18
+      }
+    },
+    {
+      "output": [
+        {
+          "content": [
+            {
+              "annotations": [],
+              "logprobs": [],
+              "text": "It is sunny in Hanoi.",
+              "type": "output_text"
+            }
+          ],
+          "id": "msg_completed_1",
+          "role": "assistant",
+          "status": "completed",
+          "type": "message"
+        }
+      ],
+      "request_id": null,
+      "response_id": "resp_completed_2",
+      "usage": {
+        "input_tokens": 19,
+        "input_tokens_details": [
+          {
+            "cache_write_tokens": 0,
+            "cached_tokens": 0
+          }
+        ],
+        "output_tokens": 5,
+        "output_tokens_details": [
+          {
+            "reasoning_tokens": 0
+          }
+        ],
+        "request_usage_entries": [],
+        "requests": 1,
+        "total_tokens": 24
+      }
+    }
+  ],
+  "nested_history_owned_session_item_refs": [],
+  "no_active_agent_run": true,
+  "original_input": "What is the weather in Hanoi?",
+  "output_guardrail_results": [],
+  "pending_input": [],
+  "previous_response_id": null,
+  "reasoning_item_id_policy": null,
+  "session_items": [
+    {
+      "agent": {
+        "name": "Weather Agent"
+      },
+      "description": "Look up the weather for a city.",
+      "raw_item": {
+        "arguments": "{\"city\":\"Hanoi\"}",
+        "call_id": "call_weather_1",
+        "id": "fc_weather_1",
+        "name": "get_weather",
+        "type": "function_call"
+      },
+      "tool_name": "get_weather",
+      "tool_origin": {
+        "type": "function"
+      },
+      "type": "tool_call_item"
+    },
+    {
+      "agent": {
+        "name": "Weather Agent"
+      },
+      "output": "The weather in Hanoi is sunny.",
+      "raw_item": {
+        "call_id": "call_weather_1",
+        "output": "The weather in Hanoi is sunny.",
+        "type": "function_call_output"
+      },
+      "tool_origin": {
+        "type": "function"
+      },
+      "type": "tool_call_output_item"
+    },
+    {
+      "agent": {
+        "name": "Weather Agent"
+      },
+      "raw_item": {
+        "content": [
+          {
+            "annotations": [],
+            "logprobs": [],
+            "text": "It is sunny in Hanoi.",
+            "type": "output_text"
+          }
+        ],
+        "id": "msg_completed_1",
+        "role": "assistant",
+        "status": "completed",
+        "type": "message"
+      },
+      "type": "message_output_item"
+    }
+  ],
+  "tool_input_guardrail_results": [],
+  "tool_output_guardrail_results": [],
+  "tool_use_tracker": {
+    "Weather Agent": [
+      "get_weather"
+    ]
+  },
+  "trace": null
+}

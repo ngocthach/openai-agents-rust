@@ -1,0 +1,6 @@
+path,moved_to_ported,moved_to_covered,remaining_python_only
+tests/memory/test_session_context_wrapper.py,2,0,5
+tests/test_agent_runner.py,10,1,32
+tests/sandbox/test_runtime.py,10,0,66
+tests/test_agent_scoped_approvals.py,8,0,40
+tests/test_run_state.py,2,0,148

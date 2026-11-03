@@ -1,0 +1,10 @@
+{
+  "each": {
+    "error": null,
+    "stream_event_types.first": "agent_updated:Joker",
+    "stream_event_types": {"contains": "raw:response.completed"},
+    "stream_item_events": {"contains": "item:tool_output"},
+    "usage.requests": 2
+  },
+  "across": ["error", "stream_item_events_stable", "usage.requests", "new_item_types_stable"]
+}

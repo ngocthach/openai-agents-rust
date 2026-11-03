@@ -1,0 +1,5 @@
+path,moved_to_ported,moved_to_covered,remaining_python_only
+tests/test_config.py,2,0,-1
+tests/voice/test_openai_model_provider.py,5,0,-1
+tests/memory/test_compaction_suffix.py,1,0,-1
+tests/test_agent_scoped_approvals.py,8,0,-1

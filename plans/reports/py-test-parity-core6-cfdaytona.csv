@@ -1,0 +1,5 @@
+path,total,ported,covered,python_only,not_ported,rust_files
+tests/extensions/sandbox/test_cloudflare.py,96,84,1,11,0,tests/py_sandbox_cloudflare.rs; tests/py_core6_cfdaytona_cloudflare.rs; tests/py_core6_cfdaytona_cloudflare_sse.rs; tests/py_core6_cfdaytona_paths.rs; src/extensions/sandbox/cloudflare/sse.rs
+tests/extensions/sandbox/test_e2b.py,80,49,8,23,0,tests/py_sandbox_e2b.rs; tests/py_core6_cfdaytona_paths.rs; tests/py_core6_cfdaytona_e2b.rs; tests/py_sandbox_b_mount_lifecycle.rs; tests/py_sandbox_a_runtime_2.rs; tests/py_sandbox_b_pty.rs
+tests/extensions/sandbox/test_daytona.py,72,62,4,6,0,tests/py_sandbox_daytona.rs; tests/py_core6_cfdaytona_paths.rs; tests/py_core6_cfdaytona_daytona.rs; tests/py_sandbox_b_mount_lifecycle.rs; tests/py_sandbox_a_runtime_2.rs
+tests/extensions/sandbox/test_rclone.py,15,15,0,0,0,tests/py_sandbox_rclone_mounts.rs

@@ -1,0 +1,10 @@
+{
+  "each": {
+    "error": null,
+    "interruptions": [1, 0],
+    "tool_runs": 1,
+    "tool_calls.names": ["get_temperature"],
+    "usage.requests": 2
+  },
+  "across": ["error", "interruptions", "tool_runs", "tool_calls.names", "usage.requests"]
+}

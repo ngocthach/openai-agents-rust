@@ -1,0 +1,9 @@
+{
+  "*": {
+    "/headers/user-agent": "SDK identity: Agents/Python vs the Rust crate name and version",
+    "/headers/x-stainless-*": "SDK identity: the Python openai client's build metadata"
+  },
+  "function_tools": {
+    "/body/input/*/output": "The tool returns an object: Python sends str(result) (pydantic repr), Rust sends it as JSON; both are opaque strings to the API"
+  }
+}

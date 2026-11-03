@@ -1,0 +1,1126 @@
+//! Function tool execution: approvals, tool guardrails, hooks, timeouts and error handling.
+
+use std::collections::BTreeSet;
+use std::sync::Arc;
+
+use futures::StreamExt;
+use serde_json::{Value, json};
+
+use crate::agent::Agent;
+use crate::error::{AgentsError, Result};
+use crate::items::{FunctionCall, ItemHelpers, ToolApprovalItem};
+use crate::lifecycle::RunHooks;
+use crate::run_config::{RunConfig, ToolErrorFormatterArgs, ToolErrorKind};
+use crate::run_context::RunContext;
+use crate::tool::{
+    DEFAULT_APPROVAL_REJECTION_MESSAGE, FunctionTool, Tool, ToolOrigin, ToolOutput,
+    ToolTimeoutBehavior,
+};
+use crate::tool_context::ToolContext;
+use crate::tool_guardrails::{
+    ToolGuardrailBehavior, ToolInputGuardrailData, ToolInputGuardrailResult,
+    ToolOutputGuardrailData, ToolOutputGuardrailResult,
+};
+use crate::tracing::{SpanData, create_span, scope};
+
+/// Shared inputs for executing tools in one turn.
+pub(crate) struct ToolEnv<'a, C> {
+    pub ctx: &'a RunContext<C>,
+    pub agent: &'a Arc<Agent<C>>,
+    /// The agent's identity key: its name, or `name#N` when several agents of the graph share
+    /// it. Approval decisions are owned by this key.
+    pub agent_key: &'a str,
+    /// Decisions recorded under the bare agent name also apply to a same-named agent whose
+    /// key differs (a pre-1.7 snapshot named owners by name only).
+    pub name_owner_fallback: bool,
+    pub hooks: Option<&'a Arc<dyn RunHooks<C>>>,
+    pub config: &'a Arc<RunConfig<C>>,
+    /// Call ids whose restored approval decision authorizes nothing; see
+    /// [`bound_approval_status`].
+    pub unbound_approvals: &'a BTreeSet<String>,
+    /// Call ids pending in the resumed snapshot; see `resumed_pending_approvals`.
+    pub pending_approvals: &'a BTreeSet<String>,
+}
+
+/// An owned copy of a [`ToolEnv`], so a function tool call can outlive the batch that started
+/// it: a call abandoned in its post-invoke phase keeps running on its own task.
+struct OwnedToolEnv<C> {
+    ctx: RunContext<C>,
+    agent: Arc<Agent<C>>,
+    agent_key: String,
+    name_owner_fallback: bool,
+    hooks: Option<Arc<dyn RunHooks<C>>>,
+    config: Arc<RunConfig<C>>,
+    unbound_approvals: BTreeSet<String>,
+    pending_approvals: BTreeSet<String>,
+}
+
+impl<C> OwnedToolEnv<C> {
+    fn from_env(env: &ToolEnv<'_, C>) -> Self {
+        OwnedToolEnv {
+            ctx: env.ctx.clone(),
+            agent: env.agent.clone(),
+            agent_key: env.agent_key.to_string(),
+            name_owner_fallback: env.name_owner_fallback,
+            hooks: env.hooks.cloned(),
+            config: env.config.clone(),
+            unbound_approvals: env.unbound_approvals.clone(),
+            pending_approvals: env.pending_approvals.clone(),
+        }
+    }
+
+    fn as_env(&self) -> ToolEnv<'_, C> {
+        ToolEnv {
+            ctx: &self.ctx,
+            agent: &self.agent,
+            agent_key: &self.agent_key,
+            name_owner_fallback: self.name_owner_fallback,
+            hooks: self.hooks.as_ref(),
+            config: &self.config,
+            unbound_approvals: &self.unbound_approvals,
+            pending_approvals: &self.pending_approvals,
+        }
+    }
+}
+
+/// A one-way latch that tasks can wait on: set once, observed by any number of waiters.
+pub(crate) struct Signal(tokio::sync::watch::Sender<bool>);
+
+impl Signal {
+    pub(crate) fn new() -> Self {
+        Signal(tokio::sync::watch::channel(false).0)
+    }
+
+    pub(crate) fn set(&self) {
+        self.0.send_replace(true);
+    }
+
+    pub(crate) fn is_set(&self) -> bool {
+        *self.0.borrow()
+    }
+
+    /// Resolves once the signal is set (immediately when it already is).
+    pub(crate) async fn wait(&self) {
+        let mut rx = self.0.subscribe();
+        let _ = rx.wait_for(|set| *set).await;
+    }
+}
+
+/// How long a tool that already ran may keep finalizing after a sibling failed.
+pub(crate) fn post_invoke_wait<C>(config: &RunConfig<C>) -> std::time::Duration {
+    config
+        .tool_post_invoke_wait
+        .unwrap_or(std::time::Duration::from_millis(100))
+}
+
+/// Per-call state shared between a running function tool and its batch.
+pub(crate) struct FunctionTaskCtl {
+    /// The tool body returned: from here on the call finalizes its output instead of being
+    /// cancelled when a sibling fails.
+    post_invoke: std::sync::atomic::AtomicBool,
+    /// Output committed before the end hooks, kept if the call is abandoned during them.
+    committed: std::sync::Mutex<Option<ToolExecResult>>,
+    cancel: Signal,
+}
+
+impl FunctionTaskCtl {
+    fn new() -> Self {
+        FunctionTaskCtl {
+            post_invoke: std::sync::atomic::AtomicBool::new(false),
+            committed: std::sync::Mutex::new(None),
+            cancel: Signal::new(),
+        }
+    }
+
+    fn in_post_invoke(&self) -> bool {
+        self.post_invoke.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn enter_post_invoke(&self) {
+        self.post_invoke
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn commit(&self, result: ToolExecResult) {
+        *self.committed.lock().expect("commit slot") = Some(result);
+    }
+
+    fn take_committed(&self) -> Option<ToolExecResult> {
+        self.committed.lock().expect("commit slot").take()
+    }
+}
+
+/// The approval decision in force for `call_id`, honouring the restored binding rule.
+///
+/// Port of the `_restored_unbound_approval_call_ids` branch of
+/// `RunContextWrapper._tool_invocation_status`: a decision restored from a snapshot that holds
+/// no ledger entry binding it to a concrete invocation authorizes nothing, so the call reads as
+/// undecided and goes back to the user for a fresh decision.
+pub(crate) fn bound_approval_status<C>(
+    ctx: &RunContext<C>,
+    unbound: &BTreeSet<String>,
+    agent: &str,
+    tool_name: &str,
+    call_id: &str,
+) -> Option<bool> {
+    if unbound.contains(call_id) {
+        return None;
+    }
+    ctx.is_tool_approved(agent, tool_name, call_id)
+}
+
+/// The outcome of one function tool call.
+pub(crate) enum ToolOutcome {
+    /// The tool produced output (or a model-visible error message).
+    Output { output: ToolOutput, item: Value },
+    /// The call needs approval (possibly several, from a nested agent run).
+    Interruptions(Vec<ToolApprovalItem>),
+}
+
+/// A tool call that failed, possibly after its output was already committed.
+///
+/// The output of a tool whose body succeeded is committed before the post-output step (the
+/// custom-data merge) runs, so a failure there still hands back the output: a retry skips the
+/// completed invocation instead of running the tool again.
+pub(crate) struct ToolFailure {
+    pub error: AgentsError,
+    pub committed: Option<ToolExecResult>,
+    /// The committed output is part of the public history even though the call failed: set when
+    /// an end hook failed after the output passed its guardrails, as in Python. Otherwise a
+    /// failure after the output (a custom data merge) keeps it out of the public view.
+    pub output_is_public: bool,
+}
+
+impl From<AgentsError> for ToolFailure {
+    fn from(error: AgentsError) -> Self {
+        ToolFailure {
+            error,
+            committed: None,
+            output_is_public: false,
+        }
+    }
+}
+
+/// A batch of tool calls that failed, with the outputs that completed before the failure in
+/// model call order.
+pub(crate) struct ToolBatchFailure {
+    pub error: AgentsError,
+    pub completed: Vec<ToolExecResult>,
+    /// Whether the selected failure's own output was committed before it failed (a
+    /// post-output step), rather than the call failing without output.
+    pub failure_committed: bool,
+    /// The batch was stopped because another tool category failed; `error` is a placeholder.
+    pub sibling_stopped: bool,
+}
+
+/// Result of executing one tool call.
+pub(crate) struct ToolExecResult {
+    pub call: FunctionCall,
+    pub tool_name: String,
+    pub qualified_tool_name: String,
+    pub custom_data: Option<Value>,
+    /// Where the tool came from, attached to the output and approval items it produces.
+    pub tool_origin: ToolOrigin,
+    pub outcome: ToolOutcome,
+    pub input_guardrail_results: Vec<ToolInputGuardrailResult>,
+    pub output_guardrail_results: Vec<ToolOutputGuardrailResult>,
+}
+
+async fn format_tool_error<C>(
+    config: &RunConfig<C>,
+    ctx: &RunContext<C>,
+    kind: ToolErrorKind,
+    tool_name: &str,
+    call_id: &str,
+    default_message: String,
+) -> String {
+    format_tool_error_for(
+        config,
+        ctx,
+        kind,
+        "function",
+        tool_name,
+        call_id,
+        default_message,
+        None,
+    )
+    .await
+}
+
+/// Apply the run's tool error formatter for a tool of the given runtime type.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn format_tool_error_for<C>(
+    config: &RunConfig<C>,
+    ctx: &RunContext<C>,
+    kind: ToolErrorKind,
+    tool_type: &str,
+    tool_name: &str,
+    call_id: &str,
+    default_message: String,
+    error: Option<&AgentsError>,
+) -> String {
+    if let Some(f) = &config.tool_error_formatter {
+        let args = ToolErrorFormatterArgs {
+            kind,
+            tool_type: tool_type.into(),
+            tool_name: tool_name.to_string(),
+            call_id: call_id.to_string(),
+            default_message: default_message.clone(),
+            run_context: ctx,
+            error,
+        };
+        if let Some(m) = crate::run_config::apply_tool_error_formatter(f, &args).await {
+            return m;
+        }
+    }
+    default_message
+}
+
+/// Model-visible output for a tool the model called but the agent does not have.
+pub(crate) async fn tool_not_found_message<C>(
+    config: &RunConfig<C>,
+    ctx: &RunContext<C>,
+    name: &str,
+    call_id: &str,
+) -> String {
+    format_tool_error(
+        config,
+        ctx,
+        ToolErrorKind::ToolNotFound,
+        name,
+        call_id,
+        format!("Tool '{name}' not found."),
+    )
+    .await
+}
+
+fn output_outcome(call: &FunctionCall, output: ToolOutput) -> ToolOutcome {
+    let item = ItemHelpers::tool_call_output_item(call, &output);
+    ToolOutcome::Output { output, item }
+}
+
+/// An SDK-generated error for a call (a rejection, a guardrail verdict or a default failure
+/// message). A schema-backed tool that a program called answers with `{"error": text}`, so the
+/// program can parse the result; the run item keeps the plain text. Port of
+/// `function_tool_error_output`.
+fn error_outcome(
+    output_json_schema: Option<&Value>,
+    call: &FunctionCall,
+    text: String,
+) -> ToolOutcome {
+    let called_by_program = call
+        .extra
+        .get("caller")
+        .and_then(|c| c.get("type"))
+        .and_then(Value::as_str)
+        == Some("program");
+    let provider_text = if output_json_schema.is_some() && called_by_program {
+        json!({"error": text}).to_string()
+    } else {
+        text.clone()
+    };
+    ToolOutcome::Output {
+        output: ToolOutput::Text(text),
+        item: ItemHelpers::tool_call_output_item(call, &ToolOutput::Text(provider_text)),
+    }
+}
+
+enum InputGuardrailVerdict {
+    Allow,
+    Reject(String),
+}
+
+async fn run_input_guardrails<C: Send + Sync + 'static>(
+    env: &ToolEnv<'_, C>,
+    tool: &FunctionTool<C>,
+    tool_ctx: &ToolContext<C>,
+    results: &mut Vec<ToolInputGuardrailResult>,
+) -> Result<InputGuardrailVerdict> {
+    for g in &tool.tool_input_guardrails {
+        let out = g
+            .run(ToolInputGuardrailData {
+                context: tool_ctx.clone(),
+                agent_name: env.agent.name.clone(),
+            })
+            .await?;
+        results.push(ToolInputGuardrailResult {
+            guardrail_name: g.name.clone(),
+            tool_name: tool.name.clone(),
+            output: out.clone(),
+        });
+        match &out.behavior {
+            ToolGuardrailBehavior::Allow => {}
+            ToolGuardrailBehavior::RejectContent { message } => {
+                return Ok(InputGuardrailVerdict::Reject(message.clone()));
+            }
+            ToolGuardrailBehavior::RaiseException => {
+                return Err(AgentsError::ToolInputGuardrailTripwireTriggered {
+                    guardrail_name: g.name.clone(),
+                    output: Box::new(out),
+                    run_data: None,
+                });
+            }
+        }
+    }
+    Ok(InputGuardrailVerdict::Allow)
+}
+
+/// Execute one function tool call.
+pub(crate) async fn execute_function_tool<C: Send + Sync + 'static>(
+    env: &ToolEnv<'_, C>,
+    call: FunctionCall,
+    tool: Arc<FunctionTool<C>>,
+    ctl: &FunctionTaskCtl,
+) -> std::result::Result<ToolExecResult, ToolFailure> {
+    let mut input_results = Vec::new();
+    let mut output_results = Vec::new();
+    let tool_ctx = ToolContext::from_call(env.ctx.clone(), &env.agent.name, &call)
+        .with_namespace(tool.namespace.clone().or_else(|| {
+            // A deferred top-level tool loaded by tool search is called under its synthetic
+            // `name` namespace, which the tool context reports as Python does.
+            call.extra
+                .get("namespace")
+                .and_then(serde_json::Value::as_str)
+                .filter(|ns| tool.defer_loading && *ns == tool.name)
+                .map(str::to_string)
+        }))
+        .with_agent(env.agent.clone())
+        .with_run_config(env.config.clone());
+    let finish = |outcome: ToolOutcome, i: Vec<_>, o: Vec<_>| ToolExecResult {
+        call: call.clone(),
+        tool_name: tool.name.clone(),
+        qualified_tool_name: tool.qualified_name(),
+        custom_data: None,
+        tool_origin: tool.tool_origin(),
+        outcome,
+        input_guardrail_results: i,
+        output_guardrail_results: o,
+    };
+
+    // Approvals are keyed by the qualified name so namespaced tools never collide.
+    let approval_name = tool.qualified_name();
+    // Decisions are recorded under the invocation-scoped key (`apply_patch:function_call` for a
+    // function tool named `apply_patch`), so they are read back under the same key.
+    let approval_key = crate::run_context::approval_tool_key(&approval_name, &call);
+    // A decision bound to a capability authorizes only the tool it was taken for: the same
+    // agent (not a clone) exposing a tool with the same name, namespace, description, schema
+    // and origin.
+    // A stand-in for a resumed call whose tool is gone answers with the decision taken on the
+    // original tool, so it is matched against the capability that interruption registered.
+    let capability = tool
+        .resumes_registered_capability
+        .then(|| env.ctx.registered_capability(&call.call_id))
+        .flatten()
+        .unwrap_or_else(|| crate::run_context::owned_capability(env.agent, &tool));
+    // A restored decision that no ledger entry binds authorizes nothing; see
+    // [`bound_approval_status`].
+    let status_now = || {
+        if env.unbound_approvals.contains(&call.call_id) {
+            return None;
+        }
+        let mut status = env.ctx.function_tool_status(
+            env.agent_key,
+            &approval_key,
+            &call.call_id,
+            Some(&capability),
+        );
+        if status.approved.is_none() && env.name_owner_fallback && env.agent_key != env.agent.name {
+            status = env.ctx.function_tool_status(
+                &env.agent.name,
+                &approval_key,
+                &call.call_id,
+                Some(&capability),
+            );
+        }
+        status.approved
+    };
+    // A recorded decision wins: the policy runs only for an undecided call, so a resumed call
+    // never re-runs it and a rejection holds whatever the policy would say. A decision recorded
+    // while the policy ran is read again afterwards. Mirrors `_maybe_execute_tool_approval`.
+    let mut status = status_now();
+    let mut gated = status.is_some();
+    if status.is_none() {
+        // A call still pending from the resumed snapshot requires approval as it did.
+        let needs_approval = env.pending_approvals.contains(&call.call_id)
+            || tool
+                .try_evaluate_needs_approval(env.ctx, &call.arguments, &call.call_id)
+                .await?;
+        status = status_now();
+        gated = needs_approval || status.is_some();
+    }
+    if gated {
+        // The guardrails vet a call before it is offered for approval. Once an approval
+        // decision exists they run with the invocation instead, so a resumed run does not
+        // run them a second time. A decision recorded while they ran wins over their verdict.
+        if status.is_none() && env.config.tool_execution.pre_approval_tool_input_guardrails {
+            let verdict = run_input_guardrails(env, &tool, &tool_ctx, &mut input_results).await?;
+            status = status_now();
+            if let (None, InputGuardrailVerdict::Reject(msg)) = (status, verdict) {
+                return Ok(finish(
+                    error_outcome(tool.output_json_schema.as_ref(), &call, msg),
+                    input_results,
+                    output_results,
+                ));
+            }
+        }
+        match status {
+            None => {
+                env.ctx.register_approval_capability(
+                    &call.call_id,
+                    crate::run_context::ApprovalCapability {
+                        agent: env.agent_key.to_string(),
+                        tool_key: approval_key.clone(),
+                        fingerprint: capability.clone(),
+                    },
+                );
+                let item = ToolApprovalItem {
+                    agent: env.agent_key.to_string(),
+                    raw_item: call.clone(),
+                    tool_name: approval_name.clone(),
+                    tool_origin: Some(tool.tool_origin()),
+                };
+                return Ok(finish(
+                    ToolOutcome::Interruptions(vec![item]),
+                    input_results,
+                    output_results,
+                ));
+            }
+            Some(false) => {
+                let mut decided = env.ctx.function_tool_status(
+                    env.agent_key,
+                    &approval_key,
+                    &call.call_id,
+                    Some(&capability),
+                );
+                if decided.approved.is_none() && env.name_owner_fallback {
+                    decided = env.ctx.function_tool_status(
+                        &env.agent.name,
+                        &approval_key,
+                        &call.call_id,
+                        Some(&capability),
+                    );
+                }
+                let message = match decided.rejection_message {
+                    Some(message) => message,
+                    None => {
+                        format_tool_error(
+                            env.config,
+                            env.ctx,
+                            ToolErrorKind::ApprovalRejected,
+                            &tool.name,
+                            &call.call_id,
+                            DEFAULT_APPROVAL_REJECTION_MESSAGE.to_string(),
+                        )
+                        .await
+                    }
+                };
+                let span = create_span(
+                    SpanData::Function {
+                        name: tool.qualified_name(),
+                        input: None,
+                        output: None,
+                        mcp_data: None,
+                    },
+                    None,
+                    false,
+                );
+                span.start();
+                // The rejection message is app-supplied text, so it reaches the span under the
+                // sensitive-data gate. Port of `_execute_single_tool`'s rejection span.
+                let include = env.config.trace_include_sensitive_data;
+                if include {
+                    span.update_data(|d| {
+                        if let SpanData::Function { output, .. } = d {
+                            *output = Some(message.clone());
+                        }
+                    });
+                }
+                span.set_error(
+                    if include {
+                        message.clone()
+                    } else {
+                        "Tool execution rejected".to_string()
+                    },
+                    Some(serde_json::json!({
+                        "tool_name": tool.name,
+                        "error": format!(
+                            "Tool execution for {} was manually rejected by user.",
+                            call.call_id
+                        ),
+                    })),
+                );
+                span.finish();
+                return Ok(finish(
+                    error_outcome(tool.output_json_schema.as_ref(), &call, message),
+                    input_results,
+                    output_results,
+                ));
+            }
+            Some(true) => {}
+        }
+    }
+
+    let include = env.config.trace_include_sensitive_data;
+    let span = create_span(
+        SpanData::Function {
+            name: tool.qualified_name(),
+            input: if include {
+                Some(call.arguments.clone())
+            } else {
+                None
+            },
+            output: None,
+            mcp_data: tool.mcp_server_name().map(|s| json!({"server": s})),
+        },
+        None,
+        false,
+    );
+    span.start();
+    // Resuming a nested agent run re-enters only that run: the outer call's input guardrails
+    // and start hooks already ran when it first started.
+    let continues_nested_run =
+        tool.is_agent_tool && env.ctx.nested_states().contains_key(&call.call_id);
+    let run = async {
+        if !continues_nested_run
+            && let InputGuardrailVerdict::Reject(msg) =
+                run_input_guardrails(env, &tool, &tool_ctx, &mut input_results).await?
+        {
+            return Ok(error_outcome(tool.output_json_schema.as_ref(), &call, msg));
+        }
+        let tool_enum = Tool::Function(tool.clone());
+        // From here on user code runs: a retry must not run it again. A call that only resumes
+        // a nested agent run is exempt: the nested run keeps its own committed progress, so a
+        // retry of the outer call resumes it instead of repeating anything.
+        if !continues_nested_run {
+            env.ctx.mark_invocation_executed(&call.call_id);
+            let run_hook = async {
+                match env.hooks {
+                    Some(h) => h.try_on_tool_start(&tool_ctx, env.agent, &tool_enum).await,
+                    None => Ok(()),
+                }
+            };
+            let agent_hook = async {
+                match &env.agent.hooks {
+                    Some(h) => h.try_on_tool_start(&tool_ctx, env.agent, &tool_enum).await,
+                    None => Ok(()),
+                }
+            };
+            // Both hook sets run, and the first failure (run hooks first) fails the call.
+            let (run_hook, agent_hook) = futures::join!(run_hook, agent_hook);
+            run_hook?;
+            agent_hook?;
+        }
+
+        // A failure or timeout that the tool's error function turned into model text is not the
+        // tool's own output, so the declared output type does not apply to it.
+        let mut formatted_failure = false;
+        let mut output_rejected = false;
+        // The text is the SDK's own (a default failure or timeout message), not the tool's.
+        let mut sdk_generated_text = false;
+        let invocation = tool.invoke_body(tool_ctx.clone(), call.arguments.clone());
+        let result = match tool.timeout {
+            Some(d) => match tokio::time::timeout(d, invocation).await {
+                Ok(r) => r,
+                Err(_) => {
+                    let err = AgentsError::ToolTimeoutError {
+                        tool_name: tool.name.clone(),
+                        timeout_seconds: d.as_secs_f64(),
+                        run_data: None,
+                    };
+                    match tool.timeout_behavior {
+                        ToolTimeoutBehavior::RaiseException => return Err(err),
+                        ToolTimeoutBehavior::ErrorAsResult => {
+                            formatted_failure = true;
+                            let msg = match &tool.timeout_error_function {
+                                Some(f) => f(env.ctx, &err).await?,
+                                None => {
+                                    sdk_generated_text = true;
+                                    format!(
+                                        "Tool '{}' timed out after {} seconds.",
+                                        tool.name,
+                                        d.as_secs_f64()
+                                    )
+                                }
+                            };
+                            Ok(ToolOutput::Text(msg))
+                        }
+                    }
+                }
+            },
+            None => invocation.await,
+        };
+        ctl.enter_post_invoke();
+
+        if let Some(nested) = env.ctx.take_nested_interruptions(&call.call_id) {
+            // A nested run parked on an approval resumes later; the call has not finished.
+            env.ctx.mark_invocation_completed(&call.call_id);
+            return Ok(ToolOutcome::Interruptions(nested));
+        }
+
+        let mut output = match result {
+            Ok(o) => o,
+            Err(e) => {
+                formatted_failure = true;
+                let propagate = matches!(
+                    e,
+                    AgentsError::InputGuardrailTripwireTriggered { .. }
+                        | AgentsError::OutputGuardrailTripwireTriggered { .. }
+                        | AgentsError::ToolInputGuardrailTripwireTriggered { .. }
+                        | AgentsError::ToolOutputGuardrailTripwireTriggered { .. }
+                );
+                // A hosted program needs the declared structured output, so the default
+                // message must not stand in for it. Port of
+                // `resolve_function_tool_failure_error_function`.
+                let propagate = propagate
+                    || (tool.uses_default_failure_error_function
+                        && tool.output_json_schema.is_some()
+                        && !matches!(e, AgentsError::ToolTimeoutError { .. })
+                        && call
+                            .extra
+                            .get("caller")
+                            .and_then(|c| c.get("type"))
+                            .and_then(Value::as_str)
+                            == Some("program"));
+                match (&tool.failure_error_function, propagate) {
+                    (Some(f), false) => {
+                        let mut msg = f(env.ctx, &e).await?;
+                        if tool.uses_default_failure_error_function
+                            && !matches!(e, AgentsError::MCPToolCancellationError { .. })
+                        {
+                            // Keep the default failure policy identity: approving model
+                            // feedback must not opt the original error into handled traces.
+                            msg = format_tool_error_for(
+                                env.config,
+                                env.ctx,
+                                ToolErrorKind::ToolException,
+                                "function",
+                                &tool.qualified_name(),
+                                &call.call_id,
+                                msg,
+                                Some(&e),
+                            )
+                            .await;
+                            sdk_generated_text = true;
+                        }
+                        // The default policy keeps the error out of traces even when sensitive
+                        // data is traced; only an application handler opts the detail in.
+                        if let Some(s) = scope::current_span() {
+                            let include = env.config.trace_include_sensitive_data
+                                && !tool.default_failure_error_function;
+                            s.set_error(
+                                "Error running tool (non-fatal)",
+                                Some(serde_json::json!({
+                                    "tool_name": tool.name,
+                                    "error": crate::tracing::get_trace_tool_error(
+                                        include,
+                                        &e.to_string()
+                                    ),
+                                })),
+                            );
+                        }
+                        // Port of `_on_handled_error`'s log: the detail only reaches the log
+                        // when the tool data policy allows it.
+                        if crate::debug::dont_log_tool_data() {
+                            log::debug!(target: crate::logger::LOG_TARGET, "Tool {} failed", tool.name);
+                        } else {
+                            log::error!(
+                                target: crate::logger::LOG_TARGET,
+                                "Tool {} failed: {} {e}",
+                                tool.name,
+                                call.arguments
+                            );
+                        }
+                        ToolOutput::Text(msg)
+                    }
+                    _ => return Err(e),
+                }
+            }
+        };
+
+        // A declared output type is a contract on the tool, not model feedback: a mismatch
+        // fails the run rather than reaching `failure_error_function`.
+        // The default failure text is model feedback, not a structured result. An application
+        // handler's output is the tool's result, so it must match the declared type too.
+        if !formatted_failure {
+            tool.validate_output(&tool_ctx.tool_name, &output)?;
+        } else if !tool.uses_default_failure_error_function
+            && let ToolOutput::Text(text) = &output
+        {
+            tool.validate_failure_text(&tool_ctx.tool_name, text)?;
+        }
+
+        for g in &tool.tool_output_guardrails {
+            let out = g
+                .run(ToolOutputGuardrailData {
+                    context: tool_ctx.clone(),
+                    agent_name: env.agent.name.clone(),
+                    output: output.clone(),
+                })
+                .await?;
+            output_results.push(ToolOutputGuardrailResult {
+                guardrail_name: g.name.clone(),
+                tool_name: tool.name.clone(),
+                output: out.clone(),
+            });
+            match &out.behavior {
+                ToolGuardrailBehavior::Allow => {}
+                ToolGuardrailBehavior::RejectContent { message } => {
+                    output = ToolOutput::Text(message.clone());
+                    output_rejected = true;
+                    break;
+                }
+                ToolGuardrailBehavior::RaiseException => {
+                    return Err(AgentsError::ToolOutputGuardrailTripwireTriggered {
+                        guardrail_name: g.name.clone(),
+                        output: Box::new(out),
+                        run_data: None,
+                    });
+                }
+            }
+        }
+
+        // The default failure text and a guardrail's rejection are SDK-generated errors, which a
+        // schema-backed tool called by a program answers as a JSON error object.
+        let make_outcome = |output: ToolOutput| match &output {
+            ToolOutput::Text(text) if sdk_generated_text || output_rejected => {
+                error_outcome(tool.output_json_schema.as_ref(), &call, text.clone())
+            }
+            _ => output_outcome(&call, output),
+        };
+        // Accepted output is recorded before the end hooks, so a call abandoned during them
+        // still contributes it.
+        ctl.commit(finish(
+            make_outcome(output.clone()),
+            input_results.clone(),
+            output_results.clone(),
+        ));
+        let run_hook = async {
+            match env.hooks {
+                Some(h) => {
+                    h.try_on_tool_end(&tool_ctx, env.agent, &tool_enum, &output)
+                        .await
+                }
+                None => Ok(()),
+            }
+        };
+        let agent_hook = async {
+            match &env.agent.hooks {
+                Some(h) => {
+                    h.try_on_tool_end(&tool_ctx, env.agent, &tool_enum, &output)
+                        .await
+                }
+                None => Ok(()),
+            }
+        };
+        let (run_hook, agent_hook) = futures::join!(run_hook, agent_hook);
+        run_hook?;
+        agent_hook?;
+        Ok(make_outcome(output))
+    };
+    let outcome = scope::with_span(span.clone(), Box::pin(run)).await;
+    match &outcome {
+        Ok(ToolOutcome::Output { output, .. }) if include => {
+            let text = output.to_model_string();
+            span.update_data(|d| {
+                if let SpanData::Function { output, .. } = d {
+                    *output = Some(text);
+                }
+            });
+        }
+        Err(e) => span.set_error(
+            "Error running tool",
+            Some(serde_json::json!({
+                "tool_name": tool.name,
+                "error": crate::tracing::get_trace_tool_error(
+                    env.config.trace_include_sensitive_data,
+                    &e.to_string()
+                ),
+            })),
+        ),
+        _ => {}
+    }
+    span.finish();
+    // A failure that is not an SDK error surfaces as a `UserError` naming the tool, like
+    // Python's `UserError(f"Error running tool {name}: {e}")`.
+    // An end hook that fails after the output was committed still hands the output back, so a
+    // retry skips the completed invocation.
+    let outcome = outcome.map_err(|e| {
+        let error = match e {
+            AgentsError::Other(_) | AgentsError::Json(_) | AgentsError::Io(_) => {
+                AgentsError::user(format!("Error running tool {}: {e}", tool.name))
+            }
+            other => other,
+        };
+        let committed = ctl.take_committed();
+        ToolFailure {
+            output_is_public: committed.is_some(),
+            error,
+            committed,
+        }
+    })?;
+    // SDK-only data the tool body attached plus whatever the extractor produces; the
+    // extractor wins on conflicting keys. Port of `maybe_extract_custom_data` +
+    // `merge_custom_data`.
+    let extracted = match (&tool.custom_data_extractor, &outcome) {
+        (Some(extractor), ToolOutcome::Output { output, item }) => {
+            let ctx = crate::tool::FunctionToolCustomDataContext {
+                tool_context: &tool_ctx,
+                tool: &tool,
+                output,
+                raw_item: item,
+                result_meta: tool_ctx.result_meta(),
+            };
+            extractor(&ctx).await
+        }
+        _ => None,
+    };
+    let custom_data = match crate::tool::merge_custom_data(&[tool_ctx.custom_data(), extracted]) {
+        Ok(data) => data,
+        Err(error) => {
+            // The output is committed; only the SDK-only data failed to attach.
+            return Err(ToolFailure {
+                error,
+                committed: Some(finish(outcome, input_results, output_results)),
+                output_is_public: false,
+            });
+        }
+    };
+    let mut result = finish(outcome, input_results, output_results);
+    result.custom_data = custom_data;
+    Ok(result)
+}
+
+/// How one function tool task ended.
+#[allow(clippy::large_enum_variant)]
+enum TaskEnd {
+    Done(std::result::Result<ToolExecResult, ToolFailure>),
+    /// Cancelled by the batch before it reached its post-invoke phase (or abandoned after the
+    /// wait).
+    Cancelled,
+}
+
+/// Execute tool calls concurrently (bounded by `max_function_tool_concurrency`), preserving
+/// the call order in the results.
+///
+/// `stop` is the sibling-category failure signal: when it fires the batch is wound down like a
+/// failed batch. `on_selected` runs as soon as the batch has selected its own failure, before
+/// its siblings are drained.
+pub(crate) async fn execute_function_tools<C: Send + Sync + 'static>(
+    env: &ToolEnv<'_, C>,
+    runs: Vec<(FunctionCall, Arc<FunctionTool<C>>)>,
+    stop: Option<&Signal>,
+    on_selected: &(dyn Fn() + Sync),
+) -> std::result::Result<Vec<ToolExecResult>, ToolBatchFailure> {
+    if runs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let limit = env
+        .config
+        .tool_execution
+        .max_function_tool_concurrency
+        .unwrap_or(runs.len())
+        .max(1);
+    // Up to `limit` calls run at once, and a finished call frees its slot immediately, so the
+    // queue refills in call order however the in-flight calls complete. Port of the
+    // `_FunctionToolBatchExecutor` FIFO refill. On the first failure the siblings that have not
+    // reached their post-invoke phase are cancelled (dropped), the ones that have get a bounded
+    // wait to finish their output (`_raise_failure_after_draining_siblings`); among the
+    // failures the one with the lowest tool-call order wins (`_select_function_tool_failure`).
+    // Siblings that had already committed their output are kept, in call order, so a retry does
+    // not run them again.
+    // Enablement is re-checked right before execution: every configured function tool is
+    // checked concurrently, a failing check aborts the batch with its own error (cancelling the
+    // checks still in flight), and a called tool that became disabled since the model saw it
+    // fails the batch before any call starts. Port of `_FunctionToolBatchExecutor.execute`'s
+    // `resolve_enabled_function_tools` pass.
+    let configured: Vec<&Arc<FunctionTool<C>>> = env
+        .agent
+        .tools
+        .iter()
+        .filter_map(|t| t.as_function())
+        .collect();
+    let fail = |error: AgentsError| ToolBatchFailure {
+        error,
+        completed: Vec::new(),
+        failure_committed: false,
+        sibling_stopped: false,
+    };
+    let enabled = futures::future::try_join_all(
+        configured
+            .iter()
+            .map(|tool| tool.is_enabled.try_evaluate(env.ctx, &env.agent.name)),
+    )
+    .await
+    .map_err(fail)?;
+    for (_, tool) in &runs {
+        let mut same = configured
+            .iter()
+            .zip(&enabled)
+            .filter(|(t, _)| Arc::ptr_eq(t, tool));
+        let is_configured = same.clone().next().is_some();
+        if is_configured && !same.any(|(_, on)| *on) {
+            return Err(fail(AgentsError::model_behavior(format!(
+                "Tool {} is currently disabled for agent {}.",
+                tool.name, env.agent.name
+            ))));
+        }
+    }
+    // The in-flight set is refilled by hand so that, once a call fails, draining the siblings
+    // never starts a queued call.
+    let mut queue = runs.into_iter().enumerate();
+    let ctls: std::sync::Mutex<Vec<(usize, Arc<FunctionTaskCtl>)>> =
+        std::sync::Mutex::new(Vec::new());
+    // Each call owns its environment, so a call still finalizing when the batch gives up on it
+    // can be handed to its own task instead of being dropped.
+    let start = |(order, (call, tool)): (usize, (FunctionCall, Arc<FunctionTool<C>>))| {
+        let ctl = Arc::new(FunctionTaskCtl::new());
+        ctls.lock().expect("ctls").push((order, ctl.clone()));
+        let owned = OwnedToolEnv::from_env(env);
+        Box::pin(async move {
+            let env = owned.as_env();
+            let end = tokio::select! {
+                biased;
+                r = execute_function_tool(&env, call, tool, &ctl) => TaskEnd::Done(r),
+                _ = ctl.cancel.wait() => TaskEnd::Cancelled,
+            };
+            (order, ctl, end)
+        })
+    };
+    let mut in_flight = futures::stream::FuturesUnordered::new();
+    for run in queue.by_ref().take(limit) {
+        in_flight.push(start(run));
+    }
+    let mut results: Vec<(usize, ToolExecResult)> = Vec::new();
+    let into_ordered = |mut results: Vec<(usize, ToolExecResult)>| {
+        results.sort_by_key(|(order, _)| *order);
+        results.into_iter().map(|(_, r)| r).collect::<Vec<_>>()
+    };
+    // The failure the batch selected: (order, error, its own output was committed).
+    let mut chosen: Option<(usize, AgentsError, bool)> = None;
+    let mut sibling_stopped = false;
+    loop {
+        let next = match stop {
+            Some(stop) => tokio::select! {
+                biased;
+                n = in_flight.next() => n,
+                _ = stop.wait() => {
+                    sibling_stopped = true;
+                    break;
+                }
+            },
+            None => in_flight.next().await,
+        };
+        let Some((order, ctl, end)) = next else {
+            break;
+        };
+        match end {
+            TaskEnd::Done(Ok(result)) => {
+                results.push((order, result));
+                if let Some(run) = queue.next() {
+                    in_flight.push(start(run));
+                }
+            }
+            TaskEnd::Done(Err(failure)) => {
+                let committed = failure.committed.is_some() && !failure.output_is_public;
+                results.extend(failure.committed.map(|c| (order, c)));
+                chosen = Some((order, failure.error, committed));
+                break;
+            }
+            TaskEnd::Cancelled => results.extend(ctl.take_committed().map(|c| (order, c))),
+        }
+    }
+    if chosen.is_none() && !sibling_stopped {
+        return Ok(into_ordered(results));
+    }
+    if chosen.is_some() {
+        on_selected();
+    }
+    // Wind the siblings down: calls still invoking are cancelled, calls already finalizing get
+    // a bounded wait and are abandoned after it, keeping any output they committed.
+    let live: Vec<Arc<FunctionTaskCtl>> = ctls
+        .lock()
+        .expect("ctls")
+        .iter()
+        .map(|(_, ctl)| ctl.clone())
+        .collect();
+    for ctl in &live {
+        if !ctl.in_post_invoke() {
+            ctl.cancel.set();
+        }
+    }
+    let mut settled: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut absorb = |order: usize,
+                      ctl: Arc<FunctionTaskCtl>,
+                      end: TaskEnd,
+                      results: &mut Vec<(usize, ToolExecResult)>| {
+        settled.insert(order);
+        match end {
+            TaskEnd::Done(Ok(result)) => results.push((order, result)),
+            TaskEnd::Done(Err(other)) => {
+                let committed = other.committed.is_some() && !other.output_is_public;
+                results.extend(other.committed.map(|c| (order, c)));
+                if chosen.as_ref().is_none_or(|c| order < c.0) {
+                    chosen = Some((order, other.error, committed));
+                }
+            }
+            TaskEnd::Cancelled => results.extend(ctl.take_committed().map(|c| (order, c))),
+        }
+    };
+    let drained = tokio::time::timeout(post_invoke_wait(env.config), async {
+        while let Some((order, ctl, end)) = in_flight.next().await {
+            absorb(order, ctl, end, &mut results);
+        }
+    })
+    .await;
+    if drained.is_err() {
+        // Every call still in flight was finalizing when the batch cancelled the rest (the
+        // cancelled ones end at their next poll). They keep the output they committed and
+        // keep running detached, as Python leaves its post-invoke tasks running once the
+        // failure propagates; a late failure is only logged.
+        let abandoned: Vec<(usize, Arc<FunctionTaskCtl>)> = ctls
+            .lock()
+            .expect("ctls")
+            .iter()
+            .filter(|(order, _)| !settled.contains(order))
+            .map(|(order, ctl)| (*order, ctl.clone()))
+            .collect();
+        for (order, ctl) in abandoned {
+            results.extend(ctl.take_committed().map(|c| (order, c)));
+        }
+        let scope = scope::ScopeSnapshot::capture();
+        let owner = crate::models::run_context::get_model_run_owner();
+        for task in in_flight {
+            let detached = scope.clone().enter(async move {
+                let (_, _, end) = match owner {
+                    Some(owner) => {
+                        crate::models::run_context::model_run_context(owner, task).await
+                    }
+                    None => task.await,
+                };
+                if let TaskEnd::Done(Err(failure)) = end {
+                    const MESSAGE: &str =
+                        "Background function tool post-invoke task raised after failure propagation.";
+                    if crate::debug::dont_log_tool_data() {
+                        log::error!(target: crate::logger::LOG_TARGET, "{MESSAGE}");
+                    } else {
+                        log::error!(target: crate::logger::LOG_TARGET, "{MESSAGE} {}", failure.error);
+                    }
+                }
+            });
+            drop(tokio::spawn(detached));
+        }
+    }
+    let (error, failure_committed) = match chosen {
+        Some((_, error, committed)) => (error, committed),
+        None => (
+            AgentsError::user("Tool execution stopped because a sibling tool failed."),
+            false,
+        ),
+    };
+    Err(ToolBatchFailure {
+        error,
+        completed: into_ordered(results),
+        failure_committed,
+        sibling_stopped,
+    })
+}

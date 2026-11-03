@@ -1,0 +1,28 @@
+[
+  {
+    "choices": [
+      {
+        "message": {
+          "role": "assistant",
+          "content": null,
+          "tool_calls": [
+            {
+              "id": "call_parity_chat_1",
+              "type": "function",
+              "function": {"name": "get_weather", "arguments": "{\"city\":\"Tokyo\"}"}
+            }
+          ]
+        },
+        "finish_reason": "tool_calls"
+      }
+    ]
+  },
+  {
+    "choices": [
+      {
+        "message": {"role": "assistant", "content": "The weather in Tokyo is sunny."},
+        "finish_reason": "stop"
+      }
+    ]
+  }
+]
