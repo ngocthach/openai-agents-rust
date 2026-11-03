@@ -1,0 +1,10 @@
+{
+  "each": {
+    "error": null,
+    "final_output": "nonempty",
+    "search_calls": {"gt": 0},
+    "annotations": {"gt": 0},
+    "usage.requests": 1
+  },
+  "across": ["error", "usage.requests"]
+}

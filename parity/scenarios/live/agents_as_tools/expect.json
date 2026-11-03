@@ -1,0 +1,9 @@
+{
+  "each": {
+    "error": null,
+    "tool_calls.names": ["translate_to_spanish"],
+    "usage.requests": 3,
+    "new_item_types": ["tool_call_item", "tool_call_output_item", "message_output_item"]
+  },
+  "across": ["error", "tool_calls.names", "usage.requests", "new_item_types"]
+}

@@ -1,0 +1,21 @@
+[
+  {
+    "output": [
+      {"type": "function_call", "name": "how_many_jokes", "arguments": "{}"}
+    ]
+  },
+  {
+    "output": [
+      {
+        "type": "message",
+        "content": [
+          {
+            "type": "output_text",
+            "text": "1. Why did the scarecrow win an award? Outstanding in his field. 2. What do you call fake spaghetti? An impasta. 3. Why did the bicycle fall over? It was two-tired.",
+            "annotations": []
+          }
+        ]
+      }
+    ]
+  }
+]

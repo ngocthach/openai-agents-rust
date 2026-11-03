@@ -1,0 +1,17 @@
+[
+  {
+    "output": [
+      {"type": "function_call", "name": "get_weather", "arguments": "{\"city\":\"Tokyo\"}"}
+    ]
+  },
+  {
+    "output": [
+      {
+        "type": "message",
+        "content": [
+          {"type": "output_text", "text": "The weather in Tokyo is sunny.", "annotations": []}
+        ]
+      }
+    ]
+  }
+]

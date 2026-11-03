@@ -1,0 +1,17 @@
+[
+  {
+    "output": [
+      {"type": "function_call", "name": "transfer_to_history_tutor", "arguments": "{}"}
+    ]
+  },
+  {
+    "output": [
+      {
+        "type": "message",
+        "content": [
+          {"type": "output_text", "text": "George Washington.", "annotations": []}
+        ]
+      }
+    ]
+  }
+]

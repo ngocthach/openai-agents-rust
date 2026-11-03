@@ -1,0 +1,59 @@
+[
+  {
+    "when": {"instructions_contains": "math homework"},
+    "output": [
+      {
+        "type": "message",
+        "content": [
+          {
+            "type": "output_text",
+            "text": "{\"reasoning\":\"Solving for x is homework.\",\"is_math_homework\":true}",
+            "annotations": []
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "when": {"instructions_contains": "math homework"},
+    "output": [
+      {
+        "type": "message",
+        "content": [
+          {
+            "type": "output_text",
+            "text": "{\"reasoning\":\"Solving for x is homework.\",\"is_math_homework\":true}",
+            "annotations": []
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "when": {"instructions_contains": "(parallel)"},
+    "output": [
+      {
+        "type": "message",
+        "content": [{"type": "output_text", "text": "x = 3", "annotations": []}]
+      }
+    ]
+  },
+  {
+    "when": {"instructions_contains": "(blocking)"},
+    "output": [
+      {
+        "type": "message",
+        "content": [{"type": "output_text", "text": "x = 3", "annotations": []}]
+      }
+    ]
+  },
+  {
+    "when": {"instructions_contains": "(output)"},
+    "output": [
+      {
+        "type": "message",
+        "content": [{"type": "output_text", "text": "x = 3", "annotations": []}]
+      }
+    ]
+  }
+]

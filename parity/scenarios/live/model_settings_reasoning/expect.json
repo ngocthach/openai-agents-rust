@@ -1,0 +1,8 @@
+{
+  "each": {
+    "error": null,
+    "final_output": "nonempty",
+    "usage.requests": 1
+  },
+  "across": ["error", "usage.requests", "has_reasoning_item"]
+}

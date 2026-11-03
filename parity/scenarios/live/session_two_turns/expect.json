@@ -1,0 +1,10 @@
+{
+  "each": {
+    "error": null,
+    "mentions_fact": true,
+    "usage.requests": 1,
+    "session_items": 4,
+    "input_list_len": 4
+  },
+  "across": ["error", "mentions_fact", "usage.requests", "session_items", "input_list_len"]
+}

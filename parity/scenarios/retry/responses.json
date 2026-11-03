@@ -1,0 +1,14 @@
+[
+  {
+    "status": 429,
+    "body": {"error": {"message": "Rate limit reached.", "type": "rate_limit_error", "code": "rate_limit_exceeded"}}
+  },
+  {
+    "output": [
+      {
+        "type": "message",
+        "content": [{"type": "output_text", "text": "RETRY_OK", "annotations": []}]
+      }
+    ]
+  }
+]

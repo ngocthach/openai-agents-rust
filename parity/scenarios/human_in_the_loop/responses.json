@@ -1,0 +1,32 @@
+[
+  {
+    "output": [
+      {"type": "function_call", "name": "get_temperature", "arguments": "{\"city\":\"Oakland\"}"}
+    ]
+  },
+  {
+    "output": [
+      {
+        "type": "message",
+        "content": [
+          {"type": "output_text", "text": "It is 20° Celsius in Oakland.", "annotations": []}
+        ]
+      }
+    ]
+  },
+  {
+    "output": [
+      {"type": "function_call", "name": "get_temperature", "arguments": "{\"city\":\"Oakland\"}"}
+    ]
+  },
+  {
+    "output": [
+      {
+        "type": "message",
+        "content": [
+          {"type": "output_text", "text": "I could not get the temperature.", "annotations": []}
+        ]
+      }
+    ]
+  }
+]

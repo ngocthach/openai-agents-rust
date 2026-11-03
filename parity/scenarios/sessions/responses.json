@@ -1,0 +1,14 @@
+[
+  {"when": {"instructions_contains": "Reply very concisely."},
+   "output": [{"type": "message", "content": [{"type": "output_text", "text": "San Francisco.", "annotations": []}]}]},
+  {"when": {"instructions_contains": "Reply very concisely."},
+   "output": [{"type": "message", "content": [{"type": "output_text", "text": "California.", "annotations": []}]}]},
+  {"when": {"instructions_contains": "Reply very concisely."},
+   "output": [{"type": "message", "content": [{"type": "output_text", "text": "About 39 million.", "annotations": []}]}]},
+  {"when": {"instructions_contains": "be VERY concise."},
+   "output": [{"type": "message", "content": [{"type": "output_text", "text": "Brazil", "annotations": []}]}]},
+  {"when": {"instructions_contains": "be VERY concise."},
+   "output": [{"type": "message", "content": [{"type": "output_text", "text": "Brasilia", "annotations": []}]}]},
+  {"when": {"instructions_contains": "You are a helpful assistant."},
+   "output": [{"type": "message", "content": [{"type": "output_text", "text": "Hello!", "annotations": []}]}]}
+]
