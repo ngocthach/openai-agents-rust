@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.24.3 (2026-11-03)
+
+Two request-payload differences found by the new parity harness (`parity/`, `docs/parity-harness.md`), which runs
+the same scenarios through the Python SDK 0.24.0 and this crate against a local capture server and diffs the
+requests they send.
+
+- Agents as tools: the default parameter schema now carries Python's description
+  (`"Default input schema for agent-as-tool calls."`), so the model sees the same tool definition. As in Python, a
+  structured input builder on such a tool now receives the schema summary built from that description
+  (`Description: … \n- input (string, required)`) instead of `None`.
+- Hosted code interpreter: no `code_interpreter_call.outputs` entry is added to `include` any more; the Python SDK
+  never requests it.
+
+Capture matrix: 18 scenarios (default model, explicit `gpt-6-luna`, model settings, function tools, structured
+output, handoffs, agents as tools, guardrails, human in the loop, sessions, streaming, hosted tools, media inputs,
+prompts, chat completions, retry, tracing export, reasoning items), all request bodies identical after
+normalization; report in `plans/reports/parity-capture-matrix-261103-0651-python-vs-rust-report.md`.
+
+Remaining differences (not changed): an object returned by a function tool reaches the model as Python's `str()` of
+it in Python and as JSON here; the rebuilt-agent and JSON-restored resume differences recorded under 0.24.2.
+
 ## 0.24.2 (2026-11-02)
 
 - Resume: an in-memory `RunState` (from `to_state()`) now carries its run's starting agent (`RunState::origin_agent`,
